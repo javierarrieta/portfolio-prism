@@ -37,6 +37,11 @@ export default function TransactionLedger({ transactions, assets, onDeleteTransa
               const cost = tx.quantity * tx.price;
               const total = isSplit ? null : (tx.type === 'BUY' ? (cost + tx.fee) : (cost - tx.fee));
               return (
+                // The row click is a mouse convenience. The TrendingUp button below is
+                // the keyboard and screen-reader affordance -- it is a real button with an
+                // accessible name. A tabIndex on the <tr> would add a second tab stop for
+                // the same action and give the row ambiguous table semantics, so it stays
+                // deliberately un-focusable.
                 <tr
                   key={tx.id}
                   onClick={isSell ? () => onSelectSell(tx.id) : undefined}
