@@ -213,3 +213,50 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
     assert_eq!(body["strategy"], "FIFO", "an unrecognized value must not come back naming a method that did not run");
     assert_eq!(dec(&body, "realized_pnl"), d("2000"), "FIFO figure, not LIFO's 1600");
 }
+
+async fn split_fixture(split_date: &str) -> (Client, i32) {
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Split Flag", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, split_date).await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    (client, sell)
+}
+
+async fn split_applied_at(split_date: &str) -> serde_json::Value {
+    let (client, sell) = split_fixture(split_date).await;
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    serde_json::from_str(&resp.into_string().await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_sell_pnl_split_before_sell_sets_split_applied() {
+    // The `true` branch of split_applied had no endpoint coverage: the modal's own
+    // test drives the payload directly, so the server-side computation was untested.
+    let body = split_applied_at("2024-06-01T00:00:00Z").await;
+    assert_eq!(body["split_applied"], true);
+    // 2:1 split halves the recorded buy price; the footnote exists because the
+    // table then shows a price nobody typed into a form.
+    assert_eq!(dec(&body["matches"][0], "buy_price"), d("50"));
+}
+
+#[tokio::test]
+async fn test_sell_pnl_split_on_the_sell_date_counts() {
+    // Pins the `<=` boundary. Splits sort ahead of same-day sells in the replay, so
+    // a same-date split has already been applied to the lots this sell consumed.
+    let body = split_applied_at("2024-12-01T00:00:00Z").await;
+    assert_eq!(body["split_applied"], true);
+    assert_eq!(dec(&body["matches"][0], "buy_price"), d("50"));
+}
+
+#[tokio::test]
+async fn test_sell_pnl_split_after_the_sell_does_not_count() {
+    // Pins the other side of `<=`: a split that happened later did not touch the
+    // prices this sell was computed from, so claiming it did would be a lie.
+    let body = split_applied_at("2025-01-01T00:00:00Z").await;
+    assert_eq!(body["split_applied"], false);
+    assert_eq!(dec(&body["matches"][0], "buy_price"), d("100"));
+}
