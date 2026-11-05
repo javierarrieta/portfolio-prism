@@ -208,7 +208,9 @@ export default function App() {
       setLoading(true);
       const res = await fetch(`${API_BASE}/transactions/${txId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete transaction');
-      setSellPnl(null);
+      // Only close the breakdown if this is the sell it is showing; deleting an
+      // unrelated row should not dismiss a figure someone is reading.
+      setSellPnl((current) => (current?.txId === txId ? null : current));
       if (selectedId) await fetchPortfolioData(selectedId);
     } catch (err) {
       alert(`Error deleting transaction: ${err instanceof Error ? err.message : String(err)}`);
