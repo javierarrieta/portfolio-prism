@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Info, Loader2, X } from 'lucide-react';
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import { normalizeSellPnl } from '../utils/decimal';
@@ -13,12 +13,28 @@ interface Props {
 
 const pnlColor = (v: number) => (v >= 0 ? 'var(--color-success)' : 'var(--color-danger)');
 const qty = (v: number) => v.toLocaleString(undefined, { maximumFractionDigits: 6 });
+// A request that neither resolves nor fails would otherwise leave the spinner up
+// forever, with the retry button unreachable behind it. Exported so the test cannot
+// drift from the value it is meant to pin.
+export const REQUEST_TIMEOUT_MS = 15_000;
 
 export default function SellPnlModal({ transactionId, strategy, thresholdDays, onClose }: Props) {
   const [data, setData] = useState<SellPnlBreakdown | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  // Escape is the only way out for a keyboard user who cannot reach the X, and the
+  // backdrop is a mouse affordance.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Focus the dialog so Tab cannot wander into the page behind it.
+  useEffect(() => { cardRef.current?.focus(); }, []);
 
   // Keyed on strategy and threshold so the modal refetches when the Holdings tab
   // changes the matching method -- that is the point, not an accident to prune.
@@ -26,22 +42,30 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
   // synchronous reset there, and the retry handler below does that reset instead.
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`)
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    fetch(`/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`, { signal: controller.signal })
       .then((r) => {
         if (!r.ok) throw new Error(`sell pnl request failed: ${r.status}`);
         return r.json();
       })
       .then((json) => {
         if (cancelled) return;
+        clearTimeout(timer);
         setData(normalizeSellPnl(json));
         setLoading(false);
       })
       .catch(() => {
         if (cancelled) return;
+        clearTimeout(timer);
         setError(true);
         setLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [transactionId, strategy, thresholdDays, retryKey]);
 
   const retry = () => {
@@ -58,7 +82,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }}
     >
-      <div className="glass-card" style={{ padding: '32px', width: '760px', maxWidth: '92vw', maxHeight: '86vh', overflowY: 'auto', background: '#121929' }}>
+      <div className="glass-card" data-testid="sell-pnl-dialog" role="dialog" aria-modal="true" aria-label="Sell realized P&L breakdown" tabIndex={-1} ref={cardRef} style={{ padding: '32px', width: '760px', maxWidth: '92vw', maxHeight: '86vh', overflowY: 'auto', background: '#121929' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
           {data ? (
             <div>

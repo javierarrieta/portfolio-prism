@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import SellPnlModal from '../../components/SellPnlModal'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import SellPnlModal, { REQUEST_TIMEOUT_MS } from '../../components/SellPnlModal'
 import { server } from '../mocks/server'
 import { http, HttpResponse } from 'msw'
 
@@ -110,5 +110,32 @@ describe('SellPnlModal', () => {
     await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: /close/i }))
     expect(onClose).toHaveBeenCalled()
+  })
+
+  it('is a dialog, takes focus, and closes on Escape', async () => {
+    const onClose = vi.fn()
+    renderModal({ onClose })
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveFocus()
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it('gives up on a request that never settles', async () => {
+    // A hung request used to leave the spinner up forever with the retry button
+    // unreachable behind it. The fake honours the abort signal the way fetch does.
+    const real = globalThis.fetch
+    vi.stubGlobal('fetch', (_url: unknown, opts: { signal: AbortSignal }) =>
+      new Promise((_res, rej) => opts.signal.addEventListener('abort', () => rej(new Error('aborted')))))
+    vi.useFakeTimers()
+    try {
+      renderModal()
+      await act(async () => { await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS) })
+      expect(screen.getByTestId('modal-error')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+      globalThis.fetch = real
+    }
   })
 })
