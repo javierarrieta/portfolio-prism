@@ -284,12 +284,12 @@ git commit -m "feat: add sell P&L breakdown schemas with optional-decimal json"
 
 This is a pure refactor. There is no new test here: the acceptance proof is that the 14 existing engine tests pass with **zero edits to the test module**. If one of them fails, the refactor changed behaviour — fix the refactor, not the test.
 
-- [ ] **Step 1: Capture the green baseline**
+- [x] **Step 1: Capture the green baseline**
 
 Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -10`
 Expected: `test result: ok. 14 passed`. If this is not green before you start, stop and report it — the plan assumes it is.
 
-- [ ] **Step 2: Add `source_tx_id` to `InternalLot` and share the sort**
+- [x] **Step 2: Add `source_tx_id` to `InternalLot` and share the sort**
 
 Replace the `InternalLot` struct with:
 
@@ -320,7 +320,7 @@ Add this associated function as the first item in `impl TaxLotEngine`:
     }
 ```
 
-- [ ] **Step 3: Move the loop body into `replay()`**
+- [x] **Step 3: Move the loop body into `replay()`**
 
 Add this associated function after `sorted_transactions`. **Move the body of the existing `for tx in sorted_txs { ... }` loop in `calculate_lots` into it — do not retype it.** The sort order, the split rescaling, the fee amortisation, the FX conversion and the HYBRID bucketing are already correct there; the entire point of the refactor is that they come across unchanged.
 
@@ -347,7 +347,7 @@ Exactly **three** changes to the moved loop, and nothing else:
 
 `InternalLot` gains `source_tx_id: i32`, set from `tx.id` in the BUY branch. Without it two buys on the same date at the same price are indistinguishable and the view cannot say which purchase a cost basis came from.
 
-- [ ] **Step 4: Rewrite `calculate_lots` to call `replay`**
+- [x] **Step 4: Rewrite `calculate_lots` to call `replay`**
 
 Keep the `calculate_lots` signature byte-identical — nine parameters, `symbol` and `asset_type` first — and replace everything from it through the end of its `for tx in sorted_txs { ... }` loop with four steps:
 
@@ -364,12 +364,12 @@ use crate::schemas::{AssetTaxSummary, LotMatch, SellBreakdown, TaxLot};
 
 `LotMatch` is unused until Task 3. That is a warning at most: CI (`.github/workflows/ci.yml:21`) runs `cargo test` and nothing else, and this repository has no clippy step. Do not add `#[allow(unused_imports)]` for a gate that does not exist — Task 3 consumes the import two commits later.
 
-- [ ] **Step 5: Run the existing engine tests — they must pass unmodified**
+- [x] **Step 5: Run the existing engine tests — they must pass unmodified**
 
 Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -15`
 Expected: `test result: ok. 14 passed; 0 failed`. They are green here because Step 3 already produces correct per-sell totals; Step 6 only adds the per-lot detail those 14 tests do not look at. If any fail now, the refactor changed behaviour — fix the refactor, not the test. **Do not edit the test module.**
 
-- [ ] **Step 6: Add `term_for`, then record each match**
+- [x] **Step 6: Add `term_for`, then record each match**
 
 First, at file scope in `tax_engine.rs`, after the `impl TaxLotEngine` block:
 
@@ -443,21 +443,21 @@ Then replace the `breakdowns.push(...)` from Step 3 so its totals are derived fr
                 });
 ```
 
-- [ ] **Step 7: Confirm the placeholder is gone**
+- [x] **Step 7: Confirm the placeholder is gone**
 
 `grep -n "matches: vec!\[\]" backend_rust/src/engines/tax_engine.rs` must return nothing. If it matches, Step 6's per-lot recording is not wired up yet, and the modal would render a correct total with an empty lot table — the one failure mode this feature exists to prevent.
 
-- [ ] **Step 8: Run the engine tests**
+- [x] **Step 8: Run the engine tests**
 
 Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -15`
 Expected: `test result: ok. 14 passed; 0 failed` — same 14 tests, same assertions, none edited.
 
-- [ ] **Step 9: Run the whole backend suite**
+- [x] **Step 9: Run the whole backend suite**
 
 Run: `cd backend_rust && cargo test 2>&1 | tail -20`
 Expected: PASS, including `analytics_test`, `transactions_test`, `portfolios_test`, `decimal_migration_test`, `cors_test`.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add backend_rust/src/engines/tax_engine.rs

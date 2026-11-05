@@ -1,5 +1,5 @@
 use crate::models::Transaction;
-use crate::schemas::{TaxLot, AssetTaxSummary};
+use crate::schemas::{AssetTaxSummary, LotMatch, SellBreakdown, TaxLot};
 use crate::services::currency_service::CurrencyService;
 use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
@@ -207,6 +207,7 @@ mod tests {
 pub struct TaxLotEngine;
 
 struct InternalLot {
+    source_tx_id: i32,
     date: DateTime<Utc>,
     price: Decimal,
     qty: Decimal,
@@ -214,36 +215,33 @@ struct InternalLot {
 }
 
 impl TaxLotEngine {
-    pub async fn calculate_lots(
-        symbol: &str,
-        asset_type: &str,
-        transactions: &[Transaction],
-        current_price: Decimal,
-        asset_currency: &str,
-        base_currency: &str,
-        currency_service: &CurrencyService,
-        strategy: &str,
-        hybrid_threshold_days: i64,
-    ) -> Result<AssetTaxSummary> {
-        let mut sorted_txs = transactions.to_vec();
-        // Splits must apply to existing lots before any same-day buy/sell.
+    /// Canonical transaction order. Splits must apply to existing lots before
+    /// any same-day buy/sell, so they sort ahead of everything else on a tie.
+    fn sorted_transactions(transactions: &[Transaction]) -> Vec<Transaction> {
         let split_priority = |tx: &Transaction| {
             if tx.r#type.to_uppercase() == "SPLIT" { 0 } else { 1 }
         };
+        let mut sorted_txs = transactions.to_vec();
         sorted_txs.sort_by(|a, b| {
             a.date.cmp(&b.date).then_with(|| split_priority(a).cmp(&split_priority(b)))
         });
+        sorted_txs
+    }
 
-        let current_price_base = if asset_currency != base_currency {
-            let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
-            let rate = currency_service.get_rate(asset_currency, base_currency, latest_date).await?;
-            current_price * rate
-        } else {
-            current_price
-        };
-
+    /// Single source of truth for lot matching. Both public entry points call
+    /// this, which is what makes per-sell realized P&L reconcile with the
+    /// asset-level total: `realized_pnl` is *derived* from the returned
+    /// breakdowns by the caller, never accumulated on a separate path.
+    async fn replay(
+        sorted_txs: &[Transaction],
+        currency_service: &CurrencyService,
+        asset_currency: &str,
+        base_currency: &str,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+    ) -> Result<(Vec<InternalLot>, Vec<SellBreakdown>)> {
         let mut buy_lots: Vec<InternalLot> = Vec::new();
-        let mut realized_pnl = Decimal::ZERO;
+        let mut breakdowns: Vec<SellBreakdown> = Vec::new();
 
         for tx in sorted_txs {
             let tx_rate = if asset_currency != base_currency {
@@ -264,6 +262,7 @@ impl TaxLotEngine {
                 };
                 let unit_cost_base = unit_cost_asset * tx_rate;
                 buy_lots.push(InternalLot {
+                    source_tx_id: tx.id,
                     date: tx.date,
                     price: tx_price * tx_rate,
                     qty: tx_qty,
@@ -282,10 +281,6 @@ impl TaxLotEngine {
                     .filter(|(_, lot)| lot.date <= tx.date && lot.qty > Decimal::ZERO)
                     .map(|(i, _)| i)
                     .collect();
-
-                if eligible_indices.is_empty() {
-                    continue;
-                }
 
                 match strategy.to_uppercase().as_str() {
                     "FIFO" => {
@@ -315,6 +310,8 @@ impl TaxLotEngine {
                     }
                 }
 
+                let mut matches: Vec<LotMatch> = Vec::new();
+
                 for idx in eligible_indices {
                     if qty_to_sell <= Decimal::ZERO {
                         break;
@@ -323,11 +320,45 @@ impl TaxLotEngine {
                     let matched_qty = qty_to_sell.min(lot.qty);
                     let cost_basis = matched_qty * lot.unit_cost;
                     let proceeds = matched_qty * sell_unit_proceeds_base;
+                    let holding_days = tx.date.signed_duration_since(lot.date).num_days();
 
-                    realized_pnl += proceeds - cost_basis;
+                    matches.push(LotMatch {
+                        buy_transaction_id: lot.source_tx_id,
+                        buy_date: lot.date,
+                        buy_price: lot.price,
+                        unit_cost: lot.unit_cost,
+                        matched_qty,
+                        // Read before the mutation below: this is what lets the
+                        // view tell "drained the lot" from "partially used".
+                        lot_qty_before_match: lot.qty,
+                        cost_basis,
+                        proceeds,
+                        pnl: proceeds - cost_basis,
+                        holding_days,
+                        term: term_for(strategy, holding_days, hybrid_threshold_days),
+                    });
+
                     lot.qty -= matched_qty;
                     qty_to_sell -= matched_qty;
                 }
+
+                // Totals are derived from the matches, not carried alongside
+                // them, so the per-sell figure and its lot table cannot disagree.
+                let matched_qty: Decimal = matches.iter().map(|m| m.matched_qty).sum();
+                let cost_basis: Decimal = matches.iter().map(|m| m.cost_basis).sum();
+                let proceeds: Decimal = matches.iter().map(|m| m.proceeds).sum();
+
+                breakdowns.push(SellBreakdown {
+                    sell_transaction_id: tx.id,
+                    sell_date: tx.date,
+                    sold_qty: tx_qty,
+                    matched_qty,
+                    unmatched_qty: tx_qty - matched_qty,
+                    proceeds,
+                    cost_basis,
+                    realized_pnl: proceeds - cost_basis,
+                    matches,
+                });
             } else if tx.r#type.to_uppercase() == "SPLIT" {
                 // Split ratio = quantity : price (shares after : shares before).
                 // Existing lots scale in quantity and divide in unit cost so total
@@ -344,6 +375,43 @@ impl TaxLotEngine {
             }
         }
 
+        Ok((buy_lots, breakdowns))
+    }
+
+    pub async fn calculate_lots(
+        symbol: &str,
+        asset_type: &str,
+        transactions: &[Transaction],
+        current_price: Decimal,
+        asset_currency: &str,
+        base_currency: &str,
+        currency_service: &CurrencyService,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+    ) -> Result<AssetTaxSummary> {
+        let sorted_txs = Self::sorted_transactions(transactions);
+
+        let current_price_base = if asset_currency != base_currency {
+            let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
+            let rate = currency_service.get_rate(asset_currency, base_currency, latest_date).await?;
+            current_price * rate
+        } else {
+            current_price
+        };
+
+        let (buy_lots, breakdowns) = Self::replay(
+            &sorted_txs,
+            currency_service,
+            asset_currency,
+            base_currency,
+            strategy,
+            hybrid_threshold_days,
+        )
+        .await?;
+
+        // Derived, not accumulated: the asset total is the sum of the per-sell
+        // totals by construction, so the two can never drift apart.
+        let realized_pnl: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();
         let mut open_lots = Vec::new();
         let mut total_remaining_qty = Decimal::ZERO;
         let mut total_cost_basis = Decimal::ZERO;
@@ -388,4 +456,14 @@ impl TaxLotEngine {
             tax_lots: open_lots,
         })
     }
+}
+
+/// Short/long-term bucketing exists only for HYBRID, where `threshold_days` is
+/// a real strategy parameter. Reporting a term under FIFO or LIFO would present
+/// a HYBRID tuning knob as a tax fact, so it stays null there.
+fn term_for(strategy: &str, holding_days: i64, threshold_days: i64) -> Option<String> {
+    if strategy.to_uppercase() != "HYBRID" {
+        return None;
+    }
+    Some(if holding_days <= threshold_days { "SHORT".to_string() } else { "LONG".to_string() })
 }
