@@ -10,17 +10,33 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-05-sell-pnl-breakdown-design.md`
 
+**Normative for:** task sequencing, file lists and the test inventory. The spec is normative for
+schemas and JSON keys, the route contract, the reconciliation invariant and the UI contract. Where
+they disagree the spec wins for behaviour and this plan wins for order of work; the *Deviations*
+list below is the only place a divergence is allowed to live.
+
 ## Global Constraints
 
-- All money is `rust_decimal::Decimal` in the backend and serializes as a **JSON string** via `#[serde(with = "decimal_json")]`. Never `f64` for money.
-- The frontend receives decimal strings and converts them to `number` **only** at the fetch boundary in `frontend/src/utils/decimal.ts`. Components never parse decimal strings themselves.
+- All money is `rust_decimal::Decimal` in the backend and serializes as a **JSON string** via `#[serde(with = "decimal_json")]`. Never `f64` for money in production code — and that covers **derived** money too: no `f64` intermediate anywhere in the new code, including the `roi` division (`realized_pnl / cost_basis` stays `Decimal` division) and any percentage or ratio the modal computes. The only `number` in the system is the display-formatted value produced at the fetch boundary. **Test seeders are exempt:** `tests/common/mod.rs::seed_transaction` already takes `qty`/`price`/`fee` as `f64`, and the new `seed_transaction_at` follows the existing harness rather than inventing a parallel one.
+- The frontend receives decimal strings and converts them to `number` **only** at the fetch boundary in `frontend/src/utils/decimal.ts`. Components never parse decimal strings themselves, and never mutate the normalized response — no in-place sort. The response is already in consumption order; the table renders `matches` as received.
 - All API routes are under `/api`.
-- `AssetTaxSummary` and `TaxLot` must not change shape. `/tax-summary` response is byte-for-byte unchanged.
-- The new endpoint performs **no** call to `CurrencyService::get_price`. Realized P&L needs no current quote.
-- The 14 pre-existing tests in `backend_rust/src/engines/tax_engine.rs` pass **unmodified** at every commit. Do not edit them to make a refactor pass.
+- `AssetTaxSummary` and `TaxLot` must not change shape. The observable requirement is narrower and is the one to test: **the JSON value of every field in a `/tax-summary` entry is unchanged**. Whether the serializer emits `"0"` or `"0.0"` for a value is a by-product of `Decimal` scale, not a contract; the existing route test (`analytics_test.rs`) is the arbiter and must pass unmodified.
+- The new endpoint performs **no** call to `CurrencyService::get_price`. Realized P&L needs no current quote. It **does** call `get_rate` when `asset_currency != currency`, because `get_rate` is cache-aside and fetches on a miss — that is expected and is not a violation.
+- FX conversion happens **inside the engine replay**, at the same point `calculate_lots` converts today, so the per-sell numbers and the asset total are converted identically. The handler must not convert anything after the fact.
+- The engine tests present on `origin/main` (14 at the time of writing) pass **unmodified** at every commit. Do not edit them to make a refactor pass.
 - No new database table, no migration, no persisted match state. Read-only.
 - `term` (SHORT/LONG) is populated **only** when `strategy == "HYBRID"`. Under FIFO/LIFO it is `null`.
 - Branch per the repo convention: work on `feat/sell-pnl-breakdown` in a worktree, never in the primary checkout.
+
+**Names, so the next reader does not wire the wrong field.** `SellBreakdown` is the engine type,
+`SellPnlResponse` is the wire type, `SellPnlBreakdown` is the frontend mirror of the wire type. On
+the wire the sell's id is `transaction_id`; `sell_transaction_id` exists only on the engine type,
+and `buy_transaction_id` is the matched buy's id. `matched_qty` appears at two levels and means
+different things: on `LotMatch` it is the quantity taken from that lot, on the response it is the
+total matched across all lots. The UI surface has two names and both are load-bearing: the nav item
+is **"Transaction Ledger"** (`App.tsx:335`) and the card heading inside it is **"Transaction
+History"** (`App.tsx:423`). Task 9's wiring test clicks the nav item; Task 7's component test
+asserts on the heading. Do not "unify" one to match the other.
 
 ## Review Focus
 
@@ -46,6 +62,7 @@ The spec implies these inputs; no single task's happy-path test covers them, and
 | `backend_rust/tests/sell_pnl_test.rs` | create — endpoint tests |
 | `docs/openapi/openapi.json` | regenerate |
 | `frontend/src/types.ts` | modify — `LotMatch`, `SellPnlBreakdown` |
+| `frontend/src/types/api.d.ts` | regenerate — generated from the OpenAPI spec in Task 5; committed artifact, must not drift |
 | `frontend/src/utils/decimal.ts` | modify — `normalizeSellPnl` |
 | `frontend/src/utils/decimal.test.ts` | create — normalizer tests |
 | `frontend/src/components/TransactionLedger.tsx` | create — extracted ledger + SELL affordance |
@@ -54,8 +71,17 @@ The spec implies these inputs; no single task's happy-path test covers them, and
 | `frontend/src/test/mocks/handlers.ts` | modify — MSW handler for the new route |
 | `frontend/src/test/components/TransactionLedger.test.tsx` | create |
 | `frontend/src/test/components/SellPnlModal.test.tsx` | create |
+| `frontend/src/test/components/AppLedger.test.tsx` | create — wiring test: SELL row click opens the modal |
+| `frontend/src/utils/format.ts` | no change — `term_for` already exists and is the only source for SHORT/LONG labels |
 
-**Deviation from the spec, deliberate:** the spec lists `currency`, `strategy` and `thresholdDays` among `TransactionLedger`'s props. The extracted code shows the ledger only ever uses per-asset currency (`asset?.currency || 'USD'`), and the modal is rendered by `App`, not by the ledger — so the ledger's real props are `transactions`, `assets`, `onDeleteTransaction`, `onSelectSell`. Passing three props it would only forward would be noise.
+**Deviation from the spec, deliberate.** Each of these is intentional; do not "fix" them back to the spec's first draft.
+
+1. **`TransactionLedger` props.** The spec lists `currency`, `strategy` and `thresholdDays`. The extracted code shows the ledger only ever uses per-asset currency (`asset?.currency || 'USD'`), and the modal is rendered by `App`, not by the ledger — so the ledger's real props are `transactions`, `assets`, `onDeleteTransaction`, `onSelectSell`.
+2. **`replay()` returns `(Vec<InternalLot>, Vec<SellBreakdown>)`, not a 3-tuple with `realized_pnl`.** `calculate_lots` derives the asset total as `Σ breakdowns[i].realized_pnl`. One computation, one place; see the spec's *Single replay*.
+3. **The response is a flat `SellPnlResponse`.** The engine returns a `SellBreakdown`; the handler flattens it together with the context fields into one object. There is no nested `breakdown` key on the wire.
+4. **`SellBreakdown` is not registered in OpenAPI.** Only `SellPnlResponse` and `LotMatch` are published; no response body is of the engine type.
+5. **`strategy` is normalized at the handler boundary** (upper-case, unrecognized → `FIFO`) and the response reports the value that was applied, so the modal can never name a method it did not use.
+6. **Modal copy is final as written in Task 8**, including the unmatched banner and the empty-matches sentence. The spec describes their intent; Task 8 states the exact strings and the tests assert them.
 
 ---
 
@@ -115,8 +141,8 @@ Append inside `mod tests` in `backend_rust/src/db_types.rs`:
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cd backend_rust && cargo test decimal_opt 2>&1 | tail -20`
-Expected: compile error — `cannot find module or macro decimal_opt_json` (the tests are in `mod tests` with `use super::*;`, so the module must be a sibling of `decimal_json` in the file root).
+Run: `cd backend_rust && cargo test optional_decimal 2>&1 | tail -20`
+Expected: compile error — `cannot find module or macro decimal_opt_json`. The filter `optional_decimal` matches the four new test names; `decimal_opt` matches none of them, which would make this step look like a passing run rather than a missing module. The tests live in `mod tests` with `use super::*;`, so the module must be a sibling of `decimal_json` in the file root.
 
 - [ ] **Step 3: Implement `decimal_opt_json`**
 
@@ -1008,6 +1034,22 @@ mod common;
 use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction_at};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
+use rust_decimal::Decimal;
+
+/// Money fields are full-precision Decimals whose serialized scale is a by-product of the
+/// arithmetic (spec: New schemas → numeric precision). Compare values, never strings —
+/// `"2000"`, `"2000.0"` and `"2000.000"` are the same number and any of them may appear.
+fn dec(body: &serde_json::Value, key: &str) -> Decimal {
+    body[key]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<Decimal>()
+        .unwrap_or_else(|_| panic!("{key} is not a decimal string: {}", body[key]))
+}
+
+fn d(s: &str) -> Decimal {
+    s.parse::<Decimal>().unwrap()
+}
 
 // FIFO fixture: two buys, one sell of 80 units split across both lots.
 async fn fifo_fixture() -> (Client, i32, i32, i32) {
@@ -1052,17 +1094,17 @@ async fn test_sell_pnl_fifo_breakdown_shape() {
     assert_eq!(body["currency"], "USD");
     assert_eq!(body["asset_currency"], "USD");
     assert_eq!(body["fx_applied"], false);
-    assert_eq!(body["sold_qty"], "80.0");
-    assert_eq!(body["price"], "130.0");
-    assert_eq!(body["realized_pnl"], "2000.0");
-    assert_eq!(body["matched_qty"], "80.0");
-    assert_eq!(body["unmatched_qty"], "0.0");
+    assert_eq!(dec(&body, "sold_qty"), d("80"));
+    assert_eq!(dec(&body, "price"), d("130"));
+    assert_eq!(dec(&body, "realized_pnl"), d("2000"));
+    assert_eq!(dec(&body, "matched_qty"), d("80"));
+    assert_eq!(dec(&body, "unmatched_qty"), d("0"));
     assert_eq!(body["matches"].as_array().unwrap().len(), 2);
     assert_eq!(body["matches"][0]["buy_transaction_id"], buy1);
-    assert_eq!(body["matches"][0]["matched_qty"], "60.0");
+    assert_eq!(dec(&body["matches"][0], "matched_qty"), d("60"));
     assert_eq!(body["matches"][0]["holding_days"], 335);
     assert!(body["matches"][0]["term"].is_null(), "term is HYBRID-only");
-    assert_eq!(body["matches"][1]["matched_qty"], "20.0");
+    assert_eq!(dec(&body["matches"][1], "matched_qty"), d("20"));
     // Decimal division carries full precision, so pin the leading digits rather
     // than an exact 28-digit string.
     assert!(body["roi"].as_str().unwrap().starts_with("0.238"), "unexpected roi: {}", body["roi"]);
@@ -1075,7 +1117,7 @@ async fn test_sell_pnl_lifo_attributes_different_lots() {
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=LIFO&threshold_days=30", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
     assert_eq!(body["strategy"], "LIFO");
-    assert_eq!(body["realized_pnl"], "1600.0");
+    assert_eq!(dec(&body, "realized_pnl"), d("1600"));
 }
 
 #[tokio::test]
@@ -1086,7 +1128,7 @@ async fn test_sell_pnl_defaults_to_fifo_when_params_omitted() {
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
     assert_eq!(body["strategy"], "FIFO");
     assert_eq!(body["threshold_days"], 30);
-    assert_eq!(body["realized_pnl"], "2000.0");
+    assert_eq!(dec(&body, "realized_pnl"), d("2000"));
 }
 
 #[tokio::test]
@@ -1100,10 +1142,10 @@ async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
-    assert_eq!(body["sold_qty"], "100.0");
-    assert_eq!(body["matched_qty"], "50.0");
-    assert_eq!(body["unmatched_qty"], "50.0");
-    assert_eq!(body["realized_pnl"], "1000.0");
+    assert_eq!(dec(&body, "sold_qty"), d("100"));
+    assert_eq!(dec(&body, "matched_qty"), d("50"));
+    assert_eq!(dec(&body, "unmatched_qty"), d("50"));
+    assert_eq!(dec(&body, "realized_pnl"), d("1000"));
 }
 
 #[tokio::test]
@@ -1119,15 +1161,70 @@ async fn test_sell_pnl_roi_is_null_when_cost_basis_is_zero() {
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
     assert!(body["roi"].is_null(), "roi must be null, never a division by zero");
     assert!(body["matches"].as_array().unwrap().is_empty());
-    assert_eq!(body["unmatched_qty"], "50.0");
-    assert_eq!(body["realized_pnl"], "0.0");
+    assert_eq!(dec(&body, "unmatched_qty"), d("50"));
+    // An empty `matches` sums to `Decimal::ZERO` at scale 0, which serializes as "0" —
+    // exactly what `analytics_test.rs` already asserts for `/tax-summary`. Comparing as
+    // Decimals means the assertion holds whichever scale the arithmetic produces.
+    assert_eq!(dec(&body, "realized_pnl"), d("0"));
+}
+
+#[tokio::test]
+async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
+    // The central invariant as the user experiences it: two separate HTTP calls that must
+    // agree on transaction set, base-currency resolution and strategy defaults. The
+    // engine-level test cannot catch a divergence here, because within one engine call the
+    // equality holds by construction.
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Reconcile", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "RECON", "Reconcile").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
+    let sell1 = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 130.0, 0.0, "2024-08-01T00:00:00Z").await;
+    let sell2 = seed_transaction_at(&pool, asset_id, "SELL", 40.0, 150.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+
+    for strategy in ["FIFO", "LIFO", "HYBRID"] {
+        let tax_resp = client
+            .get(format!("/api/portfolios/{}/tax-summary?strategy={}&threshold_days=30", port_id, strategy))
+            .dispatch()
+            .await;
+        assert_eq!(tax_resp.status(), Status::Ok);
+        let tax: serde_json::Value = serde_json::from_str(&tax_resp.into_string().await.unwrap()).unwrap();
+        let asset = tax["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["symbol"] == "RECON")
+            .expect("asset present in tax summary");
+        // realized_pnl is not price-derived, so unlike market_value it is stable here.
+        let asset_realized = asset["realized_pnl"]
+            .as_str()
+            .unwrap()
+            .parse::<Decimal>()
+            .unwrap();
+
+        let mut sum = Decimal::ZERO;
+        for sell in [sell1, sell2] {
+            let resp = client
+                .get(format!("/api/transactions/{}/pnl?strategy={}&threshold_days=30", sell, strategy))
+                .dispatch()
+                .await;
+            assert_eq!(resp.status(), Status::Ok, "{} sell {}", strategy, sell);
+            let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+            sum += dec(&body, "realized_pnl");
+        }
+        assert_eq!(
+            sum, asset_realized,
+            "{strategy}: per-sell realized P&L must sum to the asset total the Holdings tab shows"
+        );
+    }
 }
 ```
 
 - [ ] **Step 3: Run them to verify they fail**
 
 Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
-Expected: FAIL with `404 Not Found` on every route call (Rocket has no such route yet) and `400`/`404` mismatches.
+Expected: FAIL — **6 of the 7 tests**, not all 7. `test_sell_pnl_unknown_transaction_is_404` passes already, because Rocket 404s unknown routes; it is a regression guard from here on, not a red test. The other six fail with `404 Not Found` where they expect 200 or 400. If that one also fails, the test binary is not reaching the router — fix that before writing the handler.
 
 - [ ] **Step 4: Implement the handler**
 
@@ -1189,7 +1286,12 @@ pub async fn get_transaction_sell_pnl(
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    let strategy_val = strategy.unwrap_or_else(|| "FIFO".to_string());
+    let strategy_val = match strategy.unwrap_or_default().to_uppercase().as_str() {
+        "LIFO" => "LIFO",
+        "HYBRID" => "HYBRID",
+        _ => "FIFO",
+    }
+    .to_string();
     let threshold_val = threshold_days.unwrap_or(30);
     let fx_applied = asset.currency != portfolio.base_currency;
 
@@ -1255,14 +1357,26 @@ In `backend_rust/src/lib.rs`, add to the existing `.mount("/api", routes![...])`
 - [ ] **Step 6: Run the endpoint tests**
 
 Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
-Expected: PASS — 7 tests.
+Expected: PASS — 8 tests.
 
 - [ ] **Step 7: Run the whole backend suite**
 
 Run: `cd backend_rust && cargo test 2>&1 | tail -20`
 Expected: PASS. `cors_test` and `analytics_test` still green — `/tax-summary` is untouched.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Verify the no-current-quote claim**
+
+The plan asserts three times that this endpoint never fetches a current price, and nothing else checks it:
+
+```bash
+grep -n "get_price" backend_rust/src/api_routes/analytics.rs
+```
+
+Expected: no hit between `pub async fn get_transaction_sell_pnl` and the end of that function. Hits inside `get_tax_summary` are expected and unrelated. `get_rate` calls inside the new handler are **not** a violation — FX conversion is cache-aside and legitimately fetches on a miss.
+
+**Known coverage gap, recorded rather than closed:** every backend test seeds `currency='USD'` assets into `'USD'` portfolios, so `asset_currency == base_currency`, every rate lookup short-circuits to `ONE`, and `get_rate` is never exercised. The one path in this endpoint that can reach the network and return 500 has no test. Closing it needs a `seed_asset_with_currency` helper plus a stubbed rate source; until then, do not claim the FX path is verified.
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add backend_rust/src/api_routes/analytics.rs backend_rust/src/lib.rs backend_rust/tests/common/mod.rs backend_rust/tests/sell_pnl_test.rs
@@ -1293,9 +1407,12 @@ and to the `components(schemas(...))` list after `schemas::AssetTaxSummary,`:
 
 ```rust
             schemas::LotMatch,
-            schemas::SellBreakdown,
             schemas::SellPnlResponse,
 ```
+
+`SellBreakdown` is the engine's internal type; no response body is of it, so it is **not**
+registered. Registering it would put an unconsumed type in the committed contract and in the
+generated `api.d.ts`.
 
 - [ ] **Step 2: Verify it compiles and the spec serves the new route**
 
@@ -1304,16 +1421,31 @@ Expected: no errors. If utoipa rejects a type, the error names the field — app
 
 - [ ] **Step 3: Regenerate the committed spec**
 
-Per `AGENTS.md`:
+The `AGENTS.md` recipe (`cargo run --release &` then `sleep 12`) races a fixed sleep against a
+release build that may take minutes, and if the server is not up the `curl` returns empty and the
+redirect **truncates the committed spec to zero bytes**. Poll instead of sleeping, and never
+overwrite the file unless the response is a JSON object:
 
 ```bash
 cd backend_rust
 touch portfolio.db
-cargo run --release &
-sleep 12
-curl -s http://127.0.0.1:8000/api-docs/openapi.json > ../docs/openapi/openapi.json
-kill $(jobs -p)
+cargo run --release > /tmp/sell-pnl-server.log 2>&1 &
+SERVER_PID=$!
+for i in $(seq 1 60); do
+  OUT=$(curl -sf http://127.0.0.1:8000/api-docs/openapi.json || true)
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("paths")' 2>/dev/null; then
+    printf '%s' "$OUT" > ../docs/openapi/openapi.json
+    echo "wrote $(wc -c < ../docs/openapi/openapi.json) bytes"
+    break
+  fi
+  sleep 2
+done
+kill $SERVER_PID
 ```
+
+Expected: a `wrote N bytes` line where N is larger than the current file. If nothing is written,
+the server never came up — read `/tmp/sell-pnl-server.log` and fix that; do not commit an empty or
+truncated `openapi.json`.
 
 - [ ] **Step 4: Verify the new route and schemas landed**
 
@@ -1323,12 +1455,14 @@ From the **repository root** (not `backend_rust/`):
 python3 -c "import json;d=json.load(open('docs/openapi/openapi.json'));print('/api/transactions/<id>/pnl' in d['paths']);print(sorted(s for s in d['components']['schemas'] if 'Sell' in s or s=='LotMatch'))"
 ```
 
-Expected: `True` and `['LotMatch', 'SellBreakdown', 'SellPnlResponse']`.
+Expected: `True` and `['LotMatch', 'SellPnlResponse']` — and `git diff --stat docs/openapi/openapi.json` showing additions only, with no existing path or schema removed.
 
 - [ ] **Step 5: Regenerate the generated TypeScript types**
 
+From the **repository root** — Step 3 already left you in `backend_rust/`, and `cd ../frontend` from there would land outside the repo:
+
 ```bash
-cd ../frontend && npm install && npm run generate-types
+cd frontend && npm install && npm run generate-types
 ```
 
 Nothing imports `src/types/api.d.ts` today, but it is a committed generated artifact and must not drift from the spec it was generated from.
@@ -1546,8 +1680,9 @@ git commit -m "feat: frontend types and normalizer for sell P&L breakdown"
 **Files:**
 - Create: `frontend/src/components/TransactionLedger.tsx`
 - Modify: `frontend/src/App.tsx` (replace the inline ledger block at lines 421-475, drop now-unused imports)
-- Modify: `frontend/src/test/mocks/handlers.ts`
 - Create: `frontend/src/test/components/TransactionLedger.test.tsx`
+
+(`frontend/src/test/mocks/handlers.ts` is **not** touched here — the MSW handler for the new route arrives in Task 8 Step 1 and is committed with that task.)
 
 **Interfaces:**
 - Consumes: `Transaction`, `Asset` from `../types`, `formatCurrency`.
@@ -1631,7 +1766,13 @@ Expected: FAIL — cannot resolve `../../components/TransactionLedger`.
 
 - [ ] **Step 3: Create the component**
 
-Create `frontend/src/components/TransactionLedger.tsx`. The table markup is the block currently inlined at `frontend/src/App.tsx:421-475`, moved verbatim, plus the SELL affordance:
+Create `frontend/src/components/TransactionLedger.tsx`. The table markup is the block currently inlined at `frontend/src/App.tsx:421-475`, carried over with **three** deliberate additions beyond the SELL affordance, all of them behaviour changes and none of them accidental:
+
+1. the delete button gains `title="Delete transaction"` — the new test locates it by that title;
+2. the delete handler becomes `(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }` so a delete on a SELL row does not also open the modal;
+3. SELL rows become clickable and gain the P&L button.
+
+Do not describe this step as a verbatim move when reviewing it — diff it against the original block.
 
 ```tsx
 import { Trash2, TrendingUp } from 'lucide-react';
@@ -1743,21 +1884,19 @@ Replace the whole `{activeTab === 'ledger' && ( ... )}` block (`frontend/src/App
                 transactions={transactions}
                 assets={currentPortfolio.assets || []}
                 onDeleteTransaction={handleDeleteTransaction}
-                onSelectSell={setSellPnlTxId}
+                onSelectSell={() => undefined}
               />
             )}
 ```
+
+`onSelectSell` is a placeholder on purpose. Task 9 owns the modal state and replaces it with
+`setSellPnlTxId`. Do **not** declare `sellPnlTxId` in this task: an unused `useState` binding trips
+`@typescript-eslint/no-unused-vars`, and Step 6 runs the lint gate.
 
 Add the import alongside the other component imports:
 
 ```tsx
 import TransactionLedger from './components/TransactionLedger';
-```
-
-`setSellPnlTxId` is declared in Task 9 Step 1; if you run this task before Task 9, declare it now:
-
-```tsx
-  const [sellPnlTxId, setSellPnlTxId] = useState<number | null>(null);
 ```
 
 Remove the imports the extraction orphans, or `npm run lint` fails: `Trash2` from the `lucide-react` import list, and the whole `import { formatCurrency } from './utils/formatters';` line. `History` stays — it is still used by the nav item.
@@ -1781,13 +1920,22 @@ git commit -m "refactor: extract TransactionLedger with a clickable sell P&L aff
 **Files:**
 - Create: `frontend/src/components/SellPnlModal.tsx`
 - Modify: `frontend/src/test/mocks/handlers.ts`
+- Modify: `frontend/src/test/setup.ts` (pin the test timezone)
 - Create: `frontend/src/test/components/SellPnlModal.test.tsx`
 
 **Interfaces:**
 - Consumes: `GET /api/transactions/<id>/pnl`, `normalizeSellPnl` (Task 6), `formatCurrency`, `formatPercent`.
 - Produces: `SellPnlModal` default export with props `{ transactionId: number; strategy: string; thresholdDays: number; splitBeforeSell: boolean; onClose: () => void }`.
 
-- [ ] **Step 1: Add the MSW handler**
+- [ ] **Step 1: Pin the test timezone, then add the MSW handler**
+
+The modal renders dates with `toLocaleDateString`/`toLocaleString`, which are host-timezone dependent, and `vite.config.js` sets no `TZ`. `2024-01-01T00:00:00Z` renders as `2023-12-31` on any machine west of UTC, and two of the three new frontend test files would fail there for a reason that looks like a component bug. Add to `frontend/src/test/setup.ts`, above the existing imports' effects:
+
+```ts
+process.env.TZ = 'UTC'
+```
+
+The modal therefore renders dates in UTC, and the tests below assert UTC dates.
 
 In `frontend/src/test/mocks/handlers.ts`, add before the catch-all `http.all('*', ...)` entry:
 
@@ -1820,7 +1968,7 @@ In `frontend/src/test/mocks/handlers.ts`, add before the catch-all `http.all('*'
 Create `frontend/src/test/components/SellPnlModal.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import SellPnlModal from '../../components/SellPnlModal'
 import { server } from '../mocks/server'
@@ -1875,6 +2023,12 @@ describe('SellPnlModal', () => {
     renderModal()
     await waitFor(() => expect(screen.getByTestId('unmatched-banner')).toBeInTheDocument())
     expect(screen.getByTestId('unmatched-banner')).toHaveTextContent('50 of 100')
+    // The wording is the finding, not the counts: the engine drops unmatched units from BOTH
+    // sides, so the figure is incomplete. "overstated"/"understated" would be an unsupported claim.
+    expect(screen.getByTestId('unmatched-banner')).toHaveTextContent(
+      'Neither their cost basis nor their proceeds are included',
+    )
+    expect(screen.getByTestId('unmatched-banner')).not.toHaveTextContent('overstated')
   })
 
   it('explains a sell with nothing to match', async () => {
@@ -1884,7 +2038,7 @@ describe('SellPnlModal', () => {
     })))
     renderModal()
     await waitFor(() => expect(screen.getByTestId('no-lots-note')).toBeInTheDocument())
-    expect(screen.getByTestId('no-lots-note')).toHaveTextContent('No buy lots existed')
+    expect(screen.getByTestId('no-lots-note')).toHaveTextContent('No buy lots were available to match')
   })
 
   it('renders roi as an em dash when cost basis is zero', async () => {
@@ -2019,6 +2173,11 @@ export default function SellPnlModal({
               {new Date(data.sell_date).toLocaleString()} · {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} sold
               @ {formatCurrency(data.price, data.asset_currency)}
               {data.fee ? ` · fee ${formatCurrency(data.fee, data.asset_currency)}` : ''}
+              {data.asset_currency !== data.currency && (
+                <span data-testid="as-entered-currency" style={{ color: 'var(--text-muted)' }}>
+                  {' '}price and fee as entered in {data.asset_currency}
+                </span>
+              )}
               {' · '}proceeds {formatCurrency(data.proceeds, data.currency)}
             </p>
             <p style={{ marginBottom: '16px' }}>
@@ -2035,13 +2194,14 @@ export default function SellPnlModal({
               <div data-testid="unmatched-banner" style={{ padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(245,158,11,0.35)', background: 'rgba(245,158,11,0.08)', color: 'var(--text-secondary)', marginBottom: '16px', fontSize: '0.875rem' }}>
                 {data.unmatched_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} of{' '}
                 {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} units had no buy lot
-                on or before this date, so no cost basis was subtracted for them — realized P&L is overstated.
+                on or before this date. Neither their cost basis nor their proceeds are included in
+                this figure.
               </div>
             )}
 
             {data.matches.length === 0 ? (
               <p data-testid="no-lots-note" style={{ color: 'var(--text-muted)', padding: '16px 0' }}>
-                No buy lots existed on or before this date. Realized P&L is
+                No buy lots were available to match on or before this date. Realized P&L is
                 {' '}{formatCurrency(data.realized_pnl, data.currency)} because nothing was matched.
               </p>
             ) : (
@@ -2082,7 +2242,7 @@ export default function SellPnlModal({
 
             <div style={{ marginTop: '16px', color: 'var(--text-muted)', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: '4px' }}>
               <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Info size={12} /> Matching follows the selected method — {data.strategy === 'LIFO' ? 'FIFO' : 'LIFO'} would attribute different lots.
+                <Info size={12} /> Attribution follows the {data.strategy} method. A different method would consume different lots.
               </span>
               {splitBeforeSell && (
                 <span data-testid="split-note" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -2106,7 +2266,7 @@ export default function SellPnlModal({
 - [ ] **Step 5: Run the tests**
 
 Run: `cd frontend && npx vitest run src/test/components/SellPnlModal.test.tsx 2>&1 | tail -25`
-Expected: PASS — 7 tests.
+Expected: PASS — 8 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -2129,7 +2289,7 @@ git commit -m "feat: sell P&L modal with per-lot breakdown and edge-case notes"
 
 - [ ] **Step 1: Own the modal state and derive the split flag**
 
-In `frontend/src/App.tsx`, add to the UI state block (next to `showNewPortfolioModal`) if Task 7 did not already add it:
+In `frontend/src/App.tsx`, add to the UI state block (next to `showNewPortfolioModal`). Task 7 deliberately left this to Task 9, so it is not there yet:
 
 ```tsx
   const [sellPnlTxId, setSellPnlTxId] = useState<number | null>(null);
@@ -2139,6 +2299,22 @@ Add the import:
 
 ```tsx
 import SellPnlModal from './components/SellPnlModal';
+```
+
+Clear the id whenever the modal's subject stops being the thing on screen — switching portfolio,
+or deleting the transaction the modal is showing. Without this the modal keeps rendering a sell
+belonging to the previous portfolio (with that portfolio's base currency resolved server-side),
+or one that no longer exists, and the figures on screen describe nothing the user can see.
+
+```tsx
+  useEffect(() => { setSellPnlTxId(null); }, [selectedId]);
+```
+
+and in `handleDeleteTransaction` (`App.tsx`), after the successful `DELETE` and before the
+`fetchPortfolioData` call:
+
+```tsx
+      setSellPnlTxId(null);
 ```
 
 Add the derived flag next to the other derived values (after `currentPortfolio` is resolved):
@@ -2216,9 +2392,10 @@ Expected: PASS. If the ledger tab never appears, the MSW `/api/portfolios` fixtu
 
 ```bash
 cd frontend && npm run lint && npx vitest run && cd ../backend_rust && cargo test
+grep -n "get_price" src/api_routes/analytics.rs
 ```
 
-Expected: lint clean, all frontend tests pass, all backend tests pass.
+Expected: lint clean, all frontend tests pass, all backend tests pass, and no `get_price` hit inside `get_transaction_sell_pnl`.
 
 - [ ] **Step 6: Manual smoke (optional but recommended)**
 
@@ -2236,9 +2413,12 @@ git commit -m "feat: open per-lot P&L breakdown from the transaction ledger"
 ## Done Criteria
 
 1. Clicking a SELL row shows that sale's realized P&L and every lot it consumed with per-lot P&L.
-2. Summing realized P&L over all sells of an asset equals the realized P&L shown for that asset in the Holdings tab, under FIFO, LIFO and HYBRID.
-3. Sells with unmatched quantity or with no prior buys say so explicitly instead of showing `0.00` or an empty table.
-4. Switching strategy changes the attribution shown, and the modal names the strategy it used.
-5. The new endpoint performs no live price fetch.
-6. The 14 pre-existing `tax_engine` tests are unmodified and green.
+2. Summing realized P&L over all sells of an asset equals the realized P&L shown for that asset in the Holdings tab, under FIFO, LIFO and HYBRID — proved by `test_sell_pnl_sums_to_tax_summary_realized_pnl`, which calls both endpoints, not only by the engine test.
+3. Sells with unmatched quantity, or with nothing available to match, say so in words. The unmatched banner's exact wording is asserted, including that it does **not** claim the figure is overstated.
+4. The modal requests and displays the strategy and threshold selected in the Holdings tab, and the response's `strategy` is the value that was applied (an unrecognized query value renders as `FIFO`).
+5. No `get_price` call inside `get_transaction_sell_pnl`, checked with `grep -n "get_price" backend_rust/src/api_routes/analytics.rs`. FX `get_rate` lookups are expected when the asset currency differs from the base currency.
+6. The engine tests present on `origin/main` (14 at the time of writing) are unmodified and green.
 7. `cargo test`, `npm run lint` and `npx vitest run` are all green on the branch.
+8. `docs/openapi/openapi.json` is non-empty, contains the new path, and its diff removes no existing path or schema; `frontend/src/types/api.d.ts` is regenerated from it.
+
+**Known gap carried deliberately:** the FX conversion path has no backend test (every fixture is USD-into-USD, so `get_rate` is never reached). It is recorded in Task 4 Step 8 rather than silently untested. Do not describe the FX path as verified.
