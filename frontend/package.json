@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "generate-types": "openapi-typescript ../docs/openapi/openapi.json --output src/types/api.d.ts"
+    "generate-types": "openapi-typescript ../docs/openapi/openapi.json --output src/types/api.d.ts",
+    "e2e:sell-pnl": "bash e2e/run.sh"
   },
   "dependencies": {
     "@types/papaparse": "^5.5.2",
@@ -42,6 +43,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1",
     "vite": "^8.0.12",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.9",
+    "playwright-core": "^1.64.1"
   }
 }
