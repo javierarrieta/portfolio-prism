@@ -9,12 +9,11 @@ import {
   AlertTriangle,
   FolderOpen,
   Sparkles,
-  Trash2
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
-import { formatCurrency } from './utils/formatters';
+import TransactionLedger from './components/TransactionLedger';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
 import { 
   Portfolio, 
@@ -419,58 +418,12 @@ export default function App() {
             )}
 
             {activeTab === 'ledger' && (
-              <div className="glass-card" style={{ padding: '24px' }}>
-                <h3 style={{ marginBottom: '20px' }}>Transaction History</h3>
-                {transactions.length === 0 ? (
-                  <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '24px 0' }}>No transactions logged. Go to the "Holdings & Tax lots" tab to log buy/sell transactions.</p>
-                ) : (
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>Date & Time</th>
-                        <th>Asset Symbol</th>
-                        <th>Type</th>
-                        <th>Quantity</th>
-                        <th>Price</th>
-                        <th>Fee</th>
-                        <th>Total Cost/Proceeds</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {transactions.map((tx) => {
-                        const asset = currentPortfolio.assets.find(a => a.id === tx.asset_id);
-                        const isSplit = tx.type === 'SPLIT';
-                        const cost = tx.quantity * tx.price;
-                        const total = isSplit ? null : (tx.type === 'BUY' ? (cost + tx.fee) : (cost - tx.fee));
-                        return (
-                          <tr key={tx.id}>
-                            <td>{new Date(tx.date).toLocaleString()}</td>
-                            <td style={{ fontWeight: 600 }}>{asset ? asset.symbol : 'Unknown'}</td>
-                            <td>
-                              <span style={{ color: isSplit ? 'var(--text-secondary)' : (tx.type === 'BUY' ? 'var(--color-success)' : 'var(--color-danger)'), fontWeight: 700 }}>
-                                {tx.type}
-                              </span>
-                            </td>
-                            <td>{isSplit ? `${tx.quantity} : ${tx.price}` : tx.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
-                            <td>{isSplit ? '—' : formatCurrency(tx.price, asset?.currency || 'USD')}</td>
-                            <td>{isSplit ? '—' : formatCurrency(tx.fee, asset?.currency || 'USD')}</td>
-                            <td style={{ fontWeight: 600 }}>{isSplit ? '—' : formatCurrency(total as number, asset?.currency || 'USD')}</td>
-                            <td>
-                              <button 
-                                onClick={() => handleDeleteTransaction(tx.id)}
-                                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+              <TransactionLedger
+                transactions={transactions}
+                assets={currentPortfolio.assets || []}
+                onDeleteTransaction={handleDeleteTransaction}
+                onSelectSell={() => undefined}
+              />
             )}
           </>
         ) : (

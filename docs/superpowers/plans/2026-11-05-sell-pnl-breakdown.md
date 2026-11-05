@@ -1292,7 +1292,7 @@ git commit -m "feat: frontend types and normalizer for sell P&L breakdown"
 - Consumes: `Transaction`, `Asset` from `../types`, `formatCurrency`.
 - Produces: `TransactionLedger` default export with props `{ transactions: Transaction[]; assets: Asset[]; onDeleteTransaction: (txId: number) => Promise<void>; onSelectSell: (txId: number) => void }`.
 
-- [ ] **Step 1: Write the failing component tests**
+- [x] **Step 1: Write the failing component tests**
 
 Create `frontend/src/test/components/TransactionLedger.test.tsx`:
 
@@ -1363,31 +1363,31 @@ describe('TransactionLedger', () => {
 })
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cd frontend && npx vitest run src/test/components/TransactionLedger.test.tsx 2>&1 | tail -20`
 Expected: FAIL — cannot resolve `../../components/TransactionLedger`.
 
-- [ ] **Step 3: Create the component**
+- [x] **Step 3: Create the component**
 Create `frontend/src/components/TransactionLedger.tsx`. **Copy the table markup out of `App.tsx`** — the block rendered under `{activeTab === 'ledger' && ( … )}`, the one whose heading is `Transaction History`. Locate it by that heading, not by a line number; `App.tsx:421-475` is where it sits today and any edit above it moves that range. Props are in **Interfaces** above; `formatCurrency` comes from `../utils/formatters`, `Trash2`/`TrendingUp` from `lucide-react`.
 
 Four changes to the copied markup, all of them behaviour, none of them accidental:
 
 1. the delete button gains `title="Delete transaction"` — the new test locates it by that title;
 2. the delete handler becomes `(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }`, so deleting from a SELL row does not also open the modal;
-3. a SELL row gets `onClick={() => onSelectSell(tx.id)}` and `cursor: pointer`, and the row gains a `TrendingUp` button with `aria-label="View realized P&L"` whose own handler calls `stopPropagation()` before `onSelectSell(tx.id)`;
+3. a SELL row gets `onClick={() => onSelectSell(tx.id)}` and `cursor: pointer`, and the row gains a `TrendingUp` button whose accessible name **includes the symbol** — `aria-label={`View realized P&L for ${asset ? asset.symbol : 'this holding'}`}` — because Step 1 queries it with `getByRole('button', { name: /realized P&L for AAPL/i })`. A bare `aria-label="View realized P&L"` passes the length-1 assertion and fails the click one. Its handler calls `stopPropagation()` before `onSelectSell(tx.id)`;
 4. BUY and SPLIT rows get no click handler and no button — the absence of the affordance is what tells the user this row has no realized P&L to show.
 
 Everything else must come across unchanged: column order, the `2 : 1` and `—` cells, the `--text-secondary` colours, the empty-state paragraph. `App.test.tsx` asserts on those. Do not describe this step as a verbatim move when reviewing it — diff it against the original block.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cd frontend && npx vitest run src/test/components/TransactionLedger.test.tsx 2>&1 | tail -20`
 Expected: PASS — 6 tests.
 
-- [ ] **Step 5: Replace the inline block in `App.tsx`**
+- [x] **Step 5: Replace the inline block in `App.tsx`**
 
-Replace the whole `{activeTab === 'ledger' && ( ... )}` block (`frontend/src/App.tsx:421-475`) with:
+Replace the whole `{activeTab === 'ledger' && ( ... )}` block (`frontend/src/App.tsx:421-474` as of this writing — line 475 is the closing `</>`, not part of the block) with:
 
 ```tsx
             {activeTab === 'ledger' && (
@@ -1412,12 +1412,12 @@ import TransactionLedger from './components/TransactionLedger';
 
 Remove the imports the extraction orphans, or `npm run lint` fails: `Trash2` from the `lucide-react` import list, and the whole `import { formatCurrency } from './utils/formatters';` line. `History` stays — it is still used by the nav item.
 
-- [ ] **Step 6: Run the full frontend suite and lint**
+- [x] **Step 6: Run the full frontend suite and lint**
 
 Run: `cd frontend && npm run lint && npx vitest run 2>&1 | tail -25`
 Expected: lint clean; all tests pass, including the pre-existing `App.test.tsx`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add frontend/src/components/TransactionLedger.tsx frontend/src/App.tsx frontend/src/test/components/TransactionLedger.test.tsx
