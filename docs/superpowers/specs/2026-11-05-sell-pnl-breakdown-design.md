@@ -3,6 +3,7 @@
 **Date**: 2026-11-05
 **Status**: Proposed
 **Implementation plan**: `docs/superpowers/plans/2026-11-05-sell-pnl-breakdown.md`
+**Review record**: `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` — decisions taken, proposals rejected, and what was measured rather than assumed
 
 **Normative for:** schemas and their JSON keys, the route contract, the reconciliation invariant,
 and the UI contract (what each state must say). The plan is normative for task sequencing, file

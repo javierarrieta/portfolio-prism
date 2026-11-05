@@ -9,6 +9,7 @@
 **Tech Stack:** Rust (Rocket 0.5, SQLx/SQLite, rust_decimal, utoipa 4.2), React 19 + TypeScript + Vite, Vitest + Testing Library + MSW.
 
 **Spec:** `docs/superpowers/specs/2026-11-05-sell-pnl-breakdown-design.md`
+**Review record:** `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` — read it before reopening a rejected proposal or reintroducing a decimal string assertion.
 
 **Normative for:** task sequencing, file lists and the test inventory. The spec is normative for
 schemas and JSON keys, the route contract, the reconciliation invariant and the UI contract. Where
