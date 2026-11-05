@@ -127,12 +127,14 @@ export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
   const r = asRecord(t);
   const matches = Array.isArray(r.matches) ? (r.matches as unknown[]) : [];
   return {
-    transaction_id: (r.transaction_id as number) ?? 0,
-    asset_id: (r.asset_id as number) ?? 0,
+    // num(), not `as number`: a cast is compile-time only, so a payload carrying
+    // "transaction_id":"42" would hand the UI a string typed as number.
+    transaction_id: num(r, 'transaction_id'),
+    asset_id: num(r, 'asset_id'),
     symbol: str(r, 'symbol'),
     asset_type: str(r, 'asset_type'),
     strategy: str(r, 'strategy'),
-    threshold_days: (r.threshold_days as number) ?? 0,
+    threshold_days: num(r, 'threshold_days'),
     currency: str(r, 'currency') || 'USD',
     asset_currency: str(r, 'asset_currency') || 'USD',
     fx_applied: r.fx_applied === true,
@@ -161,7 +163,7 @@ export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
         cost_basis: num(mr, 'cost_basis'),
         proceeds: num(mr, 'proceeds'),
         pnl: num(mr, 'pnl'),
-        holding_days: (mr.holding_days as number) ?? 0,
+        holding_days: num(mr, 'holding_days'),
         term: termOf(mr.term),
       };
     }),

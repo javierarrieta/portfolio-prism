@@ -50,4 +50,19 @@ describe('normalizeSellPnl', () => {
     })
     expect(d.matches[0].term).toBe('SHORT')
   })
+
+  it('coerces numeric ids that arrive as strings', () => {
+    // `as number` is a compile-time cast: a payload with "transaction_id":"42"
+    // would otherwise hand the UI a string typed as number, and `?? 0` does not
+    // catch that because a string is neither null nor undefined.
+    const d = normalizeSellPnl({
+      ...raw,
+      transaction_id: '42', asset_id: '7', threshold_days: '30',
+      matches: [{ ...raw.matches[0], holding_days: '335' }],
+    })
+    expect(d.transaction_id).toBe(42)
+    expect(d.asset_id).toBe(7)
+    expect(d.threshold_days).toBe(30)
+    expect(d.matches[0].holding_days).toBe(335)
+  })
 })
