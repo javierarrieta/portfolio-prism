@@ -66,6 +66,59 @@ pub mod decimal_json {
     }
 }
 
+/// `decimal_json` lifted to `Option<Decimal>`: `None` serializes as JSON null,
+/// `Some(d)` as the exact `d.to_string()` — no `normalize()`, no fixed scale.
+/// The `Some` arm delegates to `decimal_json::deserialize`, so there is one
+/// number/string parsing rule in this file, not two.
+pub mod decimal_opt_json {
+    use rust_decimal::Decimal;
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(d: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match d {
+            Some(v) => serializer.serialize_str(&v.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    struct OptionDecimalVisitor;
+
+    impl<'de> Visitor<'de> for OptionDecimalVisitor {
+        type Value = Option<Decimal>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("null, a string, or a number")
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Option<Decimal>, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Option<Decimal>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Option<Decimal>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            super::decimal_json::deserialize(deserializer).map(Some)
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_option(OptionDecimalVisitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +179,38 @@ mod tests {
         let err = serde_json::from_str::<Wrap>(r#"{"d":true}"#).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("a string or number"), "unexpected error: {msg}");
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct WrapOpt { #[serde(with = "decimal_opt_json")] d: Option<Decimal> }
+
+    #[test]
+    fn optional_decimal_serializes_some_as_string() {
+        let w = WrapOpt { d: Some(Decimal::from_str("9.99").unwrap()) };
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"d":"9.99"}"#);
+    }
+
+    #[test]
+    fn optional_decimal_serializes_none_as_null() {
+        let w = WrapOpt { d: None };
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"d":null}"#);
+    }
+
+    #[test]
+    fn optional_decimal_deserializes_null_number_and_string() {
+        assert_eq!(serde_json::from_str::<WrapOpt>(r#"{"d":null}"#).unwrap().d, None);
+        assert_eq!(
+            serde_json::from_str::<WrapOpt>(r#"{"d":"9.99"}"#).unwrap().d,
+            Some(Decimal::from_str("9.99").unwrap())
+        );
+        assert_eq!(
+            serde_json::from_str::<WrapOpt>(r#"{"d":100}"#).unwrap().d,
+            Some(Decimal::from_str("100").unwrap())
+        );
+    }
+
+    #[test]
+    fn optional_decimal_rejects_garbage_string() {
+        assert!(serde_json::from_str::<WrapOpt>(r#"{"d":"abc"}"#).is_err());
     }
 }

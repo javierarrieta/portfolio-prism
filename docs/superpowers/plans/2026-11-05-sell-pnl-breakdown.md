@@ -101,7 +101,7 @@ The spec implies these inputs; no single task's happy-path test covers them, and
   - `schemas::SellBreakdown { sell_transaction_id: i32, sell_date: DateTime<Utc>, sold_qty: Decimal, matched_qty: Decimal, unmatched_qty: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, matches: Vec<LotMatch> }`
   - `schemas::SellPnlResponse { transaction_id: i32, asset_id: i32, symbol: String, asset_type: String, strategy: String, threshold_days: i64, currency: String, asset_currency: String, fx_applied: bool, split_applied: bool, sell_date: DateTime<Utc>, sold_qty: Decimal, price: Decimal, fee: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, roi: Option<Decimal>, matched_qty: Decimal, unmatched_qty: Decimal, matches: Vec<LotMatch> }`
 
-- [ ] **Step 1: Write the failing tests for `decimal_opt_json`**
+- [x] **Step 1: Write the failing tests for `decimal_opt_json`**
 
 Append inside `mod tests` in `backend_rust/src/db_types.rs`:
 
@@ -140,12 +140,12 @@ Append inside `mod tests` in `backend_rust/src/db_types.rs`:
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cd backend_rust && cargo test optional_decimal 2>&1 | tail -20`
 Expected: compile error — `cannot find module or macro decimal_opt_json`. The filter `optional_decimal` matches the four new test names; `decimal_opt` matches none of them, which would make this step look like a passing run rather than a missing module. The tests live in `mod tests` with `use super::*;`, so the module must be a sibling of `decimal_json` in the file root.
 
-- [ ] **Step 3: Implement `decimal_opt_json`**
+- [x] **Step 3: Implement `decimal_opt_json`**
 
 `decimal_opt_json` is `decimal_json` lifted to `Option<Decimal>`. Write it beside that module, in the file root (not inside `mod tests`), under the same string rules:
 
@@ -156,12 +156,12 @@ Expected: compile error — `cannot find module or macro decimal_opt_json`. The 
 >
 > To take it later: enable `features = ["serde", "serde-with-str"]`, swap the `with` attribute on `roi`, delete this module and its four `optional_decimal_*` tests, and confirm those four are the only tests that disappear. `serde-with-str` only adds the `with` modules — unlike `serde-str` it does not change the blanket `Decimal` impl — so existing serialization is unaffected.
 
-- [ ] **Step 4: Run them to verify they pass**
+- [x] **Step 4: Run them to verify they pass**
 
-Run: `cd backend_rust && cargo test decimal 2>&1 | tail -20`
-Expected: PASS, including the 8 pre-existing `db_types` tests.
+Run: `cd backend_rust && cargo test db_types 2>&1 | tail -20`
+Expected: PASS — **12 tests**: the 8 pre-existing `db_types` tests plus the 4 new ones. Use the `db_types` filter, not `decimal`: the pre-existing tests are named `serialize_is_exact_string`, `integer_input_is_exact` and similar, so a `decimal` filter silently runs only 6 tests and reports green while never touching the code the new module sits next to.
 
-- [ ] **Step 5: Write the failing schema roundtrip tests**
+- [x] **Step 5: Write the failing schema roundtrip tests**
 
 Append inside `mod tests` in `backend_rust/src/schemas.rs`:
 
@@ -233,12 +233,12 @@ Append inside `mod tests` in `backend_rust/src/schemas.rs`:
     }
 ```
 
-- [ ] **Step 6: Run them to verify they fail**
+- [x] **Step 6: Run them to verify they fail**
 
 Run: `cd backend_rust && cargo test sell_pnl_response 2>&1 | tail -20`
 Expected: compile error — `cannot find struct LotMatch` / `SellBreakdown` / `SellPnlResponse`.
 
-- [ ] **Step 7: Implement the schemas**
+- [x] **Step 7: Implement the schemas**
 
 Add three `#[derive(Debug, Serialize, Deserialize, ToSchema)]` structs after `AssetTaxSummary`, with exactly the fields listed in **Interfaces** above and the field comments from the spec's *New schemas*. Only four things are worth writing down:
 
@@ -255,12 +255,12 @@ use crate::db_types::{decimal_json, decimal_opt_json};
 
 No utoipa workaround is needed for `Option<Decimal>`. Verified by compiling a `ToSchema` struct carrying `#[serde(with = …)] roi: Option<Decimal>` against the pinned utoipa 4.2.3 — it derives cleanly, and the generated schema is a nullable string. Do not add `#[schema(value_type = …)]` speculatively; if a future utoipa bump does complain, the error names the field and the fix goes directly above `pub roi` without changing the runtime type.
 
-- [ ] **Step 8: Run the whole backend test suite to verify nothing regressed**
+- [x] **Step 8: Run the whole backend test suite to verify nothing regressed**
 
 Run: `cd backend_rust && cargo test 2>&1 | tail -30`
 Expected: PASS. The 14 `tax_engine` tests and the pre-existing `schemas` tests are untouched.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add backend_rust/src/db_types.rs backend_rust/src/schemas.rs
