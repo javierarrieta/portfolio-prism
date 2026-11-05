@@ -1,0 +1,2244 @@
+# Sell Transaction P&L Breakdown Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Clicking a SELL transaction shows its realized P&L and the buy lots it consumed, with P&L per lot.
+
+**Architecture:** The tax engine gains lot identity and a single private `replay()` that records a `SellBreakdown` per sell. Two public entry points sit on that replay — the existing `calculate_lots` (unchanged signature and output) and a new `sell_breakdown` — so per-sell numbers reconcile with the per-asset realized total by construction rather than by duplicated logic. A new read-only endpoint exposes one sell's breakdown; the frontend extracts the transaction ledger into a component, makes SELL rows clickable, and opens a modal that fetches and renders the breakdown.
+
+**Tech Stack:** Rust (Rocket 0.5, SQLx/SQLite, rust_decimal, utoipa 4.2), React 19 + TypeScript + Vite, Vitest + Testing Library + MSW.
+
+**Spec:** `docs/superpowers/specs/2026-11-05-sell-pnl-breakdown-design.md`
+
+## Global Constraints
+
+- All money is `rust_decimal::Decimal` in the backend and serializes as a **JSON string** via `#[serde(with = "decimal_json")]`. Never `f64` for money.
+- The frontend receives decimal strings and converts them to `number` **only** at the fetch boundary in `frontend/src/utils/decimal.ts`. Components never parse decimal strings themselves.
+- All API routes are under `/api`.
+- `AssetTaxSummary` and `TaxLot` must not change shape. `/tax-summary` response is byte-for-byte unchanged.
+- The new endpoint performs **no** call to `CurrencyService::get_price`. Realized P&L needs no current quote.
+- The 14 pre-existing tests in `backend_rust/src/engines/tax_engine.rs` pass **unmodified** at every commit. Do not edit them to make a refactor pass.
+- No new database table, no migration, no persisted match state. Read-only.
+- `term` (SHORT/LONG) is populated **only** when `strategy == "HYBRID"`. Under FIFO/LIFO it is `null`.
+- Branch per the repo convention: work on `feat/sell-pnl-breakdown` in a worktree, never in the primary checkout.
+
+## Review Focus
+
+The spec implies these inputs; no single task's happy-path test covers them, and each is a way a real user gets a wrong number or a confusing screen. Each line has a test pinned to the task that owns the code.
+
+1. **A SELL larger than every available buy** — the unmatched units must contribute neither cost basis nor P&L, and the UI must state how many units went unmatched. Expected: realized P&L counts only matched units; a banner names the unmatched count. (Task 3, Task 8)
+2. **A SELL dated before every BUY, and any sell whose cost basis is zero** — `roi` must be `null` and render as `—`, never `0%`, `NaN%` or `Infinity%`; the modal must explain, not show an empty table. (Task 4, Task 8)
+3. **A SPLIT between the buy and the sell** — `buy_price` and `unit_cost` in a match are split-adjusted, total cost basis is unchanged by the split, and the footnote appears. Expected: per-lot P&L still sums to the asset-level realized total. (Task 3, Task 8)
+4. **Strategy switching** — FIFO/LIFO/HYBRID attribute different lots, but per-sell totals must still reconcile with the asset-level realized P&L under all three. Expected: attribution changes, totals do not. (Task 3, Task 4)
+5. **A non-SELL transaction id, or a BUY/SPLIT row** — the endpoint answers 400 and the ledger offers no P&L affordance. Expected: no clickable control on BUY or SPLIT rows. (Task 4, Task 7)
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| `backend_rust/src/db_types.rs` | modify — add `decimal_opt_json` for `Option<Decimal>` fields |
+| `backend_rust/src/schemas.rs` | modify — `LotMatch`, `SellBreakdown`, `SellPnlResponse` |
+| `backend_rust/src/engines/tax_engine.rs` | modify — lot identity, `sorted_transactions`, `replay`, `sell_breakdown` |
+| `backend_rust/src/api_routes/analytics.rs` | modify — `get_transaction_sell_pnl` |
+| `backend_rust/src/lib.rs` | modify — mount the new route |
+| `backend_rust/src/openapi.rs` | modify — register path + schemas |
+| `backend_rust/tests/common/mod.rs` | modify — `seed_transaction_at` (date-aware seeder) |
+| `backend_rust/tests/sell_pnl_test.rs` | create — endpoint tests |
+| `docs/openapi/openapi.json` | regenerate |
+| `frontend/src/types.ts` | modify — `LotMatch`, `SellPnlBreakdown` |
+| `frontend/src/utils/decimal.ts` | modify — `normalizeSellPnl` |
+| `frontend/src/utils/decimal.test.ts` | create — normalizer tests |
+| `frontend/src/components/TransactionLedger.tsx` | create — extracted ledger + SELL affordance |
+| `frontend/src/components/SellPnlModal.tsx` | create — the breakdown modal |
+| `frontend/src/App.tsx` | modify — use `TransactionLedger`, own modal state |
+| `frontend/src/test/mocks/handlers.ts` | modify — MSW handler for the new route |
+| `frontend/src/test/components/TransactionLedger.test.tsx` | create |
+| `frontend/src/test/components/SellPnlModal.test.tsx` | create |
+
+**Deviation from the spec, deliberate:** the spec lists `currency`, `strategy` and `thresholdDays` among `TransactionLedger`'s props. The extracted code shows the ledger only ever uses per-asset currency (`asset?.currency || 'USD'`), and the modal is rendered by `App`, not by the ledger — so the ledger's real props are `transactions`, `assets`, `onDeleteTransaction`, `onSelectSell`. Passing three props it would only forward would be noise.
+
+---
+
+## Task 1: Optional-decimal serialization and the three new schemas
+
+**Files:**
+- Modify: `backend_rust/src/db_types.rs` (append module + tests inside the existing `mod tests`)
+- Modify: `backend_rust/src/schemas.rs` (append structs after `AssetTaxSummary`; tests inside existing `mod tests`)
+- Test: same files, `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `crate::db_types::decimal_opt_json::{serialize, deserialize}` for `Option<Decimal>`
+  - `schemas::LotMatch { buy_transaction_id: i32, buy_date: DateTime<Utc>, buy_price: Decimal, unit_cost: Decimal, matched_qty: Decimal, lot_qty_before_match: Decimal, cost_basis: Decimal, proceeds: Decimal, pnl: Decimal, holding_days: i64, term: Option<String> }`
+  - `schemas::SellBreakdown { sell_transaction_id: i32, sell_date: DateTime<Utc>, sold_qty: Decimal, matched_qty: Decimal, unmatched_qty: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, matches: Vec<LotMatch> }`
+  - `schemas::SellPnlResponse { transaction_id: i32, asset_id: i32, symbol: String, asset_type: String, strategy: String, threshold_days: i64, currency: String, asset_currency: String, fx_applied: bool, sell_date: DateTime<Utc>, sold_qty: Decimal, price: Decimal, fee: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, roi: Option<Decimal>, matched_qty: Decimal, unmatched_qty: Decimal, matches: Vec<LotMatch> }`
+
+- [ ] **Step 1: Write the failing tests for `decimal_opt_json`**
+
+Append inside `mod tests` in `backend_rust/src/db_types.rs`:
+
+```rust
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct WrapOpt { #[serde(with = "decimal_opt_json")] d: Option<Decimal> }
+
+    #[test]
+    fn optional_decimal_serializes_some_as_string() {
+        let w = WrapOpt { d: Some(Decimal::from_str("9.99").unwrap()) };
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"d":"9.99"}"#);
+    }
+
+    #[test]
+    fn optional_decimal_serializes_none_as_null() {
+        let w = WrapOpt { d: None };
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"d":null}"#);
+    }
+
+    #[test]
+    fn optional_decimal_deserializes_null_number_and_string() {
+        assert_eq!(serde_json::from_str::<WrapOpt>(r#"{"d":null}"#).unwrap().d, None);
+        assert_eq!(
+            serde_json::from_str::<WrapOpt>(r#"{"d":"9.99"}"#).unwrap().d,
+            Some(Decimal::from_str("9.99").unwrap())
+        );
+        assert_eq!(
+            serde_json::from_str::<WrapOpt>(r#"{"d":100}"#).unwrap().d,
+            Some(Decimal::from_str("100").unwrap())
+        );
+    }
+
+    #[test]
+    fn optional_decimal_rejects_garbage_string() {
+        assert!(serde_json::from_str::<WrapOpt>(r#"{"d":"abc"}"#).is_err());
+    }
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test decimal_opt 2>&1 | tail -20`
+Expected: compile error — `cannot find module or macro decimal_opt_json` (the tests are in `mod tests` with `use super::*;`, so the module must be a sibling of `decimal_json` in the file root).
+
+- [ ] **Step 3: Implement `decimal_opt_json`**
+
+In `backend_rust/src/db_types.rs`, add after the closing brace of `pub mod decimal_json`:
+
+```rust
+pub mod decimal_opt_json {
+    use rust_decimal::Decimal;
+    use rust_decimal::prelude::FromPrimitive;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(d: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match d {
+            Some(v) => serializer.serialize_str(&v.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptDecimalVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OptDecimalVisitor {
+            type Value = Option<Decimal>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string, a number, or null")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Option<Decimal>, E> { Ok(None) }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Option<Decimal>, E> { Ok(None) }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<Decimal>, E> {
+                super::parse_decimal(v)
+                    .map(Some)
+                    .map_err(|_| E::custom(format!("invalid decimal: {v}")))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Option<Decimal>, E> {
+                Decimal::from_i64(v).map(Some).ok_or_else(|| E::custom("i64 does not fit decimal"))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Option<Decimal>, E> {
+                Decimal::from_u64(v).map(Some).ok_or_else(|| E::custom("u64 does not fit decimal"))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Option<Decimal>, E> {
+                Decimal::from_f64(v).map(Some).ok_or_else(|| E::custom("f64 does not fit decimal"))
+            }
+        }
+
+        deserializer.deserialize_any(OptDecimalVisitor)
+    }
+}
+```
+
+- [ ] **Step 4: Run them to verify they pass**
+
+Run: `cd backend_rust && cargo test decimal 2>&1 | tail -20`
+Expected: PASS, including the 8 pre-existing `db_types` tests.
+
+- [ ] **Step 5: Write the failing schema roundtrip tests**
+
+Append inside `mod tests` in `backend_rust/src/schemas.rs`:
+
+```rust
+    #[test]
+    fn test_lot_match_roundtrip() {
+        let m = LotMatch {
+            buy_transaction_id: 11,
+            buy_date: sample_datetime(),
+            buy_price: Decimal::from_str("100.0").unwrap(),
+            unit_cost: Decimal::from_str("100.5").unwrap(),
+            matched_qty: Decimal::from_str("60.0").unwrap(),
+            lot_qty_before_match: Decimal::from_str("100.0").unwrap(),
+            cost_basis: Decimal::from_str("6030.0").unwrap(),
+            proceeds: Decimal::from_str("7800.0").unwrap(),
+            pnl: Decimal::from_str("1770.0").unwrap(),
+            holding_days: 335,
+            term: Some("SHORT".to_string()),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: LotMatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.buy_transaction_id, 11);
+        assert_eq!(back.unit_cost, Decimal::from_str("100.5").unwrap());
+        assert_eq!(back.holding_days, 335);
+        assert_eq!(back.term, Some("SHORT".to_string()));
+    }
+
+    #[test]
+    fn test_sell_breakdown_roundtrip_and_decimals_are_strings() {
+        let b = SellBreakdown {
+            sell_transaction_id: 42,
+            sell_date: sample_datetime(),
+            sold_qty: Decimal::from_str("80.0").unwrap(),
+            matched_qty: Decimal::from_str("80.0").unwrap(),
+            unmatched_qty: Decimal::ZERO,
+            proceeds: Decimal::from_str("10400.0").unwrap(),
+            cost_basis: Decimal::from_str("8400.0").unwrap(),
+            realized_pnl: Decimal::from_str("2000.0").unwrap(),
+            matches: vec![],
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(json.contains(r#""realized_pnl":"2000.0""#), "decimals must serialize as strings: {json}");
+        let back: SellBreakdown = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.realized_pnl, Decimal::from_str("2000.0").unwrap());
+        assert!(back.matches.is_empty());
+    }
+
+    #[test]
+    fn test_sell_pnl_response_roi_null_when_no_cost_basis() {
+        let r = SellPnlResponse {
+            transaction_id: 42, asset_id: 7, symbol: "AAPL".to_string(),
+            asset_type: "STOCK".to_string(), strategy: "FIFO".to_string(), threshold_days: 30,
+            currency: "USD".to_string(), asset_currency: "USD".to_string(), fx_applied: false,
+            sell_date: sample_datetime(),
+            sold_qty: Decimal::from_str("50.0").unwrap(),
+            price: Decimal::from_str("120.0").unwrap(),
+            fee: Decimal::ZERO,
+            proceeds: Decimal::ZERO, cost_basis: Decimal::ZERO, realized_pnl: Decimal::ZERO,
+            roi: None,
+            matched_qty: Decimal::ZERO, unmatched_qty: Decimal::from_str("50.0").unwrap(),
+            matches: vec![],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""roi":null"#), "roi must be null, not 0: {json}");
+        let back: SellPnlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.roi, None);
+        assert_eq!(back.unmatched_qty, Decimal::from_str("50.0").unwrap());
+    }
+```
+
+- [ ] **Step 6: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test sell_pnl_response 2>&1 | tail -20`
+Expected: compile error — `cannot find struct LotMatch` / `SellBreakdown` / `SellPnlResponse`.
+
+- [ ] **Step 7: Implement the schemas**
+
+In `backend_rust/src/schemas.rs`, add after the `AssetTaxSummary` struct:
+
+```rust
+// --- Sell P&L breakdown ---
+// One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
+// split-adjusted and expressed in the portfolio base currency; `unit_cost`
+// additionally carries the amortised buy fee.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LotMatch {
+    pub buy_transaction_id: i32,
+    pub buy_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub buy_price: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unit_cost: Decimal,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub lot_qty_before_match: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub pnl: Decimal,
+    pub holding_days: i64,
+    /// "SHORT" | "LONG", populated for the HYBRID strategy only; null otherwise.
+    pub term: Option<String>,
+}
+
+/// One sell and every lot it consumed, in consumption order.
+/// `unmatched_qty` is the quantity sold with no buy lot behind it, so it
+/// carries no cost basis and contributes nothing to `realized_pnl`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SellBreakdown {
+    pub sell_transaction_id: i32,
+    pub sell_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub sold_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unmatched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_pnl: Decimal,
+    pub matches: Vec<LotMatch>,
+}
+
+/// Endpoint payload: the breakdown plus the context needed to read it honestly
+/// (which strategy produced it, which currency the money is in, whether FX was
+/// applied). `price`/`fee` are the raw as-entered values in `asset_currency`;
+/// every other money field is in `currency`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SellPnlResponse {
+    pub transaction_id: i32,
+    pub asset_id: i32,
+    pub symbol: String,
+    pub asset_type: String,
+    pub strategy: String,
+    pub threshold_days: i64,
+    pub currency: String,
+    pub asset_currency: String,
+    pub fx_applied: bool,
+    pub sell_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub sold_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub price: Decimal,
+    #[serde(with = "decimal_json")]
+    pub fee: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_pnl: Decimal,
+    /// Null when cost basis is zero — dividing there would invent a number.
+    #[serde(with = "decimal_opt_json")]
+    pub roi: Option<Decimal>,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unmatched_qty: Decimal,
+    pub matches: Vec<LotMatch>,
+}
+```
+
+Also extend the `use` line at the top of `schemas.rs` so `decimal_opt_json` is in scope:
+
+```rust
+use crate::db_types::{decimal_json, decimal_opt_json};
+```
+
+If `cargo check` reports that utoipa cannot derive `ToSchema` for `Option<Decimal>`, add `#[schema(value_type = Option<String>)]` directly above the `pub roi` line and re-run. Do not change the runtime type.
+
+- [ ] **Step 8: Run the whole backend test suite to verify nothing regressed**
+
+Run: `cd backend_rust && cargo test 2>&1 | tail -30`
+Expected: PASS. The 14 `tax_engine` tests and the pre-existing `schemas` tests are untouched.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add backend_rust/src/db_types.rs backend_rust/src/schemas.rs
+git commit -m "feat: add sell P&L breakdown schemas with optional-decimal json"
+```
+
+---
+
+## Task 2: Extract `replay()` and give lots an identity — behaviour unchanged
+
+**Files:**
+- Modify: `backend_rust/src/engines/tax_engine.rs`
+
+**Interfaces:**
+- Consumes: `crate::models::Transaction`, `crate::schemas::{TaxLot, AssetTaxSummary}`, `CurrencyService`.
+- Produces:
+  - `struct InternalLot { source_tx_id: i32, date: DateTime<Utc>, price: Decimal, qty: Decimal, unit_cost: Decimal }` (private)
+  - `fn TaxLotEngine::sorted_transactions(&[Transaction]) -> Vec<Transaction>` (private)
+  - `async fn TaxLotEngine::replay(sorted_txs: &[Transaction], currency_service: &CurrencyService, asset_currency: &str, base_currency: &str, strategy: &str, hybrid_threshold_days: i64) -> Result<(Vec<InternalLot>, Vec<SellBreakdown>)>` (private)
+  - `TaxLotEngine::calculate_lots` — **signature and output identical to before**
+
+This is a pure refactor. There is no new test here: the acceptance proof is that the 14 existing engine tests pass with **zero edits to the test module**. If one of them fails, the refactor changed behaviour — fix the refactor, not the test.
+
+- [ ] **Step 1: Capture the green baseline**
+
+Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -10`
+Expected: `test result: ok. 14 passed`. If this is not green before you start, stop and report it — the plan assumes it is.
+
+- [ ] **Step 2: Add `source_tx_id` to `InternalLot` and share the sort**
+
+Replace the `InternalLot` struct with:
+
+```rust
+struct InternalLot {
+    source_tx_id: i32,
+    date: DateTime<Utc>,
+    price: Decimal,
+    qty: Decimal,
+    unit_cost: Decimal,
+}
+```
+
+Add this associated function as the first item in `impl TaxLotEngine`:
+
+```rust
+    /// Canonical transaction order. Splits must apply to existing lots before
+    /// any same-day buy/sell, so they sort ahead of everything else on a tie.
+    fn sorted_transactions(transactions: &[Transaction]) -> Vec<Transaction> {
+        let split_priority = |tx: &Transaction| {
+            if tx.r#type.to_uppercase() == "SPLIT" { 0 } else { 1 }
+        };
+        let mut sorted_txs = transactions.to_vec();
+        sorted_txs.sort_by(|a, b| {
+            a.date.cmp(&b.date).then_with(|| split_priority(a).cmp(&split_priority(b)))
+        });
+        sorted_txs
+    }
+```
+
+- [ ] **Step 3: Move the loop body into `replay()`**
+
+Add this associated function after `sorted_transactions`. It is the loop moved verbatim, with three deliberate changes marked in comments:
+
+```rust
+    /// Single source of truth for lot matching. Both public entry points call
+    /// this, which is what makes per-sell realized P&L reconcile with the
+    /// asset-level total: `realized_pnl` is *derived* from the returned
+    /// breakdowns by the caller, never accumulated on a separate path.
+    async fn replay(
+        sorted_txs: &[Transaction],
+        currency_service: &CurrencyService,
+        asset_currency: &str,
+        base_currency: &str,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+    ) -> Result<(Vec<InternalLot>, Vec<SellBreakdown>)> {
+        let mut buy_lots: Vec<InternalLot> = Vec::new();
+        let mut breakdowns: Vec<SellBreakdown> = Vec::new();
+
+        for tx in sorted_txs {
+            let tx_rate = if asset_currency != base_currency {
+                currency_service.get_rate(asset_currency, base_currency, tx.date).await?
+            } else {
+                Decimal::ONE
+            };
+
+            let tx_qty = crate::db_types::str_to_decimal(&tx.quantity);
+            let tx_price = crate::db_types::str_to_decimal(&tx.price);
+            let tx_fee = crate::db_types::str_to_decimal(&tx.fee);
+
+            if tx.r#type.to_uppercase() == "BUY" {
+                let unit_cost_asset = if tx_qty > Decimal::ZERO {
+                    (tx_qty * tx_price + tx_fee) / tx_qty
+                } else {
+                    tx_price
+                };
+                let unit_cost_base = unit_cost_asset * tx_rate;
+                buy_lots.push(InternalLot {
+                    source_tx_id: tx.id,
+                    date: tx.date,
+                    price: tx_price * tx_rate,
+                    qty: tx_qty,
+                    unit_cost: unit_cost_base,
+                });
+            } else if tx.r#type.to_uppercase() == "SELL" {
+                let mut qty_to_sell = tx_qty;
+                let sell_unit_proceeds_asset = if tx_qty > Decimal::ZERO {
+                    (tx_qty * tx_price - tx_fee) / tx_qty
+                } else {
+                    tx_price
+                };
+                let sell_unit_proceeds_base = sell_unit_proceeds_asset * tx_rate;
+
+                let mut eligible_indices: Vec<usize> = buy_lots.iter().enumerate()
+                    .filter(|(_, lot)| lot.date <= tx.date && lot.qty > Decimal::ZERO)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // CHANGE 1: the old early `continue` on an empty eligible set is
+                // gone. A sell with nothing to match against must still produce a
+                // breakdown (all of it unmatched) so the UI can say so.
+                match strategy.to_uppercase().as_str() {
+                    "FIFO" => {
+                        eligible_indices.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
+                    }
+                    "LIFO" => {
+                        eligible_indices.sort_by(|&a, &b| buy_lots[b].date.cmp(&buy_lots[a].date));
+                    }
+                    "HYBRID" => {
+                        let mut short_term = Vec::new();
+                        let mut long_term = Vec::new();
+                        for &idx in &eligible_indices {
+                            let lot = &buy_lots[idx];
+                            let age = tx.date.signed_duration_since(lot.date).num_days();
+                            if age >= 0 && age <= hybrid_threshold_days {
+                                short_term.push(idx);
+                            } else {
+                                long_term.push(idx);
+                            }
+                        }
+                        short_term.sort_by(|&a, &b| buy_lots[b].date.cmp(&buy_lots[a].date));
+                        long_term.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
+                        eligible_indices = [short_term, long_term].concat();
+                    }
+                    _ => {
+                        eligible_indices.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
+                    }
+                }
+
+                let mut sell_cost_basis = Decimal::ZERO;
+                let mut sell_proceeds = Decimal::ZERO;
+
+                for idx in eligible_indices {
+                    if qty_to_sell <= Decimal::ZERO {
+                        break;
+                    }
+                    let lot = &mut buy_lots[idx];
+                    let matched_qty = qty_to_sell.min(lot.qty);
+                    let cost_basis = matched_qty * lot.unit_cost;
+                    let proceeds = matched_qty * sell_unit_proceeds_base;
+
+                    // CHANGE 2: the old line here was
+                    // `realized_pnl += proceeds - cost_basis;`. There is no
+                    // engine-wide accumulator any more — the per-sell totals are
+                    // accumulated instead, and the asset total is derived from
+                    // them in calculate_lots.
+                    sell_cost_basis += cost_basis;
+                    sell_proceeds += proceeds;
+
+                    lot.qty -= matched_qty;
+                    qty_to_sell -= matched_qty;
+                }
+
+                // CHANGE 3: every sell now produces a breakdown, including one
+                // with nothing eligible to match. `matches` stays empty until
+                // Step 6 fills in the per-lot detail; the totals are already
+                // correct, so the existing tests stay green at this point.
+                breakdowns.push(SellBreakdown {
+                    sell_transaction_id: tx.id,
+                    sell_date: tx.date,
+                    sold_qty: tx_qty,
+                    matched_qty: tx_qty - qty_to_sell,
+                    unmatched_qty: qty_to_sell,
+                    proceeds: sell_proceeds,
+                    cost_basis: sell_cost_basis,
+                    realized_pnl: sell_proceeds - sell_cost_basis,
+                    matches: vec![],
+                });
+            } else if tx.r#type.to_uppercase() == "SPLIT" {
+                // Split ratio = quantity : price (shares after : shares before).
+                // Existing lots scale in quantity and divide in unit cost so total
+                // cost basis is unchanged and no P&L is realized.
+                let denominator = tx_price;
+                if tx_qty > Decimal::ZERO && denominator > Decimal::ZERO {
+                    let ratio = tx_qty / denominator;
+                    for lot in buy_lots.iter_mut() {
+                        lot.qty *= ratio;
+                        lot.unit_cost /= ratio;
+                        lot.price /= ratio;
+                    }
+                }
+            }
+        }
+
+        Ok((buy_lots, breakdowns))
+    }
+```
+
+- [ ] **Step 4: Rewrite `calculate_lots` to call `replay`**
+
+Replace everything from `pub async fn calculate_lots(` through the end of its `for tx in sorted_txs { ... }` loop with:
+
+```rust
+    pub async fn calculate_lots(
+        symbol: &str,
+        asset_type: &str,
+        transactions: &[Transaction],
+        current_price: Decimal,
+        asset_currency: &str,
+        base_currency: &str,
+        currency_service: &CurrencyService,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+    ) -> Result<AssetTaxSummary> {
+        let sorted_txs = Self::sorted_transactions(transactions);
+
+        let current_price_base = if asset_currency != base_currency {
+            let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
+            let rate = currency_service.get_rate(asset_currency, base_currency, latest_date).await?;
+            current_price * rate
+        } else {
+            current_price
+        };
+
+        let (buy_lots, breakdowns) = Self::replay(
+            &sorted_txs,
+            currency_service,
+            asset_currency,
+            base_currency,
+            strategy,
+            hybrid_threshold_days,
+        )
+        .await?;
+
+        // Derived, not accumulated: the asset total is the sum of the per-sell
+        // totals by construction, so the two can never drift apart.
+        let realized_pnl: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();
+```
+
+Leave the rest of `calculate_lots` (the `let mut open_lots = Vec::new();` block through `Ok(AssetTaxSummary { ... })`) exactly as it is. The only change it needs is how `realized_pnl` is obtained — the old `let mut realized_pnl = Decimal::ZERO;` accumulator and the `realized_pnl +=` inside the loop are gone, replaced by the derived sum shown above. Extend the `use` at the top of the file:
+
+```rust
+use crate::schemas::{AssetTaxSummary, LotMatch, SellBreakdown, TaxLot};
+```
+
+`LotMatch` is unused until Task 3 — that is fine for `cargo test` (a warning at most), but if `cargo clippy -- -D warnings` is part of your gate, add `#[allow(unused_imports)]` to that `use` line and remove it in Task 3.
+
+- [ ] **Step 5: Run the existing engine tests — they must pass unmodified**
+
+Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -15`
+Expected: `test result: ok. 14 passed; 0 failed`. They are green here because Step 3 already produces correct per-sell totals; Step 6 only adds the per-lot detail those 14 tests do not look at. If any fail now, the refactor changed behaviour — fix the refactor, not the test. **Do not edit the test module.**
+
+- [ ] **Step 6: Add `term_for`, then record each match**
+
+First, at file scope in `tax_engine.rs`, after the `impl TaxLotEngine` block:
+
+```rust
+/// Short/long-term bucketing exists only for HYBRID, where `threshold_days` is
+/// a real strategy parameter. Reporting a term under FIFO or LIFO would present
+/// a HYBRID tuning knob as a tax fact, so it stays null there.
+fn term_for(strategy: &str, holding_days: i64, threshold_days: i64) -> Option<String> {
+    if strategy.to_uppercase() != "HYBRID" {
+        return None;
+    }
+    Some(if holding_days <= threshold_days { "SHORT".to_string() } else { "LONG".to_string() })
+}
+```
+
+The return type is `Option<String>`, not `Option<&'static str>`, because `LotMatch.term` is `Option<String>` — it is a serialized schema field. A `&'static str` would not compile against the struct.
+
+Then, in `replay`, inside the SELL branch, delete the two accumulator lines added in Step 3 (`let mut sell_cost_basis = Decimal::ZERO;` and `let mut sell_proceeds = Decimal::ZERO;`) and put the match vector in their place, immediately before the consumption loop:
+
+```rust
+                let mut matches: Vec<LotMatch> = Vec::new();
+```
+
+Replace the body of the consumption loop after `let proceeds = matched_qty * sell_unit_proceeds_base;` — delete the two `sell_cost_basis += cost_basis;` / `sell_proceeds += proceeds;` lines and put this in their place:
+
+```rust
+                    matches.push(LotMatch {
+                        buy_transaction_id: lot.source_tx_id,
+                        buy_date: lot.date,
+                        buy_price: lot.price,
+                        unit_cost: lot.unit_cost,
+                        matched_qty,
+                        lot_qty_before_match: lot.qty,
+                        cost_basis,
+                        proceeds,
+                        pnl: proceeds - cost_basis,
+                        holding_days: tx.date.signed_duration_since(lot.date).num_days(),
+                        term: term_for(strategy, tx.date.signed_duration_since(lot.date).num_days(), hybrid_threshold_days),
+                    });
+
+                    lot.qty -= matched_qty;
+                    qty_to_sell -= matched_qty;
+```
+
+Note the ordering requirement: `lot_qty_before_match: lot.qty` must be read **before** `lot.qty -= matched_qty`, and `lot` is still mutably borrowed at that point, which is legal because the field read happens in the same expression as the earlier value. If the borrow checker objects, hoist the reads into locals before the mutation:
+
+```rust
+                    let (lot_qty_before_match, lot_price, lot_unit_cost, lot_date, lot_source) =
+                        (lot.qty, lot.price, lot.unit_cost, lot.date, lot.source_tx_id);
+```
+
+and use those locals in the `LotMatch` literal.
+
+Then replace the `breakdowns.push(...)` from Step 3 so its totals are derived from `matches` rather than from hand-carried accumulators:
+
+```rust
+                let matched_qty: Decimal = matches.iter().map(|m| m.matched_qty).sum();
+                let cost_basis: Decimal = matches.iter().map(|m| m.cost_basis).sum();
+                let proceeds: Decimal = matches.iter().map(|m| m.proceeds).sum();
+
+                breakdowns.push(SellBreakdown {
+                    sell_transaction_id: tx.id,
+                    sell_date: tx.date,
+                    sold_qty: tx_qty,
+                    matched_qty,
+                    unmatched_qty: tx_qty - matched_qty,
+                    proceeds,
+                    cost_basis,
+                    realized_pnl: proceeds - cost_basis,
+                    matches,
+                });
+```
+
+- [ ] **Step 7: Confirm the placeholder is gone**
+
+`grep -n "matches: vec!\[\]" backend_rust/src/engines/tax_engine.rs` must return nothing. If it matches, Step 6's per-lot recording is not wired up yet, and the modal would render a correct total with an empty lot table — the one failure mode this feature exists to prevent.
+
+- [ ] **Step 8: Run the engine tests**
+
+Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -15`
+Expected: `test result: ok. 14 passed; 0 failed` — same 14 tests, same assertions, none edited.
+
+- [ ] **Step 9: Run the whole backend suite**
+
+Run: `cd backend_rust && cargo test 2>&1 | tail -20`
+Expected: PASS, including `analytics_test`, `transactions_test`, `portfolios_test`, `decimal_migration_test`, `cors_test`.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add backend_rust/src/engines/tax_engine.rs
+git commit -m "refactor: single lot-matching replay with per-sell breakdown recorded"
+```
+
+---
+
+## Task 3: `sell_breakdown` entry point and engine-level breakdown tests
+
+**Files:**
+- Modify: `backend_rust/src/engines/tax_engine.rs` (public entry point + tests in the existing `mod tests`)
+- Test: same file
+
+**Interfaces:**
+- Consumes: `TaxLotEngine::replay`, `schemas::{LotMatch, SellBreakdown}`, `term_for`.
+- Produces: `async fn TaxLotEngine::sell_breakdown(sell_transaction_id: i32, transactions: &[Transaction], asset_currency: &str, base_currency: &str, currency_service: &CurrencyService, strategy: &str, hybrid_threshold_days: i64) -> Result<Option<SellBreakdown>>`
+
+Note the signature has **no `current_price`** — realized P&L does not depend on a quote. That is what keeps the endpoint free of price fetches.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append inside `mod tests` in `tax_engine.rs`. The existing `make_tx` helper already takes an id, so reuse it.
+
+```rust
+    async fn run_breakdown(txs: &[Transaction], sell_id: i32, strategy: &str, threshold: i64) -> Option<SellBreakdown> {
+        let svc = CurrencyService::new();
+        TaxLotEngine::sell_breakdown(
+            sell_id, txs, "USD", "USD", &svc, strategy, threshold,
+        ).await.unwrap()
+    }
+
+    fn two_buys_one_sell() -> Vec<Transaction> {
+        vec![
+            make_tx(1, "BUY", "60.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "BUY", "40.0", "120.0", "0.0", "2024-06-01T00:00:00Z"),
+            make_tx(3, "SELL", "80.0", "130.0", "0.0", "2024-12-01T00:00:00Z"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_fifo_consumes_oldest_first() {
+        let txs = two_buys_one_sell();
+        let b = run_breakdown(&txs, 3, "FIFO", 30).await.expect("breakdown for sell 3");
+        assert_eq!(b.sell_transaction_id, 3);
+        assert_eq!(b.sold_qty, Decimal::from_str("80.0").unwrap());
+        assert_eq!(b.matches.len(), 2);
+        assert_eq!(b.matches[0].buy_transaction_id, 1);
+        assert_eq!(b.matches[0].matched_qty, Decimal::from_str("60.0").unwrap());
+        assert_eq!(b.matches[0].lot_qty_before_match, Decimal::from_str("60.0").unwrap());
+        assert_eq!(b.matches[0].pnl, Decimal::from_str("1800.0").unwrap());
+        assert_eq!(b.matches[0].holding_days, 335);
+        assert_eq!(b.matches[1].buy_transaction_id, 2);
+        assert_eq!(b.matches[1].matched_qty, Decimal::from_str("20.0").unwrap());
+        assert_eq!(b.matches[1].lot_qty_before_match, Decimal::from_str("40.0").unwrap());
+        assert_eq!(b.matches[1].pnl, Decimal::from_str("200.0").unwrap());
+        assert_eq!(b.matches[1].holding_days, 183);
+        assert_eq!(b.realized_pnl, Decimal::from_str("2000.0").unwrap());
+        assert_eq!(b.unmatched_qty, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_lifo_consumes_newest_first() {
+        let txs = two_buys_one_sell();
+        let b = run_breakdown(&txs, 3, "LIFO", 30).await.unwrap();
+        assert_eq!(b.matches[0].buy_transaction_id, 2);
+        assert_eq!(b.matches[0].matched_qty, Decimal::from_str("40.0").unwrap());
+        assert_eq!(b.matches[1].buy_transaction_id, 1);
+        assert_eq!(b.realized_pnl, Decimal::from_str("1600.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_term_is_null_except_hybrid() {
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "BUY", "100.0", "110.0", "0.0", "2024-11-15T00:00:00Z"),
+            make_tx(3, "SELL", "100.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let fifo = run_breakdown(&txs, 3, "FIFO", 30).await.unwrap();
+        assert_eq!(fifo.matches[0].term, None, "FIFO must not claim a tax term");
+        assert_eq!(fifo.matches[0].holding_days, 335);
+
+        let hybrid = run_breakdown(&txs, 3, "HYBRID", 30).await.unwrap();
+        assert_eq!(hybrid.matches[0].buy_transaction_id, 2, "HYBRID takes the 16-day lot first");
+        assert_eq!(hybrid.matches[0].term, Some("SHORT".to_string()));
+        assert_eq!(hybrid.matches[0].holding_days, 16);
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_hybrid_labels_long_term_bucket() {
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SELL", "100.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let b = run_breakdown(&txs, 2, "HYBRID", 30).await.unwrap();
+        assert_eq!(b.matches[0].term, Some("LONG".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_reports_unmatched_quantity() {
+        let txs = vec![
+            make_tx(1, "BUY", "50.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SELL", "100.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let b = run_breakdown(&txs, 2, "FIFO", 30).await.unwrap();
+        assert_eq!(b.matched_qty, Decimal::from_str("50.0").unwrap());
+        assert_eq!(b.unmatched_qty, Decimal::from_str("50.0").unwrap());
+        assert_eq!(b.matches.len(), 1);
+        // Only the matched half contributes: 50 * (120 - 100), not 100 * 20.
+        assert_eq!(b.realized_pnl, Decimal::from_str("1000.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_before_any_buy_is_all_unmatched() {
+        let txs = vec![
+            make_tx(1, "SELL", "50.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
+            make_tx(2, "BUY", "50.0", "100.0", "0.0", "2025-01-01T00:00:00Z"),
+        ];
+        let b = run_breakdown(&txs, 1, "FIFO", 30).await.unwrap();
+        assert!(b.matches.is_empty(), "a sell cannot consume a lot bought after it");
+        assert_eq!(b.unmatched_qty, Decimal::from_str("50.0").unwrap());
+        assert_eq!(b.matched_qty, Decimal::ZERO);
+        assert_eq!(b.cost_basis, Decimal::ZERO);
+        assert_eq!(b.realized_pnl, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_reports_split_adjusted_cost() {
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SPLIT", "2.0", "1.0", "0.0", "2024-06-01T00:00:00Z"),
+            make_tx(3, "SELL", "100.0", "60.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let b = run_breakdown(&txs, 3, "FIFO", 30).await.unwrap();
+        assert_eq!(b.matches.len(), 1);
+        assert_eq!(b.matches[0].buy_price, Decimal::from_str("50.0").unwrap());
+        assert_eq!(b.matches[0].unit_cost, Decimal::from_str("50.0").unwrap());
+        assert_eq!(b.matches[0].lot_qty_before_match, Decimal::from_str("200.0").unwrap());
+        assert_eq!(b.matches[0].cost_basis, Decimal::from_str("5000.0").unwrap());
+        assert_eq!(b.realized_pnl, Decimal::from_str("1000.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdown_unknown_id_returns_none() {
+        let txs = two_buys_one_sell();
+        assert!(run_breakdown(&txs, 999, "FIFO", 30).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sell_breakdowns_sum_to_asset_realized_pnl() {
+        // The reconciliation invariant, checked under every strategy, over a
+        // fixture with two sells, a partial lot, an unmatched tail and a split.
+        let txs = vec![
+            make_tx(1, "BUY", "60.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "BUY", "40.0", "120.0", "0.0", "2024-06-01T00:00:00Z"),
+            make_tx(3, "SPLIT", "2.0", "1.0", "0.0", "2024-08-01T00:00:00Z"),
+            make_tx(4, "SELL", "80.0", "130.0", "5.0", "2024-12-01T00:00:00Z"),
+            make_tx(5, "SELL", "300.0", "70.0", "0.0", "2025-01-01T00:00:00Z"),
+        ];
+        for strategy in ["FIFO", "LIFO", "HYBRID"] {
+            let svc = CurrencyService::new();
+            let summary = TaxLotEngine::calculate_lots(
+                "TEST", "STOCK", &txs, Decimal::from_str("110.0").unwrap(),
+                "USD", "USD", &svc, strategy, 30,
+            ).await.unwrap();
+
+            let sorted = TaxLotEngine::sorted_transactions(&txs);
+            let (_, breakdowns) = TaxLotEngine::replay(
+                &sorted, &svc, "USD", "USD", strategy, 30,
+            ).await.unwrap();
+
+            let summed: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();
+            assert_eq!(summed, summary.realized_pnl, "per-sell totals must equal the asset total under {strategy}");
+
+            let sold: Decimal = breakdowns.iter().map(|b| b.sold_qty).sum();
+            let accounted: Decimal = breakdowns.iter().map(|b| b.matched_qty + b.unmatched_qty).sum();
+            assert_eq!(sold, accounted, "every sold unit is either matched or declared unmatched under {strategy}");
+        }
+    }
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test sell_breakdown 2>&1 | tail -20`
+Expected: compile error — `no function `sell_breakdown` found for struct TaxLotEngine`.
+
+- [ ] **Step 3: Implement `sell_breakdown`**
+
+Add as the second public associated function in `impl TaxLotEngine`, right after `calculate_lots`:
+
+```rust
+    /// Realized-P&L breakdown for one sell. Replays the whole asset history
+    /// rather than a prefix: a sell's matches depend only on transactions at or
+    /// before it, so this is identical to a prefix replay and is the same call
+    /// `calculate_lots` makes. Takes no current price — realized P&L needs none.
+    pub async fn sell_breakdown(
+        sell_transaction_id: i32,
+        transactions: &[Transaction],
+        asset_currency: &str,
+        base_currency: &str,
+        currency_service: &CurrencyService,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+    ) -> Result<Option<SellBreakdown>> {
+        let sorted_txs = Self::sorted_transactions(transactions);
+        let (_, breakdowns) = Self::replay(
+            &sorted_txs,
+            currency_service,
+            asset_currency,
+            base_currency,
+            strategy,
+            hybrid_threshold_days,
+        )
+        .await?;
+        Ok(breakdowns.into_iter().find(|b| b.sell_transaction_id == sell_transaction_id))
+    }
+```
+
+- [ ] **Step 4: Run the new tests**
+
+Run: `cd backend_rust && cargo test sell_breakdown 2>&1 | tail -20`
+Expected: PASS — 9 new tests.
+
+- [ ] **Step 5: Run the whole engine module to prove nothing drifted**
+
+Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -10`
+Expected: `test result: ok. 23 passed` (14 original + 9 new), 0 failed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend_rust/src/engines/tax_engine.rs
+git commit -m "feat: per-sell lot breakdown entry point with engine tests"
+```
+
+---
+
+## Task 4: The `/api/transactions/<id>/pnl` endpoint
+
+**Files:**
+- Modify: `backend_rust/src/api_routes/analytics.rs` (append handler)
+- Modify: `backend_rust/src/lib.rs` (mount in the `/api` group)
+- Modify: `backend_rust/tests/common/mod.rs` (date-aware seeder)
+- Create: `backend_rust/tests/sell_pnl_test.rs`
+
+**Interfaces:**
+- Consumes: `TaxLotEngine::sell_breakdown` (Task 3), `schemas::SellPnlResponse` (Task 1), models `Transaction`/`Asset`/`Portfolio`.
+- Produces: `api_routes::analytics::get_transaction_sell_pnl`, mounted at `GET /api/transactions/<id>/pnl?strategy=&threshold_days=`, returning `Json<SellPnlResponse>`.
+
+- [ ] **Step 1: Add the date-aware test seeder**
+
+Append to `backend_rust/tests/common/mod.rs` (the `#[allow(dead_code)]` attribute is required — this file is compiled into every test binary):
+
+```rust
+#[allow(dead_code)]
+pub async fn seed_transaction_at(
+    pool: &SqlitePool,
+    asset_id: i32,
+    tx_type: &str,
+    qty: f64,
+    price: f64,
+    fee: f64,
+    date: &str,
+) -> i32 {
+    let date = DateTime::parse_from_rfc3339(date).unwrap().with_timezone(&Utc);
+    let res = sqlx::query_as::<_, (i32,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+    )
+    .bind(asset_id)
+    .bind(tx_type)
+    .bind(qty)
+    .bind(price)
+    .bind(fee)
+    .bind(date)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    res.0
+}
+```
+
+- [ ] **Step 2: Write the failing endpoint tests**
+
+Create `backend_rust/tests/sell_pnl_test.rs`:
+
+```rust
+mod common;
+
+use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction_at};
+use rocket::http::Status;
+use rocket::local::asynchronous::Client;
+
+// FIFO fixture: two buys, one sell of 80 units split across both lots.
+async fn fifo_fixture() -> (Client, i32, i32, i32) {
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Sell PnL", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
+    let buy1 = seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    let buy2 = seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let _ = buy2;
+    (build_rocket(pool), sell, buy1, asset_id)
+}
+
+#[tokio::test]
+async fn test_sell_pnl_unknown_transaction_is_404() {
+    let (rocket, _, _, _) = fifo_fixture().await;
+    let client = Client::tracked(rocket).await.unwrap();
+    let resp = client.get("/api/transactions/999999/pnl?strategy=FIFO&threshold_days=30").dispatch().await;
+    assert_eq!(resp.status(), Status::NotFound);
+}
+
+#[tokio::test]
+async fn test_sell_pnl_rejects_non_sell_transaction() {
+    let (rocket, _, buy1, _) = fifo_fixture().await;
+    let client = Client::tracked(rocket).await.unwrap();
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", buy1)).dispatch().await;
+    assert_eq!(resp.status(), Status::BadRequest);
+}
+
+#[tokio::test]
+async fn test_sell_pnl_fifo_breakdown_shape() {
+    let (rocket, sell, buy1, _) = fifo_fixture().await;
+    let client = Client::tracked(rocket).await.unwrap();
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO&threshold_days=30", sell)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(body["transaction_id"], sell);
+    assert_eq!(body["symbol"], "AAPL");
+    assert_eq!(body["strategy"], "FIFO");
+    assert_eq!(body["threshold_days"], 30);
+    assert_eq!(body["currency"], "USD");
+    assert_eq!(body["asset_currency"], "USD");
+    assert_eq!(body["fx_applied"], false);
+    assert_eq!(body["sold_qty"], "80.0");
+    assert_eq!(body["price"], "130.0");
+    assert_eq!(body["realized_pnl"], "2000.0");
+    assert_eq!(body["matched_qty"], "80.0");
+    assert_eq!(body["unmatched_qty"], "0.0");
+    assert_eq!(body["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(body["matches"][0]["buy_transaction_id"], buy1);
+    assert_eq!(body["matches"][0]["matched_qty"], "60.0");
+    assert_eq!(body["matches"][0]["holding_days"], 335);
+    assert!(body["matches"][0]["term"].is_null(), "term is HYBRID-only");
+    assert_eq!(body["matches"][1]["matched_qty"], "20.0");
+    // Decimal division carries full precision, so pin the leading digits rather
+    // than an exact 28-digit string.
+    assert!(body["roi"].as_str().unwrap().starts_with("0.238"), "unexpected roi: {}", body["roi"]);
+}
+
+#[tokio::test]
+async fn test_sell_pnl_lifo_attributes_different_lots() {
+    let (rocket, sell, _, _) = fifo_fixture().await;
+    let client = Client::tracked(rocket).await.unwrap();
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=LIFO&threshold_days=30", sell)).dispatch().await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "LIFO");
+    assert_eq!(body["realized_pnl"], "1600.0");
+}
+
+#[tokio::test]
+async fn test_sell_pnl_defaults_to_fifo_when_params_omitted() {
+    let (rocket, sell, _, _) = fifo_fixture().await;
+    let client = Client::tracked(rocket).await.unwrap();
+    let resp = client.get(format!("/api/transactions/{}/pnl", sell)).dispatch().await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "FIFO");
+    assert_eq!(body["threshold_days"], 30);
+    assert_eq!(body["realized_pnl"], "2000.0");
+}
+
+#[tokio::test]
+async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Unmatched", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "TSLA", "Tesla").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 50.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["sold_qty"], "100.0");
+    assert_eq!(body["matched_qty"], "50.0");
+    assert_eq!(body["unmatched_qty"], "50.0");
+    assert_eq!(body["realized_pnl"], "1000.0");
+}
+
+#[tokio::test]
+async fn test_sell_pnl_roi_is_null_when_cost_basis_is_zero() {
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "No Buys", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "NOBUYS", "No Buys").await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert!(body["roi"].is_null(), "roi must be null, never a division by zero");
+    assert!(body["matches"].as_array().unwrap().is_empty());
+    assert_eq!(body["unmatched_qty"], "50.0");
+    assert_eq!(body["realized_pnl"], "0.0");
+}
+```
+
+- [ ] **Step 3: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
+Expected: FAIL with `404 Not Found` on every route call (Rocket has no such route yet) and `400`/`404` mismatches.
+
+- [ ] **Step 4: Implement the handler**
+
+Append to `backend_rust/src/api_routes/analytics.rs`:
+
+```rust
+#[utoipa::path(
+    get,
+    path = "/api/transactions/<id>/pnl",
+    params(
+        ("id" = i32, Path, description = "Sell transaction id"),
+        ("strategy" = Option<String>, Query, description = "FIFO, LIFO or HYBRID (default FIFO)"),
+        ("threshold_days" = Option<i64>, Query, description = "HYBRID short-term threshold (default 30)")
+    ),
+    responses(
+        (status = 200, description = "Realized P&L breakdown for the sell", body = SellPnlResponse),
+        (status = 400, description = "Transaction is not a SELL"),
+        (status = 404, description = "Transaction not found")
+    )
+)]
+#[get("/transactions/<id>/pnl?<strategy>&<threshold_days>")]
+pub async fn get_transaction_sell_pnl(
+    id: i32,
+    pool: &State<SqlitePool>,
+    currency_service: &State<CurrencyService>,
+    strategy: Option<String>,
+    threshold_days: Option<i64>,
+) -> Result<Json<SellPnlResponse>, Status> {
+    let tx = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?
+        .ok_or(Status::NotFound)?;
+
+    if tx.r#type.to_uppercase() != "SELL" {
+        return Err(Status::BadRequest);
+    }
+
+    // Base currency comes from the portfolio that owns the asset, not from a
+    // path parameter, so the answer cannot disagree with the portfolio on screen.
+    let asset = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = ?")
+        .bind(tx.asset_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?
+        .ok_or(Status::NotFound)?;
+
+    let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
+        .bind(asset.portfolio_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?
+        .ok_or(Status::NotFound)?;
+
+    let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
+        .bind(asset.id)
+        .fetch_all(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?;
+
+    let strategy_val = strategy.unwrap_or_else(|| "FIFO".to_string());
+    let threshold_val = threshold_days.unwrap_or(30);
+    let fx_applied = asset.currency != portfolio.base_currency;
+
+    // No get_price call: realized P&L depends on nothing but the trade history.
+    let breakdown = TaxLotEngine::sell_breakdown(
+        id,
+        &transactions,
+        &asset.currency,
+        &portfolio.base_currency,
+        currency_service,
+        &strategy_val,
+        threshold_val,
+    )
+    .await
+    .map_err(|_| Status::InternalServerError)?
+    .ok_or(Status::NotFound)?;
+
+    let roi = if breakdown.cost_basis > Decimal::ZERO {
+        Some(breakdown.realized_pnl / breakdown.cost_basis)
+    } else {
+        None
+    };
+
+    Ok(Json(SellPnlResponse {
+        transaction_id: tx.id,
+        asset_id: asset.id,
+        symbol: asset.symbol,
+        asset_type: asset.asset_type,
+        strategy: strategy_val,
+        threshold_days: threshold_val,
+        currency: portfolio.base_currency,
+        asset_currency: asset.currency,
+        fx_applied,
+        sell_date: breakdown.sell_date,
+        sold_qty: breakdown.sold_qty,
+        price: crate::db_types::str_to_decimal(&tx.price),
+        fee: crate::db_types::str_to_decimal(&tx.fee),
+        proceeds: breakdown.proceeds,
+        cost_basis: breakdown.cost_basis,
+        realized_pnl: breakdown.realized_pnl,
+        roi,
+        matched_qty: breakdown.matched_qty,
+        unmatched_qty: breakdown.unmatched_qty,
+        matches: breakdown.matches,
+    }))
+}
+```
+
+Extend the `use` block at the top of `analytics.rs`:
+
+```rust
+use crate::schemas::SellPnlResponse;
+```
+
+- [ ] **Step 5: Mount the route**
+
+In `backend_rust/src/lib.rs`, add to the existing `.mount("/api", routes![...])` list:
+
+```rust
+            api_routes::analytics::get_transaction_sell_pnl,
+```
+
+- [ ] **Step 6: Run the endpoint tests**
+
+Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
+Expected: PASS — 7 tests.
+
+- [ ] **Step 7: Run the whole backend suite**
+
+Run: `cd backend_rust && cargo test 2>&1 | tail -20`
+Expected: PASS. `cors_test` and `analytics_test` still green — `/tax-summary` is untouched.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add backend_rust/src/api_routes/analytics.rs backend_rust/src/lib.rs backend_rust/tests/common/mod.rs backend_rust/tests/sell_pnl_test.rs
+git commit -m "feat: expose per-sell realized P&L at GET /api/transactions/<id>/pnl"
+```
+
+---
+
+## Task 5: OpenAPI registration and regenerated spec
+
+**Files:**
+- Modify: `backend_rust/src/openapi.rs`
+- Regenerate: `docs/openapi/openapi.json`, `frontend/src/types/api.d.ts`
+
+**Interfaces:**
+- Consumes: `api_routes::analytics::get_transaction_sell_pnl`, `schemas::{LotMatch, SellBreakdown, SellPnlResponse}`.
+- Produces: an `openapi.json` containing `/api/transactions/<id>/pnl` and the three new component schemas.
+
+- [ ] **Step 1: Register the path and schemas**
+
+In `backend_rust/src/openapi.rs`, add to the `paths(...)` list after `crate::api_routes::analytics::get_portfolio_performance,`:
+
+```rust
+        crate::api_routes::analytics::get_transaction_sell_pnl,
+```
+
+and to the `components(schemas(...))` list after `schemas::AssetTaxSummary,`:
+
+```rust
+            schemas::LotMatch,
+            schemas::SellBreakdown,
+            schemas::SellPnlResponse,
+```
+
+- [ ] **Step 2: Verify it compiles and the spec serves the new route**
+
+Run: `cd backend_rust && cargo check 2>&1 | tail -10`
+Expected: no errors. If utoipa rejects a type, the error names the field — apply the `#[schema(value_type = ...)]` contingency noted in Task 1 Step 7.
+
+- [ ] **Step 3: Regenerate the committed spec**
+
+Per `AGENTS.md`:
+
+```bash
+cd backend_rust
+touch portfolio.db
+cargo run --release &
+sleep 12
+curl -s http://127.0.0.1:8000/api-docs/openapi.json > ../docs/openapi/openapi.json
+kill $(jobs -p)
+```
+
+- [ ] **Step 4: Verify the new route and schemas landed**
+
+From the **repository root** (not `backend_rust/`):
+
+```bash
+python3 -c "import json;d=json.load(open('docs/openapi/openapi.json'));print('/api/transactions/<id>/pnl' in d['paths']);print(sorted(s for s in d['components']['schemas'] if 'Sell' in s or s=='LotMatch'))"
+```
+
+Expected: `True` and `['LotMatch', 'SellBreakdown', 'SellPnlResponse']`.
+
+- [ ] **Step 5: Regenerate the generated TypeScript types**
+
+```bash
+cd ../frontend && npm install && npm run generate-types
+```
+
+Nothing imports `src/types/api.d.ts` today, but it is a committed generated artifact and must not drift from the spec it was generated from.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docs/openapi/openapi.json frontend/src/types/api.d.ts backend_rust/src/openapi.rs
+git commit -m "chore: register sell P&L route in OpenAPI and regenerate spec"
+```
+
+---
+
+## Task 6: Frontend types and the decimal normalizer
+
+**Files:**
+- Modify: `frontend/src/types.ts`
+- Modify: `frontend/src/utils/decimal.ts`
+- Create: `frontend/src/utils/decimal.test.ts`
+
+**Interfaces:**
+- Consumes: the endpoint JSON from Task 4.
+- Produces:
+  - `types.ts`: `LotMatch`, `SellPnlBreakdown`
+  - `decimal.ts`: `normalizeSellPnl(t: unknown): SellPnlBreakdown`
+
+- [ ] **Step 1: Add the types**
+
+Append to `frontend/src/types.ts`:
+
+```ts
+export interface LotMatch {
+  buy_transaction_id: number;
+  buy_date: string;
+  buy_price: number;
+  unit_cost: number;
+  matched_qty: number;
+  lot_qty_before_match: number;
+  cost_basis: number;
+  proceeds: number;
+  pnl: number;
+  holding_days: number;
+  term: 'SHORT' | 'LONG' | null;
+}
+
+export interface SellPnlBreakdown {
+  transaction_id: number;
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  strategy: string;
+  threshold_days: number;
+  currency: string;
+  asset_currency: string;
+  fx_applied: boolean;
+  sell_date: string;
+  sold_qty: number;
+  price: number;
+  fee: number;
+  proceeds: number;
+  cost_basis: number;
+  realized_pnl: number;
+  /** null when cost basis is zero; render as an em dash, never 0%. */
+  roi: number | null;
+  matched_qty: number;
+  unmatched_qty: number;
+  matches: LotMatch[];
+}
+```
+
+- [ ] **Step 2: Write the failing normalizer tests**
+
+Create `frontend/src/utils/decimal.test.ts` (sits beside the source, matching `csvParser.test.ts`):
+
+```ts
+import { describe, it, expect } from 'vitest'
+import { normalizeSellPnl } from './decimal'
+
+const raw = {
+  transaction_id: 42, asset_id: 7, symbol: 'AAPL', asset_type: 'STOCK',
+  strategy: 'FIFO', threshold_days: 30,
+  currency: 'USD', asset_currency: 'USD', fx_applied: false,
+  sell_date: '2024-12-01T00:00:00Z',
+  sold_qty: '80.0', price: '130.0', fee: '0.0',
+  proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
+  matched_qty: '80.0', unmatched_qty: '0.0',
+  matches: [
+    { buy_transaction_id: 1, buy_date: '2024-01-01T00:00:00Z', buy_price: '100.0',
+      unit_cost: '100.0', matched_qty: '60.0', lot_qty_before_match: '60.0',
+      cost_basis: '6000.0', proceeds: '7800.0', pnl: '1800.0',
+      holding_days: 335, term: null },
+  ],
+}
+
+describe('normalizeSellPnl', () => {
+  it('converts decimal strings to numbers', () => {
+    const d = normalizeSellPnl(raw)
+    expect(d.sold_qty).toBe(80)
+    expect(d.realized_pnl).toBe(2000)
+    expect(d.matches[0].matched_qty).toBe(60)
+    expect(d.matches[0].pnl).toBe(1800)
+    expect(d.matches[0].holding_days).toBe(335)
+  })
+
+  it('keeps roi null when there is no cost basis', () => {
+    const d = normalizeSellPnl({ ...raw, roi: null, cost_basis: '0.0' })
+    expect(d.roi).toBeNull()
+  })
+
+  it('reads a present roi as a number', () => {
+    expect(normalizeSellPnl(raw).roi).toBeCloseTo(0.238)
+  })
+
+  it('survives a malformed payload without throwing', () => {
+    const d = normalizeSellPnl(null)
+    expect(d.matches).toEqual([])
+    expect(d.realized_pnl).toBe(0)
+    expect(d.roi).toBeNull()
+  })
+
+  it('passes term through', () => {
+    const d = normalizeSellPnl({
+      ...raw,
+      matches: [{ ...raw.matches[0], term: 'SHORT' }],
+    })
+    expect(d.matches[0].term).toBe('SHORT')
+  })
+})
+```
+
+- [ ] **Step 3: Run them to verify they fail**
+
+Run: `cd frontend && npx vitest run src/utils/decimal.test.ts 2>&1 | tail -20`
+Expected: FAIL — `normalizeSellPnl is not exported` / is not a function.
+
+- [ ] **Step 4: Implement the normalizer**
+
+In `frontend/src/utils/decimal.ts`, extend the type import at the top to include `SellPnlBreakdown` and `LotMatch`:
+
+```ts
+import type {
+  Asset, HistoryItem, LotMatch, PerformanceMetrics, PortfolioPerformance,
+  SellPnlBreakdown, TaxSummary, Transaction,
+} from '../types';
+```
+
+Append at the end of the file:
+
+```ts
+const optNum = (r: UnknownRecord, key: string): number | null =>
+  r[key] === null || r[key] === undefined ? null : toNumber(r[key] as DecimalLike);
+
+const termOf = (v: unknown): LotMatch['term'] =>
+  v === 'SHORT' || v === 'LONG' ? v : null;
+
+export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
+  const r = asRecord(t);
+  const matches = Array.isArray(r.matches) ? (r.matches as unknown[]) : [];
+  return {
+    transaction_id: r.transaction_id as number,
+    asset_id: r.asset_id as number,
+    symbol: str(r, 'symbol'),
+    asset_type: str(r, 'asset_type'),
+    strategy: str(r, 'strategy'),
+    threshold_days: (r.threshold_days as number) ?? 0,
+    currency: str(r, 'currency') || 'USD',
+    asset_currency: str(r, 'asset_currency') || 'USD',
+    fx_applied: r.fx_applied === true,
+    sell_date: str(r, 'sell_date'),
+    sold_qty: num(r, 'sold_qty'),
+    price: num(r, 'price'),
+    fee: num(r, 'fee'),
+    proceeds: num(r, 'proceeds'),
+    cost_basis: num(r, 'cost_basis'),
+    realized_pnl: num(r, 'realized_pnl'),
+    roi: optNum(r, 'roi'),
+    matched_qty: num(r, 'matched_qty'),
+    unmatched_qty: num(r, 'unmatched_qty'),
+    matches: matches.map((m: unknown) => {
+      const mr = asRecord(m);
+      return {
+        buy_transaction_id: mr.buy_transaction_id as number,
+        buy_date: str(mr, 'buy_date'),
+        buy_price: num(mr, 'buy_price'),
+        unit_cost: num(mr, 'unit_cost'),
+        matched_qty: num(mr, 'matched_qty'),
+        lot_qty_before_match: num(mr, 'lot_qty_before_match'),
+        cost_basis: num(mr, 'cost_basis'),
+        proceeds: num(mr, 'proceeds'),
+        pnl: num(mr, 'pnl'),
+        holding_days: (mr.holding_days as number) ?? 0,
+        term: termOf(mr.term),
+      };
+    }),
+  };
+};
+```
+
+- [ ] **Step 5: Run the tests**
+
+Run: `cd frontend && npx vitest run src/utils/decimal.test.ts 2>&1 | tail -20`
+Expected: PASS — 5 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add frontend/src/types.ts frontend/src/utils/decimal.ts frontend/src/utils/decimal.test.ts
+git commit -m "feat: frontend types and normalizer for sell P&L breakdown"
+```
+
+---
+
+## Task 7: Extract `TransactionLedger` and add the SELL affordance
+
+**Files:**
+- Create: `frontend/src/components/TransactionLedger.tsx`
+- Modify: `frontend/src/App.tsx` (replace the inline ledger block at lines 421-475, drop now-unused imports)
+- Modify: `frontend/src/test/mocks/handlers.ts`
+- Create: `frontend/src/test/components/TransactionLedger.test.tsx`
+
+**Interfaces:**
+- Consumes: `Transaction`, `Asset` from `../types`, `formatCurrency`.
+- Produces: `TransactionLedger` default export with props `{ transactions: Transaction[]; assets: Asset[]; onDeleteTransaction: (txId: number) => Promise<void>; onSelectSell: (txId: number) => void }`.
+
+- [ ] **Step 1: Write the failing component tests**
+
+Create `frontend/src/test/components/TransactionLedger.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent } from '@testing-library/react'
+import TransactionLedger from '../../components/TransactionLedger'
+import type { Asset, Transaction } from '../../types'
+
+const assets: Asset[] = [
+  { id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', currency: 'USD', isin: null, transactions: [] },
+]
+
+const txs: Transaction[] = [
+  { id: 10, asset_id: 1, type: 'SELL', quantity: 80, price: 130, fee: 0, date: '2024-12-01T00:00:00Z' },
+  { id: 11, asset_id: 1, type: 'BUY', quantity: 60, price: 100, fee: 0, date: '2024-01-01T00:00:00Z' },
+  { id: 12, asset_id: 1, type: 'SPLIT', quantity: 2, price: 1, fee: 0, date: '2024-06-01T00:00:00Z' },
+]
+
+const noop = async () => {}
+
+const renderLedger = (onSelectSell = vi.fn()) => {
+  render(
+    <TransactionLedger
+      transactions={txs}
+      assets={assets}
+      onDeleteTransaction={noop}
+      onSelectSell={onSelectSell}
+    />,
+  )
+  return onSelectSell
+}
+
+describe('TransactionLedger', () => {
+  it('renders every transaction', () => {
+    renderLedger()
+    expect(screen.getAllByRole('row')).toHaveLength(4)
+  })
+
+  it('offers a realized P&L control on a SELL row and fires with its id', () => {
+    const onSelectSell = renderLedger()
+    const btn = screen.getByRole('button', { name: /realized P&L for AAPL/i })
+    fireEvent.click(btn)
+    expect(onSelectSell).toHaveBeenCalledWith(10)
+  })
+
+  it('offers no P&L control on BUY or SPLIT rows', () => {
+    renderLedger()
+    expect(screen.getAllByRole('button', { name: /realized P&L/i })).toHaveLength(1)
+  })
+
+  it('clicking a SELL row body also opens the breakdown', () => {
+    const onSelectSell = renderLedger()
+    fireEvent.click(screen.getByText('SELL'))
+    expect(onSelectSell).toHaveBeenCalledWith(10)
+  })
+
+  it('clicking a BUY row body does nothing', () => {
+    const onSelectSell = renderLedger()
+    fireEvent.click(screen.getByText('BUY'))
+    expect(onSelectSell).not.toHaveBeenCalled()
+  })
+
+  it('still renders the delete control for every row', () => {
+    renderLedger()
+    expect(screen.getAllByTitle('Delete transaction')).toHaveLength(3)
+  })
+})
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd frontend && npx vitest run src/test/components/TransactionLedger.test.tsx 2>&1 | tail -20`
+Expected: FAIL — cannot resolve `../../components/TransactionLedger`.
+
+- [ ] **Step 3: Create the component**
+
+Create `frontend/src/components/TransactionLedger.tsx`. The table markup is the block currently inlined at `frontend/src/App.tsx:421-475`, moved verbatim, plus the SELL affordance:
+
+```tsx
+import { Trash2, TrendingUp } from 'lucide-react';
+import { formatCurrency } from '../utils/formatters';
+import type { Asset, Transaction } from '../types';
+
+interface TransactionLedgerProps {
+  transactions: Transaction[];
+  assets: Asset[];
+  onDeleteTransaction: (txId: number) => Promise<void>;
+  onSelectSell: (txId: number) => void;
+}
+
+export default function TransactionLedger({
+  transactions,
+  assets,
+  onDeleteTransaction,
+  onSelectSell,
+}: TransactionLedgerProps) {
+  return (
+    <div className="glass-card" style={{ padding: '24px' }}>
+      <h3 style={{ marginBottom: '20px' }}>Transaction History</h3>
+      {transactions.length === 0 ? (
+        <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '24px 0' }}>
+          No transactions logged. Go to the "Holdings & Tax lots" tab to log buy/sell transactions.
+        </p>
+      ) : (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Date & Time</th>
+              <th>Asset Symbol</th>
+              <th>Type</th>
+              <th>Quantity</th>
+              <th>Price</th>
+              <th>Fee</th>
+              <th>Total Cost/Proceeds</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {transactions.map((tx) => {
+              const asset = assets.find(a => a.id === tx.asset_id);
+              const isSplit = tx.type === 'SPLIT';
+              const isSell = tx.type === 'SELL';
+              const cost = tx.quantity * tx.price;
+              const total = isSplit ? null : (tx.type === 'BUY' ? (cost + tx.fee) : (cost - tx.fee));
+              return (
+                <tr
+                  key={tx.id}
+                  onClick={isSell ? () => onSelectSell(tx.id) : undefined}
+                  style={isSell ? { cursor: 'pointer' } : undefined}
+                >
+                  <td>{new Date(tx.date).toLocaleString()}</td>
+                  <td style={{ fontWeight: 600 }}>{asset ? asset.symbol : 'Unknown'}</td>
+                  <td>
+                    <span style={{ color: isSplit ? 'var(--text-secondary)' : (tx.type === 'BUY' ? 'var(--color-success)' : 'var(--color-danger)'), fontWeight: 700 }}>
+                      {tx.type}
+                    </span>
+                  </td>
+                  <td>{isSplit ? `${tx.quantity} : ${tx.price}` : tx.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
+                  <td>{isSplit ? '—' : formatCurrency(tx.price, asset?.currency || 'USD')}</td>
+                  <td>{isSplit ? '—' : formatCurrency(tx.fee, asset?.currency || 'USD')}</td>
+                  <td style={{ fontWeight: 600 }}>{isSplit ? '—' : formatCurrency(total as number, asset?.currency || 'USD')}</td>
+                  <td>
+                    {/* Explicit focusable control: a row that is only clickable
+                        is undiscoverable and unreachable by keyboard. */}
+                    {isSell && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onSelectSell(tx.id); }}
+                        title="View realized P&L"
+                        aria-label={`View realized P&L for ${asset?.symbol ?? 'asset'} sell`}
+                        style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--color-primary)' }}
+                      >
+                        <TrendingUp size={16} />
+                      </button>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }}
+                      title="Delete transaction"
+                      style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cd frontend && npx vitest run src/test/components/TransactionLedger.test.tsx 2>&1 | tail -20`
+Expected: PASS — 6 tests.
+
+- [ ] **Step 5: Replace the inline block in `App.tsx`**
+
+Replace the whole `{activeTab === 'ledger' && ( ... )}` block (`frontend/src/App.tsx:421-475`) with:
+
+```tsx
+            {activeTab === 'ledger' && (
+              <TransactionLedger
+                transactions={transactions}
+                assets={currentPortfolio.assets || []}
+                onDeleteTransaction={handleDeleteTransaction}
+                onSelectSell={setSellPnlTxId}
+              />
+            )}
+```
+
+Add the import alongside the other component imports:
+
+```tsx
+import TransactionLedger from './components/TransactionLedger';
+```
+
+`setSellPnlTxId` is declared in Task 9 Step 1; if you run this task before Task 9, declare it now:
+
+```tsx
+  const [sellPnlTxId, setSellPnlTxId] = useState<number | null>(null);
+```
+
+Remove the imports the extraction orphans, or `npm run lint` fails: `Trash2` from the `lucide-react` import list, and the whole `import { formatCurrency } from './utils/formatters';` line. `History` stays — it is still used by the nav item.
+
+- [ ] **Step 6: Run the full frontend suite and lint**
+
+Run: `cd frontend && npm run lint && npx vitest run 2>&1 | tail -25`
+Expected: lint clean; all tests pass, including the pre-existing `App.test.tsx`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add frontend/src/components/TransactionLedger.tsx frontend/src/App.tsx frontend/src/test/components/TransactionLedger.test.tsx
+git commit -m "refactor: extract TransactionLedger with a clickable sell P&L affordance"
+```
+
+---
+
+## Task 8: The `SellPnlModal`
+
+**Files:**
+- Create: `frontend/src/components/SellPnlModal.tsx`
+- Modify: `frontend/src/test/mocks/handlers.ts`
+- Create: `frontend/src/test/components/SellPnlModal.test.tsx`
+
+**Interfaces:**
+- Consumes: `GET /api/transactions/<id>/pnl`, `normalizeSellPnl` (Task 6), `formatCurrency`, `formatPercent`.
+- Produces: `SellPnlModal` default export with props `{ transactionId: number; strategy: string; thresholdDays: number; splitBeforeSell: boolean; onClose: () => void }`.
+
+- [ ] **Step 1: Add the MSW handler**
+
+In `frontend/src/test/mocks/handlers.ts`, add before the catch-all `http.all('*', ...)` entry:
+
+```ts
+  http.get('/api/transactions/:id/pnl', ({ params }) => {
+    const id = Number(params.id)
+    return HttpResponse.json({
+      transaction_id: id, asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK',
+      strategy: 'FIFO', threshold_days: 30,
+      currency: 'USD', asset_currency: 'USD', fx_applied: false,
+      sell_date: '2024-12-01T00:00:00Z',
+      sold_qty: '80.0', price: '130.0', fee: '0.0',
+      proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
+      matched_qty: '80.0', unmatched_qty: '0.0',
+      matches: [
+        { buy_transaction_id: 1, buy_date: '2024-01-01T00:00:00Z', buy_price: '100.0',
+          unit_cost: '100.0', matched_qty: '60.0', lot_qty_before_match: '60.0',
+          cost_basis: '6000.0', proceeds: '7800.0', pnl: '1800.0', holding_days: 335, term: null },
+        { buy_transaction_id: 2, buy_date: '2024-06-01T00:00:00Z', buy_price: '120.0',
+          unit_cost: '120.0', matched_qty: '20.0', lot_qty_before_match: '40.0',
+          cost_basis: '2400.0', proceeds: '2600.0', pnl: '200.0', holding_days: 183, term: null },
+      ],
+    })
+  }),
+  http.get('/api/transactions/999/pnl', () => new HttpResponse(null, { status: 404 })),
+```
+
+- [ ] **Step 2: Write the failing modal tests**
+
+Create `frontend/src/test/components/SellPnlModal.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import SellPnlModal from '../../components/SellPnlModal'
+import { server } from '../mocks/server'
+import { http, HttpResponse } from 'msw'
+
+const base = {
+  transaction_id: 42, asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK',
+  strategy: 'FIFO', threshold_days: 30,
+  currency: 'USD', asset_currency: 'USD', fx_applied: false,
+  sell_date: '2024-12-01T00:00:00Z',
+  sold_qty: '80.0', price: '130.0', fee: '0.0',
+  proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
+  matched_qty: '80.0', unmatched_qty: '0.0', matches: [],
+}
+
+const renderModal = (props = {}) => render(
+  <SellPnlModal
+    transactionId={42}
+    strategy="FIFO"
+    thresholdDays={30}
+    splitBeforeSell={false}
+    onClose={vi.fn()}
+    {...props}
+  />,
+)
+
+describe('SellPnlModal', () => {
+  it('shows the sell summary and every consumed lot', async () => {
+    renderModal()
+    // The symbol lives inside the heading text "Sell P&L — AAPL", so match it
+    // as a substring; getByText with a bare string compares whole text content.
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+    expect(screen.getByText(/2,000/)).toBeInTheDocument()
+    expect(screen.getByText('2024-01-01')).toBeInTheDocument()
+    expect(screen.getByText('2024-06-01')).toBeInTheDocument()
+    expect(screen.getByTestId('strategy-note')).toHaveTextContent('realized · FIFO')
+  })
+
+  it('footnotes the FX conversion for a foreign-currency asset', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
+      ...base, currency: 'EUR', asset_currency: 'USD', fx_applied: true,
+    })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('fx-note')).toBeInTheDocument())
+    expect(screen.getByTestId('fx-note')).toHaveTextContent('converted to EUR')
+  })
+
+  it('names the unmatched quantity instead of hiding it', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
+      ...base, sold_qty: '100.0', matched_qty: '50.0', unmatched_qty: '50.0', realized_pnl: '1000.0',
+    })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('unmatched-banner')).toBeInTheDocument())
+    expect(screen.getByTestId('unmatched-banner')).toHaveTextContent('50 of 100')
+  })
+
+  it('explains a sell with nothing to match', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
+      ...base, sold_qty: '50.0', matched_qty: '0.0', unmatched_qty: '50.0',
+      cost_basis: '0.0', proceeds: '0.0', realized_pnl: '0.0', roi: null,
+    })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('no-lots-note')).toBeInTheDocument())
+    expect(screen.getByTestId('no-lots-note')).toHaveTextContent('No buy lots existed')
+  })
+
+  it('renders roi as an em dash when cost basis is zero', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
+      ...base, cost_basis: '0.0', realized_pnl: '0.0', roi: null,
+    })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('roi')).toBeInTheDocument())
+    expect(screen.getByTestId('roi')).toHaveTextContent('—')
+    expect(screen.getByTestId('roi')).not.toHaveTextContent('NaN')
+    expect(screen.getByTestId('roi')).not.toHaveTextContent('Infinity')
+  })
+
+  it('footnotes split adjustment only when a split precedes the sell', async () => {
+    const { rerender } = render(
+      <SellPnlModal transactionId={42} strategy="FIFO" thresholdDays={30} splitBeforeSell={false} onClose={vi.fn()} />,
+    )
+    await waitFor(() => expect(screen.queryByTestId('split-note')).not.toBeInTheDocument())
+    rerender(
+      <SellPnlModal transactionId={42} strategy="FIFO" thresholdDays={30} splitBeforeSell onClose={vi.fn()} />,
+    )
+    await waitFor(() => expect(screen.getByTestId('split-note')).toBeInTheDocument())
+  })
+
+  it('shows an error and retries', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => new HttpResponse(null, { status: 500 })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('modal-error')).toBeInTheDocument())
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json(base)))
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+  })
+
+  it('calls onClose when dismissed', async () => {
+    const onClose = vi.fn()
+    renderModal({ onClose })
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: /close/i }))
+    expect(onClose).toHaveBeenCalled()
+  })
+})
+```
+
+- [ ] **Step 3: Run them to verify they fail**
+
+Run: `cd frontend && npx vitest run src/test/components/SellPnlModal.test.tsx 2>&1 | tail -20`
+Expected: FAIL — cannot resolve `../../components/SellPnlModal`.
+
+- [ ] **Step 4: Create the modal**
+
+Create `frontend/src/components/SellPnlModal.tsx`:
+
+```tsx
+import { useEffect, useState } from 'react';
+import { AlertTriangle, Info, Loader2, X } from 'lucide-react';
+import { formatCurrency, formatPercent } from '../utils/formatters';
+import { normalizeSellPnl } from '../utils/decimal';
+import type { SellPnlBreakdown } from '../types';
+
+interface SellPnlModalProps {
+  transactionId: number;
+  strategy: string;
+  thresholdDays: number;
+  /** True when a SPLIT for this asset is dated on or before the sell. */
+  splitBeforeSell: boolean;
+  onClose: () => void;
+}
+
+const pnlColor = (v: number) => (v >= 0 ? 'var(--color-success)' : 'var(--color-danger)');
+
+export default function SellPnlModal({
+  transactionId,
+  strategy,
+  thresholdDays,
+  splitBeforeSell,
+  onClose,
+}: SellPnlModalProps) {
+  const [data, setData] = useState<SellPnlBreakdown | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [retryKey, setRetryKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetch(`/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Failed to load realized P&L (${res.status})`);
+        return res.json();
+      })
+      .then((json) => { if (!cancelled) setData(normalizeSellPnl(json)); })
+      .catch((err) => {
+        if (cancelled) return;
+        setData(null);
+        setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [transactionId, strategy, thresholdDays, retryKey]);
+
+  const showHybridTerm = data?.strategy.toUpperCase() === 'HYBRID';
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }}>
+      <div className="glass-card" style={{ padding: '32px', width: '760px', maxWidth: '92vw', background: '#121929' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
+          <h3>Sell P&L {data ? `— ${data.symbol}` : ''}</h3>
+          <button onClick={onClose} aria-label="Close" style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '24px 0', color: 'var(--text-secondary)' }}>
+            <Loader2 size={18} className="animate-spin" style={{ color: 'var(--color-primary)' }} /> Loading realized P&L...
+          </div>
+        )}
+
+        {error && (
+          <div data-testid="modal-error" style={{ padding: '16px', borderRadius: '8px', background: 'var(--color-danger-glow)', border: '1px solid rgba(239,68,68,0.2)', color: 'var(--color-danger)', marginBottom: '16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+              <AlertTriangle size={16} /> {error}
+            </div>
+            <button onClick={() => setRetryKey(k => k + 1)} className="btn btn-secondary">Retry</button>
+          </div>
+        )}
+
+        {!loading && !error && data && (
+          <>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: '4px' }}>
+              {new Date(data.sell_date).toLocaleString()} · {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} sold
+              @ {formatCurrency(data.price, data.asset_currency)}
+              {data.fee ? ` · fee ${formatCurrency(data.fee, data.asset_currency)}` : ''}
+              {' · '}proceeds {formatCurrency(data.proceeds, data.currency)}
+            </p>
+            <p style={{ marginBottom: '16px' }}>
+              <span style={{ fontWeight: 700, fontSize: '1.25rem', color: pnlColor(data.realized_pnl) }}>
+                {formatCurrency(data.realized_pnl, data.currency)}
+              </span>{' '}
+              <span data-testid="roi" style={{ color: pnlColor(data.realized_pnl) }}>
+                {data.roi === null ? '—' : formatPercent(data.roi)}
+              </span>
+              <span data-testid="strategy-note" style={{ color: 'var(--text-muted)', marginLeft: '8px' }}>realized · {data.strategy}{showHybridTerm ? ` (threshold ${data.threshold_days}d)` : ''}</span>
+            </p>
+
+            {data.unmatched_qty > 0 && (
+              <div data-testid="unmatched-banner" style={{ padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(245,158,11,0.35)', background: 'rgba(245,158,11,0.08)', color: 'var(--text-secondary)', marginBottom: '16px', fontSize: '0.875rem' }}>
+                {data.unmatched_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} of{' '}
+                {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} units had no buy lot
+                on or before this date, so no cost basis was subtracted for them — realized P&L is overstated.
+              </div>
+            )}
+
+            {data.matches.length === 0 ? (
+              <p data-testid="no-lots-note" style={{ color: 'var(--text-muted)', padding: '16px 0' }}>
+                No buy lots existed on or before this date. Realized P&L is
+                {' '}{formatCurrency(data.realized_pnl, data.currency)} because nothing was matched.
+              </p>
+            ) : (
+              <table className="data-table" style={{ fontSize: '0.875rem' }}>
+                <thead>
+                  <tr>
+                    <th>Buy date</th>
+                    <th>Buy price</th>
+                    <th>Qty from lot</th>
+                    <th>Cost basis</th>
+                    <th>Proceeds</th>
+                    <th>P&L</th>
+                    <th>Held</th>
+                    {showHybridTerm && <th>Term</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.matches.map((m) => (
+                    <tr key={m.buy_transaction_id}>
+                      <td>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
+                      <td>{formatCurrency(m.buy_price, data.currency)}</td>
+                      <td>
+                        {m.matched_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          {' '}of {m.lot_qty_before_match.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+                        </span>
+                      </td>
+                      <td>{formatCurrency(m.cost_basis, data.currency)}</td>
+                      <td>{formatCurrency(m.proceeds, data.currency)}</td>
+                      <td style={{ color: pnlColor(m.pnl) }}>{formatCurrency(m.pnl, data.currency)}</td>
+                      <td>{m.holding_days}d</td>
+                      {showHybridTerm && <td>{m.term ?? '—'}</td>}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <div style={{ marginTop: '16px', color: 'var(--text-muted)', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Info size={12} /> Matching follows the selected method — {data.strategy === 'LIFO' ? 'FIFO' : 'LIFO'} would attribute different lots.
+              </span>
+              {splitBeforeSell && (
+                <span data-testid="split-note" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Info size={12} /> Buy prices and unit costs are split-adjusted, not the prices as entered.
+                </span>
+              )}
+              {data.fx_applied && (
+                <span data-testid="fx-note" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Info size={12} /> Cost basis and proceeds converted to {data.currency} at each transaction's date rate.
+                </span>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 5: Run the tests**
+
+Run: `cd frontend && npx vitest run src/test/components/SellPnlModal.test.tsx 2>&1 | tail -25`
+Expected: PASS — 7 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add frontend/src/components/SellPnlModal.tsx frontend/src/test/mocks/handlers.ts frontend/src/test/components/SellPnlModal.test.tsx
+git commit -m "feat: sell P&L modal with per-lot breakdown and edge-case notes"
+```
+
+---
+
+## Task 9: Wire the modal into `App` and prove the whole path
+
+**Files:**
+- Modify: `frontend/src/App.tsx`
+- Create: `frontend/src/test/components/AppLedger.test.tsx`
+
+**Interfaces:**
+- Consumes: `TransactionLedger` (Task 7), `SellPnlModal` (Task 8), `transactions` state.
+- Produces: the shipped flow — SELL row in the ledger opens the modal.
+
+- [ ] **Step 1: Own the modal state and derive the split flag**
+
+In `frontend/src/App.tsx`, add to the UI state block (next to `showNewPortfolioModal`) if Task 7 did not already add it:
+
+```tsx
+  const [sellPnlTxId, setSellPnlTxId] = useState<number | null>(null);
+```
+
+Add the import:
+
+```tsx
+import SellPnlModal from './components/SellPnlModal';
+```
+
+Add the derived flag next to the other derived values (after `currentPortfolio` is resolved):
+
+```tsx
+  // A split dated on or before the sell means the breakdown's buy prices are
+  // split-adjusted rather than as entered — the modal has to say so.
+  const sellPnlTx = sellPnlTxId === null ? undefined : transactions.find(t => t.id === sellPnlTxId);
+  const splitBeforeSell = sellPnlTx
+    ? transactions.some(t =>
+        t.asset_id === sellPnlTx.asset_id
+        && t.type === 'SPLIT'
+        && new Date(t.date).getTime() <= new Date(sellPnlTx.date).getTime())
+    : false;
+```
+
+- [ ] **Step 2: Render the modal**
+
+Add just before the closing `</main>` of the main content pane, inside the `currentPortfolio` branch so it only exists when a portfolio is active:
+
+```tsx
+        {sellPnlTxId !== null && (
+          <SellPnlModal
+            transactionId={sellPnlTxId}
+            strategy={strategy}
+            thresholdDays={thresholdDays}
+            splitBeforeSell={splitBeforeSell}
+            onClose={() => setSellPnlTxId(null)}
+          />
+        )}
+```
+
+- [ ] **Step 3: Write the integration test**
+
+Create `frontend/src/test/components/AppLedger.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import App from '../../App'
+import { server } from '../mocks/server'
+import { http, HttpResponse } from 'msw'
+
+describe('App ledger → sell P&L', () => {
+  beforeEach(() => {
+    vi.stubGlobal('alert', vi.fn())
+    vi.stubGlobal('confirm', vi.fn(() => true))
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('opens the breakdown when a SELL row is clicked', async () => {
+    const user = userEvent.setup()
+    server.use(http.get('/api/portfolios/1/transactions', () => HttpResponse.json([
+      { id: 10, asset_id: 1, type: 'SELL', quantity: '80.0', price: '130.0', fee: '0.0', date: '2024-12-01T00:00:00Z' },
+    ])))
+    render(<App />)
+
+    await waitFor(() => expect(screen.getByText('Transaction Ledger')).toBeInTheDocument())
+    await user.click(screen.getByText('Transaction Ledger'))
+    await user.click(await screen.findByRole('button', { name: /realized P&L for AAPL/i }))
+
+    await waitFor(() => expect(screen.getByText(/Sell P&L/)).toBeInTheDocument())
+    expect(await screen.findByText('2024-01-01')).toBeInTheDocument()
+  })
+})
+```
+
+- [ ] **Step 4: Run it**
+
+Run: `cd frontend && npx vitest run src/test/components/AppLedger.test.tsx 2>&1 | tail -25`
+Expected: PASS. If the ledger tab never appears, the MSW `/api/portfolios` fixture is not being served — check `server` setup in `src/test/mocks/server.ts` before changing the component.
+
+- [ ] **Step 5: Full gate**
+
+```bash
+cd frontend && npm run lint && npx vitest run && cd ../backend_rust && cargo test
+```
+
+Expected: lint clean, all frontend tests pass, all backend tests pass.
+
+- [ ] **Step 6: Manual smoke (optional but recommended)**
+
+Run `./start.sh` from the repo root, open the Transaction Ledger, click a SELL row, and confirm the per-lot P&L column sums to the realized P&L shown for that asset in the Holdings tab.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add frontend/src/App.tsx frontend/src/test/components/AppLedger.test.tsx
+git commit -m "feat: open per-lot P&L breakdown from the transaction ledger"
+```
+
+---
+
+## Done Criteria
+
+1. Clicking a SELL row shows that sale's realized P&L and every lot it consumed with per-lot P&L.
+2. Summing realized P&L over all sells of an asset equals the realized P&L shown for that asset in the Holdings tab, under FIFO, LIFO and HYBRID.
+3. Sells with unmatched quantity or with no prior buys say so explicitly instead of showing `0.00` or an empty table.
+4. Switching strategy changes the attribution shown, and the modal names the strategy it used.
+5. The new endpoint performs no live price fetch.
+6. The 14 pre-existing `tax_engine` tests are unmodified and green.
+7. `cargo test`, `npm run lint` and `npx vitest run` are all green on the branch.
