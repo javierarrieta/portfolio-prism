@@ -21,13 +21,17 @@ Contents: [Overview](#overview) · [Requirements](#requirements) · [Non-Goals](
 ## Overview
 
 Portfolio Prism currently has no authentication of any kind: every route under `/api` is reachable
-by anyone who can reach the host, and the complete OpenAPI document is publicly reachable at
-`/api-docs/openapi.json`. (No Swagger UI is mounted today — `utoipa_swagger_ui` is a dependency but
-is never used in `build_rocket` — but the document alone enumerates every route and payload.) This
-design adds OpenID Connect (OIDC) authentication against an **existing Authentik instance that is
-already operated**, stores a local identity record per authenticated person, and enforces **per-user
-data isolation**: no caller can read or mutate a portfolio, asset, or transaction outside their own
-granted access.
+by anyone who can reach the host, and `portfolios`, `assets` and `transactions` have no owner, so
+every caller sees the same data. This design adds OpenID Connect (OIDC) authentication against an
+**existing Authentik instance that is already operated**, stores a local identity record per
+authenticated person, and enforces **per-user data isolation**: no caller can read or mutate a
+portfolio, asset, or transaction outside their own granted access.
+
+The OpenAPI document is public at `/api-docs/openapi.json` and **stays public by decision** — the API
+contract is not a secret, and isolation must not depend on route secrecy
+([Alternatives](#decisions-and-alternatives-considered)). What this spec changes is access to data,
+not visibility of the contract. (No Swagger UI is mounted today — `utoipa_swagger_ui` is a dependency
+but is never used in `build_rocket`.)
 
 The isolation half is the substance of this spec. With untrusted users and sequential integer
 primary keys, ownership checks written per query are a leak waiting to happen: twelve separate
@@ -57,14 +61,17 @@ Requirement identifiers are stable; later documents and test names refer to them
 
 | ID | Requirement |
 |---|---|
-| F1 | Every request under `/api` or `/api-docs` requires an authenticated identity; unauthenticated requests get `401`. Enforced at the request lifecycle (a fairing on those two prefixes), not per handler. |
+| F1 | Every request under `/api` requires an authenticated identity; unauthenticated requests get `401`. Enforced at the request lifecycle (a fairing on that prefix), not per handler. |
 | F2 | Authentication uses the OIDC authorization code flow with Proof Key for Code Exchange (PKCE) against the existing Authentik deployment. This application never handles a password. |
 | F3 | A local `users` row is created just-in-time (JIT) on the first successful OIDC login, keyed on `(issuer, subj)`. |
 | F4 | Every portfolio has exactly one owner. Pre-existing portfolios are assigned to a designated bootstrap owner during migration. The application refuses to start if unowned portfolios exist and no bootstrap owner can be determined. |
 | F5 | A caller cannot read or mutate a portfolio, asset, or transaction outside their granted access level (owner, editor, or viewer). The response for any resource id outside the caller's access is `404`, never `403`. |
 | F6 | `GET /api/portfolios/` returns the portfolios the caller owns plus those with a `portfolio_members` row for the caller. The members table is never written in this spec, so "member of" is the empty set here. The response shape does not change in this spec. |
-| F7 | The published OpenAPI document is not publicly reachable: `/api-docs/openapi.json` requires a session, and the unused root alias `GET /openapi.json` is removed. |
-| F8 | `/api/assets/lookup` is rate limited, because it proxies a third-party API (Yahoo Finance and EODHD) against a shared quota. |
+
+Two items that were requirements in an earlier draft are not requirements here: `/api-docs/openapi.json`
+stays public, and `/api/assets/lookup` stays unthrottled. See
+[Decisions and Alternatives Considered](#decisions-and-alternatives-considered) and
+[Revision History](#revision-history).
 
 ### Operational
 
@@ -90,7 +97,8 @@ Requirement identifiers are stable; later documents and test names refer to them
 | Per-user API keys and the Model Context Protocol (MCP) server. | Spec 3 |
 | MCP OAuth 2.1 with dynamic client registration for hosted connectors (ChatGPT, Claude.ai). | Spec 4 |
 | Roles and admin panels (application-wide privilege levels, distinct from the per-portfolio membership role in `portfolio_members.role`). | No planned spec |
-| Per-user quotas beyond the lookup rate limit in F8. | No planned spec |
+| Rate limiting `/api/assets/lookup` (the shared Yahoo Finance / EODHD quota). The design is written up and tracked separately. | [Issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35) |
+| Per-user quotas of any kind. | No planned spec |
 | Syncing `is_active` from Authentik. The column exists so a future sync can populate it. | No planned spec |
 | Replacing SQLite, or changing `replicas: 1`. | No planned spec; see [Known Limitations](#known-limitations) |
 | Cleaning up the transaction rows orphaned by asset deletion. | No planned spec; see [Backend Changes §6](#6-schema-migration) |
@@ -143,7 +151,7 @@ Browser ──HTTPS──▶ nginx (frontend container, :80)
                  │ /auth/login /callback /logout /logout-all /me     │
                  │                  │                                │
                  │                  ▼                                │
-                 │ AuthFairing on /api and /api-docs prefixes:       │
+                 │ AuthFairing on the /api prefix:                   │
                  │ no valid session → 401, before any handler runs   │
                  │                  │                                │
                  │                  ▼                                │
@@ -186,15 +194,15 @@ option that was rejected with its reason.
 | Session representation | Rocket private cookie + `users.token_version` | Server-side session table — a write per request and a cleanup job for no gain. The guard reads the `users` row anyway, because `AuthedUser` carries `email` and `name` |
 | Non-owned resource response | `404` | `403` — confirms the id exists, which on sequential keys is an existence oracle |
 | Ownership enforcement | Single `access` module; `resolve` private; the nested path check lives inside it | Per-handler `WHERE owner_id = ?` — twelve places to forget |
-| Authentication enforcement | One `AuthFairing` on the `/api` and `/api-docs` prefixes | Per-handler `AuthedUser` alone — a route that does not take the guard would be public, so F1 would hold only by authoring discipline |
+| Authentication enforcement | One `AuthFairing` on the `/api` prefix | Per-handler `AuthedUser` alone — a route that does not take the guard would be public, so F1 would hold only by authoring discipline |
 | `Disabled` auth mode | Compiled out of release builds with `cfg!(debug_assertions)` | Runtime Rocket profile allowlist — a runtime string comparison guarding a build-time fact. Rocket 0.5 has no `ROCKET_ENV`, and `!= production` is fail-open on an unset variable; even an allowlist stays fail-open to one ConfigMap edit (`ROCKET_PROFILE=dev` on the release image) |
 | `owner_id` nullability | Nullable `INTEGER` column, no table rebuild | `NOT NULL` via a rebuild — `migrate_one_column` cannot emit an `INTEGER` column, so "reuse" would mean generalizing the repo's most fragile, most specifically-tested helper. The invariant is enforced by the startup check and by `access` treating `NULL` as no access |
 | Unowned rows at startup | Refuse to start (OIDC mode) | Assigning to an arbitrary user — silently misattributes financial data |
 | Legacy-portfolio handover | Keyed on `BOOTSTRAP_OWNER_SUBJ` only | Matching the ID token's `email`, gated by `email_verified` — with self-registration, `email` is a claimable takeover vector, and Authentik does not verify addresses unless separately configured |
-| Lookup rate limit | One process-global token bucket | Per-user bucket — a `HashMap` keyed by user with an eviction task, and it bounds one account while leaving the aggregate (users × rate) unbounded on the quota it exists to protect |
+| OpenAPI document visibility | Public, as today | Requiring a session on `/api-docs/openapi.json` — the document is a contract, not a secret; nothing in the isolation model depends on route secrecy; and keeping it public leaves Swagger-style tooling and the CI diff working unchanged |
+| Lookup rate limit | Out of this spec | A per-user bucket, then a global one — both protect a third-party quota rather than user data, so they belong in their own change. Carried to [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35) as one global bucket |
 | OpenAPI generation | `--print-openapi` early exit; no server | Exporting `AUTH_MODE=disabled` in CI — works around the coupling instead of removing it, and leaves the published contract dependent on runtime configuration and, for a release build, on a secret key |
-| Root `/openapi.json` alias | Remove the second mount | Authenticating it — the alias has no consumer; one public surface is easier to reason about than one authenticated duplicate |
-| Authenticated `/api-docs` | Kept (F7), because the generator change makes it free | Leaving the document public — the document enumerates every route and payload shape, and the cost of protecting it is now zero |
+| Root `/openapi.json` alias | Remove the second mount | Keeping it — it is the same handler mounted twice with no consumer anywhere in the repo or the frontend. This is duplicate-surface cleanup, not access control |
 | Three-level access model | Kept (C1), but the public response shape does not change in this spec | Shipping a new `access` field on `GET /api/portfolios/` now — no consumer exists until Spec 2's share UI, and an unpinned public field would drift |
 | Revocation (`token_version`, `is_active`) | Kept; the guard already reads the row | Dropping them — saves nothing, since the row is read for `AuthedUser`, and adding the columns later is another migration against live data |
 | Bootstrap handover mechanism | One placeholder row (`issuer='local'`, `subj='bootstrap'`) updated in place on handover | A `bootstrap:<value>` row per configured identity — more strings to keep consistent, and the id would change when the identity is provisioned |
@@ -211,7 +219,8 @@ The full register is [Security Considerations](#security-considerations) and
 | A forgotten environment variable exposes every portfolio | `AuthMode::Disabled` is not compiled into the release binary; `AUTH_MODE=disabled` there is a startup error | [Disabled mode](#2-auth-mode-oidc-or-disabled) |
 | A startup refusal turns a typo into downtime on a single replica | The three exit conditions are listed with their exact triggers, and rollout orders them so each is exercised before the next | [Rollout & Rollback](#rollout--rollback) |
 | A legacy portfolio is handed to the wrong person | Handover is keyed on `sub` only, and self-registration stays off until the handover completes | [Legacy ownership handover](#security-considerations) |
-| One account exhausts a shared third-party lookup quota | One process-global token bucket on `/api/assets/lookup` | [Shared third-party quota](#9-rate-limit-on-apiassetslookup) |
+| The API contract is public, so every route and payload shape is known to any caller | Isolation never depends on route secrecy: every `/api` route needs a session, and ids outside the caller's access are `404` | [Public API contract](#security-considerations) |
+| `/api/assets/lookup` is unthrottled against a shared third-party quota | Out of this spec; designed and tracked in issue #35 | [Non-Goals](#non-goals) |
 
 ## Backend Changes
 
@@ -372,12 +381,12 @@ launch. Rollout step 4 is therefore reversible by env alone.
 
 **Browser versus non-browser failures.** The branch is keyed on the request's `Accept` header: a
 request whose `Accept` includes `text/html` gets `302 /?auth_error=auth_failed`; anything else gets
-the `401` JSON described in §10. `/` accepts the `auth_error` query parameter as a display hint
+the `401` JSON described in §9. `/` accepts the `auth_error` query parameter as a display hint
 only; the only value this spec emits is `auth_failed`, and no IdP detail is ever reflected.
 
 ### 5. Session validation and revocation
 
-On every request under `/api` or `/api-docs`, the fairing resolves the caller once:
+On every request under `/api`, the fairing resolves the caller once:
 
 1. decrypt the `pp_session` cookie;
 2. load `users` by `uid`;
@@ -591,9 +600,9 @@ a delete-then-asset order) is a separate change with its own migration.
 | `POST /api/portfolios/:id/assets/:aid/transactions` | `require_asset_in(…, Editor)` |
 | `GET /api/portfolios/:id/transactions` | `require(…, Viewer)` |
 | `DELETE /api/transactions/:id` | `require_transaction(…, Editor)` |
-| `GET /api/assets/lookup` | authenticated; rate limited per §9 |
+| `GET /api/assets/lookup` | authenticated. Unthrottled in this spec — see [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35) |
 | `GET /` | **unchanged, public** — probes depend on it |
-| `GET /api-docs/openapi.json` | authenticated |
+| `GET /api-docs/openapi.json` | **unchanged, public** — the contract is not a secret; see [Decisions](#decisions-and-alternatives-considered) |
 | `GET /openapi.json` | **removed** — same handler, second mount (`lib.rs:252,271`), no consumer |
 
 The nested routes already scope their SQL by portfolio (`update_asset` and `create_transaction`
@@ -611,31 +620,14 @@ there (`transactions.rs:88-95`). The fix is to register the handler in `ApiDoc::
 until Spec 2. Owner-only operations are already fixed at `Owner`; Spec 2 adds new routes but does
 not change the access level assigned to any route in this table.
 
-### 9. Rate limit on `/api/assets/lookup`
-
-One process-global token bucket: capacity 10, refill 1 token per second, `429` with
-`Retry-After: <seconds until the next token, rounded up>` when empty. A single
-`Mutex<Bucket>` in `.manage()`d state — no map, no eviction task, no unbounded memory. The bucket
-takes a clock (`SystemClock` in the binary, a fixed clock in tests) so the refill test is
-deterministic.
-
-Global rather than per-user: the resource being protected is one shared third-party quota reached
-through one shared upstream credential, so a per-user bucket bounds one account while leaving the
-aggregate — users × rate — unbounded. Per-user fairness on this endpoint is deferred with the
-quota economics that would justify it ([Non-Goals](#non-goals)).
-
-In-process is sufficient because the deployment is `replicas: 1`; a second replica makes this
-per-pod rather than global, which is recorded as an accepted limitation rather than solved with new
-infrastructure.
-
-### 10. Error handling
+### 9. Error handling
 
 | Condition | Response |
 |---|---|
-| No or invalid session cookie on `/api` or `/api-docs` | `401` JSON `{ "error": "unauthenticated" }` |
+| No or invalid session cookie on `/api` | `401` JSON `{ "error": "unauthenticated" }` |
 | Valid session, resource outside the caller's access | `404` — never `403` |
 | Session valid but `is_active = 0` or `token_version` mismatch | `401` |
-| Rate limit exceeded | `429` with `Retry-After` |
+| `AUTH_MODE=oidc` with `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` or `OIDC_REDIRECT_URI` missing | process exits at startup, naming the missing variables — deny-by-default, not a degraded anonymous mode |
 | OIDC failure (`state`/`nonce` mismatch, token validation failure, Authentik unreachable or discovery failed during the browser flow on `/auth/callback`) | no session; `Accept: text/html` → `302 /?auth_error=auth_failed`, otherwise `401` JSON `{ "error": "authentication_failed" }`. The specific reason is logged server-side only |
 | `AUTH_MODE=disabled` in a release build | process exits at startup, naming the variable and the build mode |
 | Orphan portfolios with no bootstrap owner (OIDC mode) | process exits at startup, naming the count and the variable |
@@ -658,10 +650,13 @@ target id so a probing pattern is visible in logs and distinguishable from genui
 | `BOOTSTRAP_OWNER_SUBJ` | Authentik `sub` of the owner for pre-existing portfolios; also the handover match | yes if orphans exist under `AUTH_MODE=oidc` |
 | `AUTH_MODE` | `oidc` (default) or `disabled`; `disabled` is accepted only in a debug build | no |
 
-`AUTH_MODE` defaults to `oidc` and `./start.sh` exports no variables at all, so `start.sh` gains
-`AUTH_MODE=disabled`. It needs no `ROCKET_PROFILE` and no `ROCKET_SECRET_KEY`: `cargo run` is a
-debug build in the `debug` profile, where Rocket generates a temporary key. That key changes on
-every restart, so a dev session ends when the backend restarts.
+`AUTH_MODE` defaults to `oidc`, and a launch with `AUTH_MODE=oidc` and any `OIDC_*` variable missing
+refuses to start rather than serving unauthenticated (§9) — that is the state CI would otherwise be
+in, and it is why CI must generate the document without a server
+([OpenAPI, CI & Frontend Impact](#openapi-ci--frontend-impact)). `./start.sh` exports no variables at
+all, so `start.sh` gains `AUTH_MODE=disabled`. It needs no `ROCKET_PROFILE` and no
+`ROCKET_SECRET_KEY`: `cargo run` is a debug build in the `debug` profile, where Rocket generates a
+temporary key. That key changes on every restart, so a dev session ends when the backend restarts.
 
 **Authentik side (operator task, not code):** create an OAuth2/OIDC provider with client type
 *Confidential*, redirect URIs `https://<host>/auth/callback` **and** `https://<host>/` (the
@@ -704,11 +699,11 @@ Rollout step 3 still smokes the path end to end.
 probes curl that path (the frontend container's probes hit `:80`); authenticating it would stop the
 pod from becoming ready. This is asserted by an automated test, not left to review.
 
-**Startup refusals and downtime.** With `replicas: 1` on one PVC, each of the three startup
-refusals — no `ROCKET_SECRET_KEY` outside the `debug` profile, orphans with no bootstrap owner,
-`AUTH_MODE=disabled` in a release build — turns a configuration typo into an outage. Two of the
-three are caught by rollout steps 1 and 4 before the other is attempted, and none of them can be
-triggered by a code change.
+**Startup refusals and downtime.** With `replicas: 1` on one PVC, each of the four startup refusals —
+no `ROCKET_SECRET_KEY` outside the `debug` profile, orphans with no bootstrap owner,
+`AUTH_MODE=disabled` in a release build, `AUTH_MODE=oidc` with an `OIDC_*` variable missing — turns a
+configuration typo into an outage. Three of the four are caught by rollout steps 1 and 4 before the
+remaining one is attempted, and none of them can be triggered by a code change.
 
 ## OpenAPI, CI & Frontend Impact
 
@@ -718,16 +713,19 @@ triggered by a code change.
   `cargo run -- --print-openapi > current_openapi.json`, which deletes the dummy `portfolio.db`, the
   `sleep 10`, the background process and its `kill`, and any dependence on auth mode or secret key.
   `AGENTS.md`'s documented regeneration procedure is updated to the same command; its
-  `cargo run --release` variant would otherwise fail Rocket's secret-key check.
+  `cargo run --release` variant would otherwise fail Rocket's secret-key check. This is still
+  required after `/api-docs` stayed public: the server CI starts would itself refuse to launch, in
+  the default `AUTH_MODE=oidc` with no `OIDC_*` variables set.
 - **The published surface becomes complete.** `crate::api_routes::transactions::update_asset` is
   added to `ApiDoc::paths`, so the document covers all 14 API operations instead of 13. The
   annotation already exists on the handler; only the registration is missing.
 - utoipa annotations gain a cookie `securityScheme` (`apiKey`, `in: cookie`, name `pp_session`) and
-  a `401` response on every `/api` path, plus `404` where it is now the isolation answer. No
-  response shape changes in this spec. `bearerAuth` is deliberately **not** declared: this spec
-  authenticates with a session cookie, and a declared bearer scheme would make generated clients
-  send an `Authorization` header that the API ignores. Spec 3 adds `bearerAuth` when bearer tokens
-  exist.
+  a `401` response on every `/api` path, plus `404` where it is now the isolation answer. The
+  scheme documents what `/api` requires; it says nothing about how the document itself is served,
+  because the document stays public. No response shape changes in this spec. `bearerAuth` is
+  deliberately **not** declared: this spec authenticates with a session cookie, and a declared bearer
+  scheme would make generated clients send an `Authorization` header that the API ignores. Spec 3
+  adds `bearerAuth` when bearer tokens exist.
 - `docs/openapi/openapi.json` is regenerated with the new command; CI diffs it and fails on drift.
 - `npm run generate-types` refreshes `frontend/src/types/api.d.ts`.
 - Frontend gains `frontend/src/utils/apiFetch.ts`: wraps `fetch`, and on `401` redirects the
@@ -760,7 +758,6 @@ triggered by a code change.
 - bootstrap handover: a login whose `sub` equals `BOOTSTRAP_OWNER_SUBJ` takes over the placeholder
   row and keeps its id; a login that does not match gets a new row; a login matching an existing real
   row does not touch the placeholder.
-- rate limiter allows 10, blocks the 11th, refills under a fixed clock.
 
 **Backend integration tests — the isolation matrix.** Two seeded users, A and B. For every API route
 mounted in `build_rocket`, B attempts the operation against A's portfolio / asset / transaction id
@@ -785,10 +782,11 @@ the real OIDC path.
 - orphan portfolios under `Disabled` → assigned to the placeholder row, `Ok`.
 - a database with no portfolios and no orphans → `Ok`, and `owner_id` exists as a column.
 - `GET /` returns `200` with authentication enabled and no cookie.
-- `GET /api-docs/openapi.json` returns `401` without a cookie.
+- `GET /api-docs/openapi.json` returns `200` without a cookie — this pins the decision that the
+  contract stays public, so a later change cannot quietly narrow it.
 - **route coverage:** ignite the app and iterate `Rocket::routes()`, then assert that every mounted
-  `/api` route appears in `ApiDoc::json()`'s paths and methods, and that every route under `/api` or
-  `/api-docs` is behind the fairing. This is the drift CI cannot otherwise catch: `routes![]` and
+  `/api` route appears in `ApiDoc::json()`'s paths and methods, and that every route under `/api` is
+  behind the fairing. This is the drift CI cannot otherwise catch: `routes![]` and
   `ApiDoc::paths` are maintained by hand in two files, and CI diffs a document generated from one of
   them.
 
@@ -847,9 +845,15 @@ a forced re-login, not data loss.
 - **Legacy ownership handover.** Keyed on `sub` via `BOOTSTRAP_OWNER_SUBJ`. `email` never decides
   ownership, because with self-registration an `email` claim is claimable by anyone and
   `email_verified` is only as trustworthy as Authentik's configuration.
-- **Shared third-party quota.** Any authenticated user can reach `/api/assets/lookup`, which proxies
-  Yahoo Finance and EODHD against one shared upstream quota. The global bucket bounds the rate at
-  which that quota is consumed.
+- **Public API contract.** `/api-docs/openapi.json` stays reachable without a session, so every route
+  and payload shape is public. That is a deliberate choice, not an oversight: nothing in the isolation
+  model depends on the route list being secret, and every `/api` route still requires a session while
+  ids outside the caller's access are `404`. Anyone proposing to authenticate the document should
+  re-read [Decisions](#decisions-and-alternatives-considered) first — CI must not go back to generating
+  it from a running server.
+- **Unthrottled lookup.** Any authenticated user can reach `/api/assets/lookup`, which proxies Yahoo
+  Finance and EODHD against one shared upstream quota. Not addressed here; designed in
+  [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35).
 - **Transport.** TLS termination is assumed to be the operator's existing ingress.
 
 ## Deferred Work
@@ -859,6 +863,10 @@ a forced re-login, not data loss.
 | 2 — Sharing | `portfolio_members` write paths, share/unshare endpoints, "shared with me", share UI, and the `access` field on the portfolio response shape that Spec 2's UI is the first consumer of | this spec |
 | 3 — API keys + MCP | `api_keys` table, mint/revoke UI, `read`/`write` scopes, an `rmcp` (the Rust MCP SDK) streamable-HTTP server at `/mcp` | this spec's guard |
 | 4 — MCP OAuth 2.1 | Dynamic client registration, protected-resource metadata, RFC 8707 resource parameter, for hosted connectors (ChatGPT, Claude.ai) | spec 3 |
+
+Not a spec, but split out of this one: [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35),
+rate limiting `/api/assets/lookup`. It can land before or after this spec; if it lands after, it
+inherits the authenticated `/api` surface and only has to add the bucket.
 
 Spec 3's keys must be scoped. An agent holding an unscoped write key can delete transactions and
 rewrite prices, and the tax-lot engine (`backend_rust/src/engines/tax_engine.rs`, `TaxLotEngine`,
@@ -870,7 +878,9 @@ tax-reporting integrity problem. Read-only is the default scope.
 - SQLite on one PVC with `replicas: 1` is the configuration this spec ships against; it is the first
   thing to replace under real load. The `access` chokepoint is what makes a later Postgres move a
   query-shape change rather than an authorization change.
-- The lookup rate limiter is per-process, therefore per-pod.
+- `/api/assets/lookup` is unthrottled: one caller can consume the shared Yahoo / EODHD quota for
+everyone. Designed in [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35), not
+fixed here.
 - `users.email` is copied from the ID token at login and is not re-verified if it changes in
   Authentik until the next login.
 - If the bootstrap identity never signs in, pre-existing portfolios stay owned by the placeholder
@@ -896,19 +906,31 @@ None.
 
 ## Revision History
 
+**2026-11-05 (second revision) — scope reduced by the owner.** Two requirements left the spec:
+
+- `/api-docs/openapi.json` stays **public**. The earlier draft authenticated it; the contract is not a
+  secret and the isolation model does not depend on route secrecy. The fairing therefore guards the
+  `/api` prefix only, and a test now pins the `200`.
+- The `/api/assets/lookup` rate limit moved to
+  [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35), which carries the design
+  (one global bucket, capacity 10, refill 1/s, injectable clock). It protects a third-party quota,
+  not user data.
+- `--print-openapi` is kept even though it no longer protects CI from a `401`: a server started with
+  the default `AUTH_MODE=oidc` and no `OIDC_*` variables now refuses to launch, so generating the
+  document from a running server is still not workable. That refusal is now stated explicitly in §9.
+
 **2026-11-05 — revised against `reviews/2026-11-04-oidc/`.** The changes below are the substantive
 ones; the review thread (7 blockers, 24 majors, 16 nit groups) is the record of what prompted each.
 
-- OpenAPI generation is decoupled from the running server (`--print-openapi`), which removes the CI
-  breakage that authenticating `/api-docs` would otherwise cause, and the unused root
+- OpenAPI generation is decoupled from the running server (`--print-openapi`), and the unused root
   `/openapi.json` alias is removed.
 - The `owner_id NOT NULL` rebuild is dropped; the column stays nullable and the invariant is enforced
   by the startup check and by `access`. The claim that `migrate_one_column` could be reused was
   false.
 - The claim that `PATCH /api/portfolios/<pid>/assets/<aid>` lacks `#[utoipa::path]` was false; the
   real gap is `ApiDoc::paths`.
-- Requirement 5 and the Overview now say "outside their granted access level" instead of "not owned",
-  which no longer contradicts editor and viewer access.
+- F5 (requirement 5 in the old flat numbering) and the Overview now say "outside their granted access
+  level" instead of "not owned", which no longer contradicts editor and viewer access.
 - Asset deletion is described as it behaves: it orphans transactions. Owner-only deletion is a policy
   choice, not a cascade safeguard.
 - Every synthetic `users` row has literal values, and `email` became nullable so it does not need a
@@ -925,7 +947,8 @@ ones; the review thread (7 blockers, 24 majors, 16 nit groups) is the record of 
 - OIDC discovery is lazy; the browser-versus-non-browser branch is keyed on `Accept`.
 - Cookie names, payloads, and the logout redirect registration are specified; `AuthError` was dropped
   in favour of `Status`.
-- The rate limit became one global bucket with a clock the tests can control.
+- The rate limit became one global bucket with a clock the tests can control (superseded by the
+  second revision: it left this spec entirely).
 - `BOOTSTRAP_OWNER_EMAIL` and the `email_verified` handover path were removed.
 - The `wait-for-backend` initContainer premise was false; the container is removed by this spec.
 - `PATCH /api/portfolios/:id` is described as the currency-update route it is.
