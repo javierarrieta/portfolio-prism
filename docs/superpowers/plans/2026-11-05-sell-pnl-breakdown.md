@@ -707,7 +707,7 @@ git commit -m "feat: per-sell lot breakdown entry point with engine tests"
 - Consumes: `TaxLotEngine::sell_breakdown` (Task 3), `schemas::SellPnlResponse` (Task 1), models `Transaction`/`Asset`/`Portfolio`.
 - Produces: `api_routes::analytics::get_transaction_sell_pnl`, mounted at `GET /api/transactions/<id>/pnl?strategy=&threshold_days=`, returning `Json<SellPnlResponse>`.
 
-- [ ] **Step 1: Add the date-aware test seeder**
+- [x] **Step 1: Add the date-aware test seeder**
 
 Append to `backend_rust/tests/common/mod.rs` (the `#[allow(dead_code)]` attribute is required — this file is compiled into every test binary):
 
@@ -739,7 +739,7 @@ pub async fn seed_transaction_at(
 }
 ```
 
-- [ ] **Step 2: Write the failing endpoint tests**
+- [x] **Step 2: Write the failing endpoint tests**
 
 Create `backend_rust/tests/sell_pnl_test.rs`:
 
@@ -749,6 +749,7 @@ mod common;
 use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction_at};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
+use rocket::{Build, Rocket};
 use rust_decimal::Decimal;
 
 /// Money fields are full-precision Decimals whose serialized scale is a by-product of the
@@ -767,7 +768,8 @@ fn d(s: &str) -> Decimal {
 }
 
 // FIFO fixture: two buys, one sell of 80 units split across both lots.
-async fn fifo_fixture() -> (Client, i32, i32, i32) {
+// Returns the unlaunched Rocket; each test wraps it in its own tracked Client.
+async fn fifo_fixture() -> (Rocket<Build>, i32, i32, i32) {
     let pool = setup_db().await;
     let port_id = seed_portfolio(&pool, "Sell PnL", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
@@ -939,12 +941,12 @@ async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
 }
 ```
 
-- [ ] **Step 3: Run them to verify they fail**
+- [x] **Step 3: Run them to verify they fail**
 
 Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
-Expected: FAIL — **6 of the 7 tests**, not all 7. `test_sell_pnl_unknown_transaction_is_404` passes already, because Rocket 404s unknown routes; it is a regression guard from here on, not a red test. The other six fail with `404 Not Found` where they expect 200 or 400. If that one also fails, the test binary is not reaching the router — fix that before writing the handler.
+Expected: FAIL — 7 of the 8 tests fail with 404 Not Found. `test_sell_pnl_unknown_transaction_is_404` passes vacuously here because an unmounted route also 404s; it only becomes meaningful once the route exists.
 
-- [ ] **Step 4: Implement the handler**
+- [x] **Step 4: Implement the handler**
 
 Append to `backend_rust/src/api_routes/analytics.rs`. Route and signature:
 
@@ -973,13 +975,13 @@ pub async fn get_transaction_sell_pnl(
 ) -> Result<Json<SellPnlResponse>, Status>
 ```
 
-The body is seven steps, each following the pattern already in `get_tax_summary` in the same file — copy its error-handling idiom (`map_err(|_| Status::InternalServerError)`) rather than inventing one:
+The body is seven steps, each following the pattern already in `get_portfolio_tax_summary` in the same file — copy its error-handling idiom (`map_err(|_| Status::InternalServerError)`) rather than inventing one:
 
 1. `SELECT * FROM transactions WHERE id = ?` via `fetch_optional`; `None` → `Status::NotFound`.
 2. `if tx.r#type.to_uppercase() != "SELL" { return Err(Status::BadRequest); }`
 3. Load the asset by `tx.asset_id`, then its portfolio by `asset.portfolio_id`; either missing → `NotFound`. The base currency comes from the portfolio that owns the asset, never from a path parameter, so the answer cannot disagree with the portfolio on screen.
 4. Normalize the strategy **once**: `"LIFO"` and `"HYBRID"` pass through upper-cased, anything else — including absent — becomes `"FIFO"`. Use that single value for both the engine call and the response, so the modal can never name a method it did not use. `threshold_days.unwrap_or(30)`. `fx_applied = asset.currency != portfolio.base_currency`.
-5. `SELECT * FROM transactions WHERE asset_id = ?` — the same query and the same scope `get_tax_summary` uses — then `TaxLotEngine::sell_breakdown(&tx.id, &transactions, &asset.currency, &portfolio.base_currency, currency_service, &strategy_val, threshold_val)`. `None` → `NotFound`. **No `get_price` call anywhere in this function**; `get_rate` inside the engine is expected and fine.
+5. `SELECT * FROM transactions WHERE asset_id = ?` — the same query and the same scope `get_portfolio_tax_summary` uses — then `TaxLotEngine::sell_breakdown(&tx.id, &transactions, &asset.currency, &portfolio.base_currency, currency_service, &strategy_val, threshold_val)`. `None` → `NotFound`. **No `get_price` call anywhere in this function**; `get_rate` inside the engine is expected and fine.
 6. `split_applied = transactions.iter().any(|t| t.r#type.to_uppercase() == "SPLIT" && t.date <= tx.date)`. This is free — the list is already loaded — and it is scoped to exactly the asset the replay consumed by construction. The modal's split footnote reads this field instead of scanning whatever transaction list the browser happens to be holding, which can be one fetch stale.
 7. `roi = if breakdown.cost_basis > Decimal::ZERO { Some(breakdown.realized_pnl / breakdown.cost_basis) } else { None }` — `Decimal` division, never `f64`.
 8. Build `SellPnlResponse` from the breakdown plus context. `price` and `fee` are `str_to_decimal(&tx.price)` / `str_to_decimal(&tx.fee)` — as entered, in asset currency. Everything else comes straight from the breakdown.
@@ -990,25 +992,25 @@ Extend the `use` block at the top of `analytics.rs`:
 use crate::schemas::SellPnlResponse;
 ```
 
-- [ ] **Step 5: Mount the route**
+- [x] **Step 5: Mount the route**
 
-In `backend_rust/src/lib.rs`, add to the existing `.mount("/api", routes![...])` list:
+In `backend_rust/src/lib.rs`, add to the existing `.mount("/api", routes![...])` list. There are **two** mounts in `build_rocket` — `/api/portfolios` and `/api` — and this route belongs in `/api`, because its `#[get]` path already begins with `/transactions`. Putting it in the `/api/portfolios` group yields `/api/portfolios/transactions/<id>/pnl` and every request 404s while the code compiles cleanly.
 
 ```rust
             api_routes::analytics::get_transaction_sell_pnl,
 ```
 
-- [ ] **Step 6: Run the endpoint tests**
+- [x] **Step 6: Run the endpoint tests**
 
 Run: `cd backend_rust && cargo test --test sell_pnl_test 2>&1 | tail -20`
 Expected: PASS — 8 tests.
 
-- [ ] **Step 7: Run the whole backend suite**
+- [x] **Step 7: Run the whole backend suite**
 
 Run: `cd backend_rust && cargo test 2>&1 | tail -20`
 Expected: PASS. `cors_test` and `analytics_test` still green — `/tax-summary` is untouched.
 
-- [ ] **Step 8: Verify the no-current-quote claim**
+- [x] **Step 8: Verify the no-current-quote claim**
 
 The plan asserts three times that this endpoint never fetches a current price, and nothing else checks it:
 
@@ -1020,7 +1022,7 @@ Expected: no hit between `pub async fn get_transaction_sell_pnl` and the end of 
 
 **Known coverage gap, recorded rather than closed:** every backend test seeds `currency='USD'` assets into `'USD'` portfolios, so `asset_currency == base_currency`, every rate lookup short-circuits to `ONE`, and `get_rate` is never exercised. The one path in this endpoint that can reach the network and return 500 has no test. Closing it needs a `seed_asset_with_currency` helper plus a stubbed rate source; until then, do not claim the FX path is verified.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add backend_rust/src/api_routes/analytics.rs backend_rust/src/lib.rs backend_rust/tests/common/mod.rs backend_rust/tests/sell_pnl_test.rs

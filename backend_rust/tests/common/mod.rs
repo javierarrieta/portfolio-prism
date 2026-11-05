@@ -71,3 +71,28 @@ pub async fn seed_transaction(
     .unwrap();
     res.0
 }
+#[allow(dead_code)]
+pub async fn seed_transaction_at(
+    pool: &SqlitePool,
+    asset_id: i32,
+    tx_type: &str,
+    qty: f64,
+    price: f64,
+    fee: f64,
+    date: &str,
+) -> i32 {
+    let date = DateTime::parse_from_rfc3339(date).unwrap().with_timezone(&Utc);
+    let res = sqlx::query_as::<_, (i32,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+    )
+    .bind(asset_id)
+    .bind(tx_type)
+    .bind(qty)
+    .bind(price)
+    .bind(fee)
+    .bind(date)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    res.0
+}
