@@ -478,7 +478,7 @@ git commit -m "refactor: single lot-matching replay with per-sell breakdown reco
 
 Note the signature has **no `current_price`** — realized P&L does not depend on a quote. That is what keeps the endpoint free of price fetches.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append inside `mod tests` in `tax_engine.rs`. The existing `make_tx` helper already takes an id, so reuse it.
 
@@ -639,12 +639,12 @@ Append inside `mod tests` in `tax_engine.rs`. The existing `make_tx` helper alre
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cd backend_rust && cargo test sell_breakdown 2>&1 | tail -20`
 Expected: compile error — `no function `sell_breakdown` found for struct TaxLotEngine`.
 
-- [ ] **Step 3: Implement `sell_breakdown`**
+- [x] **Step 3: Implement `sell_breakdown`**
 
 Add as the second public associated function in `impl TaxLotEngine`, right after `calculate_lots`:
 
@@ -676,17 +676,17 @@ Add as the second public associated function in `impl TaxLotEngine`, right after
     }
 ```
 
-- [ ] **Step 4: Run the new tests**
+- [x] **Step 4: Run the new tests**
 
 Run: `cd backend_rust && cargo test sell_breakdown 2>&1 | tail -20`
 Expected: PASS — 9 new tests.
 
-- [ ] **Step 5: Run the whole engine module to prove nothing drifted**
+- [x] **Step 5: Run the whole engine module to prove nothing drifted**
 
 Run: `cd backend_rust && cargo test tax_engine 2>&1 | tail -10`
 Expected: `test result: ok. 23 passed` (14 original + 9 new), 0 failed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add backend_rust/src/engines/tax_engine.rs
