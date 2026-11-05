@@ -14,6 +14,7 @@ import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
+import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
 import { 
   Portfolio, 
@@ -44,6 +45,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showNewPortfolioModal, setShowNewPortfolioModal] = useState(false);
+  // Which sell's breakdown is open, and which portfolio it belonged to. The modal
+  // renders only while that still matches the selected portfolio, so switching
+  // portfolio cannot leave a breakdown on screen for a holding you no longer
+  // look at -- with that portfolio's base currency resolved server-side.
+  // Derived rather than cleared from an effect: five places change selectedId, and
+  // a reset that has to be remembered in each one is a reset that gets forgotten.
+  const [sellPnl, setSellPnl] = useState<{ txId: number; portfolioId: number } | null>(null);
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [newPortfolioDesc, setNewPortfolioDesc] = useState('');
   const [newPortfolioCurrency, setNewPortfolioCurrency] = useState('USD');
@@ -200,6 +208,7 @@ export default function App() {
       setLoading(true);
       const res = await fetch(`${API_BASE}/transactions/${txId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete transaction');
+      setSellPnl(null);
       if (selectedId) await fetchPortfolioData(selectedId);
     } catch (err) {
       alert(`Error deleting transaction: ${err instanceof Error ? err.message : String(err)}`);
@@ -422,7 +431,16 @@ export default function App() {
                 transactions={transactions}
                 assets={currentPortfolio.assets || []}
                 onDeleteTransaction={handleDeleteTransaction}
-                onSelectSell={() => undefined}
+                onSelectSell={(txId) => setSellPnl({ txId, portfolioId: currentPortfolio.id })}
+              />
+            )}
+
+            {sellPnl !== null && sellPnl.portfolioId === selectedId && (
+              <SellPnlModal
+                transactionId={sellPnl.txId}
+                strategy={strategy}
+                thresholdDays={thresholdDays}
+                onClose={() => setSellPnl(null)}
               />
             )}
           </>

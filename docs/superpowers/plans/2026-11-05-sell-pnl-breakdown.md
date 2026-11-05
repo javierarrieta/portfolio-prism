@@ -1660,7 +1660,7 @@ git commit -m "feat: sell P&L modal with per-lot breakdown and edge-case notes"
 - Consumes: `TransactionLedger` (Task 7), `SellPnlModal` (Task 8), `transactions` state.
 - Produces: the shipped flow — SELL row in the ledger opens the modal.
 
-- [ ] **Step 1: Own the modal state**
+- [x] **Step 1: Own the modal state**
 
 In `frontend/src/App.tsx`, add to the UI state block (next to `showNewPortfolioModal`). Task 7 deliberately left this to Task 9, so it is not there yet:
 
@@ -1679,20 +1679,25 @@ or deleting the transaction the modal is showing. Without this the modal keeps r
 belonging to the previous portfolio (with that portfolio's base currency resolved server-side),
 or one that no longer exists, and the figures on screen describe nothing the user can see.
 
-```tsx
-  useEffect(() => { setSellPnlTxId(null); }, [selectedId]);
-```
+> **Shipped differently.** The `useEffect(() => { setSellPnlTxId(null); }, [selectedId]);` line
+> below is rejected by `eslint`'s `react-hooks/set-state-in-effect` rule — a synchronous `setState`
+> in an effect body. It is also fragile here: five places call `setSelectedId`, so a reset that has
+> to be remembered in each one is a reset that gets forgotten. The state instead records the
+> portfolio the sell belonged to — `useState<{ txId: number; portfolioId: number } | null>` — and the
+> modal renders only while `sellPnl.portfolioId === selectedId`. Derived, not corrected after the
+> fact. Pinned by 'closes the breakdown when the portfolio changes' in `AppLedger.test.tsx`; the
+> test fails if the guard is removed.
 
 and in `handleDeleteTransaction` (`App.tsx`), after the successful `DELETE` and before the
 `fetchPortfolioData` call:
 
 ```tsx
-      setSellPnlTxId(null);
+      setSellPnl(null);
 ```
 
 The modal needs no derived context: `split_applied` arrives in the payload, computed server-side from the rows the breakdown was built from. `App` only tracks which sell was clicked.
 
-- [ ] **Step 2: Render the modal**
+- [x] **Step 2: Render the modal**
 
 Add just before the closing `</main>` of the main content pane, inside the `currentPortfolio` branch so it only exists when a portfolio is active:
 
@@ -1707,7 +1712,7 @@ Add just before the closing `</main>` of the main content pane, inside the `curr
         )}
 ```
 
-- [ ] **Step 3: Write the integration test**
+- [x] **Step 3: Write the integration test**
 
 Create `frontend/src/test/components/AppLedger.test.tsx`:
 
@@ -1743,12 +1748,21 @@ describe('App ledger → sell P&L', () => {
 })
 ```
 
-- [ ] **Step 4: Run it**
+- [x] **Step 4: Run it**
 
 Run: `cd frontend && npx vitest run src/test/components/AppLedger.test.tsx 2>&1 | tail -25`
 Expected: PASS. If the ledger tab never appears, the MSW `/api/portfolios` fixture is not being served — check `server` setup in `src/test/mocks/server.ts` before changing the component.
 
-- [ ] **Step 5: Full gate**
+- [x] **Step 4b: Close the Done Criterion 4 gap**
+
+Done Criterion 4 requires that an unrecognized `strategy` query value renders as `FIFO`, but no test
+in Task 4 covered it — the criteria demanded behaviour the task's test list never pinned. Add
+`test_sell_pnl_unrecognized_strategy_is_applied_as_fifo` to `tests/sell_pnl_test.rs`: request
+`strategy=moon-time` over the two-buy fixture and assert both `body["strategy"] == "FIFO"` **and**
+`realized_pnl == 2000`. The figure is the load-bearing half — it proves FIFO ran rather than the
+string being echoed back, since LIFO on the same fixture returns 1600.
+
+- [x] **Step 5: Full gate**
 
 ```bash
 cd frontend && npm run lint && npx vitest run && cd ../backend_rust && cargo test
@@ -1757,11 +1771,11 @@ grep -n "get_price" src/api_routes/analytics.rs
 
 Expected: lint clean, all frontend tests pass, all backend tests pass, and no `get_price` hit inside `get_transaction_sell_pnl`.
 
-- [ ] **Step 6: Manual smoke (optional but recommended)**
+- [x] **Step 6: Manual smoke (optional but recommended)**
 
 Run `./start.sh` from the repo root, open the Transaction Ledger, click a SELL row, and confirm the per-lot P&L column sums to the realized P&L shown for that asset in the Holdings tab.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add frontend/src/App.tsx frontend/src/test/components/AppLedger.test.tsx

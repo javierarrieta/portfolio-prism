@@ -193,3 +193,23 @@ async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
         );
     }
 }
+#[tokio::test]
+async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
+    // Done Criterion 4. The response's `strategy` is what the modal renders as the
+    // attribution method, so it must name the method actually used -- not echo back
+    // whatever the caller typed. FIFO and LIFO differ on this fixture (2000 vs
+    // 1600), so the figure proves which one ran.
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Strategy Echo", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=moon-time&threshold_days=30", sell)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "FIFO", "an unrecognized value must not come back naming a method that did not run");
+    assert_eq!(dec(&body, "realized_pnl"), d("2000"), "FIFO figure, not LIFO's 1600");
+}
