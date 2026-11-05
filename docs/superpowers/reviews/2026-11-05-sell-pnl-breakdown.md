@@ -64,11 +64,14 @@ Recorded because each of these overturned a claim made during the review.
 
 ## Open items
 
-1. **Split footnote is computed client-side.** The server already has the fact and could return one
-   `split_applied` boolean, removing a prop, a derived flag and a test. Deferred only because it
-   chains through four tasks; it is a net deletion and still the better shape.
-2. **FX conversion path has no backend test.** Every fixture is USD-into-USD, so `get_rate` is never
+1. **FX conversion path has no backend test.** Every fixture is USD-into-USD, so `get_rate` is never
    reached and the one path that can hit the network and 500 is unexercised. Recorded in the plan's
    Task 4 rather than left silent. Do not describe that path as verified.
-3. **Optional:** replace the hand-written `decimal_opt_json` with `rust_decimal::serde::str_option`
+2. **Optional:** replace the hand-written `decimal_opt_json` with `rust_decimal::serde::str_option`
    behind `serde-with-str`. Steps are in the plan's Task 1.
+
+**Closed after this record was first written:** the split footnote is now a server-computed
+`split_applied` field on the response rather than something the browser infers from whatever
+transaction list it holds. One field added; a prop, a derived flag in `App` and a rerender test
+removed. Net deletion, and the warning can no longer silently fail to fire because the client's
+copy of the transaction list is one fetch stale.

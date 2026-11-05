@@ -155,6 +155,7 @@ pub struct SellPnlResponse {
     pub currency: String,               // portfolio base currency
     pub asset_currency: String,
     pub fx_applied: bool,
+    pub split_applied: bool,         // a SPLIT on this asset dated on or before this sell
     // the breakdown, flattened onto the same object
     pub sell_date: DateTime<Utc>,
     pub sold_qty: Decimal,
@@ -222,7 +223,7 @@ strings and the fallback is documented behaviour.
 ```json
 { "transaction_id": 42, "asset_id": 7, "symbol": "AAPL", "asset_type": "STOCK",
   "strategy": "FIFO", "threshold_days": 30,
-  "currency": "USD", "asset_currency": "USD", "fx_applied": false,
+  "currency": "USD", "asset_currency": "USD", "fx_applied": false, "split_applied": false,
   "sell_date": "2024-12-01T00:00:00Z", "sold_qty": "80.0", "price": "130.0", "fee": "0.0",
   "proceeds": "10400.0", "cost_basis": "8400.0", "realized_pnl": "2000.0", "roi": "0.238",
   "matched_qty": "80.0", "unmatched_qty": "0.0",
@@ -253,6 +254,11 @@ Field notes:
 - `fx_applied` is `asset_currency != currency`. The example above is a same-currency asset, so it
   shows `false`; for a foreign-currency asset `price` and `fee` stay in `asset_currency` while
   every other money field is converted and `fx_applied` is `true`.
+- `split_applied` is computed server-side over the same transaction list the replay consumed:
+  `any(tx.type == "SPLIT" && tx.date <= sell.date)`. It is free — those rows are already loaded —
+  and it is scoped to the asset the numbers came from by construction. Deriving it in the browser
+  from whatever transaction list the UI happens to hold can be one fetch stale, which would let a
+  warning that exists to prevent a misread silently fail to appear.
 
 **This endpoint never calls `get_price`.** Realized P&L needs no current quote, so unlike
 `/tax-summary` it performs no price fetch. FX rates for a non-base-currency asset come from the
@@ -361,7 +367,7 @@ Each row below is something the engine does silently today.
 |---|---|
 | `unmatched_qty > 0` | Amber banner: *"{unmatched_qty} of {sold_qty} units had no buy lot on or before this date. Neither their cost basis nor their proceeds are included in this figure."* The engine drops unmatched units from **both** sides, so the figure is incomplete rather than biased in a stated direction — do not write "overstated" or "understated". A test asserts this wording, not only the counts. |
 | `matches` empty | *"No buy lots were available to match on or before this date, so nothing was matched and realized P&L is 0.00."* Not "no data". **Available**, not *existed*: lots may have existed and earlier sells already drained them, which the payload cannot distinguish. |
-| any `SPLIT` on the same asset dated ≤ the sell date | Footnote: *"Buy prices and unit costs are split-adjusted, not the prices as entered."* Detected client-side from the transaction list already in memory, **filtered to the sell's own `asset_id`**. A split that never touched a consumed lot still triggers the footnote; accepted, rather than adding a server-computed flag for a display nicety. |
+| `split_applied` | Footnote: *"Buy prices and unit costs are split-adjusted, not the prices as entered."* Computed server-side from the rows the breakdown was built from (see field notes), not inferred by the client. A split on the same asset that never touched a consumed lot still triggers the footnote; accepted, because the alternative is claiming to know lot-level split impact the engine does not record. |
 | `fx_applied` | Footnote: *"Cost basis and proceeds were converted to {currency} at the latest available {asset_currency}→{currency} rate."* Not "at each transaction's date rate": `get_rate` uses the requested date only as a cache key and returns the last non-null close in the series it fetched, so every transaction in a replay converts at effectively the same rate. The other wording would misdescribe the very conversion this footnote discloses. |
 | always | Header names the strategy actually applied (and the threshold when HYBRID), plus: *"Attribution follows the {strategy} method. A different method would consume different lots."* Do not name one specific alternative: under HYBRID, "LIFO would attribute different lots" drops the threshold and implies FIFO is the only other option. |
 | `roi` null | ROI renders as `—`, never `0%` and never `Infinity%`. |

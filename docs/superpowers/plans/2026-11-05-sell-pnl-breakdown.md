@@ -99,7 +99,7 @@ The spec implies these inputs; no single task's happy-path test covers them, and
   - `crate::db_types::decimal_opt_json::{serialize, deserialize}` for `Option<Decimal>`
   - `schemas::LotMatch { buy_transaction_id: i32, buy_date: DateTime<Utc>, buy_price: Decimal, unit_cost: Decimal, matched_qty: Decimal, lot_qty_before_match: Decimal, cost_basis: Decimal, proceeds: Decimal, pnl: Decimal, holding_days: i64, term: Option<String> }`
   - `schemas::SellBreakdown { sell_transaction_id: i32, sell_date: DateTime<Utc>, sold_qty: Decimal, matched_qty: Decimal, unmatched_qty: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, matches: Vec<LotMatch> }`
-  - `schemas::SellPnlResponse { transaction_id: i32, asset_id: i32, symbol: String, asset_type: String, strategy: String, threshold_days: i64, currency: String, asset_currency: String, fx_applied: bool, sell_date: DateTime<Utc>, sold_qty: Decimal, price: Decimal, fee: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, roi: Option<Decimal>, matched_qty: Decimal, unmatched_qty: Decimal, matches: Vec<LotMatch> }`
+  - `schemas::SellPnlResponse { transaction_id: i32, asset_id: i32, symbol: String, asset_type: String, strategy: String, threshold_days: i64, currency: String, asset_currency: String, fx_applied: bool, split_applied: bool, sell_date: DateTime<Utc>, sold_qty: Decimal, price: Decimal, fee: Decimal, proceeds: Decimal, cost_basis: Decimal, realized_pnl: Decimal, roi: Option<Decimal>, matched_qty: Decimal, unmatched_qty: Decimal, matches: Vec<LotMatch> }`
 
 - [ ] **Step 1: Write the failing tests for `decimal_opt_json`**
 
@@ -214,7 +214,8 @@ Append inside `mod tests` in `backend_rust/src/schemas.rs`:
         let r = SellPnlResponse {
             transaction_id: 42, asset_id: 7, symbol: "AAPL".to_string(),
             asset_type: "STOCK".to_string(), strategy: "FIFO".to_string(), threshold_days: 30,
-            currency: "USD".to_string(), asset_currency: "USD".to_string(), fx_applied: false,
+            currency: "USD".to_string(), asset_currency: "USD".to_string(),
+            fx_applied: false, split_applied: false,
             sell_date: sample_datetime(),
             sold_qty: Decimal::from_str("50.0").unwrap(),
             price: Decimal::from_str("120.0").unwrap(),
@@ -808,6 +809,9 @@ async fn test_sell_pnl_fifo_breakdown_shape() {
     assert_eq!(body["currency"], "USD");
     assert_eq!(body["asset_currency"], "USD");
     assert_eq!(body["fx_applied"], false);
+    // This fixture has no SPLIT row, so the server-side flag must be false. The
+    // split footnote is a response field now, not something the browser guesses.
+    assert_eq!(body["split_applied"], false);
     assert_eq!(dec(&body, "sold_qty"), d("80"));
     assert_eq!(dec(&body, "price"), d("130"));
     assert_eq!(dec(&body, "realized_pnl"), d("2000"));
@@ -976,8 +980,9 @@ The body is seven steps, each following the pattern already in `get_tax_summary`
 3. Load the asset by `tx.asset_id`, then its portfolio by `asset.portfolio_id`; either missing → `NotFound`. The base currency comes from the portfolio that owns the asset, never from a path parameter, so the answer cannot disagree with the portfolio on screen.
 4. Normalize the strategy **once**: `"LIFO"` and `"HYBRID"` pass through upper-cased, anything else — including absent — becomes `"FIFO"`. Use that single value for both the engine call and the response, so the modal can never name a method it did not use. `threshold_days.unwrap_or(30)`. `fx_applied = asset.currency != portfolio.base_currency`.
 5. `SELECT * FROM transactions WHERE asset_id = ?` — the same query and the same scope `get_tax_summary` uses — then `TaxLotEngine::sell_breakdown(&tx.id, &transactions, &asset.currency, &portfolio.base_currency, currency_service, &strategy_val, threshold_val)`. `None` → `NotFound`. **No `get_price` call anywhere in this function**; `get_rate` inside the engine is expected and fine.
-6. `roi = if breakdown.cost_basis > Decimal::ZERO { Some(breakdown.realized_pnl / breakdown.cost_basis) } else { None }` — `Decimal` division, never `f64`.
-7. Build `SellPnlResponse` from the breakdown plus context. `price` and `fee` are `str_to_decimal(&tx.price)` / `str_to_decimal(&tx.fee)` — as entered, in asset currency. Everything else comes straight from the breakdown.
+6. `split_applied = transactions.iter().any(|t| t.r#type.to_uppercase() == "SPLIT" && t.date <= tx.date)`. This is free — the list is already loaded — and it is scoped to exactly the asset the replay consumed by construction. The modal's split footnote reads this field instead of scanning whatever transaction list the browser happens to be holding, which can be one fetch stale.
+7. `roi = if breakdown.cost_basis > Decimal::ZERO { Some(breakdown.realized_pnl / breakdown.cost_basis) } else { None }` — `Decimal` division, never `f64`.
+8. Build `SellPnlResponse` from the breakdown plus context. `price` and `fee` are `str_to_decimal(&tx.price)` / `str_to_decimal(&tx.fee)` — as entered, in asset currency. Everything else comes straight from the breakdown.
 
 Extend the `use` block at the top of `analytics.rs`:
 
@@ -1157,6 +1162,8 @@ export interface SellPnlBreakdown {
   currency: string;
   asset_currency: string;
   fx_applied: boolean;
+  /** A SPLIT on this asset dated on or before the sell: buy prices are split-adjusted. */
+  split_applied: boolean;
   sell_date: string;
   sold_qty: number;
   price: number;
@@ -1183,7 +1190,7 @@ import { normalizeSellPnl } from './decimal'
 const raw = {
   transaction_id: 42, asset_id: 7, symbol: 'AAPL', asset_type: 'STOCK',
   strategy: 'FIFO', threshold_days: 30,
-  currency: 'USD', asset_currency: 'USD', fx_applied: false,
+  currency: 'USD', asset_currency: 'USD', fx_applied: false, split_applied: false,
   sell_date: '2024-12-01T00:00:00Z',
   sold_qty: '80.0', price: '130.0', fee: '0.0',
   proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
@@ -1252,7 +1259,7 @@ Append `normalizeSellPnl(t: unknown): SellPnlBreakdown` to the end of `decimal.t
 
 - two small local helpers: `optNum` (`null`/`undefined` → `null`, else `toNumber`) and `termOf` (only the literals `'SHORT'` and `'LONG'` survive; anything else → `null`).
 - every decimal-ish field goes through `num`; `roi` through `optNum`; `transaction_id`, `asset_id`, `threshold_days` and `holding_days` are plain numbers with `?? 0` fallbacks.
-- `currency` and `asset_currency` fall back to `'USD'`; `fx_applied` is `=== true`, never truthy-coerced.
+- `currency` and `asset_currency` fall back to `'USD'`; `fx_applied` and `split_applied` are `=== true`, never truthy-coerced.
 - `matches` is `Array.isArray(r.matches) ? … : []`, each element passed through `asRecord`. A malformed payload must produce a zeroed breakdown with `matches: []` and never throw — that is what the "survives a malformed payload" test pins.
 - do not sort `matches`. The payload is already in consumption order and sorting here would hide the engine's ordering from the tests that assert it.
 
@@ -1427,7 +1434,7 @@ git commit -m "refactor: extract TransactionLedger with a clickable sell P&L aff
 
 **Interfaces:**
 - Consumes: `GET /api/transactions/<id>/pnl`, `normalizeSellPnl` (Task 6), `formatCurrency`, `formatPercent`.
-- Produces: `SellPnlModal` default export with props `{ transactionId: number; strategy: string; thresholdDays: number; splitBeforeSell: boolean; onClose: () => void }`.
+- Produces: `SellPnlModal` default export with props `{ transactionId: number; strategy: string; thresholdDays: number; onClose: () => void }`.
 
 - [ ] **Step 1: Pin the test timezone, then add the MSW handler**
 
@@ -1447,7 +1454,7 @@ In `frontend/src/test/mocks/handlers.ts`, add before the catch-all `http.all('*'
     return HttpResponse.json({
       transaction_id: id, asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK',
       strategy: 'FIFO', threshold_days: 30,
-      currency: 'USD', asset_currency: 'USD', fx_applied: false,
+      currency: 'USD', asset_currency: 'USD', fx_applied: false, split_applied: false,
       sell_date: '2024-12-01T00:00:00Z',
       sold_qty: '80.0', price: '130.0', fee: '0.0',
       proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
@@ -1479,7 +1486,7 @@ import { http, HttpResponse } from 'msw'
 const base = {
   transaction_id: 42, asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK',
   strategy: 'FIFO', threshold_days: 30,
-  currency: 'USD', asset_currency: 'USD', fx_applied: false,
+  currency: 'USD', asset_currency: 'USD', fx_applied: false, split_applied: false,
   sell_date: '2024-12-01T00:00:00Z',
   sold_qty: '80.0', price: '130.0', fee: '0.0',
   proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
@@ -1491,7 +1498,6 @@ const renderModal = (props = {}) => render(
     transactionId={42}
     strategy="FIFO"
     thresholdDays={30}
-    splitBeforeSell={false}
     onClose={vi.fn()}
     {...props}
   />,
@@ -1554,14 +1560,17 @@ describe('SellPnlModal', () => {
     expect(screen.getByTestId('roi')).not.toHaveTextContent('Infinity')
   })
 
-  it('footnotes split adjustment only when a split precedes the sell', async () => {
-    const { rerender } = render(
-      <SellPnlModal transactionId={42} strategy="FIFO" thresholdDays={30} splitBeforeSell={false} onClose={vi.fn()} />,
-    )
+  it('footnotes split adjustment only when the response says a split applies', async () => {
+    // Driven by the payload, not by a prop the caller computes: the server knows
+    // whether a split touched this asset because it read the same rows the
+    // numbers came from. `base` carries split_applied: false.
+    renderModal()
     await waitFor(() => expect(screen.queryByTestId('split-note')).not.toBeInTheDocument())
-    rerender(
-      <SellPnlModal transactionId={42} strategy="FIFO" thresholdDays={30} splitBeforeSell onClose={vi.fn()} />,
-    )
+
+    server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
+      ...base, split_applied: true,
+    })))
+    renderModal()
     await waitFor(() => expect(screen.getByTestId('split-note')).toBeInTheDocument())
   })
 
@@ -1595,7 +1604,7 @@ Create `frontend/src/components/SellPnlModal.tsx`. Build it from the parts below
 
 **Imports:** `useEffect`/`useState` from react; `AlertTriangle`, `Info`, `Loader2`, `X` from `lucide-react`; `formatCurrency`, `formatPercent` from `../utils/formatters`; `normalizeSellPnl` from `../utils/decimal`; `SellPnlBreakdown` from `../types`. Local helper `pnlColor = (v: number) => (v >= 0 ? 'var(--color-success)' : 'var(--color-danger)')`.
 
-**Props:** `{ transactionId: number; strategy: string; thresholdDays: number; splitBeforeSell: boolean; onClose: () => void }`.
+**Props:** `{ transactionId: number; strategy: string; thresholdDays: number; onClose: () => void }`. Nothing about the split footnote is the caller's business — it reads `data.split_applied` from the payload.
 
 **Fetch.** `useState` for `data` / `loading` / `error`, plus a `retryKey` counter. One `useEffect` keyed on `[transactionId, strategy, thresholdDays, retryKey]` fetching `` `/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}` `` and piping the JSON through `normalizeSellPnl`. Keying on strategy and threshold is what makes the modal refetch when the Holdings tab changes strategy — that is the whole point, not an accident to prune.
 
@@ -1622,7 +1631,7 @@ Quantities via `toLocaleString(undefined, { maximumFractionDigits: 6 })`. The se
 **Footnotes** (muted, `Info` icon, stacked):
 
 - always: `Attribution follows the {strategy} method. A different method would consume different lots.`
-- `data-testid="split-note"` when `splitBeforeSell`: `Buy prices and unit costs are split-adjusted, not the prices as entered.`
+- `data-testid="split-note"` when `data.split_applied`: `Buy prices and unit costs are split-adjusted, not the prices as entered.`
 - `data-testid="fx-note"` when `fx_applied`: `Cost basis and proceeds were converted to {currency} at the latest available {asset_currency}→{currency} rate.` Not "at each transaction's date rate" — `get_rate` uses the requested date only as a cache key and returns the last non-null close, so every transaction in a replay converts at effectively the same rate.
 
 - [ ] **Step 5: Run the tests**
@@ -1649,7 +1658,7 @@ git commit -m "feat: sell P&L modal with per-lot breakdown and edge-case notes"
 - Consumes: `TransactionLedger` (Task 7), `SellPnlModal` (Task 8), `transactions` state.
 - Produces: the shipped flow — SELL row in the ledger opens the modal.
 
-- [ ] **Step 1: Own the modal state and derive the split flag**
+- [ ] **Step 1: Own the modal state**
 
 In `frontend/src/App.tsx`, add to the UI state block (next to `showNewPortfolioModal`). Task 7 deliberately left this to Task 9, so it is not there yet:
 
@@ -1679,19 +1688,7 @@ and in `handleDeleteTransaction` (`App.tsx`), after the successful `DELETE` and 
       setSellPnlTxId(null);
 ```
 
-Add the derived flag next to the other derived values (after `currentPortfolio` is resolved):
-
-```tsx
-  // A split dated on or before the sell means the breakdown's buy prices are
-  // split-adjusted rather than as entered — the modal has to say so.
-  const sellPnlTx = sellPnlTxId === null ? undefined : transactions.find(t => t.id === sellPnlTxId);
-  const splitBeforeSell = sellPnlTx
-    ? transactions.some(t =>
-        t.asset_id === sellPnlTx.asset_id
-        && t.type === 'SPLIT'
-        && new Date(t.date).getTime() <= new Date(sellPnlTx.date).getTime())
-    : false;
-```
+The modal needs no derived context: `split_applied` arrives in the payload, computed server-side from the rows the breakdown was built from. `App` only tracks which sell was clicked.
 
 - [ ] **Step 2: Render the modal**
 
@@ -1703,7 +1700,6 @@ Add just before the closing `</main>` of the main content pane, inside the `curr
             transactionId={sellPnlTxId}
             strategy={strategy}
             thresholdDays={thresholdDays}
-            splitBeforeSell={splitBeforeSell}
             onClose={() => setSellPnlTxId(null)}
           />
         )}
