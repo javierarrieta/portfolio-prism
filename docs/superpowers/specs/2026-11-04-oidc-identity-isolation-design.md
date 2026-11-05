@@ -66,7 +66,7 @@ Requirement identifiers are stable; later documents and test names refer to them
 | F3 | A local `users` row is created just-in-time (JIT) on the first successful OIDC login, keyed on `(issuer, subj)`. |
 | F4 | Every portfolio has exactly one owner. Pre-existing portfolios are assigned to a designated bootstrap owner during migration. The application refuses to start if unowned portfolios exist and no bootstrap owner can be determined. |
 | F5 | A caller cannot read or mutate a portfolio, asset, or transaction outside their granted access level (owner, editor, or viewer). The response for any resource id outside the caller's access is `404`, never `403`. |
-| F6 | `GET /api/portfolios/` returns the portfolios the caller owns plus those with a `portfolio_members` row for the caller. The members table is never written in this spec, so "member of" is the empty set here. The response shape does not change in this spec. |
+| F6 | `GET /api/portfolios/` returns the portfolios the caller owns (`owner_id = caller`). The response shape does not change in this spec; the "shared with me" half arrives with Spec 2. |
 
 Two items that were requirements in an earlier draft are not requirements here: `/api-docs/openapi.json`
 stays public, and `/api/assets/lookup` stays unthrottled. See
@@ -86,17 +86,17 @@ stays public, and `/api/assets/lookup` stays unthrottled. See
 
 | ID | Requirement |
 |---|---|
-| C1 | The access layer is written against the final access model (owner / editor / viewer) even though sharing is not delivered until Spec 2. |
+| C1 | Every access check names the minimum level it needs (owner / editor / viewer), so the per-route level decisions are made here rather than re-litigated in Spec 2. The membership half — the `portfolio_members` table and the lookup behind it — is deferred to Spec 2, where a write path exists. |
 | C2 | The guard accepts a session cookie only. Bearer tokens are Spec 3; an `Authorization` header on an API request is ignored, not accepted. |
 
 ## Non-Goals
 
 | Out of scope here | Where it belongs |
 |---|---|
-| Sharing portfolios (UI, share/unshare endpoints, "shared with me"). The `portfolio_members` table **is** created here and read by the access layer; nothing writes to it. | Spec 2 |
+| Sharing portfolios: the UI, share/unshare endpoints, "shared with me", the `portfolio_members` table itself, and the membership lookup in `access`. Nothing in this spec can create a member row. | Spec 2 |
 | Per-user API keys and the Model Context Protocol (MCP) server. | Spec 3 |
 | MCP OAuth 2.1 with dynamic client registration for hosted connectors (ChatGPT, Claude.ai). | Spec 4 |
-| Roles and admin panels (application-wide privilege levels, distinct from the per-portfolio membership role in `portfolio_members.role`). | No planned spec |
+| Roles and admin panels (application-wide privilege levels, distinct from the per-portfolio membership role Spec 2 will store in `portfolio_members.role`). | No planned spec |
 | Rate limiting `/api/assets/lookup` (the shared Yahoo Finance / EODHD quota). The design is written up and tracked separately. | [Issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35) |
 | Per-user quotas of any kind. | No planned spec |
 | Syncing `is_active` from Authentik. The column exists so a future sync can populate it. | No planned spec |
@@ -165,8 +165,8 @@ Browser ──HTTPS──▶ nginx (frontend container, :80)
                  │ handlers: portfolios · transactions · analytics   │
                  │                  │                                │
                  │                  ▼                                │
-                 │ SQLite: users · portfolios.owner_id ·             │
-                 │         portfolio_members (read, never written)   │
+                 │ SQLite: users · portfolios.owner_id               │
+                 │   (portfolio_members arrives with Spec 2)         │
                  └────────────────┬──────────────────────────────────┘
                                   │
                     Authentik — outside the cluster, already running
@@ -177,7 +177,7 @@ Three units, each independently understandable:
 | Unit | Responsibility | Depends on |
 |---|---|---|
 | `src/auth/` | OIDC code flow, session cookie issuance and verification, the `AuthFairing`, the `AuthedUser` guard | `AuthMode`, Rocket cookies, `users` table |
-| `src/access.rs` | Map `(user, portfolio_id)` → `Access`, or nothing | `users`, `portfolios`, `portfolio_members` |
+| `src/access.rs` | Map `(user, portfolio_id)` → `Access`, or nothing | `users`, `portfolios`; Spec 2 adds `portfolio_members` |
 | `src/api_routes/*` | Business logic; never resolves ownership themselves | `AuthedUser`, `access` |
 
 ## Decisions and Alternatives Considered
@@ -203,7 +203,9 @@ option that was rejected with its reason.
 | Lookup rate limit | Out of this spec | A per-user bucket, then a global one — both protect a third-party quota rather than user data, so they belong in their own change. Carried to [issue #35](https://github.com/javierarrieta/portfolio-prism/issues/35) as one global bucket |
 | OpenAPI generation | `--print-openapi` early exit; no server | Exporting `AUTH_MODE=disabled` in CI — works around the coupling instead of removing it, and leaves the published contract dependent on runtime configuration and, for a release build, on a secret key |
 | Root `/openapi.json` alias | Remove the second mount | Keeping it — it is the same handler mounted twice with no consumer anywhere in the repo or the frontend. This is duplicate-surface cleanup, not access control |
-| Three-level access model | Kept (C1), but the public response shape does not change in this spec | Shipping a new `access` field on `GET /api/portfolios/` now — no consumer exists until Spec 2's share UI, and an unpinned public field would drift |
+| Access levels | Kept as a parameter: every call site names the minimum level it needs (owner / editor / viewer), and §8 fixes which route needs which | Collapsing to `require_owner(user, id)` — smaller today, but Spec 2 would then re-decide the level of all 14 routes while also shipping the share UI |
+| `portfolio_members` | Created in Spec 2, together with its first write path | Creating it here and leaving it unwritten — a table, an index and a fallback query that nothing can populate, exercised only by tests that insert rows by hand |
+| Public response shape | Unchanged in this spec | Shipping a new `access` field on `GET /api/portfolios/` now — no consumer exists until Spec 2's share UI, and an unpinned public field would drift |
 | Revocation (`token_version`, `is_active`) | Kept; the guard already reads the row | Dropping them — saves nothing, since the row is read for `AuthedUser`, and adding the columns later is another migration against live data |
 | Bootstrap handover mechanism | One placeholder row (`issuer='local'`, `subj='bootstrap'`) updated in place on handover | A `bootstrap:<value>` row per configured identity — more strings to keep consistent, and the id would change when the identity is provisioned |
 
@@ -425,20 +427,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_users_issuer_subj ON users(issuer, subj);
 
 -- guarded by column_exists(pool, "portfolios", "owner_id")
 ALTER TABLE portfolios ADD COLUMN owner_id INTEGER;
-
-CREATE TABLE IF NOT EXISTS portfolio_members (
-    portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    role TEXT NOT NULL CHECK (role IN ('editor','viewer')),
-    added_at TEXT NOT NULL,
-    PRIMARY KEY (portfolio_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_portfolio_members_user ON portfolio_members(user_id);
 ```
 
-`portfolio_members` is created here and read by the access layer and by `GET /api/portfolios/`, but
-nothing writes to it in this spec: it lets `access` be written once against the final access model
-instead of being rewritten in Spec 2.
+No `portfolio_members` table is created here. Spec 2 creates it in the same change as its first write
+path, so a table is never shipped before something can put a row in it. What this spec keeps from the
+final access model is the `min` parameter on every `access` call and the per-route levels in §8 — the
+decisions Spec 2 would otherwise have to make again.
 
 **`owner_id` stays nullable.** `ALTER TABLE portfolios ADD COLUMN owner_id INTEGER` is a plain add:
 no rename, no copy, no drop. A `NOT NULL` column would need a table rebuild, and the existing
@@ -542,19 +536,21 @@ There is no `AuthError` type. Handlers in this repository already return `Result
 Resolution queries, stated so the dangling-row cases are not left to the implementer:
 
 ```sql
--- resolve(): owner first, then membership
+-- resolve(): the owner, and nothing else in this spec
 SELECT owner_id FROM portfolios WHERE id = ?;
-SELECT role FROM portfolio_members WHERE portfolio_id = ? AND user_id = ?;
 
 -- require_asset(): the asset's real portfolio
 SELECT portfolio_id FROM assets WHERE id = ?;
 
--- require_asset_in(): the path id must equal the value returned above
+-- require_asset_in(): no extra query — the path id must equal the portfolio_id returned above
 
 -- require_transaction(): transaction → asset → portfolio
 SELECT asset_id FROM transactions WHERE id = ?;
 SELECT portfolio_id FROM assets WHERE id = ?;
 ```
+
+Spec 2 adds the membership query here (`SELECT role FROM portfolio_members WHERE portfolio_id = ?
+AND user_id = ?`) as the fallback when the owner check does not match.
 
 A transaction whose `asset_id` matches no asset row — reachable today, because asset deletion
 orphans transactions and foreign keys are off — resolves to `Status::NotFound`.
@@ -567,7 +563,10 @@ tables. The rule is checked, not assumed: CI runs a grep gate over `src/api_rout
 a bare `WHERE id`. The gate is a heuristic — a join or a subquery satisfies the pattern-free case —
 so it supplements the isolation matrix rather than replacing it.
 
-**Access level semantics.** Ordering is `Owner > Editor > Viewer`.
+**Access level semantics.** Ordering is `Owner > Editor > Viewer`. With no membership table in this
+spec, `resolve` returns `Owner` or `None`: the `min` argument is threaded through every call, and
+every level is currently satisfied only by the owner, so `require(…, Viewer)` and
+`require(…, Editor)` behave identically today. The table below is the contract Spec 2 fills in.
 
 | Level | May |
 |---|---|
@@ -588,7 +587,7 @@ a delete-then-asset order) is a separate change with its own migration.
 | Route | Change |
 |---|---|
 | `POST /api/portfolios/` | `owner_id` bound to `user.id`; insert includes the column |
-| `GET /api/portfolios/` | `WHERE owner_id = ? OR id IN (SELECT portfolio_id FROM portfolio_members WHERE user_id = ?)`. Response shape unchanged |
+| `GET /api/portfolios/` | `WHERE owner_id = ?`. Response shape unchanged; Spec 2 adds the members clause |
 | `GET /api/portfolios/:id` | `require(…, Viewer)` → `404` if not held |
 | `PATCH /api/portfolios/:id` | `require(…, Owner)` — this route sets `currency` / `base_currency`; there is no rename endpoint |
 | `DELETE /api/portfolios/:id` | `require(…, Owner)` |
@@ -616,9 +615,10 @@ API operations. The published spec documents 13 because `update_asset` is missin
 `paths(...)` list in `openapi.rs`, not because it lacks an annotation — the annotation is already
 there (`transactions.rs:88-95`). The fix is to register the handler in `ApiDoc::paths`.
 
-`Access::Editor` is defined in this spec and exercised by tests, even though no member rows exist
-until Spec 2. Owner-only operations are already fixed at `Owner`; Spec 2 adds new routes but does
-not change the access level assigned to any route in this table.
+`Access::Editor` and `Access::Viewer` are defined here and their ordering is tested, but no caller
+can hold either level until Spec 2 creates the membership table. Owner-only operations are already
+fixed at `Owner`; Spec 2 adds new routes but does not change the access level assigned to any route
+in this table.
 
 ### 9. Error handling
 
@@ -742,9 +742,10 @@ remaining one is attempted, and none of them can be triggered by a code change.
 
 **Backend unit tests**
 
-- `access::resolve` matrix: owner / editor / viewer / none, against each required level, including
-  a `NULL` owner_id resolving to no access.
+- `access::resolve`: owner → `Owner`, another user → `None`, `NULL` owner_id → `None`.
 - `Access` ordering.
+- `require(…, Viewer)` and `require(…, Editor)` both admit the owner and both `404` a non-owner —
+  pinning that the level argument is threaded through while membership is still absent.
 - `require_asset_in` rejects an asset whose `portfolio_id` differs from the path id; `require_asset`
   accepts the same asset when no path id is given.
 - `require_transaction` returns `NotFound` for a transaction whose `asset_id` matches no asset.
@@ -860,7 +861,7 @@ a forced re-login, not data loss.
 
 | Spec | Contents | Depends on |
 |---|---|---|
-| 2 — Sharing | `portfolio_members` write paths, share/unshare endpoints, "shared with me", share UI, and the `access` field on the portfolio response shape that Spec 2's UI is the first consumer of | this spec |
+| 2 — Sharing | the `portfolio_members` table and its write paths, the membership fallback in `access::resolve`, share/unshare endpoints, "shared with me", share UI, and the `access` field on the portfolio response shape that Spec 2's UI is the first consumer of | this spec |
 | 3 — API keys + MCP | `api_keys` table, mint/revoke UI, `read`/`write` scopes, an `rmcp` (the Rust MCP SDK) streamable-HTTP server at `/mcp` | this spec's guard |
 | 4 — MCP OAuth 2.1 | Dynamic client registration, protected-resource metadata, RFC 8707 resource parameter, for hosted connectors (ChatGPT, Claude.ai) | spec 3 |
 
@@ -889,7 +890,10 @@ fixed here.
 - Ownership of a legacy portfolio is decided by `sub` and by nothing else. That guarantee is a policy
   of this application, not something Authentik enforces on its behalf.
 - Foreign keys are not enabled (`PRAGMA foreign_keys` is off throughout this repository), so
-  `owner_id` and `portfolio_members` referential integrity is application-enforced only.
+  `owner_id` referential integrity is application-enforced only.
+- The access level named at each call site is inert until Spec 2: with no membership table, every
+  grant resolves to `Owner`. The levels are a contract declared ahead of the mechanism that fills
+  them in.
 - Deleting an asset leaves its transactions with a dangling `asset_id`. They are unreachable through
   the API and are not cleaned up by this spec.
 - `cargo test --release` is not supported: the release binary has no `AuthMode::Disabled`, and the
@@ -906,7 +910,8 @@ None.
 
 ## Revision History
 
-**2026-11-05 (second revision) — scope reduced by the owner.** Two requirements left the spec:
+**2026-11-05 (second revision) — scope reduced by the owner.** Two requirements left the spec and one
+was reduced:
 
 - `/api-docs/openapi.json` stays **public**. The earlier draft authenticated it; the contract is not a
   secret and the isolation model does not depend on route secrecy. The fairing therefore guards the
@@ -918,6 +923,10 @@ None.
 - `--print-openapi` is kept even though it no longer protects CI from a `401`: a server started with
   the default `AUTH_MODE=oidc` and no `OIDC_*` variables now refuses to launch, so generating the
   document from a running server is still not workable. That refusal is now stated explicitly in §9.
+- C1 became the middle option: the `min` level parameter and the per-route levels stay, so Spec 2
+  does not re-decide them, but the `portfolio_members` table, its index and the membership fallback
+  move to Spec 2, where a write path exists. `resolve` is owner-or-nothing here, and the tests say so
+  instead of hand-seeding member rows the application cannot create.
 
 **2026-11-05 — revised against `reviews/2026-11-04-oidc/`.** The changes below are the substantive
 ones; the review thread (7 blockers, 24 majors, 16 nit groups) is the record of what prompted each.
