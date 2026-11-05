@@ -1135,7 +1135,7 @@ git commit -m "chore: register sell P&L route in OpenAPI and regenerate spec"
   - `types.ts`: `LotMatch`, `SellPnlBreakdown`
   - `decimal.ts`: `normalizeSellPnl(t: unknown): SellPnlBreakdown`
 
-- [ ] **Step 1: Add the types**
+- [x] **Step 1: Add the types**
 
 Append to `frontend/src/types.ts`:
 
@@ -1181,7 +1181,7 @@ export interface SellPnlBreakdown {
 }
 ```
 
-- [ ] **Step 2: Write the failing normalizer tests**
+- [x] **Step 2: Write the failing normalizer tests**
 
 Create `frontend/src/utils/decimal.test.ts` (sits beside the source, matching `csvParser.test.ts`):
 
@@ -1241,12 +1241,12 @@ describe('normalizeSellPnl', () => {
 })
 ```
 
-- [ ] **Step 3: Run them to verify they fail**
+- [x] **Step 3: Run them to verify they fail**
 
 Run: `cd frontend && npx vitest run src/utils/decimal.test.ts 2>&1 | tail -20`
 Expected: FAIL — `normalizeSellPnl is not exported` / is not a function.
 
-- [ ] **Step 4: Implement the normalizer**
+- [x] **Step 4: Implement the normalizer**
 
 In `frontend/src/utils/decimal.ts`, extend the type import at the top to include `SellPnlBreakdown` and `LotMatch`:
 
@@ -1265,12 +1265,12 @@ Append `normalizeSellPnl(t: unknown): SellPnlBreakdown` to the end of `decimal.t
 - `matches` is `Array.isArray(r.matches) ? … : []`, each element passed through `asRecord`. A malformed payload must produce a zeroed breakdown with `matches: []` and never throw — that is what the "survives a malformed payload" test pins.
 - do not sort `matches`. The payload is already in consumption order and sorting here would hide the engine's ordering from the tests that assert it.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cd frontend && npx vitest run src/utils/decimal.test.ts 2>&1 | tail -20`
 Expected: PASS — 5 tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add frontend/src/types.ts frontend/src/utils/decimal.ts frontend/src/utils/decimal.test.ts

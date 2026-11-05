@@ -1,5 +1,6 @@
 import type {
-  Asset, HistoryItem, PerformanceMetrics, PortfolioPerformance, TaxSummary, Transaction,
+  Asset, HistoryItem, LotMatch, PerformanceMetrics, PortfolioPerformance,
+  SellPnlBreakdown, TaxSummary, Transaction,
 } from '../types';
 
 export type DecimalLike = string | number | null | undefined;
@@ -114,3 +115,55 @@ export const normalizeAsset = (a: unknown): Asset => {
 };
 
 export const normalizeAssetList = (assets: unknown[]): Asset[] => assets.map(normalizeAsset);
+const optNum = (r: UnknownRecord, key: string): number | null =>
+  r[key] === null || r[key] === undefined ? null : toNumber(r[key] as DecimalLike);
+
+// Only the two literals the engine emits survive. Anything else becomes null
+// rather than being passed through as a tax term the backend never asserted.
+const termOf = (v: unknown): 'SHORT' | 'LONG' | null =>
+  v === 'SHORT' || v === 'LONG' ? v : null;
+
+export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
+  const r = asRecord(t);
+  const matches = Array.isArray(r.matches) ? (r.matches as unknown[]) : [];
+  return {
+    transaction_id: (r.transaction_id as number) ?? 0,
+    asset_id: (r.asset_id as number) ?? 0,
+    symbol: str(r, 'symbol'),
+    asset_type: str(r, 'asset_type'),
+    strategy: str(r, 'strategy'),
+    threshold_days: (r.threshold_days as number) ?? 0,
+    currency: str(r, 'currency') || 'USD',
+    asset_currency: str(r, 'asset_currency') || 'USD',
+    fx_applied: r.fx_applied === true,
+    split_applied: r.split_applied === true,
+    sell_date: str(r, 'sell_date'),
+    sold_qty: num(r, 'sold_qty'),
+    price: num(r, 'price'),
+    fee: num(r, 'fee'),
+    proceeds: num(r, 'proceeds'),
+    cost_basis: num(r, 'cost_basis'),
+    realized_pnl: num(r, 'realized_pnl'),
+    roi: optNum(r, 'roi'),
+    matched_qty: num(r, 'matched_qty'),
+    unmatched_qty: num(r, 'unmatched_qty'),
+    // Left in payload order: that is the engine's consumption order, and sorting
+    // here would hide it from the tests that assert on it.
+    matches: matches.map((m: unknown): LotMatch => {
+      const mr = asRecord(m);
+      return {
+        buy_transaction_id: (mr.buy_transaction_id as number) ?? 0,
+        buy_date: str(mr, 'buy_date'),
+        buy_price: num(mr, 'buy_price'),
+        unit_cost: num(mr, 'unit_cost'),
+        matched_qty: num(mr, 'matched_qty'),
+        lot_qty_before_match: num(mr, 'lot_qty_before_match'),
+        cost_basis: num(mr, 'cost_basis'),
+        proceeds: num(mr, 'proceeds'),
+        pnl: num(mr, 'pnl'),
+        holding_days: (mr.holding_days as number) ?? 0,
+        term: termOf(mr.term),
+      };
+    }),
+  };
+};
