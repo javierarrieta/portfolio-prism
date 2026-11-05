@@ -1041,7 +1041,7 @@ git commit -m "feat: expose per-sell realized P&L at GET /api/transactions/<id>/
 - Consumes: `api_routes::analytics::get_transaction_sell_pnl`, `schemas::{LotMatch, SellBreakdown, SellPnlResponse}`.
 - Produces: an `openapi.json` containing `/api/transactions/<id>/pnl` and the three new component schemas.
 
-- [ ] **Step 1: Register the path and schemas**
+- [x] **Step 1: Register the path and schemas**
 
 In `backend_rust/src/openapi.rs`, add to the `paths(...)` list after `crate::api_routes::analytics::get_portfolio_performance,`:
 
@@ -1060,12 +1060,12 @@ and to the `components(schemas(...))` list after `schemas::AssetTaxSummary,`:
 registered. Registering it would put an unconsumed type in the committed contract and in the
 generated `api.d.ts`.
 
-- [ ] **Step 2: Verify it compiles and the spec serves the new route**
+- [x] **Step 2: Verify it compiles and the spec serves the new route**
 
 Run: `cd backend_rust && cargo check 2>&1 | tail -10`
 Expected: no errors. `Option<Decimal>` derives `ToSchema` without help (verified against utoipa 4.2.3 in Task 1), so there is no contingency to apply here.
 
-- [ ] **Step 3: Regenerate the committed spec**
+- [x] **Step 3: Regenerate the committed spec**
 
 The `AGENTS.md` recipe (`cargo run --release &` then `sleep 12`) races a fixed sleep against a
 release build that may take minutes, and if the server is not up the `curl` returns empty and the
@@ -1093,7 +1093,7 @@ Expected: a `wrote N bytes` line where N is larger than the current file. If not
 the server never came up — read `/tmp/sell-pnl-server.log` and fix that; do not commit an empty or
 truncated `openapi.json`.
 
-- [ ] **Step 4: Verify the new route and schemas landed**
+- [x] **Step 4: Verify the new route and schemas landed**
 
 From the **repository root** (not `backend_rust/`):
 
@@ -1103,7 +1103,7 @@ python3 -c "import json;d=json.load(open('docs/openapi/openapi.json'));print('/a
 
 Expected: `True` and `['LotMatch', 'SellPnlResponse']` — and `git diff --stat docs/openapi/openapi.json` showing additions only, with no existing path or schema removed.
 
-- [ ] **Step 5: Regenerate the generated TypeScript types**
+- [x] **Step 5: Regenerate the generated TypeScript types**
 
 From the **repository root** — Step 3 already left you in `backend_rust/`, and `cd ../frontend` from there would land outside the repo:
 
@@ -1113,7 +1113,7 @@ cd frontend && npm install && npm run generate-types
 
 Nothing imports `src/types/api.d.ts` today, but it is a committed generated artifact and must not drift from the spec it was generated from.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/openapi/openapi.json frontend/src/types/api.d.ts backend_rust/src/openapi.rs
