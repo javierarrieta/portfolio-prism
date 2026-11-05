@@ -123,6 +123,27 @@ export const handlers = [
        { id: 2, asset_id: 1, type: 'SPLIT', quantity: 2, price: 1, fee: 0, date: '2024-06-01T00:00:00Z' },
      ])
    }),
+    http.get('/api/transactions/:id/pnl', ({ params }) => {
+    const id = Number(params.id)
+    return HttpResponse.json({
+      transaction_id: id, asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK',
+      strategy: 'FIFO', threshold_days: 30,
+      currency: 'USD', asset_currency: 'USD', fx_applied: false, split_applied: false,
+      sell_date: '2024-12-01T00:00:00Z',
+      sold_qty: '80.0', price: '130.0', fee: '0.0',
+      proceeds: '10400.0', cost_basis: '8400.0', realized_pnl: '2000.0', roi: '0.238',
+      matched_qty: '80.0', unmatched_qty: '0.0',
+      matches: [
+        { buy_transaction_id: 1, buy_date: '2024-01-01T00:00:00Z', buy_price: '100.0',
+          unit_cost: '100.0', matched_qty: '60.0', lot_qty_before_match: '60.0',
+          cost_basis: '6000.0', proceeds: '7800.0', pnl: '1800.0', holding_days: 335, term: null },
+        { buy_transaction_id: 2, buy_date: '2024-06-01T00:00:00Z', buy_price: '120.0',
+          unit_cost: '120.0', matched_qty: '20.0', lot_qty_before_match: '40.0',
+          cost_basis: '2400.0', proceeds: '2600.0', pnl: '200.0', holding_days: 183, term: null },
+      ],
+    })
+  }),
+  http.get('/api/transactions/999/pnl', () => new HttpResponse(null, { status: 404 })),
    http.all('*', () => {
      return HttpResponse.json({ error: 'not implemented' }, { status: 501 })
    })

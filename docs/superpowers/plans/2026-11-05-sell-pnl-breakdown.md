@@ -1438,7 +1438,7 @@ git commit -m "refactor: extract TransactionLedger with a clickable sell P&L aff
 - Consumes: `GET /api/transactions/<id>/pnl`, `normalizeSellPnl` (Task 6), `formatCurrency`, `formatPercent`.
 - Produces: `SellPnlModal` default export with props `{ transactionId: number; strategy: string; thresholdDays: number; onClose: () => void }`.
 
-- [ ] **Step 1: Pin the test timezone, then add the MSW handler**
+- [x] **Step 1: Pin the test timezone, then add the MSW handler**
 
 The modal renders dates with `toLocaleDateString`/`toLocaleString`, which are host-timezone dependent, and `vite.config.js` sets no `TZ`. `2024-01-01T00:00:00Z` renders as `2023-12-31` on any machine west of UTC, and two of the three new frontend test files would fail there for a reason that looks like a component bug. Add to `frontend/src/test/setup.ts`, above the existing imports' effects:
 
@@ -1474,7 +1474,7 @@ In `frontend/src/test/mocks/handlers.ts`, add before the catch-all `http.all('*'
   http.get('/api/transactions/999/pnl', () => new HttpResponse(null, { status: 404 })),
 ```
 
-- [ ] **Step 2: Write the failing modal tests**
+- [x] **Step 2: Write the failing modal tests**
 
 Create `frontend/src/test/components/SellPnlModal.test.tsx`:
 
@@ -1595,12 +1595,12 @@ describe('SellPnlModal', () => {
 })
 ```
 
-- [ ] **Step 3: Run them to verify they fail**
+- [x] **Step 3: Run them to verify they fail**
 
 Run: `cd frontend && npx vitest run src/test/components/SellPnlModal.test.tsx 2>&1 | tail -20`
 Expected: FAIL — cannot resolve `../../components/SellPnlModal`.
 
-- [ ] **Step 4: Create the modal**
+- [x] **Step 4: Create the modal**
 
 Create `frontend/src/components/SellPnlModal.tsx`. Build it from the parts below. **The quoted strings are load-bearing** — the tests assert them verbatim, and several of them exist because a reviewer found the alternative was wrong, not because they read nicely. Do not paraphrase them.
 
@@ -1636,12 +1636,12 @@ Quantities via `toLocaleString(undefined, { maximumFractionDigits: 6 })`. The se
 - `data-testid="split-note"` when `data.split_applied`: `Buy prices and unit costs are split-adjusted, not the prices as entered.`
 - `data-testid="fx-note"` when `fx_applied`: `Cost basis and proceeds were converted to {currency} at the latest available {asset_currency}→{currency} rate.` Not "at each transaction's date rate" — `get_rate` uses the requested date only as a cache key and returns the last non-null close, so every transaction in a replay converts at effectively the same rate.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cd frontend && npx vitest run src/test/components/SellPnlModal.test.tsx 2>&1 | tail -25`
 Expected: PASS — 8 tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add frontend/src/components/SellPnlModal.tsx frontend/src/test/mocks/handlers.ts frontend/src/test/components/SellPnlModal.test.tsx
