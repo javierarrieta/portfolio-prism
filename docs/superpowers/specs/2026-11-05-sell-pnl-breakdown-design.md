@@ -108,6 +108,14 @@ value, and an empty sum serializes as `"0"` (as `/tax-summary` already does). Co
 decimals to numbers — the frontend does it in `normalizeSellPnl` — so nothing may assert on the
 string form. Tests compare parsed `Decimal`s.
 
+Measured against the pinned toolchain, for the FIFO example further down this document: the engine
+emits `proceeds: "10400.00"`, `cost_basis: "8400.00"`, `realized_pnl: "2000.00"` and an `roi` of
+`0.2380952380952380952380952381` — twenty-eight fractional digits, which is what `formatPercent`
+renders as `+23.8%`. Not the `"10400.0"` the example below prints, and not the `"2000.000"` two
+reviewers predicted; those were derivations, this is a compiled run. The sum of the two per-lot
+P&L values compared equal to the sell total, which is the claim the no-quantisation rule above is
+made to protect.
+
 ```rust
 pub struct LotMatch {
     pub buy_transaction_id: i32,        // the BUY row in the ledger

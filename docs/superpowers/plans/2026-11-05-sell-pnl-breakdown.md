@@ -146,63 +146,14 @@ Expected: compile error — `cannot find module or macro decimal_opt_json`. The 
 
 - [ ] **Step 3: Implement `decimal_opt_json`**
 
-In `backend_rust/src/db_types.rs`, add after the closing brace of `pub mod decimal_json`:
+`decimal_opt_json` is `decimal_json` lifted to `Option<Decimal>`. Write it beside that module, in the file root (not inside `mod tests`), under the same string rules:
 
-```rust
-pub mod decimal_opt_json {
-    use rust_decimal::Decimal;
-    use rust_decimal::prelude::FromPrimitive;
-    use serde::{Deserializer, Serializer};
+- `serialize(&Option<Decimal>, S)`: `None` → `serialize_none()`; `Some(d)` → `serialize_str(&d.to_string())`. Exact string, no `normalize()`, no fixed scale — the same rule `decimal_json` already applies.
+- `deserialize<D>(D) -> Result<Option<Decimal>, D::Error>`: `deserialize_option` with a visitor accepting `null`, a JSON number, and a string parseable by `Decimal::from_str`, rejecting anything else. Reuse `decimal_json`'s existing visitor for the `Some` arm rather than writing a second number/string parser.
 
-    pub fn serialize<S>(d: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match d {
-            Some(v) => serializer.serialize_str(&v.to_string()),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct OptDecimalVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for OptDecimalVisitor {
-            type Value = Option<Decimal>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a string, a number, or null")
-            }
-
-            fn visit_none<E: serde::de::Error>(self) -> Result<Option<Decimal>, E> { Ok(None) }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Option<Decimal>, E> { Ok(None) }
-
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<Decimal>, E> {
-                super::parse_decimal(v)
-                    .map(Some)
-                    .map_err(|_| E::custom(format!("invalid decimal: {v}")))
-            }
-
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Option<Decimal>, E> {
-                Decimal::from_i64(v).map(Some).ok_or_else(|| E::custom("i64 does not fit decimal"))
-            }
-
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Option<Decimal>, E> {
-                Decimal::from_u64(v).map(Some).ok_or_else(|| E::custom("u64 does not fit decimal"))
-            }
-
-            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Option<Decimal>, E> {
-                Decimal::from_f64(v).map(Some).ok_or_else(|| E::custom("f64 does not fit decimal"))
-            }
-        }
-
-        deserializer.deserialize_any(OptDecimalVisitor)
-    }
-}
-```
+> **Possible improvement, deliberately not taken in this plan.** `rust_decimal` ships an equivalent: `rust_decimal::serde::str_option`. (The name the review cited, `option_str`, does not exist — checked against the locked `rust_decimal 1.42.1`.) Two caveats, both verified against the vendored source rather than assumed: it is gated behind `#[cfg(feature = "serde-with-str")]`, and `Cargo.toml:19` enables only `features = ["serde"]`; and the project already hand-writes `decimal_json` for the non-optional case, so a hand-written `decimal_opt_json` is house style, not reinvention.
+>
+> To take it later: enable `features = ["serde", "serde-with-str"]`, swap the `with` attribute on `roi`, delete this module and its four `optional_decimal_*` tests, and confirm those four are the only tests that disappear. `serde-with-str` only adds the `with` modules — unlike `serde-str` it does not change the blanket `Decimal` impl — so existing serialization is unaffected.
 
 - [ ] **Step 4: Run them to verify they pass**
 
@@ -287,96 +238,12 @@ Expected: compile error — `cannot find struct LotMatch` / `SellBreakdown` / `S
 
 - [ ] **Step 7: Implement the schemas**
 
-In `backend_rust/src/schemas.rs`, add after the `AssetTaxSummary` struct:
+Add three `#[derive(Debug, Serialize, Deserialize, ToSchema)]` structs after `AssetTaxSummary`, with exactly the fields listed in **Interfaces** above and the field comments from the spec's *New schemas*. Only four things are worth writing down:
 
-```rust
-// --- Sell P&L breakdown ---
-// One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
-// split-adjusted and expressed in the portfolio base currency; `unit_cost`
-// additionally carries the amortised buy fee.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct LotMatch {
-    pub buy_transaction_id: i32,
-    pub buy_date: DateTime<Utc>,
-    #[serde(with = "decimal_json")]
-    pub buy_price: Decimal,
-    #[serde(with = "decimal_json")]
-    pub unit_cost: Decimal,
-    #[serde(with = "decimal_json")]
-    pub matched_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub lot_qty_before_match: Decimal,
-    #[serde(with = "decimal_json")]
-    pub cost_basis: Decimal,
-    #[serde(with = "decimal_json")]
-    pub proceeds: Decimal,
-    #[serde(with = "decimal_json")]
-    pub pnl: Decimal,
-    pub holding_days: i64,
-    /// "SHORT" | "LONG", populated for the HYBRID strategy only; null otherwise.
-    pub term: Option<String>,
-}
-
-/// One sell and every lot it consumed, in consumption order.
-/// `unmatched_qty` is the quantity sold with no buy lot behind it, so it
-/// carries no cost basis and contributes nothing to `realized_pnl`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SellBreakdown {
-    pub sell_transaction_id: i32,
-    pub sell_date: DateTime<Utc>,
-    #[serde(with = "decimal_json")]
-    pub sold_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub matched_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub unmatched_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub proceeds: Decimal,
-    #[serde(with = "decimal_json")]
-    pub cost_basis: Decimal,
-    #[serde(with = "decimal_json")]
-    pub realized_pnl: Decimal,
-    pub matches: Vec<LotMatch>,
-}
-
-/// Endpoint payload: the breakdown plus the context needed to read it honestly
-/// (which strategy produced it, which currency the money is in, whether FX was
-/// applied). `price`/`fee` are the raw as-entered values in `asset_currency`;
-/// every other money field is in `currency`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SellPnlResponse {
-    pub transaction_id: i32,
-    pub asset_id: i32,
-    pub symbol: String,
-    pub asset_type: String,
-    pub strategy: String,
-    pub threshold_days: i64,
-    pub currency: String,
-    pub asset_currency: String,
-    pub fx_applied: bool,
-    pub sell_date: DateTime<Utc>,
-    #[serde(with = "decimal_json")]
-    pub sold_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub price: Decimal,
-    #[serde(with = "decimal_json")]
-    pub fee: Decimal,
-    #[serde(with = "decimal_json")]
-    pub proceeds: Decimal,
-    #[serde(with = "decimal_json")]
-    pub cost_basis: Decimal,
-    #[serde(with = "decimal_json")]
-    pub realized_pnl: Decimal,
-    /// Null when cost basis is zero — dividing there would invent a number.
-    #[serde(with = "decimal_opt_json")]
-    pub roi: Option<Decimal>,
-    #[serde(with = "decimal_json")]
-    pub matched_qty: Decimal,
-    #[serde(with = "decimal_json")]
-    pub unmatched_qty: Decimal,
-    pub matches: Vec<LotMatch>,
-}
-```
+- every `Decimal` field carries `#[serde(with = "decimal_json")]`; `roi` alone carries `#[serde(with = "decimal_opt_json")]`.
+- `term: Option<String>` on `LotMatch` — `"SHORT"` / `"LONG"`, populated for HYBRID only, `null` otherwise.
+- `SellBreakdown` is the engine's internal type and is **not** registered in OpenAPI; `SellPnlResponse` and `LotMatch` are.
+- `SellPnlResponse` flattens the breakdown next to its context fields. There is no nested `breakdown` key on the wire, and the sell's id is `transaction_id` there, not `sell_transaction_id`.
 
 Also extend the `use` line at the top of `schemas.rs` so `decimal_opt_json` is in scope:
 
@@ -384,7 +251,7 @@ Also extend the `use` line at the top of `schemas.rs` so `decimal_opt_json` is i
 use crate::db_types::{decimal_json, decimal_opt_json};
 ```
 
-If `cargo check` reports that utoipa cannot derive `ToSchema` for `Option<Decimal>`, add `#[schema(value_type = Option<String>)]` directly above the `pub roi` line and re-run. Do not change the runtime type.
+No utoipa workaround is needed for `Option<Decimal>`. Verified by compiling a `ToSchema` struct carrying `#[serde(with = …)] roi: Option<Decimal>` against the pinned utoipa 4.2.3 — it derives cleanly, and the generated schema is a nullable string. Do not add `#[schema(value_type = …)]` speculatively; if a future utoipa bump does complain, the error names the field and the fix goes directly above `pub roi` without changing the runtime type.
 
 - [ ] **Step 8: Run the whole backend test suite to verify nothing regressed**
 
@@ -453,13 +320,13 @@ Add this associated function as the first item in `impl TaxLotEngine`:
 
 - [ ] **Step 3: Move the loop body into `replay()`**
 
-Add this associated function after `sorted_transactions`. It is the loop moved verbatim, with three deliberate changes marked in comments:
+Add this associated function after `sorted_transactions`. **Move the body of the existing `for tx in sorted_txs { ... }` loop in `calculate_lots` into it — do not retype it.** The sort order, the split rescaling, the fee amortisation, the FX conversion and the HYBRID bucketing are already correct there; the entire point of the refactor is that they come across unchanged.
 
 ```rust
-    /// Single source of truth for lot matching. Both public entry points call
-    /// this, which is what makes per-sell realized P&L reconcile with the
-    /// asset-level total: `realized_pnl` is *derived* from the returned
-    /// breakdowns by the caller, never accumulated on a separate path.
+    /// Single source of truth for lot matching. Both public entry points call this,
+    /// which is what makes per-sell realized P&L reconcile with the asset-level
+    /// total: `realized_pnl` is *derived* from the returned breakdowns by the
+    /// caller, never accumulated on a separate path.
     async fn replay(
         sorted_txs: &[Transaction],
         currency_service: &CurrencyService,
@@ -467,179 +334,25 @@ Add this associated function after `sorted_transactions`. It is the loop moved v
         base_currency: &str,
         strategy: &str,
         hybrid_threshold_days: i64,
-    ) -> Result<(Vec<InternalLot>, Vec<SellBreakdown>)> {
-        let mut buy_lots: Vec<InternalLot> = Vec::new();
-        let mut breakdowns: Vec<SellBreakdown> = Vec::new();
-
-        for tx in sorted_txs {
-            let tx_rate = if asset_currency != base_currency {
-                currency_service.get_rate(asset_currency, base_currency, tx.date).await?
-            } else {
-                Decimal::ONE
-            };
-
-            let tx_qty = crate::db_types::str_to_decimal(&tx.quantity);
-            let tx_price = crate::db_types::str_to_decimal(&tx.price);
-            let tx_fee = crate::db_types::str_to_decimal(&tx.fee);
-
-            if tx.r#type.to_uppercase() == "BUY" {
-                let unit_cost_asset = if tx_qty > Decimal::ZERO {
-                    (tx_qty * tx_price + tx_fee) / tx_qty
-                } else {
-                    tx_price
-                };
-                let unit_cost_base = unit_cost_asset * tx_rate;
-                buy_lots.push(InternalLot {
-                    source_tx_id: tx.id,
-                    date: tx.date,
-                    price: tx_price * tx_rate,
-                    qty: tx_qty,
-                    unit_cost: unit_cost_base,
-                });
-            } else if tx.r#type.to_uppercase() == "SELL" {
-                let mut qty_to_sell = tx_qty;
-                let sell_unit_proceeds_asset = if tx_qty > Decimal::ZERO {
-                    (tx_qty * tx_price - tx_fee) / tx_qty
-                } else {
-                    tx_price
-                };
-                let sell_unit_proceeds_base = sell_unit_proceeds_asset * tx_rate;
-
-                let mut eligible_indices: Vec<usize> = buy_lots.iter().enumerate()
-                    .filter(|(_, lot)| lot.date <= tx.date && lot.qty > Decimal::ZERO)
-                    .map(|(i, _)| i)
-                    .collect();
-
-                // CHANGE 1: the old early `continue` on an empty eligible set is
-                // gone. A sell with nothing to match against must still produce a
-                // breakdown (all of it unmatched) so the UI can say so.
-                match strategy.to_uppercase().as_str() {
-                    "FIFO" => {
-                        eligible_indices.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
-                    }
-                    "LIFO" => {
-                        eligible_indices.sort_by(|&a, &b| buy_lots[b].date.cmp(&buy_lots[a].date));
-                    }
-                    "HYBRID" => {
-                        let mut short_term = Vec::new();
-                        let mut long_term = Vec::new();
-                        for &idx in &eligible_indices {
-                            let lot = &buy_lots[idx];
-                            let age = tx.date.signed_duration_since(lot.date).num_days();
-                            if age >= 0 && age <= hybrid_threshold_days {
-                                short_term.push(idx);
-                            } else {
-                                long_term.push(idx);
-                            }
-                        }
-                        short_term.sort_by(|&a, &b| buy_lots[b].date.cmp(&buy_lots[a].date));
-                        long_term.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
-                        eligible_indices = [short_term, long_term].concat();
-                    }
-                    _ => {
-                        eligible_indices.sort_by(|&a, &b| buy_lots[a].date.cmp(&buy_lots[b].date));
-                    }
-                }
-
-                let mut sell_cost_basis = Decimal::ZERO;
-                let mut sell_proceeds = Decimal::ZERO;
-
-                for idx in eligible_indices {
-                    if qty_to_sell <= Decimal::ZERO {
-                        break;
-                    }
-                    let lot = &mut buy_lots[idx];
-                    let matched_qty = qty_to_sell.min(lot.qty);
-                    let cost_basis = matched_qty * lot.unit_cost;
-                    let proceeds = matched_qty * sell_unit_proceeds_base;
-
-                    // CHANGE 2: the old line here was
-                    // `realized_pnl += proceeds - cost_basis;`. There is no
-                    // engine-wide accumulator any more — the per-sell totals are
-                    // accumulated instead, and the asset total is derived from
-                    // them in calculate_lots.
-                    sell_cost_basis += cost_basis;
-                    sell_proceeds += proceeds;
-
-                    lot.qty -= matched_qty;
-                    qty_to_sell -= matched_qty;
-                }
-
-                // CHANGE 3: every sell now produces a breakdown, including one
-                // with nothing eligible to match. `matches` stays empty until
-                // Step 6 fills in the per-lot detail; the totals are already
-                // correct, so the existing tests stay green at this point.
-                breakdowns.push(SellBreakdown {
-                    sell_transaction_id: tx.id,
-                    sell_date: tx.date,
-                    sold_qty: tx_qty,
-                    matched_qty: tx_qty - qty_to_sell,
-                    unmatched_qty: qty_to_sell,
-                    proceeds: sell_proceeds,
-                    cost_basis: sell_cost_basis,
-                    realized_pnl: sell_proceeds - sell_cost_basis,
-                    matches: vec![],
-                });
-            } else if tx.r#type.to_uppercase() == "SPLIT" {
-                // Split ratio = quantity : price (shares after : shares before).
-                // Existing lots scale in quantity and divide in unit cost so total
-                // cost basis is unchanged and no P&L is realized.
-                let denominator = tx_price;
-                if tx_qty > Decimal::ZERO && denominator > Decimal::ZERO {
-                    let ratio = tx_qty / denominator;
-                    for lot in buy_lots.iter_mut() {
-                        lot.qty *= ratio;
-                        lot.unit_cost /= ratio;
-                        lot.price /= ratio;
-                    }
-                }
-            }
-        }
-
-        Ok((buy_lots, breakdowns))
-    }
+    ) -> Result<(Vec<InternalLot>, Vec<SellBreakdown>)>
 ```
+
+Exactly **three** changes to the moved loop, and nothing else:
+
+1. **Delete the early `continue` for an empty eligible set** (`tax_engine.rs:286-288` today). A sell with nothing to match against must still produce a breakdown, all of it unmatched, so the UI can say so.
+2. **Delete the engine-wide `realized_pnl` accumulator.** Accumulate `sell_cost_basis` and `sell_proceeds` per sell instead; the asset total is derived from the breakdowns in Step 4. Keeping the accumulator *and* the breakdowns leaves two independent paths and makes the doc comment above false — this is the one thing that must not be simplified back.
+3. **Push a `SellBreakdown` for every sell**, after the consumption loop, with `matched_qty = tx_qty - qty_to_sell`, `unmatched_qty = qty_to_sell` (the leftover that today vanishes), `realized_pnl = sell_proceeds - sell_cost_basis`, and `matches: vec![]`. Step 6 fills in the per-lot detail; the totals are already correct at this point, which is why the 14 existing tests stay green before any per-lot data exists.
+
+`InternalLot` gains `source_tx_id: i32`, set from `tx.id` in the BUY branch. Without it two buys on the same date at the same price are indistinguishable and the view cannot say which purchase a cost basis came from.
 
 - [ ] **Step 4: Rewrite `calculate_lots` to call `replay`**
 
-Replace everything from `pub async fn calculate_lots(` through the end of its `for tx in sorted_txs { ... }` loop with:
+Keep the `calculate_lots` signature byte-identical — nine parameters, `symbol` and `asset_type` first — and replace everything from it through the end of its `for tx in sorted_txs { ... }` loop with four steps:
 
-```rust
-    pub async fn calculate_lots(
-        symbol: &str,
-        asset_type: &str,
-        transactions: &[Transaction],
-        current_price: Decimal,
-        asset_currency: &str,
-        base_currency: &str,
-        currency_service: &CurrencyService,
-        strategy: &str,
-        hybrid_threshold_days: i64,
-    ) -> Result<AssetTaxSummary> {
-        let sorted_txs = Self::sorted_transactions(transactions);
-
-        let current_price_base = if asset_currency != base_currency {
-            let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
-            let rate = currency_service.get_rate(asset_currency, base_currency, latest_date).await?;
-            current_price * rate
-        } else {
-            current_price
-        };
-
-        let (buy_lots, breakdowns) = Self::replay(
-            &sorted_txs,
-            currency_service,
-            asset_currency,
-            base_currency,
-            strategy,
-            hybrid_threshold_days,
-        )
-        .await?;
-
-        // Derived, not accumulated: the asset total is the sum of the per-sell
-        // totals by construction, so the two can never drift apart.
-        let realized_pnl: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();
-```
+1. `let sorted_txs = Self::sorted_transactions(transactions);`
+2. Keep the existing `current_price_base` block exactly as it is (current price × rate at the last transaction's date, `Utc::now` fallback). It is the one place a current quote is legitimately involved, and it belongs to `calculate_lots`, not to `replay`.
+3. `let (buy_lots, breakdowns) = Self::replay(&sorted_txs, currency_service, asset_currency, base_currency, strategy, hybrid_threshold_days).await?;`
+4. Derive the total instead of accumulating it: `let realized_pnl: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();` — the old `let mut realized_pnl = Decimal::ZERO;` and the `realized_pnl +=` inside the loop are gone.
 
 Leave the rest of `calculate_lots` (the `let mut open_lots = Vec::new();` block through `Ok(AssetTaxSummary { ... })`) exactly as it is. The only change it needs is how `realized_pnl` is obtained — the old `let mut realized_pnl = Decimal::ZERO;` accumulator and the `realized_pnl +=` inside the loop are gone, replaced by the derived sum shown above. Extend the `use` at the top of the file:
 
@@ -647,7 +360,7 @@ Leave the rest of `calculate_lots` (the `let mut open_lots = Vec::new();` block 
 use crate::schemas::{AssetTaxSummary, LotMatch, SellBreakdown, TaxLot};
 ```
 
-`LotMatch` is unused until Task 3 — that is fine for `cargo test` (a warning at most), but if `cargo clippy -- -D warnings` is part of your gate, add `#[allow(unused_imports)]` to that `use` line and remove it in Task 3.
+`LotMatch` is unused until Task 3. That is a warning at most: CI (`.github/workflows/ci.yml:21`) runs `cargo test` and nothing else, and this repository has no clippy step. Do not add `#[allow(unused_imports)]` for a gate that does not exist — Task 3 consumes the import two commits later.
 
 - [ ] **Step 5: Run the existing engine tests — they must pass unmodified**
 
@@ -1228,7 +941,7 @@ Expected: FAIL — **6 of the 7 tests**, not all 7. `test_sell_pnl_unknown_trans
 
 - [ ] **Step 4: Implement the handler**
 
-Append to `backend_rust/src/api_routes/analytics.rs`:
+Append to `backend_rust/src/api_routes/analytics.rs`. Route and signature:
 
 ```rust
 #[utoipa::path(
@@ -1252,93 +965,18 @@ pub async fn get_transaction_sell_pnl(
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
-) -> Result<Json<SellPnlResponse>, Status> {
-    let tx = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
-
-    if tx.r#type.to_uppercase() != "SELL" {
-        return Err(Status::BadRequest);
-    }
-
-    // Base currency comes from the portfolio that owns the asset, not from a
-    // path parameter, so the answer cannot disagree with the portfolio on screen.
-    let asset = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = ?")
-        .bind(tx.asset_id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
-
-    let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(asset.portfolio_id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
-
-    let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
-        .bind(asset.id)
-        .fetch_all(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let strategy_val = match strategy.unwrap_or_default().to_uppercase().as_str() {
-        "LIFO" => "LIFO",
-        "HYBRID" => "HYBRID",
-        _ => "FIFO",
-    }
-    .to_string();
-    let threshold_val = threshold_days.unwrap_or(30);
-    let fx_applied = asset.currency != portfolio.base_currency;
-
-    // No get_price call: realized P&L depends on nothing but the trade history.
-    let breakdown = TaxLotEngine::sell_breakdown(
-        id,
-        &transactions,
-        &asset.currency,
-        &portfolio.base_currency,
-        currency_service,
-        &strategy_val,
-        threshold_val,
-    )
-    .await
-    .map_err(|_| Status::InternalServerError)?
-    .ok_or(Status::NotFound)?;
-
-    let roi = if breakdown.cost_basis > Decimal::ZERO {
-        Some(breakdown.realized_pnl / breakdown.cost_basis)
-    } else {
-        None
-    };
-
-    Ok(Json(SellPnlResponse {
-        transaction_id: tx.id,
-        asset_id: asset.id,
-        symbol: asset.symbol,
-        asset_type: asset.asset_type,
-        strategy: strategy_val,
-        threshold_days: threshold_val,
-        currency: portfolio.base_currency,
-        asset_currency: asset.currency,
-        fx_applied,
-        sell_date: breakdown.sell_date,
-        sold_qty: breakdown.sold_qty,
-        price: crate::db_types::str_to_decimal(&tx.price),
-        fee: crate::db_types::str_to_decimal(&tx.fee),
-        proceeds: breakdown.proceeds,
-        cost_basis: breakdown.cost_basis,
-        realized_pnl: breakdown.realized_pnl,
-        roi,
-        matched_qty: breakdown.matched_qty,
-        unmatched_qty: breakdown.unmatched_qty,
-        matches: breakdown.matches,
-    }))
-}
+) -> Result<Json<SellPnlResponse>, Status>
 ```
+
+The body is seven steps, each following the pattern already in `get_tax_summary` in the same file — copy its error-handling idiom (`map_err(|_| Status::InternalServerError)`) rather than inventing one:
+
+1. `SELECT * FROM transactions WHERE id = ?` via `fetch_optional`; `None` → `Status::NotFound`.
+2. `if tx.r#type.to_uppercase() != "SELL" { return Err(Status::BadRequest); }`
+3. Load the asset by `tx.asset_id`, then its portfolio by `asset.portfolio_id`; either missing → `NotFound`. The base currency comes from the portfolio that owns the asset, never from a path parameter, so the answer cannot disagree with the portfolio on screen.
+4. Normalize the strategy **once**: `"LIFO"` and `"HYBRID"` pass through upper-cased, anything else — including absent — becomes `"FIFO"`. Use that single value for both the engine call and the response, so the modal can never name a method it did not use. `threshold_days.unwrap_or(30)`. `fx_applied = asset.currency != portfolio.base_currency`.
+5. `SELECT * FROM transactions WHERE asset_id = ?` — the same query and the same scope `get_tax_summary` uses — then `TaxLotEngine::sell_breakdown(&tx.id, &transactions, &asset.currency, &portfolio.base_currency, currency_service, &strategy_val, threshold_val)`. `None` → `NotFound`. **No `get_price` call anywhere in this function**; `get_rate` inside the engine is expected and fine.
+6. `roi = if breakdown.cost_basis > Decimal::ZERO { Some(breakdown.realized_pnl / breakdown.cost_basis) } else { None }` — `Decimal` division, never `f64`.
+7. Build `SellPnlResponse` from the breakdown plus context. `price` and `fee` are `str_to_decimal(&tx.price)` / `str_to_decimal(&tx.fee)` — as entered, in asset currency. Everything else comes straight from the breakdown.
 
 Extend the `use` block at the top of `analytics.rs`:
 
@@ -1417,7 +1055,7 @@ generated `api.d.ts`.
 - [ ] **Step 2: Verify it compiles and the spec serves the new route**
 
 Run: `cd backend_rust && cargo check 2>&1 | tail -10`
-Expected: no errors. If utoipa rejects a type, the error names the field — apply the `#[schema(value_type = ...)]` contingency noted in Task 1 Step 7.
+Expected: no errors. `Option<Decimal>` derives `ToSchema` without help (verified against utoipa 4.2.3 in Task 1), so there is no contingency to apply here.
 
 - [ ] **Step 3: Regenerate the committed spec**
 
@@ -1609,57 +1247,13 @@ import type {
 } from '../types';
 ```
 
-Append at the end of the file:
+Append `normalizeSellPnl(t: unknown): SellPnlBreakdown` to the end of `decimal.ts`, built from the helpers already in that file (`asRecord`, `str`, `num`, `toNumber`, `DecimalLike`, `UnknownRecord`). Rules, not code:
 
-```ts
-const optNum = (r: UnknownRecord, key: string): number | null =>
-  r[key] === null || r[key] === undefined ? null : toNumber(r[key] as DecimalLike);
-
-const termOf = (v: unknown): LotMatch['term'] =>
-  v === 'SHORT' || v === 'LONG' ? v : null;
-
-export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
-  const r = asRecord(t);
-  const matches = Array.isArray(r.matches) ? (r.matches as unknown[]) : [];
-  return {
-    transaction_id: r.transaction_id as number,
-    asset_id: r.asset_id as number,
-    symbol: str(r, 'symbol'),
-    asset_type: str(r, 'asset_type'),
-    strategy: str(r, 'strategy'),
-    threshold_days: (r.threshold_days as number) ?? 0,
-    currency: str(r, 'currency') || 'USD',
-    asset_currency: str(r, 'asset_currency') || 'USD',
-    fx_applied: r.fx_applied === true,
-    sell_date: str(r, 'sell_date'),
-    sold_qty: num(r, 'sold_qty'),
-    price: num(r, 'price'),
-    fee: num(r, 'fee'),
-    proceeds: num(r, 'proceeds'),
-    cost_basis: num(r, 'cost_basis'),
-    realized_pnl: num(r, 'realized_pnl'),
-    roi: optNum(r, 'roi'),
-    matched_qty: num(r, 'matched_qty'),
-    unmatched_qty: num(r, 'unmatched_qty'),
-    matches: matches.map((m: unknown) => {
-      const mr = asRecord(m);
-      return {
-        buy_transaction_id: mr.buy_transaction_id as number,
-        buy_date: str(mr, 'buy_date'),
-        buy_price: num(mr, 'buy_price'),
-        unit_cost: num(mr, 'unit_cost'),
-        matched_qty: num(mr, 'matched_qty'),
-        lot_qty_before_match: num(mr, 'lot_qty_before_match'),
-        cost_basis: num(mr, 'cost_basis'),
-        proceeds: num(mr, 'proceeds'),
-        pnl: num(mr, 'pnl'),
-        holding_days: (mr.holding_days as number) ?? 0,
-        term: termOf(mr.term),
-      };
-    }),
-  };
-};
-```
+- two small local helpers: `optNum` (`null`/`undefined` → `null`, else `toNumber`) and `termOf` (only the literals `'SHORT'` and `'LONG'` survive; anything else → `null`).
+- every decimal-ish field goes through `num`; `roi` through `optNum`; `transaction_id`, `asset_id`, `threshold_days` and `holding_days` are plain numbers with `?? 0` fallbacks.
+- `currency` and `asset_currency` fall back to `'USD'`; `fx_applied` is `=== true`, never truthy-coerced.
+- `matches` is `Array.isArray(r.matches) ? … : []`, each element passed through `asRecord`. A malformed payload must produce a zeroed breakdown with `matches: []` and never throw — that is what the "survives a malformed payload" test pins.
+- do not sort `matches`. The payload is already in consumption order and sorting here would hide the engine's ordering from the tests that assert it.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1765,109 +1359,16 @@ Run: `cd frontend && npx vitest run src/test/components/TransactionLedger.test.t
 Expected: FAIL — cannot resolve `../../components/TransactionLedger`.
 
 - [ ] **Step 3: Create the component**
+Create `frontend/src/components/TransactionLedger.tsx`. **Copy the table markup out of `App.tsx`** — the block rendered under `{activeTab === 'ledger' && ( … )}`, the one whose heading is `Transaction History`. Locate it by that heading, not by a line number; `App.tsx:421-475` is where it sits today and any edit above it moves that range. Props are in **Interfaces** above; `formatCurrency` comes from `../utils/formatters`, `Trash2`/`TrendingUp` from `lucide-react`.
 
-Create `frontend/src/components/TransactionLedger.tsx`. The table markup is the block currently inlined at `frontend/src/App.tsx:421-475`, carried over with **three** deliberate additions beyond the SELL affordance, all of them behaviour changes and none of them accidental:
+Four changes to the copied markup, all of them behaviour, none of them accidental:
 
 1. the delete button gains `title="Delete transaction"` — the new test locates it by that title;
-2. the delete handler becomes `(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }` so a delete on a SELL row does not also open the modal;
-3. SELL rows become clickable and gain the P&L button.
+2. the delete handler becomes `(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }`, so deleting from a SELL row does not also open the modal;
+3. a SELL row gets `onClick={() => onSelectSell(tx.id)}` and `cursor: pointer`, and the row gains a `TrendingUp` button with `aria-label="View realized P&L"` whose own handler calls `stopPropagation()` before `onSelectSell(tx.id)`;
+4. BUY and SPLIT rows get no click handler and no button — the absence of the affordance is what tells the user this row has no realized P&L to show.
 
-Do not describe this step as a verbatim move when reviewing it — diff it against the original block.
-
-```tsx
-import { Trash2, TrendingUp } from 'lucide-react';
-import { formatCurrency } from '../utils/formatters';
-import type { Asset, Transaction } from '../types';
-
-interface TransactionLedgerProps {
-  transactions: Transaction[];
-  assets: Asset[];
-  onDeleteTransaction: (txId: number) => Promise<void>;
-  onSelectSell: (txId: number) => void;
-}
-
-export default function TransactionLedger({
-  transactions,
-  assets,
-  onDeleteTransaction,
-  onSelectSell,
-}: TransactionLedgerProps) {
-  return (
-    <div className="glass-card" style={{ padding: '24px' }}>
-      <h3 style={{ marginBottom: '20px' }}>Transaction History</h3>
-      {transactions.length === 0 ? (
-        <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '24px 0' }}>
-          No transactions logged. Go to the "Holdings & Tax lots" tab to log buy/sell transactions.
-        </p>
-      ) : (
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Date & Time</th>
-              <th>Asset Symbol</th>
-              <th>Type</th>
-              <th>Quantity</th>
-              <th>Price</th>
-              <th>Fee</th>
-              <th>Total Cost/Proceeds</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {transactions.map((tx) => {
-              const asset = assets.find(a => a.id === tx.asset_id);
-              const isSplit = tx.type === 'SPLIT';
-              const isSell = tx.type === 'SELL';
-              const cost = tx.quantity * tx.price;
-              const total = isSplit ? null : (tx.type === 'BUY' ? (cost + tx.fee) : (cost - tx.fee));
-              return (
-                <tr
-                  key={tx.id}
-                  onClick={isSell ? () => onSelectSell(tx.id) : undefined}
-                  style={isSell ? { cursor: 'pointer' } : undefined}
-                >
-                  <td>{new Date(tx.date).toLocaleString()}</td>
-                  <td style={{ fontWeight: 600 }}>{asset ? asset.symbol : 'Unknown'}</td>
-                  <td>
-                    <span style={{ color: isSplit ? 'var(--text-secondary)' : (tx.type === 'BUY' ? 'var(--color-success)' : 'var(--color-danger)'), fontWeight: 700 }}>
-                      {tx.type}
-                    </span>
-                  </td>
-                  <td>{isSplit ? `${tx.quantity} : ${tx.price}` : tx.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
-                  <td>{isSplit ? '—' : formatCurrency(tx.price, asset?.currency || 'USD')}</td>
-                  <td>{isSplit ? '—' : formatCurrency(tx.fee, asset?.currency || 'USD')}</td>
-                  <td style={{ fontWeight: 600 }}>{isSplit ? '—' : formatCurrency(total as number, asset?.currency || 'USD')}</td>
-                  <td>
-                    {/* Explicit focusable control: a row that is only clickable
-                        is undiscoverable and unreachable by keyboard. */}
-                    {isSell && (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onSelectSell(tx.id); }}
-                        title="View realized P&L"
-                        aria-label={`View realized P&L for ${asset?.symbol ?? 'asset'} sell`}
-                        style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--color-primary)' }}
-                      >
-                        <TrendingUp size={16} />
-                      </button>
-                    )}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); void onDeleteTransaction(tx.id); }}
-                      title="Delete transaction"
-                      style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-    </div>
-  );
-}
-```
+Everything else must come across unchanged: column order, the `2 : 1` and `—` cells, the `--text-secondary` colours, the empty-state paragraph. `App.test.tsx` asserts on those. Do not describe this step as a verbatim move when reviewing it — diff it against the original block.
 
 - [ ] **Step 4: Run the tests**
 
@@ -2089,179 +1590,39 @@ Expected: FAIL — cannot resolve `../../components/SellPnlModal`.
 
 - [ ] **Step 4: Create the modal**
 
-Create `frontend/src/components/SellPnlModal.tsx`:
+Create `frontend/src/components/SellPnlModal.tsx`. Build it from the parts below. **The quoted strings are load-bearing** — the tests assert them verbatim, and several of them exist because a reviewer found the alternative was wrong, not because they read nicely. Do not paraphrase them.
 
-```tsx
-import { useEffect, useState } from 'react';
-import { AlertTriangle, Info, Loader2, X } from 'lucide-react';
-import { formatCurrency, formatPercent } from '../utils/formatters';
-import { normalizeSellPnl } from '../utils/decimal';
-import type { SellPnlBreakdown } from '../types';
+**Imports:** `useEffect`/`useState` from react; `AlertTriangle`, `Info`, `Loader2`, `X` from `lucide-react`; `formatCurrency`, `formatPercent` from `../utils/formatters`; `normalizeSellPnl` from `../utils/decimal`; `SellPnlBreakdown` from `../types`. Local helper `pnlColor = (v: number) => (v >= 0 ? 'var(--color-success)' : 'var(--color-danger)')`.
 
-interface SellPnlModalProps {
-  transactionId: number;
-  strategy: string;
-  thresholdDays: number;
-  /** True when a SPLIT for this asset is dated on or before the sell. */
-  splitBeforeSell: boolean;
-  onClose: () => void;
-}
+**Props:** `{ transactionId: number; strategy: string; thresholdDays: number; splitBeforeSell: boolean; onClose: () => void }`.
 
-const pnlColor = (v: number) => (v >= 0 ? 'var(--color-success)' : 'var(--color-danger)');
+**Fetch.** `useState` for `data` / `loading` / `error`, plus a `retryKey` counter. One `useEffect` keyed on `[transactionId, strategy, thresholdDays, retryKey]` fetching `` `/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}` `` and piping the JSON through `normalizeSellPnl`. Keying on strategy and threshold is what makes the modal refetch when the Holdings tab changes strategy — that is the whole point, not an accident to prune.
 
-export default function SellPnlModal({
-  transactionId,
-  strategy,
-  thresholdDays,
-  splitBeforeSell,
-  onClose,
-}: SellPnlModalProps) {
-  const [data, setData] = useState<SellPnlBreakdown | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [retryKey, setRetryKey] = useState(0);
+**Overlay.** The existing `position: fixed` + `.glass-card` + `zIndex: 100` pattern from `PortfolioDetail.tsx`; backdrop click and the `X` button both call `onClose()`. `Loader2` + "Loading realized P&L..." while in flight. On failure, `data-testid="modal-error"` with a retry button that bumps `retryKey`.
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    fetch(`/api/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`Failed to load realized P&L (${res.status})`);
-        return res.json();
-      })
-      .then((json) => { if (!cancelled) setData(normalizeSellPnl(json)); })
-      .catch((err) => {
-        if (cancelled) return;
-        setData(null);
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [transactionId, strategy, thresholdDays, retryKey]);
+**Header.** Symbol · sell date · `{sold_qty} sold @ {formatCurrency(price, asset_currency)}` · ` · fee {…}` only when the fee is non-zero · ` · proceeds {formatCurrency(proceeds, currency)}`. When `asset_currency !== currency`, insert `data-testid="as-entered-currency"` reading `price and fee as entered in {asset_currency}` — the payload carries two currencies and the reader must never guess which column is which.
 
-  const showHybridTerm = data?.strategy.toUpperCase() === 'HYBRID';
+**Realized line.** `formatCurrency(realized_pnl, currency)` in `pnlColor`; `data-testid="roi"` rendering `—` when `roi === null` else `formatPercent(roi)`; `data-testid="strategy-note"` reading `realized · {strategy}` plus ` (threshold {threshold_days}d)` only when the strategy is HYBRID.
 
-  return (
-    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }}>
-      <div className="glass-card" style={{ padding: '32px', width: '760px', maxWidth: '92vw', background: '#121929' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
-          <h3>Sell P&L {data ? `— ${data.symbol}` : ''}</h3>
-          <button onClick={onClose} aria-label="Close" style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-            <X size={18} />
-          </button>
-        </div>
+**`data-testid="unmatched-banner"`** when `unmatched_qty > 0` (amber, `AlertTriangle`):
 
-        {loading && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '24px 0', color: 'var(--text-secondary)' }}>
-            <Loader2 size={18} className="animate-spin" style={{ color: 'var(--color-primary)' }} /> Loading realized P&L...
-          </div>
-        )}
+> `{unmatched_qty} of {sold_qty} units had no buy lot on or before this date. Neither their cost basis nor their proceeds are included in this figure.`
 
-        {error && (
-          <div data-testid="modal-error" style={{ padding: '16px', borderRadius: '8px', background: 'var(--color-danger-glow)', border: '1px solid rgba(239,68,68,0.2)', color: 'var(--color-danger)', marginBottom: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-              <AlertTriangle size={16} /> {error}
-            </div>
-            <button onClick={() => setRetryKey(k => k + 1)} className="btn btn-secondary">Retry</button>
-          </div>
-        )}
+Quantities via `toLocaleString(undefined, { maximumFractionDigits: 6 })`. The sentence deliberately makes no claim about the figure being too high or too low — the engine drops unmatched units from both sides, so it is simply incomplete.
 
-        {!loading && !error && data && (
-          <>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: '4px' }}>
-              {new Date(data.sell_date).toLocaleString()} · {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} sold
-              @ {formatCurrency(data.price, data.asset_currency)}
-              {data.fee ? ` · fee ${formatCurrency(data.fee, data.asset_currency)}` : ''}
-              {data.asset_currency !== data.currency && (
-                <span data-testid="as-entered-currency" style={{ color: 'var(--text-muted)' }}>
-                  {' '}price and fee as entered in {data.asset_currency}
-                </span>
-              )}
-              {' · '}proceeds {formatCurrency(data.proceeds, data.currency)}
-            </p>
-            <p style={{ marginBottom: '16px' }}>
-              <span style={{ fontWeight: 700, fontSize: '1.25rem', color: pnlColor(data.realized_pnl) }}>
-                {formatCurrency(data.realized_pnl, data.currency)}
-              </span>{' '}
-              <span data-testid="roi" style={{ color: pnlColor(data.realized_pnl) }}>
-                {data.roi === null ? '—' : formatPercent(data.roi)}
-              </span>
-              <span data-testid="strategy-note" style={{ color: 'var(--text-muted)', marginLeft: '8px' }}>realized · {data.strategy}{showHybridTerm ? ` (threshold ${data.threshold_days}d)` : ''}</span>
-            </p>
+**`data-testid="no-lots-note"`** when `matches.length === 0`:
 
-            {data.unmatched_qty > 0 && (
-              <div data-testid="unmatched-banner" style={{ padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(245,158,11,0.35)', background: 'rgba(245,158,11,0.08)', color: 'var(--text-secondary)', marginBottom: '16px', fontSize: '0.875rem' }}>
-                {data.unmatched_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} of{' '}
-                {data.sold_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} units had no buy lot
-                on or before this date. Neither their cost basis nor their proceeds are included in
-                this figure.
-              </div>
-            )}
+> `No buy lots were available to match on or before this date. Realized P&L is {formatCurrency(realized_pnl, currency)} because nothing was matched.`
 
-            {data.matches.length === 0 ? (
-              <p data-testid="no-lots-note" style={{ color: 'var(--text-muted)', padding: '16px 0' }}>
-                No buy lots were available to match on or before this date. Realized P&L is
-                {' '}{formatCurrency(data.realized_pnl, data.currency)} because nothing was matched.
-              </p>
-            ) : (
-              <table className="data-table" style={{ fontSize: '0.875rem' }}>
-                <thead>
-                  <tr>
-                    <th>Buy date</th>
-                    <th>Buy price</th>
-                    <th>Qty from lot</th>
-                    <th>Cost basis</th>
-                    <th>Proceeds</th>
-                    <th>P&L</th>
-                    <th>Held</th>
-                    {showHybridTerm && <th>Term</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.matches.map((m) => (
-                    <tr key={m.buy_transaction_id}>
-                      <td>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
-                      <td>{formatCurrency(m.buy_price, data.currency)}</td>
-                      <td>
-                        {m.matched_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })}
-                        <span style={{ color: 'var(--text-muted)' }}>
-                          {' '}of {m.lot_qty_before_match.toLocaleString(undefined, { maximumFractionDigits: 6 })}
-                        </span>
-                      </td>
-                      <td>{formatCurrency(m.cost_basis, data.currency)}</td>
-                      <td>{formatCurrency(m.proceeds, data.currency)}</td>
-                      <td style={{ color: pnlColor(m.pnl) }}>{formatCurrency(m.pnl, data.currency)}</td>
-                      <td>{m.holding_days}d</td>
-                      {showHybridTerm && <td>{m.term ?? '—'}</td>}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
+"Available", not "existed": lots may have existed and earlier sells already drained them, which the payload cannot distinguish.
 
-            <div style={{ marginTop: '16px', color: 'var(--text-muted)', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Info size={12} /> Attribution follows the {data.strategy} method. A different method would consume different lots.
-              </span>
-              {splitBeforeSell && (
-                <span data-testid="split-note" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Info size={12} /> Buy prices and unit costs are split-adjusted, not the prices as entered.
-                </span>
-              )}
-              {data.fx_applied && (
-                <span data-testid="fx-note" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Info size={12} /> Cost basis and proceeds converted to {data.currency} at each transaction's date rate.
-                </span>
-              )}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-```
+**Matches table**, rendered in the order received — do not sort. Columns: Buy date (`new Date(m.buy_date).toLocaleDateString('en-CA')`; UTC is pinned in `src/test/setup.ts`), Buy price (`formatCurrency(m.buy_price, data.currency)`), Qty from lot (`{m.matched_qty}` then a muted ` of {m.lot_qty_before_match}`), Cost basis, Proceeds, P&L (`formatCurrency(m.pnl, data.currency)` in `pnlColor`), Held (`{m.holding_days}d`), and a Term column only when HYBRID rendering `{m.term ?? '—'}`.
+
+**Footnotes** (muted, `Info` icon, stacked):
+
+- always: `Attribution follows the {strategy} method. A different method would consume different lots.`
+- `data-testid="split-note"` when `splitBeforeSell`: `Buy prices and unit costs are split-adjusted, not the prices as entered.`
+- `data-testid="fx-note"` when `fx_applied`: `Cost basis and proceeds were converted to {currency} at the latest available {asset_currency}→{currency} rate.` Not "at each transaction's date rate" — `get_rate` uses the requested date only as a cache key and returns the last non-null close, so every transaction in a replay converts at effectively the same rate.
 
 - [ ] **Step 5: Run the tests**
 
