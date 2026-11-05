@@ -167,6 +167,9 @@ export default function PortfolioDetail({
             <div style={{ display: 'flex', flexDirection: 'column' }}>
               <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px', fontWeight: 600 }}>TAX ACCOUNTING METHOD</label>
               <select 
+                // The visible label is not associated with this control, so a screen
+                // reader announces the select with no name at all.
+                aria-label="Tax accounting method"
                 value={strategy} 
                 onChange={(e) => setStrategy(e.target.value)} 
                 className="form-control"
