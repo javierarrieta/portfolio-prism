@@ -132,7 +132,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
                   <tr>
                     <th>Buy date</th>
                     <th>Buy price</th>
-                    <th>Qty from lot</th>
+                    <th style={{ whiteSpace: 'nowrap' }}>Qty from lot</th>
                     <th>Cost basis</th>
                     <th>Proceeds</th>
                     <th>P&amp;L</th>
@@ -144,7 +144,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
                   {/* Rendered in payload order: that is the engine's consumption order. */}
                   {data.matches.map((m) => (
                     <tr key={`${m.buy_transaction_id}-${m.buy_date}`}>
-                      <td>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
+                      <td style={{ whiteSpace: 'nowrap' }}>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
                       <td>{formatCurrency(m.buy_price, data.currency)}</td>
                       <td>{qty(m.matched_qty)}<span style={muted}> of {qty(m.lot_qty_before_match)}</span></td>
                       <td>{formatCurrency(m.cost_basis, data.currency)}</td>
