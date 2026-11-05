@@ -106,27 +106,36 @@ try {
   await page.getByRole('button', { name: /realized P&L for AAPL/i }).click()
   await page.getByText(/Sell P&L/).waitFor({ timeout: 10000 })
 
-  const dom = await page.evaluate(() => {
-    const modal = [...document.querySelectorAll('.glass-card')].find((el) => el.textContent.includes('Sell P&L'))
-    if (!modal) throw new Error('modal .glass-card not found')
+  const readModal = () => page.evaluate(() => {
+    const modal = document.querySelector('[role="dialog"]')
+    if (!modal) throw new Error('no [role=dialog] on the page')
+    const headers = [...modal.querySelectorAll('thead th')].map((th) => th.textContent.trim())
+    // Index by header text: a hardcoded r[5] silently reads the wrong column the
+    // moment anyone inserts one.
+    const pnlCol = headers.findIndex((h) => /P&L/i.test(h))
+    const dateCol = headers.findIndex((h) => /Buy Date/i.test(h))
     return {
-      rows: [...modal.querySelectorAll('tbody tr')].map((r) => [...r.querySelectorAll('td')].map((td) => td.textContent.trim())),
+      pnlCol, dateCol,
+      headers,
       realizedShown: [...modal.querySelectorAll('div')].find(
         (d) => /^\$[\d,]+\.\d{2}$/.test(d.textContent.trim()) && getComputedStyle(d).fontWeight === '700',
       )?.textContent.trim(),
       roi: modal.querySelector('[data-testid="roi"]')?.textContent.trim(),
       strategyNote: modal.querySelector('[data-testid="strategy-note"]')?.textContent.trim(),
+      rows: [...modal.querySelectorAll('tbody tr')].map((r) => [...r.querySelectorAll('td')].map((td) => td.textContent.trim())),
       // Wrapping is invisible to textContent -- "2024-01-01" reads the same whether
       // it sits on one line or three. A Range's client rects are per line-box, so
       // more than one means the text is broken across lines. Only a browser can
       // see this; jsdom has no layout engine.
-      dateRects: [...modal.querySelectorAll('tbody tr td:first-child')].map((td) => {
+      dateRects: [...modal.querySelectorAll('tbody tr')].map((tr) => {
+        const td = tr.querySelectorAll('td')[dateCol]
         const r = document.createRange()
         r.selectNodeContents(td)
         return r.getClientRects().length
       }),
     }
   })
+  let dom = await readModal()
   console.log('dom  realized=' + dom.realizedShown + ' roi=' + dom.roi + ' note=' + JSON.stringify(dom.strategyNote))
   console.log('dom  rows=' + JSON.stringify(dom.rows))
 
@@ -138,7 +147,8 @@ try {
   else ok(`modal realized ${dom.realizedShown} matches tax-summary`)
 
   // 2. The per-lot column adds up to it. This is the invariant the feature exists for.
-  const column = dom.rows.map((r) => money(r[5]))
+  if (dom.pnlCol < 0) fail(`no P&L column among ${JSON.stringify(dom.headers)}`)
+  const column = dom.rows.map((r) => money(r[dom.pnlCol]))
   const sum = column.reduce((a, b) => a + b, 0)
   if (dom.rows.length !== truth.lots.length) fail(`modal shows ${dom.rows.length} lot rows, endpoint returned ${truth.lots.length}`)
   if (sum !== truth.realized) fail(`per-lot column ${column.join(' + ')} = ${sum}, not ${truth.realized}`)
@@ -148,9 +158,40 @@ try {
   if (!/realized · FIFO/.test(dom.strategyNote ?? '')) fail(`strategy note unexpected: ${dom.strategyNote}`)
   else ok('strategy note names the method that ran')
 
-  // 4. Dates survive their column. jsdom has no layout, so only a browser sees this.
-  if (dom.dateRects.some((n) => n > 1)) fail(`buy date wraps across ${Math.max(...dom.dateRects)} line boxes -- the column is too narrow`)
-  else ok('buy dates render on one line')
+  // 4. Dates survive their column at every width the layout claims to support.
+  //    Asserting at one viewport only proves the width the test happened to pick.
+  for (const width of [1400, 1100, 900]) {
+    await page.setViewportSize({ width, height: 1000 })
+    const wrapped = (await readModal()).dateRects.filter((n) => n > 1).length
+    if (wrapped) fail(`at ${width}px, ${wrapped} buy date(s) wrap -- column too narrow`)
+    else ok(`buy dates on one line at ${width}px`)
+  }
+  await page.setViewportSize({ width: 1400, height: 1000 })
+  dom = await readModal()
+
+  // 5. Escape closes the modal, and a reopened one reflects the current strategy.
+  //    The backdrop covers the strategy select, so changing strategy with the modal
+  //    open is not something a user can do -- this drives the reachable path:
+  //    close, switch, reopen. A stale memo would show FIFO figures under a LIFO
+  //    label. LIFO on this fixture is 1600 against FIFO's 2000, so it cannot be missed.
+  await page.keyboard.press('Escape')
+  await page.locator('[role="dialog"]').waitFor({ state: 'detached', timeout: 5000 })
+  ok('Escape closed the dialog')
+
+  // The strategy select lives on the Holdings & Tax lots tab, so switching means
+  // leaving the ledger tab and coming back.
+  await page.getByText('Holdings & Tax lots').click()
+  // Locate by the accessible name. filter({ hasText: 'LIFO' }) cannot work: a
+  // select's innerText is only its *selected* option, so it never contains LIFO
+  // until after the click that is trying to find it.
+  await page.getByLabel('Tax accounting method').selectOption('LIFO')
+  await page.getByText('Transaction Ledger').click()
+  await page.getByRole('button', { name: /realized P&L for AAPL/i }).click()
+  await page.getByText(/Sell P&L/).waitFor({ timeout: 10000 })
+  const lifo = await readModal()
+  if (!/realized \u00b7 LIFO/.test(lifo.strategyNote ?? '')) fail(`after reopening, note is ${lifo.strategyNote}`)
+  else if (money(lifo.realizedShown) !== 1600) fail(`after switching to LIFO the modal shows ${lifo.realizedShown}, expected $1,600.00`)
+  else ok(`reopened under LIFO: ${lifo.realizedShown}`)
 
   if (jsErrors.length) fail(jsErrors.join(' | '))
   else ok('no page errors')

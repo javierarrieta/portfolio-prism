@@ -18,11 +18,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 REPO_ROOT="$(cd .. && pwd)"
 WORK="$(mktemp -d)"
 BACKEND_PID=""
+BACKEND_PGID=""
 FRONTEND_PID=""
 
 cleanup() {
   [ -n "$FRONTEND_PID" ] && kill "$FRONTEND_PID" 2>/dev/null
-  [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null
+  # `cargo run` forks the compiled binary, so killing the cargo PID leaves the
+  # binary alive and bound to :8000 -- verified: after `kill $BACKEND_PID` the port
+  # still answered 200. Kill the whole process group instead of pattern-matching a
+  # name, which would also hit a backend the operator runs in another shell.
+  [ -n "$BACKEND_PGID" ] && kill -- -"$BACKEND_PGID" 2>/dev/null
   wait 2>/dev/null
   rm -rf "$WORK"
 }
@@ -74,13 +79,23 @@ wait_for() { # url, label, tries
   return 1
 }
 
+# Fail fast rather than driving someone else's server: this smoke seeds a throwaway
+# database and needs to own both ports.
+curl -s -o /dev/null -m 2 "http://127.0.0.1:8000/" && die "something already answers on :8000 -- stop it first"
+curl -s -o /dev/null -m 2 "$BASE_URL/" && die "something already answers on $BASE_URL -- stop it first"
+
 echo "backend  cargo run (DATABASE_URL=$DATABASE_URL)"
-(cd "$REPO_ROOT/backend_rust" && exec cargo run) > "$WORK/backend.log" 2>&1 &
-BACKEND_PID=$!
+# setsid puts cargo and the binary it spawns in their own process group so cleanup
+# can take both down with one signal.
+(cd "$REPO_ROOT/backend_rust" && exec setsid cargo run) > "$WORK/backend.log" 2>&1 &
+BACKEND_PGID=$!
+BACKEND_PID=$BACKEND_PGID
 wait_for "http://127.0.0.1:8000/" backend 180 || { tail -20 "$WORK/backend.log"; die "backend did not come up"; }
 
 echo "frontend  vite dev"
-(npx vite --port 5173) > "$WORK/vite.log" 2>&1 &
+# --strictPort: vite silently increments the port when 5173 is busy, and BASE_URL
+# would then point at whatever else is listening there.
+(npx vite --port 5173 --strictPort) > "$WORK/vite.log" 2>&1 &
 FRONTEND_PID=$!
 wait_for "$BASE_URL/" frontend 60 || { tail -20 "$WORK/vite.log"; die "vite did not come up"; }
 
