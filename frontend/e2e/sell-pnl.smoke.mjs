@@ -17,6 +17,9 @@
 //   API_URL    default http://127.0.0.1:8000/api
 //   SMOKE_SHOT set to a path to write a screenshot of the open modal
 
+import { readFileSync } from 'node:fs'
+import Papa from 'papaparse'
+
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:5173'
 const API_URL = process.env.API_URL ?? 'http://127.0.0.1:8000/api'
 const CHROMIUM = process.env.CHROMIUM
@@ -192,6 +195,37 @@ try {
   if (!/realized \u00b7 LIFO/.test(lifo.strategyNote ?? '')) fail(`after reopening, note is ${lifo.strategyNote}`)
   else if (money(lifo.realizedShown) !== 1600) fail(`after switching to LIFO the modal shows ${lifo.realizedShown}, expected $1,600.00`)
   else ok(`reopened under LIFO: ${lifo.realizedShown}`)
+
+  // 6. The file the browser actually downloads. The vitest component test cannot reach this
+  //    far: jsdom implements neither URL.createObjectURL nor Blob.text(), so it reads the
+  //    Blob back through FileReader and stops at the bytes. Here the download is real, so
+  //    the anchor, the object URL and the suggested filename are all genuinely exercised.
+  //    The modal is showing LIFO at this point, which is the point: the export must reflect
+  //    the payload on screen, not the FIFO one the modal fetched first.
+  const expectedName = 'AAPL_2024-12-01_sell-pnl.csv'
+  const downloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: /download csv/i }).click()
+  const download = await downloadPromise
+  const gotName = download.suggestedFilename()
+  if (gotName !== expectedName) fail(`download offered as ${gotName}, expected ${expectedName}`)
+  else ok(`download offered as ${gotName}`)
+
+  const filePath = await download.path()
+  if (!filePath) fail('download produced no file (acceptDownloads off?)')
+  else {
+    const csvText = readFileSync(filePath, 'utf8')
+    const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true })
+    const rows = parsed.data
+    const sum = rows.reduce((a, r) => (r.lot_pnl === '' ? a : a + parseFloat(r.lot_pnl)), 0)
+    const realized = parseFloat(rows[0]?.realized_pnl)
+    const shown = money(lifo.realizedShown)
+    if (rows.length !== 2) fail(`csv has ${rows.length} lot rows, expected 2`)
+    else if (rows.some((r) => r.strategy !== 'LIFO')) fail('csv rows do not all say LIFO -- exported a stale payload')
+    else if (csvText.includes('$')) fail('csv contains a currency symbol: built from a display formatter')
+    else if (realized !== shown) fail(`csv realized_pnl ${realized} does not match the ${shown} on screen`)
+    else if (Math.abs(sum - realized) > 1e-9) fail(`csv lot pnl sums to ${sum}, not ${realized}`)
+    else ok(`csv matches the screen: 2 LIFO lots summing to ${realized}`)
+  }
 
   if (jsErrors.length) fail(jsErrors.join(' | '))
   else ok('no page errors')
