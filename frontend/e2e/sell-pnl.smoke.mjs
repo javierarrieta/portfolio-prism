@@ -106,7 +106,11 @@ try {
 
   await page.getByText('Transaction Ledger').click()
   await page.getByRole('button', { name: /realized P&L for AAPL/i }).click()
-  await page.getByText(/Sell P&L/).waitFor({ timeout: 10000 })
+  // Wait for the payload, not for a heading: while the request is in flight the dialog
+  // renders the bare "Sell P&L" title, so /Sell P&L/ matches immediately and readModal()
+  // then reads a dialog with no figures in it. The strategy note only exists once data has
+  // landed, so waiting on it is waiting on the fetch.
+  await page.getByTestId('strategy-note').waitFor({ timeout: 10000 })
 
   const readModal = () => page.evaluate(() => {
     const modal = document.querySelector('[role="dialog"]')
@@ -189,7 +193,11 @@ try {
   await page.getByLabel('Tax accounting method').selectOption('LIFO')
   await page.getByText('Transaction Ledger').click()
   await page.getByRole('button', { name: /realized P&L for AAPL/i }).click()
-  await page.getByText(/Sell P&L/).waitFor({ timeout: 10000 })
+  // Same wait as the first open, and the same reason: this one was measured failing with
+  // "after reopening, note is undefined" because the heading matched while the LIFO request
+  // was still in flight. The download step below reads this same `lifo` payload, so it
+  // inherits the race.
+  await page.getByTestId('strategy-note').waitFor({ timeout: 10000 })
   const lifo = await readModal()
   if (!/realized \u00b7 LIFO/.test(lifo.strategyNote ?? '')) fail(`after reopening, note is ${lifo.strategyNote}`)
   else if (money(lifo.realizedShown) !== 1600) fail(`after switching to LIFO the modal shows ${lifo.realizedShown}, expected $1,600.00`)
