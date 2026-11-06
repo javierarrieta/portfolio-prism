@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Info, Loader2, X } from 'lucide-react';
+import { AlertTriangle, Download, Info, Loader2, X } from 'lucide-react';
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import { normalizeSellPnl } from '../utils/decimal';
+import { sellPnlFilename, sellPnlToCsv } from '../utils/sellPnlCsv';
+import { downloadCsv } from '../utils/download';
 import { API_BASE } from '../utils/api';
 import type { SellPnlBreakdown } from '../types';
 
@@ -146,9 +148,30 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
           ) : (
             <h3 style={{ marginBottom: '4px' }}>Sell P&amp;L</h3>
           )}
-          <button aria-label="Close" onClick={onClose} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}>
-            <X size={18} />
-          </button>
+          {/* Download precedes Close in DOM order on purpose. The focus trap below reads
+              focusable elements in document order, so this makes Download the first control
+              and leaves Close the last; putting it after Close would move the wrap point. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            <button
+              className="btn btn-secondary"
+              aria-label="Download CSV"
+              // Nothing to export until a payload exists, and a failed or vanished sell has
+              // no numbers to take away -- offering the button there would export a lie.
+              // `loading` does not cover a refetch triggered by the strategy/threshold props
+              // (the fetch effect cannot setState there), so during that window this exports
+              // the previous payload. It is unreachable today only because the modal's own
+              // backdrop covers the strategy selector -- if that overlay ever goes away, the
+              // guard needs `loading` plus an in-flight flag, not `loading` alone.
+              disabled={loading || failure !== null || data === null}
+              onClick={() => { if (data) downloadCsv(sellPnlFilename(data), sellPnlToCsv(data)); }}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
+            >
+              <Download size={14} /> Download CSV
+            </button>
+            <button aria-label="Close" onClick={onClose} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}>
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         {loading && (
