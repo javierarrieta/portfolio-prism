@@ -18,7 +18,6 @@
 //   SMOKE_SHOT set to a path to write a screenshot of the open modal
 
 import { readFileSync } from 'node:fs'
-import Papa from 'papaparse'
 
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:5173'
 const API_URL = process.env.API_URL ?? 'http://127.0.0.1:8000/api'
@@ -202,6 +201,9 @@ try {
   //    the anchor, the object URL and the suggested filename are all genuinely exercised.
   //    The modal is showing LIFO at this point, which is the point: the export must reflect
   //    the payload on screen, not the FIFO one the modal fetched first.
+  //    Imported here rather than at the top, for the same reason playwright-core is: a module
+  //    that fails to resolve should not bury the "CHROMIUM is not set" message below it.
+  const Papa = (await import('papaparse')).default
   const expectedName = 'AAPL_2024-12-01_sell-pnl.csv'
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: /download csv/i }).click()
@@ -215,14 +217,18 @@ try {
   else {
     const csvText = readFileSync(filePath, 'utf8')
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true })
+    if (parsed.errors.length) fail(`csv did not parse cleanly: ${parsed.errors.map((e) => e.message).join(' | ')}`)
     const rows = parsed.data
     const sum = rows.reduce((a, r) => (r.lot_pnl === '' ? a : a + parseFloat(r.lot_pnl)), 0)
     const realized = parseFloat(rows[0]?.realized_pnl)
+    // The screen rounds to 2dp (formatCurrency) and the file does not, so this compares to
+    // the display's own resolution. Exact equality here only held because the fixture is
+    // round; one fractional cent in a fixture would have failed on formatting, not a bug.
     const shown = money(lifo.realizedShown)
     if (rows.length !== 2) fail(`csv has ${rows.length} lot rows, expected 2`)
     else if (rows.some((r) => r.strategy !== 'LIFO')) fail('csv rows do not all say LIFO -- exported a stale payload')
     else if (csvText.includes('$')) fail('csv contains a currency symbol: built from a display formatter')
-    else if (realized !== shown) fail(`csv realized_pnl ${realized} does not match the ${shown} on screen`)
+    else if (Math.abs(realized - shown) > 0.005) fail(`csv realized_pnl ${realized} does not match the ${shown} on screen`)
     else if (Math.abs(sum - realized) > 1e-9) fail(`csv lot pnl sums to ${sum}, not ${realized}`)
     else ok(`csv matches the screen: 2 LIFO lots summing to ${realized}`)
   }

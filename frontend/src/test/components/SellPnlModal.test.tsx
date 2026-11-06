@@ -177,17 +177,19 @@ describe('SellPnlModal', () => {
 
   // jsdom implements neither URL.createObjectURL nor Blob.text(), so a download can only
   // be observed at the two seams left open: the object-URL call that hands over the Blob,
-  // and the anchor click that triggers it. Both are recorded, nothing is faked.
+  // and the anchor click that triggers it. Both are recorded, nothing is faked. The click
+  // record also notes whether the anchor was in the document at that moment, which is the
+  // half of the download that Safari and old Firefox were strict about.
   const captureDownload = () => {
     const blobs: Blob[] = []
-    const anchors: HTMLAnchorElement[] = []
+    const anchors: { el: HTMLAnchorElement; attached: boolean }[] = []
     const url = URL as unknown as Record<string, unknown>
     const saved = { create: url.createObjectURL, revoke: url.revokeObjectURL }
     const revoke = vi.fn()
     url.createObjectURL = (b: Blob) => { blobs.push(b); return 'blob:mock-url' }
     url.revokeObjectURL = revoke
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(
-      function (this: HTMLAnchorElement) { anchors.push(this) })
+      function (this: HTMLAnchorElement) { anchors.push({ el: this, attached: this.isConnected }) })
     return {
       blobs, anchors, revoke,
       restore: () => {
@@ -235,8 +237,11 @@ describe('SellPnlModal', () => {
       fireEvent.click(button)
 
       expect(dl.anchors).toHaveLength(1)
-      expect(dl.anchors[0].download).toBe('AAPL_2024-12-01_sell-pnl.csv')
-      expect(dl.anchors[0].href).toBe('blob:mock-url')
+      // Attached when clicked, gone again by the time the click returns.
+      expect(dl.anchors[0].attached).toBe(true)
+      expect(dl.anchors[0].el.isConnected).toBe(false)
+      expect(dl.anchors[0].el.download).toBe('AAPL_2024-12-01_sell-pnl.csv')
+      expect(dl.anchors[0].el.href).toBe('blob:mock-url')
       expect(dl.blobs[0].type).toBe('text/csv;charset=utf-8')
 
       // The real Blob, read back: this is the payload the user gets, not what the
@@ -244,7 +249,9 @@ describe('SellPnlModal', () => {
       const text = await readBlob(dl.blobs[0])
       expect(text.split('\r\n')[0].startsWith('row_type,transaction_id')).toBe(true)
       expect(text).toContain('2024-01-01T00:00:00Z')
-      expect(dl.revoke).toHaveBeenCalledWith('blob:mock-url')
+      // Revocation is deferred one task on purpose (see utils/download.ts), so it has to be
+      // waited for rather than asserted on the line after the click.
+      await waitFor(() => expect(dl.revoke).toHaveBeenCalledWith('blob:mock-url'))
     } finally {
       dl.restore()
     }

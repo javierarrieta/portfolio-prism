@@ -155,9 +155,13 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
             <button
               className="btn btn-secondary"
               aria-label="Download CSV"
-              data-testid="download-csv"
               // Nothing to export until a payload exists, and a failed or vanished sell has
               // no numbers to take away -- offering the button there would export a lie.
+              // `loading` does not cover a refetch triggered by the strategy/threshold props
+              // (the fetch effect cannot setState there), so during that window this exports
+              // the previous payload. It is unreachable today only because the modal's own
+              // backdrop covers the strategy selector -- if that overlay ever goes away, the
+              // guard needs `loading` plus an in-flight flag, not `loading` alone.
               disabled={loading || failure !== null || data === null}
               onClick={() => { if (data) downloadCsv(sellPnlFilename(data), sellPnlToCsv(data)); }}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}

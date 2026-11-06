@@ -10,8 +10,15 @@ export const downloadCsv = (filename: string, csv: string): void => {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
+  // An off-document anchor has not always been enough: Safari and older Firefox are on
+  // record for dropping a download whose anchor was never in the document, so it goes in and
+  // straight back out again.
+  document.body.appendChild(anchor);
   anchor.click();
-  // The click starts the download synchronously, so the URL is already spent by the time
-  // this returns; revoking here is what keeps the Blob from leaking for the page's lifetime.
-  URL.revokeObjectURL(url);
+  anchor.remove();
+  // Deferred one task rather than done on the next line. Chrome has the transfer underway
+  // by the time click() returns, but that is browser behaviour and not the spec, and
+  // revoking in the same tick has been seen to cancel the download elsewhere. One task is
+  // long enough for the handover and short enough that the Blob does not outlive the click.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 };

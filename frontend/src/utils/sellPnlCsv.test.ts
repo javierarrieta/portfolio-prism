@@ -91,7 +91,7 @@ describe('sellPnlToCsv', () => {
     // Assert on cells, not the raw line: adjacent numbers like `891,8400` are two columns
     // but look exactly like a thousands separator to a regex run over the whole file.
     const moneyCols = ['price_in_asset_currency', 'fee_in_asset_currency', 'proceeds', 'cost_basis', 'realized_pnl',
-      'lot_cost_basis', 'lot_proceeds', 'lot_pnl']
+      'buy_price', 'lot_cost_basis', 'lot_proceeds', 'lot_pnl']
     for (const row of dataRows(csv)) {
       for (const col of moneyCols) expect(row[col]).toMatch(/^-?\d+(\.\d+)?$/)
     }
@@ -119,6 +119,34 @@ describe('sellPnlToCsv', () => {
     const csv = sellPnlToCsv(breakdown({ symbol: 'ACME,INC' }))
     expect(csv).toContain('"ACME,INC"')
     expect(dataRows(csv)[0].symbol).toBe('ACME,INC')
+  })
+
+  it('writes the price the screen shows alongside the fee-loaded unit cost', () => {
+    // The modal's Buy price column is buy_price; unit_cost additionally carries the
+    // amortised buy fee (backend_rust/src/schemas.rs), so with any fee they differ and the
+    // file is only reconcilable against the screen if both are there.
+    const csv = sellPnlToCsv(breakdown({ matches: [lot({ buy_price: 100, unit_cost: 100.5 })] }))
+    expect([dataRows(csv)[0].buy_price, dataRows(csv)[0].unit_cost]).toEqual(['100', '100.5'])
+  })
+
+  it('neutralises a symbol that a spreadsheet would execute', () => {
+    // A symbol is free text the whole way down: csvValidator only checks it is non-empty and
+    // the backend uppercases it without filtering, so somebody else's imported CSV can put
+    // a formula in one. Excel and Sheets run a cell starting with = + - @ or a tab, and
+    // Papa quotes only on comma/quote/newline, so nothing else stands between the two. The
+    // leading apostrophe is what makes the cell text. Numbers keep their sign -- a guard
+    // that prefixed -1500 would break the numeric column the file exists to be.
+    for (const lead of ['=', '+', '-', '@', '\t']) {
+      expect(dataRows(sellPnlToCsv(breakdown({ symbol: `${lead}EVIL` })))[0].symbol).toBe(`'${lead}EVIL`)
+    }
+    expect(dataRows(sellPnlToCsv(breakdown({ matches: [lot({ pnl: -1500 })] })))[0].lot_pnl).toBe('-1500')
+  })
+
+  it('writes a tiny number in fixed notation, not exponent notation', () => {
+    // String(1e-7) is '1e-7', and a small pnl on a large basis reaches it without trying.
+    const csv = sellPnlToCsv(breakdown({ roi: 1e-7, matches: [lot({ pnl: 0.00000001 })] }))
+    expect(csv).not.toMatch(/e[-+]/)
+    expect([dataRows(csv)[0].roi, dataRows(csv)[0].lot_pnl]).toEqual(['0.0000001', '0.00000001'])
   })
 
   it('leaves a null roi as a blank cell', () => {
@@ -198,6 +226,8 @@ describe('sellPnlFilename', () => {
     // new Date('2024-12-01T00:30:00Z') is 2024-11-30 west of UTC and
     // '2024-12-01T23:30:00Z' is 2024-12-02 east of it. Either conversion silently
     // mislabels the file; the first 10 characters of the payload string cannot.
+    // Rewriting TZ bites only because Node re-reads it since v16; on an older runtime this
+    // loop would pass vacuously, so it proves the slice rather than the zone handling.
     const realTZ = process.env.TZ
     try {
       for (const zone of ['America/Los_Angeles', 'Asia/Tokyo', 'UTC']) {
