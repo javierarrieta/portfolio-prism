@@ -29,6 +29,17 @@ with it only because the UI fetches tax-summary before the ledger. Making the ne
 sync was considered and rejected: it turns a GET into a writer and puts a network fetch on a click
 the user expects to be instant. The ordering is pinned by a route test rather than left implicit.
 
+**Focus trap — reversed after implementation.** The row below originally refused focus management for
+all modals together. The branch then shipped `role="dialog"` + `aria-modal="true"` + Escape on
+`SellPnlModal` anyway, which turns that refusal into a live defect: `aria-modal` asserts to
+assistive tech that the background is inert, and without a trap a sighted keyboard user Tabs
+straight through it — the attribute becomes a claim the component does not keep. Kept the ~30-line
+per-component trap so the attribute tells the truth. This is explicitly **not** a shared
+focus-management system: the five other modals still declare no dialog semantics at all, so the
+original "all three together" follow-up stands for them. Focus restoration to the trigger was
+considered in the same pass and dropped — no precedent in this codebase, and it is not what makes
+the `aria-modal` claim honest.
+
 ---
 
 ## Rejected as over-reach — do not re-raise without new evidence
@@ -41,7 +52,7 @@ the user expects to be instant. The ordering is pinned by a route test rather th
 | FX rate dedup inside one replay; p50/p99 targets; max-transactions limit | No measured bottleneck. Discharged by one sentence stating the scale assumption (see spec *Risks*). |
 | Input validation matrix for `strategy` / `threshold_days` (400s, ranges) | The frontend owns those query strings and the engine's FIFO fallback is documented. The real defect was echoing unvalidated input as fact; one normalisation fixes it. |
 | `term` as a serde enum | `schemas.rs` has no serde enums; `Option<String>` with a documented value set matches the file and yields equivalent OpenAPI. |
-| Focus trap, focus restoration, scroll lock, `aria-modal` | The two existing modals in `PortfolioDetail.tsx` have none of this. Adding a focus-management system to one feature is either a lie in the spec or an unrelated refactor. Follow-up for all three together. |
+| Focus trap, focus restoration, scroll lock, `aria-modal` | *Partly superseded — see **Focus trap** above.* The remaining refusal stands for the five modals that declare no dialog semantics: scroll lock and focus restoration are still out. |
 | Ownership scoping / id-enumeration threat model | No auth anywhere in this API and `DELETE /api/transactions/<id>` already takes a bare id. Trust model stated in one sentence. |
 
 ---
@@ -59,6 +70,13 @@ Recorded because each of these overturned a claim made during the review.
   the plan's lint gates are stricter than CI on purpose.
 - `rust_decimal` has no `serde::option_str`; the module is `serde::str_option` and it needs the
   `serde-with-str` feature, which this project does not enable.
+- The split-sync refusal above was re-tested on a live build rather than re-argued, and holds.
+  Measured on a fresh database: first `GET /transactions/<id>/pnl` after a cold throttle costs
+  ~350 ms and writes a `split_sync` row; the same call warm costs ~5 ms. `split_sync` is written
+  only on success, so a host without egress re-pays the full retry ladder (3 attempts, 1 s + 2 s
+  backoff, ~3 s floor, up to ~30 s at the 10 s request timeout) on every click, forever. Adding
+  the call also made `cargo test` reach Yahoo Finance — the `sell_pnl` suite went 1.33 s → 5.67 s —
+  which is the hermeticity `analytics_test.rs` already guards against by pre-seeding `split_sync`.
 
 ---
 
