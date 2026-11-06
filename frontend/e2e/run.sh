@@ -20,8 +20,12 @@ WORK="$(mktemp -d)"
 BACKEND_PID=""
 BACKEND_PGID=""
 FRONTEND_PID=""
+FRONTEND_PGID=""
 
 cleanup() {
+  # Same reasoning as the backend: npx spawns vite, which spawns esbuild, and a
+  # plain kill of the wrapper leaves the dev server holding :5173.
+  [ -n "$FRONTEND_PGID" ] && kill -- -"$FRONTEND_PGID" 2>/dev/null
   [ -n "$FRONTEND_PID" ] && kill "$FRONTEND_PID" 2>/dev/null
   # `cargo run` forks the compiled binary, so killing the cargo PID leaves the
   # binary alive and bound to :8000 -- verified: after `kill $BACKEND_PID` the port
@@ -90,13 +94,18 @@ echo "backend  cargo run (DATABASE_URL=$DATABASE_URL)"
 (cd "$REPO_ROOT/backend_rust" && exec setsid cargo run) > "$WORK/backend.log" 2>&1 &
 BACKEND_PGID=$!
 BACKEND_PID=$BACKEND_PGID
-wait_for "http://127.0.0.1:8000/" backend 180 || { tail -20 "$WORK/backend.log"; die "backend did not come up"; }
+# Cold `cargo run` on a fresh target/ has been measured well past three minutes for
+# this crate; a shorter budget fails the smoke for a reason that has nothing to do
+# with the feature under test.
+wait_for "http://127.0.0.1:8000/" backend 420 || { tail -20 "$WORK/backend.log"; die "backend did not come up"; }
 
 echo "frontend  vite dev"
 # --strictPort: vite silently increments the port when 5173 is busy, and BASE_URL
 # would then point at whatever else is listening there.
-(npx vite --port 5173 --strictPort) > "$WORK/vite.log" 2>&1 &
-FRONTEND_PID=$!
+# setsid for the same reason as the backend -- see cleanup().
+(exec setsid npx vite --port 5173 --strictPort) > "$WORK/vite.log" 2>&1 &
+FRONTEND_PGID=$!
+FRONTEND_PID=$FRONTEND_PGID
 wait_for "$BASE_URL/" frontend 60 || { tail -20 "$WORK/vite.log"; die "vite did not come up"; }
 
 # --- run ---------------------------------------------------------------------

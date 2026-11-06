@@ -154,7 +154,7 @@ export const normalizeSellPnl = (t: unknown): SellPnlBreakdown => {
     matches: matches.map((m: unknown): LotMatch => {
       const mr = asRecord(m);
       return {
-        buy_transaction_id: (mr.buy_transaction_id as number) ?? 0,
+        buy_transaction_id: num(mr, 'buy_transaction_id'),
         buy_date: str(mr, 'buy_date'),
         buy_price: num(mr, 'buy_price'),
         unit_cost: num(mr, 'unit_cost'),

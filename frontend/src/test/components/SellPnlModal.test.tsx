@@ -121,6 +121,28 @@ describe('SellPnlModal', () => {
     expect(onClose).toHaveBeenCalled()
   })
 
+  it('treats a vanished sell as a dead end, not a retry', async () => {
+    // 999 is a 404 in the shared handlers. Retrying a deleted sell fails again
+    // forever, so the only honest affordance is the message.
+    renderModal({ transactionId: 999 })
+    await waitFor(() => expect(screen.getByTestId('modal-gone')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps Tab inside the dialog', async () => {
+    // aria-modal="true" claims the background is inert, but the browser still Tabs a
+    // sighted keyboard user out of the dialog. Shift+Tab from the dialog itself has
+    // to wrap to its last control rather than escape behind the overlay.
+    renderModal()
+    const dialog = await screen.findByRole('dialog')
+
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+    expect(screen.getByRole('button', { name: /close/i })).toHaveFocus()
+
+    fireEvent.keyDown(screen.getByRole('button', { name: /close/i }), { key: 'Tab' })
+    expect(dialog).toContainElement(document.activeElement as HTMLElement | null)
+  })
+
   it('gives up on a request that never settles', async () => {
     // A hung request used to leave the spinner up forever with the retry button
     // unreachable behind it. The fake honours the abort signal the way fetch does.

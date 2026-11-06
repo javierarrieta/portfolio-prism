@@ -79,9 +79,29 @@ async fn test_sell_pnl_fifo_breakdown_shape() {
     assert_eq!(body["matches"][0]["holding_days"], 335);
     assert!(body["matches"][0]["term"].is_null(), "term is HYBRID-only");
     assert_eq!(dec(&body["matches"][1], "matched_qty"), d("20"));
-    // Decimal division carries full precision, so pin the leading digits rather
-    // than an exact 28-digit string.
-    assert!(body["roi"].as_str().unwrap().starts_with("0.238"), "unexpected roi: {}", body["roi"]);
+    // Compare parsed Decimals, never serialized strings (review record: "Decimal
+    // scale -- full precision, no quantisation"). This pins the actual quotient
+    // instead of hedging on the leading digits of a 28-digit division tail.
+    assert_eq!(dec(&body, "roi"), d("2000") / d("8400"));
+}
+
+#[tokio::test]
+async fn test_sell_pnl_split_before_every_buy_is_not_claimed() {
+    // The replay rescales lots that already exist, so a split older than every buy
+    // adjusted nothing. Claiming otherwise would tell the user the table shows
+    // split-adjusted prices when it shows exactly what they typed.
+    let pool = setup_db().await;
+    let port_id = seed_portfolio(&pool, "Split Too Early", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "EARLY", "Early Split").await;
+    seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, "2023-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
+    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+
+    let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["split_applied"], false, "a split older than every buy adjusted no lot");
+    assert_eq!(dec(&body["matches"][0], "buy_price"), d("100"));
 }
 
 #[tokio::test]
@@ -148,6 +168,11 @@ async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
     // agree on transaction set, base-currency resolution and strategy defaults. The
     // engine-level test cannot catch a divergence here, because within one engine call the
     // equality holds by construction.
+    //
+    // The order below is load-bearing, not cosmetic: /tax-summary inserts auto-detected
+    // SPLIT rows and this endpoint is read-only, so the breakdown only agrees when the
+    // summary has run first -- which is what the UI guarantees. Do not reorder this test
+    // as a "cleanup"; that is the ordering this pins.
     let pool = setup_db().await;
     let port_id = seed_portfolio(&pool, "Reconcile", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "RECON", "Reconcile").await;

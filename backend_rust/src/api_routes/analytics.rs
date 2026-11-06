@@ -207,8 +207,13 @@ pub async fn get_transaction_sell_pnl(
     let threshold_val = threshold_days.unwrap_or(30);
     let fx_applied = asset.currency != portfolio.base_currency;
 
-    // Same query and same scope as get_portfolio_tax_summary, which is what makes
-    // this endpoint's total reconcile with the tax summary for the same asset.
+    // Read-only on purpose -- see the review record for this feature. The two other
+    // analytics endpoints insert auto-detected SPLIT rows before reading; this one
+    // agrees with them because fetchPortfolioData loads tax-summary before the
+    // ledger tab is reachable, which pins the ordering. Pinned by
+    // test_sell_pnl_sums_to_tax_summary_realized_pnl.
+    //
+    // Same query and same scope as get_portfolio_tax_summary.
     let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
         .bind(asset.id)
         .fetch_all(pool.inner())
@@ -228,13 +233,26 @@ pub async fn get_transaction_sell_pnl(
     .map_err(|_| Status::InternalServerError)?
     .ok_or(Status::NotFound)?;
 
-    // Free: this list is already loaded, and it is scoped to exactly the asset the
-    // replay consumed. The modal reads this instead of scanning whatever list the
-    // browser happens to hold, which can be one fetch stale.
-    let split_applied = transactions.iter().any(|t| {
-        t.r#type.to_uppercase() == "SPLIT" && t.date <= tx.date
-    });
+    // This list is already loaded, and it is scoped to exactly the asset the replay
+    // consumed. The modal reads this instead of scanning whatever list the browser
+    // happens to hold, which can be one fetch stale.
+    //
+    // Scoped to the lots this sell actually consumed, not "any split on the asset":
+    // the replay only rescales lots that already exist, so a split predating every
+    // matched buy adjusted nothing and the footnote would claim otherwise. A split
+    // on the same date as a buy also adjusted nothing -- splits sort first on a tie.
+    let earliest_buy = breakdown.matches.iter().map(|m| m.buy_date).min();
+    let split_applied = match earliest_buy {
+        Some(buy_floor) => transactions.iter().any(|t| {
+            t.r#type.to_uppercase() == "SPLIT" && t.date > buy_floor && t.date <= tx.date
+        }),
+        None => false,
+    };
 
+    // Full precision, unquantised, per the review record: no field on this response
+    // is rounded. The frontend renders it with toFixed(2), so the digit tail is a
+    // wire concern only, and quantising here would make this field the one exception
+    // to a rule the rest of the payload obeys.
     let roi = if breakdown.cost_basis > Decimal::ZERO {
         Some(breakdown.realized_pnl / breakdown.cost_basis)
     } else {

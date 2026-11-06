@@ -45,6 +45,23 @@ describe('App ledger → sell P&L', () => {
     await waitFor(() => expect(screen.queryByText(/Sell P&L/)).not.toBeInTheDocument())
   })
 
+  it('closes the breakdown when leaving the ledger tab', async () => {
+    // The breakdown is about a ledger row. Left rendered, it floats over Dashboard
+    // -- a modal about a transaction on a screen showing no transactions.
+    const user = userEvent.setup()
+    server.use(http.get('/api/portfolios/1/transactions', () => HttpResponse.json([
+      { id: 10, asset_id: 1, type: 'SELL', quantity: '80.0', price: '130.0', fee: '0.0', date: '2024-12-01T00:00:00Z' },
+    ])))
+    render(<App />)
+
+    await user.click(await screen.findByText('Transaction Ledger'))
+    await user.click(await screen.findByRole('button', { name: /realized P&L for AAPL/i }))
+    await screen.findByRole('dialog')
+
+    await user.click(await screen.findByText('Dashboard'))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
   // Locate a row's delete button by the row's own Type cell. Index-based lookups
   // silently target the wrong row if the ledger ever changes its sort order.
   const deleteButtonFor = async (type: 'SELL' | 'BUY') => {

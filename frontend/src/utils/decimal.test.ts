@@ -58,11 +58,14 @@ describe('normalizeSellPnl', () => {
     const d = normalizeSellPnl({
       ...raw,
       transaction_id: '42', asset_id: '7', threshold_days: '30',
-      matches: [{ ...raw.matches[0], holding_days: '335' }],
+      matches: [{ ...raw.matches[0], holding_days: '335', buy_transaction_id: '11' }],
     })
     expect(d.transaction_id).toBe(42)
     expect(d.asset_id).toBe(7)
     expect(d.threshold_days).toBe(30)
     expect(d.matches[0].holding_days).toBe(335)
+    // The nested id is a React key and the only handle back to the buy row, so it
+    // needs the same runtime coercion as the top-level ones.
+    expect(d.matches[0].buy_transaction_id).toBe(11)
   })
 })

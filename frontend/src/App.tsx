@@ -16,6 +16,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
+import { API_BASE } from './utils/api';
 import { 
   Portfolio, 
   PortfolioPerformance, 
@@ -25,12 +26,13 @@ import {
   TransactionType
 } from './types';
 
-const API_BASE = '/api';
+// dashboard, portfolios, analytics, ledger
+const DEFAULT_TAB = 'dashboard';
 
 export default function App() {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, portfolios, analytics, ledger
+  const [activeTab, setActiveTab] = useState(DEFAULT_TAB);
   
   // Tax state
   const [strategy, setStrategy] = useState('FIFO');
@@ -52,6 +54,13 @@ export default function App() {
   // Derived rather than cleared from an effect: five places change selectedId, and
   // a reset that has to be remembered in each one is a reset that gets forgotten.
   const [sellPnl, setSellPnl] = useState<{ txId: number; portfolioId: number } | null>(null);
+  // The breakdown is opened from the ledger and is about a ledger row, so leaving
+  // the ledger closes it. Left rendered, it would float over Dashboard or Analytics
+  // -- a modal about a transaction on a screen that shows no transactions.
+  const selectTab = (tab: string) => {
+    setActiveTab(tab);
+    setSellPnl(null);
+  };
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [newPortfolioDesc, setNewPortfolioDesc] = useState('');
   const [newPortfolioCurrency, setNewPortfolioCurrency] = useState('USD');
@@ -332,16 +341,16 @@ export default function App() {
         </div>
 
         <ul className="nav-menu">
-          <li className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>
+          <li className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => selectTab('dashboard')}>
             <LayoutDashboard size={18} /> Dashboard
           </li>
-          <li className={`nav-item ${activeTab === 'portfolios' ? 'active' : ''}`} onClick={() => setActiveTab('portfolios')}>
+          <li className={`nav-item ${activeTab === 'portfolios' ? 'active' : ''}`} onClick={() => selectTab('portfolios')}>
             <Briefcase size={18} /> Holdings & Tax lots
           </li>
-          <li className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`} onClick={() => setActiveTab('analytics')}>
+          <li className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`} onClick={() => selectTab('analytics')}>
             <BarChart3 size={18} /> Risk & Correlation
           </li>
-          <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => setActiveTab('ledger')}>
+          <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => selectTab('ledger')}>
             <History size={18} /> Transaction Ledger
           </li>
         </ul>
