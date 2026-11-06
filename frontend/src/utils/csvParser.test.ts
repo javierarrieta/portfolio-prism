@@ -58,11 +58,13 @@ describe('detectColumns', () => {
 });
 
 // Excel writes a BOM when you save CSV from a UTF-8 workbook, so every Excel-authored
-// upload starts with U+FEFF. Two layers swallow it here and neither was written down until
-// now: Papa strips it before the header row is built (Papa.BYTE_ORDER_MARK / stripBom), and
-// detectColumns' `[^a-z0-9_]` sanitizer drops it a second time. Pin both, because the
-// failure mode of a future tightening is `Symbol is required` on every row -- which points
-// the user at their data rather than at the parser.
+// upload starts with U+FEFF. Two layers swallow it: Papa strips it before the header row is
+// built (Papa.BYTE_ORDER_MARK / stripBom), and detectColumns' `[^a-z0-9_]` sanitizer drops it
+// a second time. What this file owns is the seam between them -- `meta.fields` feeds both
+// detectColumns and every `row[h]` lookup after it -- so that is what gets pinned. Papa's own
+// strip is a third-party guarantee, pinned here only so a bump that changes it fails in CI
+// rather than on a user's upload, where the symptom is `Symbol is required` on every row and
+// points at their data instead of at the parser.
 describe('BOM on upload', () => {
   // CsvImportModal parses the uploaded File, not a string, and Papa's BOM strip is on a
   // different code path for each (stripBom on the string input, stripBom per header on the

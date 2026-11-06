@@ -258,9 +258,10 @@ describe('SellPnlModal', () => {
       // The real Blob, read back: this is the payload the user gets, not what the
       // serializer unit test already proved.
       const text = await readBlob(dl.blobs[0])
-      // UTF-8 BOM (EF BB BF) as the first three bytes, added exactly once -- see
-      // utils/download.ts for why it is there and utils/sellPnlCsv.test.ts for the half
-      // that keeps the serializer from adding a second one.
+      // UTF-8 BOM (EF BB BF) as the first three bytes -- see utils/download.ts for why it is
+      // there. "Exactly once" is proved by the line *after* this one, not by the byte check:
+      // a UTF-8 decode consumes only the first BOM, so a doubled one would leave `\uFEFF`
+      // at the front of `text`. The guard itself is pinned in utils/download.test.ts.
       expect(await readHeadBytes(dl.blobs[0], 3)).toEqual([0xef, 0xbb, 0xbf])
       expect(text.startsWith('row_type,transaction_id')).toBe(true)
       expect(text).toContain('2024-01-01T00:00:00Z')

@@ -12,13 +12,18 @@ const BOM = '\uFEFF';
  * builders so every CSV this app exports is covered by construction. Excel decides the
  * encoding from the BOM: without one it falls back to the machine's ANSI codepage, so on a
  * Windows-1250/1252 install a non-ASCII cell arrives mojibake'd. The free-text columns a
- * user can type at asset creation -- symbol, asset_type, currency, asset_currency -- are all
- * reachable that way: the backend uppercases them and checks no charset
- * (backend_rust/src/api_routes/transactions.rs). The import side strips a BOM too, through
- * Papa.BYTE_ORDER_MARK, so both edges agree (pinned in csvParser.test.ts).
+ * user types at asset creation -- symbol, asset_type and currency -- reach a cell that way:
+ * the asset endpoint uppercases them and checks no charset, so any of the three can hold a
+ * non-ASCII byte. The import side strips a BOM too, through Papa.BYTE_ORDER_MARK, so both
+ * edges agree (pinned in csvParser.test.ts).
  */
 export const downloadCsv = (filename: string, csv: string): void => {
-  const url = URL.createObjectURL(new Blob([BOM + csv], { type: 'text/csv;charset=utf-8' }));
+  // Idempotent on purpose. The builders are expected to stay BOM-free -- sellPnlCsv.test.ts
+  // pins that for the one that exists -- but a second BOM is worse than none: it puts
+  // `\uFEFF` in front of the header and breaks the first column for every consumer, Excel
+  // included. One comparison keeps that invariant here instead of two files away.
+  const body = csv.startsWith(BOM) ? csv : BOM + csv;
+  const url = URL.createObjectURL(new Blob([body], { type: 'text/csv;charset=utf-8' }));
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
