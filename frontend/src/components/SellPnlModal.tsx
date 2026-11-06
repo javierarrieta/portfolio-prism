@@ -127,7 +127,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }}
     >
-      <div className="glass-card" data-testid="sell-pnl-dialog" role="dialog" aria-modal="true" aria-label="Sell realized P&L breakdown" tabIndex={-1} ref={cardRef} style={{ padding: '32px', width: '760px', maxWidth: '92vw', maxHeight: '86vh', overflowY: 'auto', background: '#121929' }}>
+      <div className="glass-card" data-testid="sell-pnl-dialog" role="dialog" aria-modal="true" aria-label="Sell realized P&L breakdown" tabIndex={-1} ref={cardRef} style={{ padding: '32px', width: 'min(1040px, 94vw)', maxHeight: '86vh', overflowY: 'auto', background: '#121929' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
           {data ? (
             <div>
@@ -204,35 +204,43 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
             )}
 
             {data.matches.length > 0 && (
-              <table className="data-table" style={{ marginBottom: '16px' }}>
-                <thead>
-                  <tr>
-                    <th>Buy date</th>
-                    <th>Buy price</th>
-                    <th style={{ whiteSpace: 'nowrap' }}>Qty from lot</th>
-                    <th>Cost basis</th>
-                    <th>Proceeds</th>
-                    <th>P&amp;L</th>
-                    <th>Held</th>
-                    {isHybrid && <th>Term</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {/* Rendered in payload order: that is the engine's consumption order. */}
-                  {data.matches.map((m) => (
-                    <tr key={`${m.buy_transaction_id}-${m.buy_date}`}>
-                      <td style={{ whiteSpace: 'nowrap' }}>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
-                      <td>{formatCurrency(m.buy_price, data.currency)}</td>
-                      <td>{qty(m.matched_qty)}<span style={muted}> of {qty(m.lot_qty_before_match)}</span></td>
-                      <td>{formatCurrency(m.cost_basis, data.currency)}</td>
-                      <td>{formatCurrency(m.proceeds, data.currency)}</td>
-                      <td style={{ color: pnlColor(m.pnl) }}>{formatCurrency(m.pnl, data.currency)}</td>
-                      <td>{m.holding_days}d</td>
-                      {isHybrid && <td>{m.term ?? '—'}</td>}
+              // The scroll lives here, on the table, not on the dialog. The card
+              // sets overflowY for long lot lists, and CSS promotes a `visible`
+              // overflow-x to `auto` whenever the other axis is not visible -- so
+              // any table wider than the card would hand the whole dialog a
+              // horizontal scrollbar. Containing the overflow here keeps that from
+              // happening on viewports too narrow for the table to fit outright.
+              <div className="data-table-container" style={{ margin: '0 0 16px' }}>
+                <table className="data-table data-table--compact">
+                  <thead>
+                    <tr>
+                      <th>Buy date</th>
+                      <th>Buy price</th>
+                      <th style={{ whiteSpace: 'nowrap' }}>Qty from lot</th>
+                      <th>Cost basis</th>
+                      <th>Proceeds</th>
+                      <th>P&amp;L</th>
+                      <th>Held</th>
+                      {isHybrid && <th>Term</th>}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {/* Rendered in payload order: that is the engine's consumption order. */}
+                    {data.matches.map((m) => (
+                      <tr key={`${m.buy_transaction_id}-${m.buy_date}`}>
+                        <td style={{ whiteSpace: 'nowrap' }}>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
+                        <td>{formatCurrency(m.buy_price, data.currency)}</td>
+                        <td>{qty(m.matched_qty)}<span style={muted}> of {qty(m.lot_qty_before_match)}</span></td>
+                        <td>{formatCurrency(m.cost_basis, data.currency)}</td>
+                        <td>{formatCurrency(m.proceeds, data.currency)}</td>
+                        <td style={{ color: pnlColor(m.pnl) }}>{formatCurrency(m.pnl, data.currency)}</td>
+                        <td>{m.holding_days}d</td>
+                        {isHybrid && <td>{m.term ?? '—'}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
             <div style={{ ...muted, fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>

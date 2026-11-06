@@ -252,6 +252,15 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.01);
 }
 
+/* Compact variant for tables inside dialogs, where the default 16px cell padding
+   on seven columns costs more width than the dialog has. Opt-in by class so no
+   existing table changes. */
+.data-table--compact th,
+.data-table--compact td {
+  padding: 10px 12px;
+  font-size: 0.875rem;
+}
+
 /* Forms */
 .form-group {
   margin-bottom: 20px;
