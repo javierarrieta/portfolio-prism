@@ -215,6 +215,12 @@ describe('sellPnlToCsv', () => {
     // Papa.unparse's default, and what RFC 4180 asks for. Pinned so nobody "fixes" it.
     expect(sellPnlToCsv(breakdown())).toContain('\r\n')
   })
+
+  it('emits no byte-order mark', () => {
+    // downloadCsv owns the BOM (see its comment). If the serializer grew one too, the file
+    // would open with two of them and the first header would be unreadable.
+    expect(sellPnlToCsv(breakdown()).startsWith('\uFEFF')).toBe(false)
+  })
 })
 
 describe('sellPnlFilename', () => {

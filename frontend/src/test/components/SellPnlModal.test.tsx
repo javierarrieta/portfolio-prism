@@ -207,6 +207,17 @@ describe('SellPnlModal', () => {
     reader.readAsText(blob)
   })
 
+  // The BOM is invisible at the seam above: readAsText performs a UTF-8 decode, and the
+  // Encoding spec has that decode consume a leading BOM. That is what a correct consumer
+  // does -- and precisely what Excel does not do without the BOM, which is why it has to be
+  // in the bytes. So the BOM is pinned on the bytes, and the header on the decoded text.
+  const readHeadBytes = (blob: Blob, n: number) => new Promise<number[]>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve([...new Uint8Array(reader.result as ArrayBuffer)])
+    reader.onerror = () => reject(reader.error)
+    reader.readAsArrayBuffer(blob.slice(0, n))
+  })
+
   it('disables Download while the request is in flight', async () => {
     renderModal()
     expect(screen.getByRole('button', { name: /download csv/i })).toBeDisabled()
@@ -247,7 +258,11 @@ describe('SellPnlModal', () => {
       // The real Blob, read back: this is the payload the user gets, not what the
       // serializer unit test already proved.
       const text = await readBlob(dl.blobs[0])
-      expect(text.split('\r\n')[0].startsWith('row_type,transaction_id')).toBe(true)
+      // UTF-8 BOM (EF BB BF) as the first three bytes, added exactly once -- see
+      // utils/download.ts for why it is there and utils/sellPnlCsv.test.ts for the half
+      // that keeps the serializer from adding a second one.
+      expect(await readHeadBytes(dl.blobs[0], 3)).toEqual([0xef, 0xbb, 0xbf])
+      expect(text.startsWith('row_type,transaction_id')).toBe(true)
       expect(text).toContain('2024-01-01T00:00:00Z')
       // Revocation is deferred one task on purpose (see utils/download.ts), so it has to be
       // waited for rather than asserted on the line after the click.
