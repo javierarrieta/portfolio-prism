@@ -36,6 +36,20 @@ describe('SellPnlModal', () => {
     expect(screen.getByTestId('strategy-note')).toHaveTextContent('realized · FIFO')
   })
 
+  it('contains the table overflow in its own scroller, not in the dialog', async () => {
+    // The dialog sets overflowY for long lot lists, and CSS promotes a `visible`
+    // overflow-x to `auto` whenever the other axis is not visible. So a table
+    // wider than the dialog hands the whole dialog a horizontal scrollbar -- the
+    // bug this pins. The table must sit inside its own scroll container and use the
+    // compact cell padding that makes it fit a wide dialog outright.
+    renderModal()
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+    const table = screen.getByRole('table')
+    expect(table).toHaveClass('data-table--compact')
+    expect(table.parentElement).toHaveClass('data-table-container')
+    expect(screen.getByTestId('sell-pnl-dialog').contains(table)).toBe(true)
+  })
+
   it('footnotes the FX conversion for a foreign-currency asset', async () => {
     server.use(http.get('/api/transactions/42/pnl', () => HttpResponse.json({
       ...base, currency: 'EUR', asset_currency: 'USD', fx_applied: true,
