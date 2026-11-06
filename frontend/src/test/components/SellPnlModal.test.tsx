@@ -174,4 +174,102 @@ describe('SellPnlModal', () => {
       globalThis.fetch = real
     }
   })
+
+  // jsdom implements neither URL.createObjectURL nor Blob.text(), so a download can only
+  // be observed at the two seams left open: the object-URL call that hands over the Blob,
+  // and the anchor click that triggers it. Both are recorded, nothing is faked.
+  const captureDownload = () => {
+    const blobs: Blob[] = []
+    const anchors: HTMLAnchorElement[] = []
+    const url = URL as unknown as Record<string, unknown>
+    const saved = { create: url.createObjectURL, revoke: url.revokeObjectURL }
+    const revoke = vi.fn()
+    url.createObjectURL = (b: Blob) => { blobs.push(b); return 'blob:mock-url' }
+    url.revokeObjectURL = revoke
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(
+      function (this: HTMLAnchorElement) { anchors.push(this) })
+    return {
+      blobs, anchors, revoke,
+      restore: () => {
+        url.createObjectURL = saved.create
+        url.revokeObjectURL = saved.revoke
+        vi.restoreAllMocks()
+      },
+    }
+  }
+
+  const readBlob = (blob: Blob) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsText(blob)
+  })
+
+  it('disables Download while the request is in flight', async () => {
+    renderModal()
+    expect(screen.getByRole('button', { name: /download csv/i })).toBeDisabled()
+    // Let the request land so the modal is not still settling when the test ends.
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+  })
+
+  it('disables Download when the request fails', async () => {
+    server.use(http.get('/api/transactions/42/pnl', () => new HttpResponse(null, { status: 500 })))
+    renderModal()
+    await waitFor(() => expect(screen.getByTestId('modal-error')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /download csv/i })).toBeDisabled()
+  })
+
+  it('disables Download for a vanished sell', async () => {
+    renderModal({ transactionId: 999 })
+    await waitFor(() => expect(screen.getByTestId('modal-gone')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /download csv/i })).toBeDisabled()
+  })
+
+  it('downloads the breakdown as a file named for the sell', async () => {
+    const dl = captureDownload()
+    try {
+      renderModal()
+      await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+      const button = screen.getByRole('button', { name: /download csv/i })
+      expect(button).toBeEnabled()
+      fireEvent.click(button)
+
+      expect(dl.anchors).toHaveLength(1)
+      expect(dl.anchors[0].download).toBe('AAPL_2024-12-01_sell-pnl.csv')
+      expect(dl.anchors[0].href).toBe('blob:mock-url')
+      expect(dl.blobs[0].type).toBe('text/csv;charset=utf-8')
+
+      // The real Blob, read back: this is the payload the user gets, not what the
+      // serializer unit test already proved.
+      const text = await readBlob(dl.blobs[0])
+      expect(text.split('\r\n')[0].startsWith('row_type,transaction_id')).toBe(true)
+      expect(text).toContain('2024-01-01T00:00:00Z')
+      expect(dl.revoke).toHaveBeenCalledWith('blob:mock-url')
+    } finally {
+      dl.restore()
+    }
+  })
+
+  it('reaches Download by Tab and keeps Shift+Tab inside the dialog', async () => {
+    // Download is placed before Close in the header, so it becomes the trap's first control
+    // and Close stays the last -- which is why the existing wrap test needed no edit.
+    renderModal()
+    // Wait for the payload, not just for the dialog: the dialog renders while still
+    // loading, and a disabled button silently refuses focus, which made this flaky.
+    await waitFor(() => expect(screen.getByText(/AAPL/)).toBeInTheDocument())
+    const dialog = screen.getByRole('dialog')
+    const download = screen.getByRole('button', { name: /download csv/i })
+    const close = screen.getByRole('button', { name: /close/i })
+    expect(download).toBeEnabled()
+
+    expect(dialog).toContainElement(download)
+    download.focus()
+    expect(download).toHaveFocus()
+
+    fireEvent.keyDown(download, { key: 'Tab', shiftKey: true })
+    expect(close).toHaveFocus()
+
+    fireEvent.keyDown(close, { key: 'Tab' })
+    expect(dialog).toContainElement(document.activeElement as HTMLElement | null)
+  })
 })
