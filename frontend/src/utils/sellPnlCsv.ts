@@ -15,14 +15,16 @@ import type { LotMatch, SellPnlBreakdown } from '../types';
  * CSV readers. Nulls are blank cells, not `n/a`, so a numeric column stays numeric.
  */
 
-// Sell-level names are the API's, verbatim. Lot-level names that would collide with one
-// (matched_qty, cost_basis, proceeds, pnl) are prefixed lot_; the rest keep their payload
-// names. `realized_pnl` and `lot_pnl` therefore never get confused for each other.
+// Sell-level names are the API's, verbatim, with one deliberate exception: price and fee
+// are the two columns in asset_currency rather than the base currency, so they say so in
+// their own header. Lot-level names that would collide with a sell-level one (matched_qty,
+// cost_basis, proceeds, pnl) are prefixed lot_; the rest keep their payload names.
+// `realized_pnl` and `lot_pnl` therefore never get confused for each other.
 const SELL_COLUMNS = [
   'transaction_id', 'asset_id', 'symbol', 'asset_type', 'strategy', 'threshold_days',
   'currency', 'asset_currency', 'fx_applied', 'split_applied', 'sell_date', 'sold_qty',
-  'price', 'fee', 'proceeds', 'cost_basis', 'realized_pnl', 'roi', 'matched_qty',
-  'unmatched_qty',
+  'price_in_asset_currency', 'fee_in_asset_currency', 'proceeds', 'cost_basis', 'realized_pnl',
+  'roi', 'matched_qty', 'unmatched_qty',
 ] as const;
 
 const LOT_COLUMNS = [
@@ -49,8 +51,9 @@ const sellCells = (d: SellPnlBreakdown): Row => ({
   split_applied: d.split_applied,
   sell_date: d.sell_date,
   sold_qty: d.sold_qty,
-  price: d.price,
-  fee: d.fee,
+  // As entered, in asset_currency -- the same convention the API and the modal footnote use.
+  price_in_asset_currency: d.price,
+  fee_in_asset_currency: d.fee,
   proceeds: d.proceeds,
   cost_basis: d.cost_basis,
   realized_pnl: d.realized_pnl,

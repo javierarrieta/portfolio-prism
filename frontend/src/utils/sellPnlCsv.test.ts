@@ -90,12 +90,29 @@ describe('sellPnlToCsv', () => {
     expect(csv).not.toMatch(/\$/)
     // Assert on cells, not the raw line: adjacent numbers like `891,8400` are two columns
     // but look exactly like a thousands separator to a regex run over the whole file.
-    const moneyCols = ['price', 'fee', 'proceeds', 'cost_basis', 'realized_pnl',
+    const moneyCols = ['price_in_asset_currency', 'fee_in_asset_currency', 'proceeds', 'cost_basis', 'realized_pnl',
       'lot_cost_basis', 'lot_proceeds', 'lot_pnl']
     for (const row of dataRows(csv)) {
       for (const col of moneyCols) expect(row[col]).toMatch(/^-?\d+(\.\d+)?$/)
     }
     expect(Number(dataRows(csv)[0].lot_proceeds)).toBe(9876543.21)
+  })
+
+  it('names the as-entered columns with the currency they are in', () => {
+    // price and fee arrive as entered, so they are in asset_currency, while every other
+    // money column on the file is in the base currency. A bare `price` header is the one
+    // thing a tax tool could silently misread on a foreign-currency sell.
+    const csv = sellPnlToCsv(breakdown({ currency: 'EUR', asset_currency: 'USD', fx_applied: true }))
+    const h = headerRow(csv)
+    expect(h).toContain('price_in_asset_currency')
+    expect(h).toContain('fee_in_asset_currency')
+    expect(h).not.toContain('price')
+    expect(h).not.toContain('fee')
+
+    const row = dataRows(csv)[0]
+    expect([row.price_in_asset_currency, row.fee_in_asset_currency]).toEqual(['130', '0'])
+    // The two currency columns say which string each of those names refers to.
+    expect([row.currency, row.asset_currency]).toEqual(['EUR', 'USD'])
   })
 
   it('quotes a symbol containing a comma', () => {
