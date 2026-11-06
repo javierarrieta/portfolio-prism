@@ -93,3 +93,43 @@ export interface TaxSummary {
   total_realized_pnl: number;
   total_unrealized_pnl: number;
 }
+
+export interface LotMatch {
+  buy_transaction_id: number;
+  buy_date: string;
+  buy_price: number;
+  unit_cost: number;
+  matched_qty: number;
+  lot_qty_before_match: number;
+  cost_basis: number;
+  proceeds: number;
+  pnl: number;
+  holding_days: number;
+  term: 'SHORT' | 'LONG' | null;
+}
+
+export interface SellPnlBreakdown {
+  transaction_id: number;
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  strategy: string;
+  threshold_days: number;
+  currency: string;
+  asset_currency: string;
+  fx_applied: boolean;
+  /** A SPLIT on this asset dated on or before the sell: buy prices are split-adjusted. */
+  split_applied: boolean;
+  sell_date: string;
+  sold_qty: number;
+  price: number;
+  fee: number;
+  proceeds: number;
+  cost_basis: number;
+  realized_pnl: number;
+  /** null when cost basis is zero; render as an em dash, never 0%. */
+  roi: number | null;
+  matched_qty: number;
+  unmatched_qty: number;
+  matches: LotMatch[];
+}

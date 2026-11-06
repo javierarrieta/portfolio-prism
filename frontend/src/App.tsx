@@ -9,13 +9,14 @@ import {
   AlertTriangle,
   FolderOpen,
   Sparkles,
-  Trash2
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
-import { formatCurrency } from './utils/formatters';
+import TransactionLedger from './components/TransactionLedger';
+import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
+import { API_BASE } from './utils/api';
 import { 
   Portfolio, 
   PortfolioPerformance, 
@@ -25,12 +26,13 @@ import {
   TransactionType
 } from './types';
 
-const API_BASE = '/api';
+// dashboard, portfolios, analytics, ledger
+const DEFAULT_TAB = 'dashboard';
 
 export default function App() {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, portfolios, analytics, ledger
+  const [activeTab, setActiveTab] = useState(DEFAULT_TAB);
   
   // Tax state
   const [strategy, setStrategy] = useState('FIFO');
@@ -45,6 +47,20 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showNewPortfolioModal, setShowNewPortfolioModal] = useState(false);
+  // Which sell's breakdown is open, and which portfolio it belonged to. The modal
+  // renders only while that still matches the selected portfolio, so switching
+  // portfolio cannot leave a breakdown on screen for a holding you no longer
+  // look at -- with that portfolio's base currency resolved server-side.
+  // Derived rather than cleared from an effect: five places change selectedId, and
+  // a reset that has to be remembered in each one is a reset that gets forgotten.
+  const [sellPnl, setSellPnl] = useState<{ txId: number; portfolioId: number } | null>(null);
+  // The breakdown is opened from the ledger and is about a ledger row, so leaving
+  // the ledger closes it. Left rendered, it would float over Dashboard or Analytics
+  // -- a modal about a transaction on a screen that shows no transactions.
+  const selectTab = (tab: string) => {
+    setActiveTab(tab);
+    setSellPnl(null);
+  };
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [newPortfolioDesc, setNewPortfolioDesc] = useState('');
   const [newPortfolioCurrency, setNewPortfolioCurrency] = useState('USD');
@@ -201,6 +217,9 @@ export default function App() {
       setLoading(true);
       const res = await fetch(`${API_BASE}/transactions/${txId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete transaction');
+      // Only close the breakdown if this is the sell it is showing; deleting an
+      // unrelated row should not dismiss a figure someone is reading.
+      setSellPnl((current) => (current?.txId === txId ? null : current));
       if (selectedId) await fetchPortfolioData(selectedId);
     } catch (err) {
       alert(`Error deleting transaction: ${err instanceof Error ? err.message : String(err)}`);
@@ -322,16 +341,16 @@ export default function App() {
         </div>
 
         <ul className="nav-menu">
-          <li className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>
+          <li className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => selectTab('dashboard')}>
             <LayoutDashboard size={18} /> Dashboard
           </li>
-          <li className={`nav-item ${activeTab === 'portfolios' ? 'active' : ''}`} onClick={() => setActiveTab('portfolios')}>
+          <li className={`nav-item ${activeTab === 'portfolios' ? 'active' : ''}`} onClick={() => selectTab('portfolios')}>
             <Briefcase size={18} /> Holdings & Tax lots
           </li>
-          <li className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`} onClick={() => setActiveTab('analytics')}>
+          <li className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`} onClick={() => selectTab('analytics')}>
             <BarChart3 size={18} /> Risk & Correlation
           </li>
-          <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => setActiveTab('ledger')}>
+          <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => selectTab('ledger')}>
             <History size={18} /> Transaction Ledger
           </li>
         </ul>
@@ -419,58 +438,21 @@ export default function App() {
             )}
 
             {activeTab === 'ledger' && (
-              <div className="glass-card" style={{ padding: '24px' }}>
-                <h3 style={{ marginBottom: '20px' }}>Transaction History</h3>
-                {transactions.length === 0 ? (
-                  <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '24px 0' }}>No transactions logged. Go to the "Holdings & Tax lots" tab to log buy/sell transactions.</p>
-                ) : (
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>Date & Time</th>
-                        <th>Asset Symbol</th>
-                        <th>Type</th>
-                        <th>Quantity</th>
-                        <th>Price</th>
-                        <th>Fee</th>
-                        <th>Total Cost/Proceeds</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {transactions.map((tx) => {
-                        const asset = currentPortfolio.assets.find(a => a.id === tx.asset_id);
-                        const isSplit = tx.type === 'SPLIT';
-                        const cost = tx.quantity * tx.price;
-                        const total = isSplit ? null : (tx.type === 'BUY' ? (cost + tx.fee) : (cost - tx.fee));
-                        return (
-                          <tr key={tx.id}>
-                            <td>{new Date(tx.date).toLocaleString()}</td>
-                            <td style={{ fontWeight: 600 }}>{asset ? asset.symbol : 'Unknown'}</td>
-                            <td>
-                              <span style={{ color: isSplit ? 'var(--text-secondary)' : (tx.type === 'BUY' ? 'var(--color-success)' : 'var(--color-danger)'), fontWeight: 700 }}>
-                                {tx.type}
-                              </span>
-                            </td>
-                            <td>{isSplit ? `${tx.quantity} : ${tx.price}` : tx.quantity.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
-                            <td>{isSplit ? '—' : formatCurrency(tx.price, asset?.currency || 'USD')}</td>
-                            <td>{isSplit ? '—' : formatCurrency(tx.fee, asset?.currency || 'USD')}</td>
-                            <td style={{ fontWeight: 600 }}>{isSplit ? '—' : formatCurrency(total as number, asset?.currency || 'USD')}</td>
-                            <td>
-                              <button 
-                                onClick={() => handleDeleteTransaction(tx.id)}
-                                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+              <TransactionLedger
+                transactions={transactions}
+                assets={currentPortfolio.assets || []}
+                onDeleteTransaction={handleDeleteTransaction}
+                onSelectSell={(txId) => setSellPnl({ txId, portfolioId: currentPortfolio.id })}
+              />
+            )}
+
+            {sellPnl !== null && sellPnl.portfolioId === selectedId && (
+              <SellPnlModal
+                transactionId={sellPnl.txId}
+                strategy={strategy}
+                thresholdDays={thresholdDays}
+                onClose={() => setSellPnl(null)}
+              />
             )}
           </>
         ) : (

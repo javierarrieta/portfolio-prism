@@ -267,6 +267,7 @@ pub fn build_rocket(pool: SqlitePool, currency_service: CurrencyService, cors: C
             api_routes::transactions::create_transaction,
             api_routes::transactions::list_portfolio_transactions,
             api_routes::transactions::delete_transaction,
+            api_routes::analytics::get_transaction_sell_pnl,
         ])
         .mount("/api-docs", routes![openapi_json])
 }
