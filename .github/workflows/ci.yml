@@ -55,6 +55,12 @@ jobs:
         run: npm run generate-types
         working-directory: frontend
 
+      - name: Typecheck
+        # `vite build` strips types without checking them, so without this step nothing in
+        # CI ever ran tsc and the test files were never type-checked at all.
+        run: npm run typecheck
+        working-directory: frontend
+
       - name: Run tests
         run: npm test
         working-directory: frontend

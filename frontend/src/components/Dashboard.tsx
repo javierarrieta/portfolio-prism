@@ -138,7 +138,9 @@ export default function Dashboard({
                        borderRadius: '8px',
                        color: 'var(--text-primary)'
                      }}
-                     formatter={(value: number | string | undefined, name: string | undefined) => {
+                     formatter={(value, name) => {
+                       // Params left to recharts' own Formatter type: annotating them narrower
+                       // than ValueType/NameType is what failed to typecheck, not the body.
                        if (name === 'value') return [formatCurrency(value as number ?? 0, displayCurrency), 'Portfolio Value'];
                        if (name === 'twr') return [formatPercent(value as number ?? 0), 'Time-Weighted Return'];
                        return [value ?? '', name ?? ''];
@@ -177,7 +179,7 @@ export default function Dashboard({
                        border: '1px solid var(--border-color)', 
                        borderRadius: '8px'
                      }}
-                     formatter={(value: number) => [formatCurrency(value, displayCurrency), '']}
+                     formatter={(value) => [formatCurrency(value as number, displayCurrency), '']}
                    />
                 </PieChart>
               </ResponsiveContainer>
