@@ -4,7 +4,7 @@ import { formatCurrency, formatPercent } from '../utils/formatters';
 import { normalizeSellPnl } from '../utils/decimal';
 import { sellPnlFilename, sellPnlToCsv } from '../utils/sellPnlCsv';
 import { downloadCsv } from '../utils/download';
-import { API_BASE } from '../utils/api';
+import { apiFetch, API_BASE } from '../utils/apiFetch';
 import type { SellPnlBreakdown } from '../types';
 
 interface Props {
@@ -90,7 +90,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
     let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    fetch(`${API_BASE}/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`, { signal: controller.signal })
+    apiFetch(`${API_BASE}/transactions/${transactionId}/pnl?strategy=${strategy}&threshold_days=${thresholdDays}`, { signal: controller.signal })
       .then((r) => {
         if (!r.ok) throw new Error(r.status === 404 ? 'gone' : `sell pnl request failed: ${r.status}`);
         return r.json();
