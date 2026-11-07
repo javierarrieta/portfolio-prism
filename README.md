@@ -42,6 +42,26 @@ Full-stack portfolio management application with tax lot tracking (FIFO/LIFO/Hyb
 
 ---
 
+## CSV Encoding
+
+Exports are UTF-8 **with a byte-order mark** (`EF BB BF`). It is added once, in
+`frontend/src/utils/download.ts`, so every export this app grows is covered by construction;
+the CSV builders stay BOM-free and `downloadCsv` refuses to add a second one. Imports accept
+a BOM and strip it.
+
+| consumer | behaviour with the BOM present |
+|----------|--------------------------------|
+| Excel (Windows or Mac) | needs it. Without one Excel decodes the file as the machine's ANSI codepage and any non-ASCII cell arrives mojibake'd |
+| Google Sheets | detects UTF-8 and drops the BOM on import |
+| this app's own CSV import | strips it, via `Papa.BYTE_ORDER_MARK` |
+| Python `utf-8`, `pandas.read_csv` | keeps it: the first column comes back as `\ufeffrow_type`. Read these files with `encoding='utf-8-sig'`, which is correct whether or not a BOM is there (pandas issues [#4793](https://github.com/pandas-dev/pandas/issues/4793), [#13497](https://github.com/pandas-dev/pandas/issues/13497)) |
+
+So: a new programmatic consumer should be pointed at `utf-8-sig`. Do not drop the BOM to
+spare one reader — that silently re-breaks Excel, and nothing in the test suite will notice
+except the byte assertions in `frontend/src/utils/download.test.ts` and `frontend/e2e/`.
+
+---
+
 ## Kubernetes Deployment
 
 The application is packaged as two Docker images (backend and frontend) and can be deployed to any Kubernetes cluster using the manifests below.

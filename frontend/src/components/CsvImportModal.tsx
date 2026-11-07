@@ -202,8 +202,10 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
     }
   }, [validationReport, assets, portfolioId, onImportComplete]);
 
+  // The predicate, not just the truthiness filter: without it `field` keeps the null member
+  // of CsvTransactionField and every consumer below has to re-narrow it.
   const mappedColumns = Object.entries(columnMapping)
-    .filter(([, field]) => field !== null)
+    .filter((entry): entry is [string, Exclude<CsvTransactionField, null>] => entry[1] !== null)
     .sort(([a], [b]) => parseInt(a, 10) - parseInt(b, 10));
 
   const unmappedColumns = Object.entries(columnMapping)
@@ -211,7 +213,11 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
 
   const totalRows = csvRows.length;
   const validCount = validationReport?.validRows ?? 0;
-  const allFields: CsvTransactionField[] = ['date', 'symbol', 'type', 'quantity', 'price', 'fee'];
+  // No null member: this is the list of fields a column can be mapped *to*, and `null` here
+  // means "unmapped", which is not a choice the dropdown offers. Leaving it in the type made
+  // every `f.charAt`/`value={f}` below a null-deref the compiler could see and the runtime
+  // could not.
+  const allFields: Exclude<CsvTransactionField, null>[] = ['date', 'symbol', 'type', 'quantity', 'price', 'fee'];
 
   return (
     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }}>
@@ -303,7 +309,9 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
                              <select
                                value={field}
                                onChange={(e) => {
-                                 const val = e.target.value as CsvTransactionField;
+                                 // '' is the real DOM value of the "(clear)" option; the cast
+                                 // has to admit it or the comparison below is dead code.
+                                 const val = e.target.value as CsvTransactionField | '';
                                  handleColumnChange(parseInt(idx, 10), val === '' ? null : val);
                                }}
                                className="form-control"
@@ -343,7 +351,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
                    <select
                      value=""
                      onChange={(e) => {
-                       const val = e.target.value as CsvTransactionField;
+                       const val = e.target.value as CsvTransactionField | '';
                        handleColumnChange(parseInt(idx, 10), val === '' ? null : val);
                      }}
                      className="form-control"

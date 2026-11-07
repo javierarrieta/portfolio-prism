@@ -7,7 +7,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={() => {}}
       />
@@ -104,7 +104,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={onImportComplete}
       />
@@ -123,7 +123,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={() => {}}
       />
@@ -145,7 +145,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={() => {}}
       />
@@ -166,7 +166,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={() => {}}
       />
@@ -198,7 +198,7 @@ describe('CsvImportModal integration', () => {
     render(
       <CsvImportModal
         portfolioId={1}
-        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', transactions: [] }]}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
         onClose={() => {}}
         onImportComplete={() => {}}
       />

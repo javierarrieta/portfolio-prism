@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use utoipa::ToSchema;
 use rust_decimal::Decimal;
-use crate::db_types::decimal_json;
+use crate::db_types::{decimal_json, decimal_opt_json};
 
 // --- Transaction ---
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -122,6 +122,100 @@ pub struct AssetTaxSummary {
     #[serde(with = "decimal_json")]
     pub realized_pnl: Decimal,
     pub tax_lots: Vec<TaxLot>,
+}
+
+// --- Sell P&L breakdown ---
+
+/// One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
+/// split-adjusted and expressed in the portfolio base currency; `unit_cost`
+/// additionally carries the amortised buy fee.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LotMatch {
+    pub buy_transaction_id: i32,
+    pub buy_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub buy_price: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unit_cost: Decimal,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub lot_qty_before_match: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub pnl: Decimal,
+    pub holding_days: i64,
+    /// "SHORT" | "LONG", populated for the HYBRID strategy only; null otherwise.
+    pub term: Option<String>,
+}
+
+/// One sell and every lot it consumed, in consumption order. `unmatched_qty` is
+/// the quantity sold with no buy lot behind it, so it carries no cost basis and
+/// contributes nothing to `realized_pnl`.
+///
+/// Engine-internal: not registered in the OpenAPI components, because no
+/// response body is of this type.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SellBreakdown {
+    pub sell_transaction_id: i32,
+    pub sell_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub sold_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unmatched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_pnl: Decimal,
+    pub matches: Vec<LotMatch>,
+}
+
+/// Endpoint payload: the breakdown flattened next to the context needed to read
+/// it honestly — which strategy produced it, which currency the money is in,
+/// whether FX or a split touched it. `price`/`fee` are the raw as-entered values
+/// in `asset_currency`; every other money field is in `currency`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SellPnlResponse {
+    pub transaction_id: i32,
+    pub asset_id: i32,
+    pub symbol: String,
+    pub asset_type: String,
+    pub strategy: String,
+    pub threshold_days: i64,
+    pub currency: String,
+    pub asset_currency: String,
+    pub fx_applied: bool,
+    /// A SPLIT on this asset dated on or before the sell: buy prices in the
+    /// matches are split-adjusted rather than as entered.
+    pub split_applied: bool,
+    pub sell_date: DateTime<Utc>,
+    #[serde(with = "decimal_json")]
+    pub sold_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub price: Decimal,
+    #[serde(with = "decimal_json")]
+    pub fee: Decimal,
+    #[serde(with = "decimal_json")]
+    pub proceeds: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_pnl: Decimal,
+    /// Null when cost basis is zero — dividing there would invent a number.
+    #[serde(with = "decimal_opt_json")]
+    pub roi: Option<Decimal>,
+    #[serde(with = "decimal_json")]
+    pub matched_qty: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unmatched_qty: Decimal,
+    pub matches: Vec<LotMatch>,
 }
 
 #[cfg(test)]
@@ -294,5 +388,71 @@ mod tests {
         let json = serde_json::to_string(&u).unwrap();
         let deserialized: AssetUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.currency, "GBP");
+    }
+
+    #[test]
+    fn test_lot_match_roundtrip() {
+        let m = LotMatch {
+            buy_transaction_id: 11,
+            buy_date: sample_datetime(),
+            buy_price: Decimal::from_str("100.0").unwrap(),
+            unit_cost: Decimal::from_str("100.5").unwrap(),
+            matched_qty: Decimal::from_str("60.0").unwrap(),
+            lot_qty_before_match: Decimal::from_str("100.0").unwrap(),
+            cost_basis: Decimal::from_str("6030.0").unwrap(),
+            proceeds: Decimal::from_str("7800.0").unwrap(),
+            pnl: Decimal::from_str("1770.0").unwrap(),
+            holding_days: 335,
+            term: Some("SHORT".to_string()),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: LotMatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.buy_transaction_id, 11);
+        assert_eq!(back.unit_cost, Decimal::from_str("100.5").unwrap());
+        assert_eq!(back.holding_days, 335);
+        assert_eq!(back.term, Some("SHORT".to_string()));
+    }
+
+    #[test]
+    fn test_sell_breakdown_roundtrip_and_decimals_are_strings() {
+        let b = SellBreakdown {
+            sell_transaction_id: 42,
+            sell_date: sample_datetime(),
+            sold_qty: Decimal::from_str("80.0").unwrap(),
+            matched_qty: Decimal::from_str("80.0").unwrap(),
+            unmatched_qty: Decimal::ZERO,
+            proceeds: Decimal::from_str("10400.0").unwrap(),
+            cost_basis: Decimal::from_str("8400.0").unwrap(),
+            realized_pnl: Decimal::from_str("2000.0").unwrap(),
+            matches: vec![],
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(json.contains(r#""realized_pnl":"2000.0""#), "decimals must serialize as strings: {json}");
+        let back: SellBreakdown = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.realized_pnl, Decimal::from_str("2000.0").unwrap());
+        assert!(back.matches.is_empty());
+    }
+
+    #[test]
+    fn test_sell_pnl_response_roi_null_when_no_cost_basis() {
+        let r = SellPnlResponse {
+            transaction_id: 42, asset_id: 7, symbol: "AAPL".to_string(),
+            asset_type: "STOCK".to_string(), strategy: "FIFO".to_string(), threshold_days: 30,
+            currency: "USD".to_string(), asset_currency: "USD".to_string(),
+            fx_applied: false, split_applied: false,
+            sell_date: sample_datetime(),
+            sold_qty: Decimal::from_str("50.0").unwrap(),
+            price: Decimal::from_str("120.0").unwrap(),
+            fee: Decimal::ZERO,
+            proceeds: Decimal::ZERO, cost_basis: Decimal::ZERO, realized_pnl: Decimal::ZERO,
+            roi: None,
+            matched_qty: Decimal::ZERO, unmatched_qty: Decimal::from_str("50.0").unwrap(),
+            matches: vec![],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""roi":null"#), "roi must be null, not 0: {json}");
+        let back: SellPnlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.roi, None);
+        assert_eq!(back.unmatched_qty, Decimal::from_str("50.0").unwrap());
     }
 }

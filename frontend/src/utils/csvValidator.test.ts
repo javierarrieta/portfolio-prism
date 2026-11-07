@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'vitest';
+import type { ColumnMapping } from '../types/csv';
 import { detectColumns } from './csvParser';
 import { validateCsvRow, validateCsvFile } from './csvValidator';
 
@@ -169,7 +170,9 @@ describe('validateCsvRow', () => {
   });
 
   test('uses constants for unmapped fields', () => {
-    const mapping: Record<number, string> = { 0: 'date', 1: 'quantity', 2: 'price' };
+    // ColumnMapping, not Record<number, string>: the values are the CsvTransactionField
+    // union, and a bare string here describes a mapping production could never produce.
+    const mapping: ColumnMapping = { 0: 'date', 1: 'quantity', 2: 'price' };
     const row = { date: '2024-01-15', qty: '100', price: '150.00' };
     const result = validateCsvRow(row, mapping, 1, { symbol: 'AAPL', type: 'BUY' });
     expect(result.errors).toHaveLength(0);

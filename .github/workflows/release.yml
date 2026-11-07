@@ -41,7 +41,7 @@ jobs:
             ghcr.io/${{ github.repository }}/backend:${{ steps.version.outputs.VERSION }}-amd64
 
   backend-build-arm64:
-    runs-on: investment-portfolio-manager-arm64-runners
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 

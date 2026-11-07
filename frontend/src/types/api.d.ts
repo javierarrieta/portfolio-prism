@@ -38,6 +38,9 @@ export interface paths {
   "/api/transactions/<id>": {
     delete: operations["delete_transaction"];
   };
+  "/api/transactions/<id>/pnl": {
+    get: operations["get_transaction_sell_pnl"];
+  };
 }
 
 export type webhooks = Record<string, never>;
@@ -95,6 +98,28 @@ export interface components {
       unrealized_pnl: string;
       unrealized_roi: string;
     };
+    /**
+     * @description One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
+     * split-adjusted and expressed in the portfolio base currency; `unit_cost`
+     * additionally carries the amortised buy fee.
+     */
+    LotMatch: {
+      /** Format: date-time */
+      buy_date: string;
+      buy_price: string;
+      /** Format: int32 */
+      buy_transaction_id: number;
+      cost_basis: string;
+      /** Format: int64 */
+      holding_days: number;
+      lot_qty_before_match: string;
+      matched_qty: string;
+      pnl: string;
+      proceeds: string;
+      /** @description "SHORT" | "LONG", populated for the HYBRID strategy only; null otherwise. */
+      term?: string | null;
+      unit_cost: string;
+    };
     Portfolio: {
       base_currency: string;
       currency: string;
@@ -118,6 +143,44 @@ export interface components {
     };
     PortfolioUpdate: {
       currency: string;
+    };
+    /**
+     * @description Endpoint payload: the breakdown flattened next to the context needed to read
+     * it honestly — which strategy produced it, which currency the money is in,
+     * whether FX or a split touched it. `price`/`fee` are the raw as-entered values
+     * in `asset_currency`; every other money field is in `currency`.
+     */
+    SellPnlResponse: {
+      asset_currency: string;
+      /** Format: int32 */
+      asset_id: number;
+      asset_type: string;
+      cost_basis: string;
+      currency: string;
+      fee: string;
+      fx_applied: boolean;
+      matched_qty: string;
+      matches: components["schemas"]["LotMatch"][];
+      price: string;
+      proceeds: string;
+      realized_pnl: string;
+      /** @description Null when cost basis is zero — dividing there would invent a number. */
+      roi?: string | null;
+      /** Format: date-time */
+      sell_date: string;
+      sold_qty: string;
+      /**
+       * @description A SPLIT on this asset dated on or before the sell: buy prices in the
+       * matches are split-adjusted rather than as entered.
+       */
+      split_applied: boolean;
+      strategy: string;
+      symbol: string;
+      /** Format: int64 */
+      threshold_days: number;
+      /** Format: int32 */
+      transaction_id: number;
+      unmatched_qty: string;
     };
     TaxLot: {
       /** Format: date-time */
@@ -427,6 +490,36 @@ export interface operations {
     responses: {
       /** @description Transaction deleted */
       204: {
+        content: never;
+      };
+      /** @description Transaction not found */
+      404: {
+        content: never;
+      };
+    };
+  };
+  get_transaction_sell_pnl: {
+    parameters: {
+      query?: {
+        /** @description FIFO, LIFO or HYBRID (default FIFO) */
+        strategy?: string | null;
+        /** @description HYBRID short-term threshold (default 30) */
+        threshold_days?: number | null;
+      };
+      path: {
+        /** @description Sell transaction id */
+        id: number;
+      };
+    };
+    responses: {
+      /** @description Realized P&L breakdown for the sell */
+      200: {
+        content: {
+          "application/json": components["schemas"]["SellPnlResponse"];
+        };
+      };
+      /** @description Transaction is not a SELL */
+      400: {
         content: never;
       };
       /** @description Transaction not found */

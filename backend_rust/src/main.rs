@@ -2,7 +2,7 @@
 
 use sqlx::sqlite::SqlitePool;
 use backend_rust::services::currency_service::CurrencyService;
-use backend_rust::get_cors_options;
+use backend_rust::{get_cors_options, parse_allowed_origins};
 use backend_rust::build_rocket;
 use backend_rust::init_db;
 
@@ -17,9 +17,8 @@ async fn rocket() -> _ {
     
     let currency_service = CurrencyService::new();
 
-    let origins = std::env::var("ALLOWED_ORIGINS")
-        .map(|val| val.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_else(|_| vec!["http://localhost:5173".to_string(), "http://127.0.0.1:5173".to_string()]);
+    let origins = parse_allowed_origins(std::env::var("ALLOWED_ORIGINS").ok().as_deref());
+    eprintln!("ALLOWED_ORIGINS -> CORS origins: {:?}", origins);
 
     let cors = get_cors_options(origins);
 
