@@ -15,23 +15,12 @@ spec:
       labels:
         app: investment-portfolio-manager
     spec:
-      initContainers:
-        - name: wait-for-backend
-          image: busybox:1.36
-          command:
-            - sh
-            - -c
-            - |
-              for i in $(seq 1 30); do
-                if curl -sf http://127.0.0.1:8000/ > /dev/null 2>&1; then
-                  echo "Backend is ready"
-                  exit 0
-                fi
-                echo "Waiting for backend... ($i)"
-                sleep 2
-              done
-              echo "Backend did not become ready in time"
-              exit 1
+      # No initContainer waiting for the backend. The previous one curled
+      # `http://127.0.0.1:8000/` from an init phase, which runs **before** the
+      # backend container exists, so it could only ever exhaust its retries and
+      # exit 1 — it delayed every pod start by 60 seconds and could never succeed.
+      # The backend's own readiness probe is what gates traffic, and it already
+      # exists below.
       containers:
         - name: frontend
           image: ghcr.io/<org>/investment-portfolio-manager/frontend:latest
@@ -65,6 +54,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: backend-config
+            # ROCKET_SECRET_KEY and OIDC_CLIENT_SECRET. The Secret must exist before
+            # rollout; with it missing the pod fails to start rather than booting
+            # with an ephemeral key that would invalidate every session on restart.
+            - secretRef:
+                name: backend-secrets
           env:
             - name: RUST_LOG
               value: "info"
