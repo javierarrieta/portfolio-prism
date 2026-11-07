@@ -90,7 +90,13 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        # v4 runs the action itself on Node 20, which GitHub is retiring; the runner
+        # prints a warning annotation on every frontend job because of it. v7 targets
+        # Node 24 and takes the same inputs used here (`node-version`, `cache`,
+        # `cache-dependency-path`). This is the action's runtime, not the app's —
+        # `node-version: '20'` below stays, because frontend/Dockerfile builds on
+        # node:20-alpine and CI must keep matching the image it tests.
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
