@@ -47,7 +47,14 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 5
         - name: backend
-          image: ghcr.io/<org>/investment-portfolio-manager/backend:latest
+          # Pinned by digest, not `:latest`. The rollback story for an auth change is
+          # "roll back the image revision" — `AUTH_MODE=disabled` is not compiled
+          # into the release image, so no environment variable can undo a bad auth
+          # deploy. `kubectl rollout undo` on a `:latest` tag is a no-op: the pod
+          # template is byte-identical, so nothing rolls out and the restart pulls
+          # whatever is published today. Record the digest you deployed before you
+          # deploy it, or the rollback does not exist.
+          image: ghcr.io/<org>/investment-portfolio-manager/backend@sha256:REPLACE_WITH_DIGEST
           ports:
             - containerPort: 8000
               name: http
@@ -69,6 +76,16 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # `init_db` now runs ALTERs and a full-table ownership backfill before
+          # Rocket binds the port. On a large database that is longer than the
+          # liveness `initialDelaySeconds`, so without a startup probe the kubelet
+          # kills the container mid-migration and it restarts into the same work.
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /

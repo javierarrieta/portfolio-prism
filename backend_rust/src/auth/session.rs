@@ -10,9 +10,9 @@
 //! without a Rocket instance.
 
 use rocket::http::Cookie;
+use rocket::http::CookieJar;
 use rocket::http::SameSite;
 use rocket::time::Duration;
-use rocket::http::CookieJar;
 use serde::{Deserialize, Serialize};
 
 /// Name of the session cookie.
@@ -80,15 +80,33 @@ fn build(name: &str, value: &str, max_age: Duration) -> Cookie<'static> {
 }
 
 /// Issue a session cookie for `uid` at token version `tv`.
+/// The `(name, value)` pair [`issue`] would attach, for callers that have no request
+/// to attach it to — the tests in particular. Going through here rather than
+/// hand-writing a payload keeps "what does a fresh session carry" a single answer.
+pub fn pair(uid: i64, tv: i64) -> (&'static str, String) {
+    (SESSION_COOKIE, value(uid, tv, expiry_now()))
+}
+
 pub fn issue(jar: &CookieJar, uid: i64, tv: i64) {
-    jar.add_private(build(SESSION_COOKIE, &value(uid, tv, expiry_now()), SESSION_MAX_AGE));
+    jar.add_private(build(
+        SESSION_COOKIE,
+        &value(uid, tv, expiry_now()),
+        SESSION_MAX_AGE,
+    ));
+}
+
+/// Attach a `(name, value)` pair produced by [`pair`]. Exists so a caller that
+/// derived the pair through its own helper attaches exactly what it derived.
+pub fn attach(jar: &CookieJar, name: &str, value: &str) {
+    jar.add_private(build(name, value, SESSION_MAX_AGE));
 }
 
 /// Read and decrypt the session cookie. Does **not** check `exp` — the caller
 /// ([`crate::auth::guard::resolve_caller`]) compares it against the row it loads
 /// anyway and can distinguish "expired" from "no cookie".
 pub fn read(jar: &CookieJar) -> Option<SessionPayload> {
-    jar.get_private(SESSION_COOKIE).and_then(|c| parse(c.value()))
+    jar.get_private(SESSION_COOKIE)
+        .and_then(|c| parse(c.value()))
 }
 
 /// Expire the session cookie in the browser and forget it here.
@@ -106,7 +124,8 @@ pub fn issue_state(jar: &CookieJar, payload: &StatePayload) {
 
 /// Read the OAuth state cookie.
 pub fn read_state(jar: &CookieJar) -> Option<StatePayload> {
-    jar.get_private(STATE_COOKIE).and_then(|c| serde_json::from_str(c.value()).ok())
+    jar.get_private(STATE_COOKIE)
+        .and_then(|c| serde_json::from_str(c.value()).ok())
 }
 
 /// Forget the OAuth state cookie.
@@ -123,14 +142,26 @@ mod tests {
         let raw = value(7, 3, 1_800_000_000);
         assert_eq!(
             parse(&raw),
-            Some(SessionPayload { uid: 7, tv: 3, exp: 1_800_000_000 })
+            Some(SessionPayload {
+                uid: 7,
+                tv: 3,
+                exp: 1_800_000_000
+            })
         );
     }
 
     #[test]
     fn parse_rejects_anything_that_is_not_the_payload_shape() {
         // A tampered or foreign cookie must fail closed, not default to a user.
-        for raw in ["", "not json", "{}", r#"{"uid":1}"#, r#"{"uid":1,"tv":2}"#, "7", "null"] {
+        for raw in [
+            "",
+            "not json",
+            "{}",
+            r#"{"uid":1}"#,
+            r#"{"uid":1,"tv":2}"#,
+            "7",
+            "null",
+        ] {
             assert_eq!(parse(raw), None, "raw={raw:?}");
         }
     }

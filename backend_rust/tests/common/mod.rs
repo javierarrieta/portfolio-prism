@@ -1,9 +1,9 @@
-use chrono::{DateTime, Utc};
-use rocket::{Rocket, Build};
-use sqlx::SqlitePool;
-use backend_rust::{build_rocket as lib_build_rocket, init_db, get_cors_options};
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::services::currency_service::CurrencyService;
+use backend_rust::{build_rocket as lib_build_rocket, get_cors_options, init_db};
+use chrono::{DateTime, Utc};
+use rocket::{Build, Rocket};
+use sqlx::SqlitePool;
 
 /// The user every existing test runs as: the placeholder row `init_db` creates
 /// unconditionally, which is `id = 1` on a fresh in-memory database.
@@ -13,10 +13,8 @@ pub const DEFAULT_USER: i32 = 1;
 /// environment source rather than by mutating the process environment (which is
 /// `unsafe` in edition 2024 and racy across parallel tests).
 pub fn disabled_config() -> StartupConfig {
-    StartupConfig::from_env_with(&|key| {
-        (key == "AUTH_MODE").then(|| "disabled".to_string())
-    })
-    .expect("AUTH_MODE=disabled parses in a debug build")
+    StartupConfig::from_env_with(&|key| (key == "AUTH_MODE").then(|| "disabled".to_string()))
+        .expect("AUTH_MODE=disabled parses in a debug build")
 }
 
 /// An `OidcConfig` that parses but is never contacted: provider discovery is lazy,
@@ -57,6 +55,15 @@ pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
 pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
     let currency_service = CurrencyService::new();
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
+    lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
+}
+
+/// Build in OIDC mode with an explicit origin allowlist, for the tests that care
+/// about how CORS and authentication are ordered.
+#[allow(dead_code)]
+pub fn build_rocket_oidc_with_cors(pool: SqlitePool, origins: Vec<String>) -> Rocket<Build> {
+    let currency_service = CurrencyService::new();
+    let cors = get_cors_options(origins);
     lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
 }
 
@@ -138,7 +145,9 @@ pub async fn seed_transaction(
     price: f64,
     fee: f64,
 ) -> i32 {
-    let date = DateTime::parse_from_rfc3339("2024-06-15T00:00:00Z").unwrap().with_timezone(&Utc);
+    let date = DateTime::parse_from_rfc3339("2024-06-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
     let res = sqlx::query_as::<_, (i32,)>(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
     )
@@ -163,7 +172,9 @@ pub async fn seed_transaction_at(
     fee: f64,
     date: &str,
 ) -> i32 {
-    let date = DateTime::parse_from_rfc3339(date).unwrap().with_timezone(&Utc);
+    let date = DateTime::parse_from_rfc3339(date)
+        .unwrap()
+        .with_timezone(&Utc);
     let res = sqlx::query_as::<_, (i32,)>(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
     )

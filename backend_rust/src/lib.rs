@@ -446,6 +446,17 @@ pub fn build_rocket(
             auth::routes::denied_head,
             auth::routes::denied_options,
         ])
+        // The outage sentinel: same seven methods, so no method can answer 405
+        // where 503 is the truth.
+        .mount("/_auth", routes![
+            auth::routes::unavailable_get,
+            auth::routes::unavailable_post,
+            auth::routes::unavailable_put,
+            auth::routes::unavailable_delete,
+            auth::routes::unavailable_patch,
+            auth::routes::unavailable_head,
+            auth::routes::unavailable_options,
+        ])
         .mount("/auth", routes![auth::routes::me])
         .mount("/api/portfolios", routes![
             api_routes::portfolios::create_portfolio,

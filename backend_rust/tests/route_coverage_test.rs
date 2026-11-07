@@ -9,7 +9,7 @@
 mod common;
 
 use backend_rust::access::Access;
-use backend_rust::auth::fairing::DENIED_PATH;
+use backend_rust::auth::fairing::{DENIED_PATH, UNAVAILABLE_PATH};
 use rocket::http::Method;
 use std::collections::HashSet;
 
@@ -28,13 +28,37 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     ("GET", "/api/portfolios/<id>", Some(Access::Viewer)),
     ("PATCH", "/api/portfolios/<id>", Some(Access::Owner)),
     ("DELETE", "/api/portfolios/<id>", Some(Access::Owner)),
-    ("GET", "/api/portfolios/<id>/tax-summary", Some(Access::Viewer)),
-    ("GET", "/api/portfolios/<id>/performance", Some(Access::Viewer)),
-    ("POST", "/api/portfolios/<portfolio_id>/assets", Some(Access::Editor)),
-    ("PATCH", "/api/portfolios/<portfolio_id>/assets/<asset_id>", Some(Access::Editor)),
+    (
+        "GET",
+        "/api/portfolios/<id>/tax-summary",
+        Some(Access::Viewer),
+    ),
+    (
+        "GET",
+        "/api/portfolios/<id>/performance",
+        Some(Access::Viewer),
+    ),
+    (
+        "POST",
+        "/api/portfolios/<portfolio_id>/assets",
+        Some(Access::Editor),
+    ),
+    (
+        "PATCH",
+        "/api/portfolios/<portfolio_id>/assets/<asset_id>",
+        Some(Access::Editor),
+    ),
     ("DELETE", "/api/assets/<id>", Some(Access::Owner)),
-    ("POST", "/api/portfolios/<portfolio_id>/assets/<asset_id>/transactions", Some(Access::Editor)),
-    ("GET", "/api/portfolios/<portfolio_id>/transactions", Some(Access::Viewer)),
+    (
+        "POST",
+        "/api/portfolios/<portfolio_id>/assets/<asset_id>/transactions",
+        Some(Access::Editor),
+    ),
+    (
+        "GET",
+        "/api/portfolios/<portfolio_id>/transactions",
+        Some(Access::Viewer),
+    ),
     ("DELETE", "/api/transactions/<id>", Some(Access::Editor)),
     ("GET", "/api/transactions/<id>/pnl", Some(Access::Viewer)),
     ("GET", "/api/assets/lookup", None),
@@ -62,13 +86,20 @@ fn is_api(path: &str) -> bool {
 /// spelling is *not* translated: this codebase writes utoipa paths in Rocket's
 /// `<param>` form, so the two are otherwise byte-identical.
 fn to_document_path(rocket_uri: &str) -> String {
-    rocket_uri.split('?').next().unwrap_or(rocket_uri).to_string()
+    rocket_uri
+        .split('?')
+        .next()
+        .unwrap_or(rocket_uri)
+        .to_string()
 }
 
 /// Every route the router actually holds, after ignition.
 async fn mounted() -> Vec<(Method, String)> {
     let pool = common::setup_db(&common::oidc_config()).await;
-    let rocket = common::build_rocket_oidc(pool).ignite().await.expect("rocket ignites");
+    let rocket = common::build_rocket_oidc(pool)
+        .ignite()
+        .await
+        .expect("rocket ignites");
     rocket
         .routes()
         .map(|r| (r.method, r.uri.to_string()))
@@ -113,11 +144,57 @@ async fn every_mounted_api_route_is_in_the_published_document() {
 async fn no_mounted_route_escapes_the_prefix_rule() {
     // A route resolving to exactly `/api` would not start with `/api/`, so the
     // fairing would skip it while an inventory check still saw it as covered.
+    //
+    // Checking only for the exact string `/api` would miss every other way a data
+    // route can sit outside the rule — mounted at `/data`, at `/apifoo`, at `/` — so
+    // the assertion is inverted: every mounted route must be in a namespace that is
+    // public by decision, and anything else is an escape.
+    const PUBLIC_NAMESPACES: &[&str] = &["/api/", "/auth", "/_auth", "/api-docs"];
     for (method, uri) in mounted().await {
         let path = uri.split('?').next().unwrap();
         if path == "/api" {
             panic!("{method} {uri} resolves to exactly /api and would bypass enforcement");
         }
+        let root = format!(
+            "/{}",
+            path.trim_matches('/').split('/').next().unwrap_or("")
+        );
+        let allowed = path == "/"
+            || path == "/api-docs"
+            || PUBLIC_NAMESPACES.iter().any(|p| path.starts_with(p))
+            // rocket_cors mounts its own responder under /cors/ and rewrites a
+            // rejected request there; it is public by construction, not by us.
+            || path.starts_with("/cors/");
+        assert!(
+            allowed,
+            "{method} {uri} (root {root}) is mounted outside every public namespace, \
+             so it is reachable without a session while not being a deliberate public route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_outage_sentinel_covers_every_method_outside_api() {
+    // Same reasoning as the denial sentinel: a method that is not mounted there
+    // answers 405 where the truth is 503, and 405 tells the client nothing is wrong
+    // with the server.
+    let mounted = mounted().await;
+    for method in [
+        Method::Get,
+        Method::Post,
+        Method::Put,
+        Method::Delete,
+        Method::Patch,
+        Method::Head,
+        Method::Options,
+    ] {
+        assert!(
+            mounted
+                .iter()
+                .any(|(m, u)| *m == method && u == UNAVAILABLE_PATH),
+            "{method} {UNAVAILABLE_PATH} is not mounted"
+        );
+        assert!(!UNAVAILABLE_PATH.starts_with("/api/"));
     }
 }
 
@@ -146,7 +223,9 @@ async fn the_denial_sentinel_covers_every_method_outside_api() {
         Method::Options,
     ] {
         assert!(
-            mounted.iter().any(|(m, u)| *m == method && u == DENIED_PATH),
+            mounted
+                .iter()
+                .any(|(m, u)| *m == method && u == DENIED_PATH),
             "{method} {DENIED_PATH} is not mounted, so that method would answer 405 where 401 is required"
         );
         assert!(!DENIED_PATH.starts_with("/api/"));
@@ -172,8 +251,14 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
 
     let missing: Vec<_> = mounted_api.difference(&inventory).collect();
     let extra: Vec<_> = inventory.difference(&mounted_api).collect();
-    assert!(missing.is_empty(), "routes not in PROTECTED_ROUTES: {missing:?}");
-    assert!(extra.is_empty(), "PROTECTED_ROUTES names routes that are not mounted: {extra:?}");
+    assert!(
+        missing.is_empty(),
+        "routes not in PROTECTED_ROUTES: {missing:?}"
+    );
+    assert!(
+        extra.is_empty(),
+        "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
+    );
     assert_eq!(PROTECTED_ROUTES.len(), 15);
 }
 
@@ -183,6 +268,12 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
     // name a level are not aspirational. A handler that dropped its `require*`
     // call would still pass the gate script only if it also dropped the query, so
     // the isolation matrix is the runtime half and this is the static half.
-    let with_level = PROTECTED_ROUTES.iter().filter(|(_, _, level)| level.is_some()).count();
-    assert_eq!(with_level, 13, "two routes authenticate without checking an id");
+    let with_level = PROTECTED_ROUTES
+        .iter()
+        .filter(|(_, _, level)| level.is_some())
+        .count();
+    assert_eq!(
+        with_level, 13,
+        "two routes authenticate without checking an id"
+    );
 }

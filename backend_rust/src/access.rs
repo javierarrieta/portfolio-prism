@@ -187,9 +187,13 @@ pub async fn require_transaction(
         return Err(deny("transaction", tx_id, user_id));
     };
 
-    // A transaction whose asset no longer exists resolves to not-found. That is
-    // reachable today: deleting an asset leaves its transactions behind, and
-    // foreign keys are not enforced in this schema.
+    // A transaction whose asset no longer exists resolves to not-found. Defensive,
+    // not reachable through the API: sqlx turns SQLite foreign keys ON by default, so
+    // the API cannot leave a transaction pointing at a missing asset —
+    // `deleting_an_asset_that_has_transactions_fails_today` pins that. A hand-edited
+    // database still can, and this branch must not grant on it. The schema built in
+    // `access_test.rs` has no foreign keys, which is what makes the case constructible
+    // there and nowhere else.
     require_asset(pool, user_id, asset_id as i32, min).await
 }
 

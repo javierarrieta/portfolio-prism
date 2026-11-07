@@ -1,9 +1,9 @@
+use crate::api_routes::lookup::AssetLookupResult;
+use crate::models;
+use crate::schemas;
 use utoipa::OpenApi;
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{Components, RefOr, Response};
-use crate::schemas;
-use crate::models;
-use crate::api_routes::lookup::AssetLookupResult;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -24,26 +24,23 @@ use crate::api_routes::lookup::AssetLookupResult;
         crate::api_routes::analytics::get_transaction_sell_pnl,
         crate::api_routes::lookup::lookup_isin,
     ),
-
-    components(
-        schemas(
-            models::Portfolio,
-            models::Asset,
-            models::Transaction,
-            schemas::PortfolioCreate,
-            schemas::PortfolioOut,
-            schemas::PortfolioUpdate,
-            schemas::AssetCreate,
-            schemas::AssetOut,
-            schemas::TransactionCreate,
-            schemas::TransactionOut,
-            schemas::TaxLot,
-            schemas::AssetTaxSummary,
-            schemas::LotMatch,
-            schemas::SellPnlResponse,
-            AssetLookupResult,
-        )
-    )
+    components(schemas(
+        models::Portfolio,
+        models::Asset,
+        models::Transaction,
+        schemas::PortfolioCreate,
+        schemas::PortfolioOut,
+        schemas::PortfolioUpdate,
+        schemas::AssetCreate,
+        schemas::AssetOut,
+        schemas::TransactionCreate,
+        schemas::TransactionOut,
+        schemas::TaxLot,
+        schemas::AssetTaxSummary,
+        schemas::LotMatch,
+        schemas::SellPnlResponse,
+        AssetLookupResult,
+    ))
 )]
 pub struct ApiDoc;
 
@@ -80,7 +77,9 @@ pub fn document() -> utoipa::openapi::OpenApi {
     for (path, item) in doc.paths.paths.iter_mut() {
         // Only the protected surface. `/` and `/api-docs/openapi.json` stay public
         // and must not advertise a `401`.
-        if !path.starts_with("/api") {
+        // The same rule the fairing enforces, not a bare `/api` prefix: `/api-docs`
+        // is a public route and must not be documented as requiring a session.
+        if !(path == "/api" || path.starts_with("/api/")) {
             continue;
         }
         for operation in item.operations.values_mut() {

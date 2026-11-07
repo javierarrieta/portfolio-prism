@@ -15,12 +15,21 @@ use rocket::http::Method;
 use rocket::http::uri::Origin;
 use rocket::{Data, Request};
 
-use super::guard::resolve_caller;
 use super::AuthMode;
+use super::guard::resolve_caller;
 
 /// The sentinel every denied `/api/` request is routed to. Outside `/api`, so it
 /// is neither covered by the prefix rule nor part of the public API surface.
 pub const DENIED_PATH: &str = "/_auth/denied";
+
+/// The sentinel a request is routed to when the **lookup itself** failed.
+///
+/// Separate from [`DENIED_PATH`] on purpose. Collapsing a database failure into the
+/// `401` made the frontend's `apiFetch` bounce a signed-in user to the identity
+/// provider for the duration of an outage, and once there the provider had nothing
+/// to fix, so the browser came back and bounced again. A `503` is both the truth
+/// and loop-proof: the frontend does not redirect on it.
+pub const UNAVAILABLE_PATH: &str = "/_auth/unavailable";
 
 pub struct AuthFairing;
 
@@ -40,13 +49,20 @@ fn is_protected(req: &Request<'_>) -> bool {
 fn is_cors_preflight(req: &Request<'_>) -> bool {
     req.method() == Method::Options
         && req.headers().get("Origin").next().is_some()
-        && req.headers().get("Access-Control-Request-Method").next().is_some()
+        && req
+            .headers()
+            .get("Access-Control-Request-Method")
+            .next()
+            .is_some()
 }
 
 #[rocket::async_trait]
 impl Fairing for AuthFairing {
     fn info(&self) -> Info {
-        Info { name: "auth", kind: Kind::Request }
+        Info {
+            name: "auth",
+            kind: Kind::Request,
+        }
     }
 
     async fn on_request(&self, req: &mut Request<'_>, _data: &mut Data<'_>) {
@@ -78,12 +94,22 @@ impl Fairing for AuthFairing {
             }
             Err(e) => {
                 // A database failure is not a denial, but the handler must not run
-                // either: it would execute with no caller.
-                eprintln!("ERROR: authentication lookup failed for {} {}: {e}", req.method(), req.uri().path());
-                deny(req);
+                // either: it would execute with no caller. Route it somewhere that
+                // says "try again", not "sign in".
+                eprintln!(
+                    "ERROR: authentication lookup failed for {} {}: {e}",
+                    req.method(),
+                    req.uri().path()
+                );
+                unavailable(req);
             }
         }
     }
+}
+
+fn unavailable(req: &mut Request<'_>) {
+    let path = Origin::parse(UNAVAILABLE_PATH).expect("UNAVAILABLE_PATH is a valid origin");
+    req.set_uri(path);
 }
 
 fn deny(req: &mut Request<'_>) {

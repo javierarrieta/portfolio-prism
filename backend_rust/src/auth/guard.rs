@@ -13,8 +13,8 @@ use rocket::response::Responder;
 use rocket::{Request, Response};
 use sqlx::SqlitePool;
 
-use super::session;
 use super::AuthMode;
+use super::session;
 
 /// The authenticated caller.
 #[derive(Debug, Clone)]
@@ -23,6 +23,29 @@ pub struct AuthedUser {
     pub email: Option<String>,
     pub name: Option<String>,
     pub sub: String,
+    /// The row's current `token_version`, carried so a caller that mints a session
+    /// (the OIDC callback) issues it at the version the guard is about to demand.
+    /// Issuing a literal `0` instead locks a user out permanently after their first
+    /// `logout-all`, because the guard rejects `tv != token_version` and nothing
+    /// ever lowers the column again.
+    pub token_version: i64,
+}
+
+impl AuthedUser {
+    /// The `(name, value)` pair of a fresh session for this identity. The version
+    /// comes from the row the identity was read from, and this is the **only** place
+    /// that chooses it: two places picking a token version is how the `logout-all`
+    /// lockout shipped.
+    pub fn session_pair(&self) -> (&'static str, String) {
+        super::session::pair(self.id as i64, self.token_version)
+    }
+
+    /// Mint a session for this identity, attaching exactly what [`Self::session_pair`]
+    /// derived.
+    pub fn issue_session(&self, jar: &rocket::http::CookieJar<'_>) {
+        let (name, value) = self.session_pair();
+        super::session::attach(jar, name, &value);
+    }
 }
 
 /// The one definition of the unauthenticated response body.
@@ -47,7 +70,10 @@ impl Responder<'_, 'static> for Unauthenticated {
         Response::build()
             .status(Status::Unauthorized)
             .header(ContentType::JSON)
-            .sized_body(UNAUTHENTICATED_BODY.len(), Cursor::new(UNAUTHENTICATED_BODY))
+            .sized_body(
+                UNAUTHENTICATED_BODY.len(),
+                Cursor::new(UNAUTHENTICATED_BODY),
+            )
             .ok()
     }
 }
@@ -112,7 +138,13 @@ pub async fn resolve_caller(
         }
     }
 
-    Ok(Some(AuthedUser { id: id as i32, email, name, sub }))
+    Ok(Some(AuthedUser {
+        id: id as i32,
+        email,
+        name,
+        sub,
+        token_version,
+    }))
 }
 
 #[rocket::async_trait]

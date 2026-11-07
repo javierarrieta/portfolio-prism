@@ -37,11 +37,12 @@ jobs:
           diff /tmp/current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
 
   release-build:
-    # Compilation only. It proves the release binary builds with
-    # `AuthMode::Disabled` compiled out; it does not run the release binary, so it
-    # cannot prove the runtime refusal of `AUTH_MODE=disabled` in release. That is
-    # checked by a test, not here. `cargo test --release` is deliberately not used:
-    # the integration tests need the `Disabled` variant and do not compile without it.
+    # Compiles the release binary with `AuthMode::Disabled` compiled out, and then
+    # actually runs it to prove the runtime refusal. The refusal is behind
+    # `!cfg!(debug_assertions)`, so no `cargo test` in the debug profile can reach
+    # it and the claim would otherwise be unverified. `cargo test --release` is
+    # deliberately not used: the integration tests need the `Disabled` variant and
+    # do not compile without it.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -51,6 +52,36 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+        working-directory: backend_rust
+
+      - name: Release binary refuses AUTH_MODE=disabled
+        # Exit 1 and a message naming the variable. Anything else — a clean start, a
+        # panic, or a silent exit 0 — means the release image can be talked into
+        # running with no authentication, which is the one configuration that must be
+        # impossible to reach by environment alone.
+        run: |
+          set +e
+          out=$(AUTH_MODE=disabled ./target/release/backend_rust 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "release binary started with AUTH_MODE=disabled; it must refuse"; exit 1
+          fi
+          echo "$out" | grep -q "AUTH_MODE=disabled" || { echo "refusal did not name AUTH_MODE"; exit 1; }
+        working-directory: backend_rust
+
+      - name: Release binary refuses a missing OIDC configuration
+        run: |
+          set +e
+          out=$(AUTH_MODE=oidc ./target/release/backend_rust 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "release binary started with no OIDC configuration"; exit 1; fi
+          for v in OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_REDIRECT_URI; do
+            echo "$out" | grep -q "$v" || { echo "refusal did not name $v"; exit 1; }
+          done
         working-directory: backend_rust
 
   frontend-tests:
@@ -85,6 +116,13 @@ jobs:
         # `vite build` strips types without checking them, so without this step nothing in
         # CI ever ran tsc and the test files were never type-checked at all.
         run: npm run typecheck
+        working-directory: frontend
+
+      - name: Lint
+        # The plan's own gate list, and the reason the local check and CI cannot
+        # diverge. Without it a lint error ships and only shows up on someone's
+        # machine.
+        run: npm run lint
         working-directory: frontend
 
       - name: Run tests

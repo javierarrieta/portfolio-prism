@@ -26,8 +26,24 @@ data:
   # have no owner and no bootstrap target make the backend refuse to start, which is
   # the intended outcome rather than guessing an owner.
   #
-  # A blank value here counts as unset, exactly as an absent one does.
-  BOOTSTRAP_OWNER_SUBJ: "REPLACE_WITH_AUTHENTIK_SUB"
+  # Deliberately EMPTY rather than a placeholder string. The refuse-to-start guard
+  # distinguishes set from unset, so a sentinel like `REPLACE_ME` would count as
+  # *set*: applying this manifest unedited would quietly hand every pre-existing
+  # portfolio to the placeholder row — which no identity can ever claim, because no
+  # provider issues that `sub` — instead of stopping. Blank counts as unset, exactly
+  # like an absent key, so the guard fires.
+  BOOTSTRAP_OWNER_SUBJ: ""
+
+  # Cross-origin requests the backend will accept. This is not cosmetic: rocket_cors
+  # runs before the auth layer and rewrites any request whose `Origin` is not listed
+  # to its own `403` route, so with the default (localhost dev origins only) every
+  # `POST`/`PATCH`/`DELETE` from the deployed site fails before authentication —
+  # and because the browser sends `Origin` on same-origin writes, this bites even
+  # though nothing here is actually cross-origin.
+  #
+  # Set this to the exact public origin the browser loads the app from, no trailing
+  # slash. The dev defaults are `http://localhost:5173,http://127.0.0.1:5173`.
+  ALLOWED_ORIGINS: "https://portfolio.example.com"
 
   # Deliberately absent:
   #   ROCKET_PROFILE — the release image resolves to the `release` profile on its

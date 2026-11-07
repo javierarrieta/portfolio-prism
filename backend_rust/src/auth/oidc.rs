@@ -13,6 +13,7 @@
 //! `authorize_url` takes the flow, CSRF and nonce generators as three arguments.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
 use openidconnect::core::{
@@ -25,9 +26,9 @@ use openidconnect::{
 };
 use sqlx::SqlitePool;
 
+use super::OidcConfig;
 use super::guard::AuthedUser;
 use super::session::StatePayload;
-use super::OidcConfig;
 
 /// Provider metadata type.
 ///
@@ -44,8 +45,17 @@ type ProviderMetadata = ProviderMetadataWithLogout;
 /// not disable logins until the next restart.
 static PROVIDER_CACHE: Mutex<Option<(String, ProviderMetadata)>> = Mutex::new(None);
 
-/// Cached JWKS, keyed on issuer (it rotates, but slowly, and a restart refreshes it).
-static JWKS_CACHE: Mutex<Option<(String, CoreJsonWebKeySet)>> = Mutex::new(None);
+/// Cached JWKS, keyed on issuer and **bounded by age**.
+///
+/// Unbounded, this is a scheduled outage: when Authentik rotates its signing key,
+/// every login fails ID-token validation against the stale set until someone
+/// restarts the pod, and nothing alarms. The TTL makes rotation self-healing within
+/// one window instead of an incident. Key rotation is slow and rare, so a window of
+/// this size costs one extra fetch per process per window.
+static JWKS_CACHE: Mutex<Option<(String, Instant, CoreJsonWebKeySet)>> = Mutex::new(None);
+
+/// How long a cached provider metadata document or key set stays usable.
+const CACHE_TTL: Duration = Duration::from_secs(900);
 
 fn http_client() -> reqwest::Client {
     // `reqwest::Client` implements `oauth2::AsyncHttpClient`, which is how the
@@ -72,15 +82,17 @@ pub async fn provider(cfg: &OidcConfig) -> anyhow::Result<ProviderMetadata> {
 }
 
 async fn jwks(cfg: &OidcConfig, md: &ProviderMetadata) -> anyhow::Result<CoreJsonWebKeySet> {
-    if let Some((issuer, set)) = JWKS_CACHE.lock().expect("jwks cache lock").as_ref()
+    if let Some((issuer, at, set)) = JWKS_CACHE.lock().expect("jwks cache lock").as_ref()
         && *issuer == cfg.issuer
+        && at.elapsed() < CACHE_TTL
     {
         return Ok(set.clone());
     }
     let set = CoreJsonWebKeySet::fetch_async(md.jwks_uri(), &http_client())
         .await
         .context("could not fetch the OIDC provider JWKS")?;
-    *JWKS_CACHE.lock().expect("jwks cache lock") = Some((cfg.issuer.clone(), set.clone()));
+    *JWKS_CACHE.lock().expect("jwks cache lock") =
+        Some((cfg.issuer.clone(), Instant::now(), set.clone()));
     Ok(set)
 }
 
@@ -96,11 +108,15 @@ macro_rules! core_client {
             .token_endpoint()
             .cloned()
             .ok_or_else(|| anyhow!("provider metadata has no token_endpoint"))?;
-        CoreClient::new(ClientId::new($cfg.client_id.clone()), issuer, jwks($cfg, $md).await?)
-            .set_client_secret(ClientSecret::new($cfg.client_secret.clone()))
-            .set_auth_uri($md.authorization_endpoint().clone())
-            .set_token_uri(token_uri)
-            .set_redirect_uri(RedirectUrl::new($cfg.redirect_uri.clone())?)
+        CoreClient::new(
+            ClientId::new($cfg.client_id.clone()),
+            issuer,
+            jwks($cfg, $md).await?,
+        )
+        .set_client_secret(ClientSecret::new($cfg.client_secret.clone()))
+        .set_auth_uri($md.authorization_endpoint().clone())
+        .set_token_uri(token_uri)
+        .set_redirect_uri(RedirectUrl::new($cfg.redirect_uri.clone())?)
     }};
 }
 
@@ -225,7 +241,7 @@ pub async fn provision_or_update(
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, _, _, _, _, _)) = existing {
+    if let Some((id, _, _, _, _, token_version)) = existing {
         sqlx::query("UPDATE users SET email = ?, name = ?, last_login_at = ? WHERE id = ?")
             .bind(email)
             .bind(name)
@@ -238,6 +254,7 @@ pub async fn provision_or_update(
             email: email.map(str::to_string),
             name: name.map(str::to_string),
             sub: sub.to_string(),
+            token_version,
         });
     }
 
@@ -247,16 +264,15 @@ pub async fn provision_or_update(
     // A blank configured subject counts as unset, matching the backfill rule.
     let bootstrap = bootstrap_subj.map(str::trim).filter(|s| !s.is_empty());
     if bootstrap == Some(sub) {
-        let placeholder: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'",
-        )
-        .fetch_optional(pool)
-        .await?;
+        let placeholder: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'")
+                .fetch_optional(pool)
+                .await?;
 
         if let Some((placeholder_id,)) = placeholder {
-            sqlx::query(
+            let handed: (i64,) = sqlx::query_as(
                 "UPDATE users SET issuer = ?, subj = ?, email = ?, name = ?, last_login_at = ? \
-                 WHERE id = ?",
+                 WHERE id = ? RETURNING token_version",
             )
             .bind(issuer)
             .bind(sub)
@@ -264,7 +280,7 @@ pub async fn provision_or_update(
             .bind(name)
             .bind(&now)
             .bind(placeholder_id)
-            .execute(pool)
+            .fetch_one(pool)
             .await?;
             eprintln!(
                 "INFO: bootstrap handover — placeholder user {placeholder_id} is now \
@@ -275,6 +291,7 @@ pub async fn provision_or_update(
                 email: email.map(str::to_string),
                 name: name.map(str::to_string),
                 sub: sub.to_string(),
+                token_version: handed.0,
             });
         }
     }
@@ -295,17 +312,23 @@ pub async fn provision_or_update(
     .execute(pool)
     .await?;
 
-    let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT id, email, name FROM users WHERE issuer = ? AND subj = ?",
+    let row: (i64, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT id, email, name, token_version FROM users WHERE issuer = ? AND subj = ?",
     )
     .bind(issuer)
     .bind(sub)
     .fetch_one(pool)
     .await?;
 
-    let (id, email, name) = row;
+    let (id, email, name, token_version) = row;
     eprintln!("INFO: provisioned user id={id} issuer={issuer} sub={sub}");
-    Ok(AuthedUser { id: id as i32, email, name, sub: sub.to_string() })
+    Ok(AuthedUser {
+        id: id as i32,
+        email,
+        name,
+        sub: sub.to_string(),
+        token_version,
+    })
 }
 
 /// Bump the caller's `token_version`, invalidating every session issued to them.

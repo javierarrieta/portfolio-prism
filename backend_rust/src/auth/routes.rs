@@ -2,18 +2,18 @@
 
 use std::io::Cursor;
 
+use openidconnect::TokenResponse;
+use rocket::http::CookieJar;
 use rocket::http::{ContentType, Status};
 use rocket::request::{self, FromRequest, Outcome};
 use rocket::response::{Redirect, Responder};
 use rocket::serde::json::Json;
-use openidconnect::TokenResponse;
 use rocket::{Request, Response, State};
-use rocket::http::CookieJar;
 use serde_json::json;
 use sqlx::SqlitePool;
 
 use super::guard::{AuthedUser, Unauthenticated};
-use super::{oidc, session, AuthMode};
+use super::{AuthMode, oidc, session};
 
 /// Body for "the OIDC exchange failed", which is a different fact from
 /// "you have no session" and must not be conflated with it.
@@ -27,6 +27,63 @@ pub(crate) const AUTH_FAILED_REDIRECT: &str = "/?auth_error=auth_failed";
 // Denial sentinel (one handler per method, so no method can answer 405 where the
 // requirement is 401)
 // --------------------------------------------------------------------------------------
+
+/// Body for "the server could not decide who you are". Deliberately distinct from
+/// the `401` body: a client must be able to tell "log in" from "wait and retry".
+pub(crate) const UNAVAILABLE_BODY: &str = r#"{"error":"service_unavailable"}"#;
+
+pub struct Unavailable;
+
+impl std::fmt::Debug for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Unavailable")
+    }
+}
+
+impl Responder<'_, 'static> for Unavailable {
+    fn respond_to(self, _: &Request<'_>) -> Result<Response<'static>, Status> {
+        Response::build()
+            .status(Status::ServiceUnavailable)
+            .header(ContentType::JSON)
+            .sized_body(UNAVAILABLE_BODY.len(), Cursor::new(UNAVAILABLE_BODY))
+            .ok()
+    }
+}
+
+#[get("/unavailable")]
+pub fn unavailable_get() -> Unavailable {
+    Unavailable
+}
+
+#[post("/unavailable")]
+pub fn unavailable_post() -> Unavailable {
+    Unavailable
+}
+
+#[put("/unavailable")]
+pub fn unavailable_put() -> Unavailable {
+    Unavailable
+}
+
+#[delete("/unavailable")]
+pub fn unavailable_delete() -> Unavailable {
+    Unavailable
+}
+
+#[patch("/unavailable")]
+pub fn unavailable_patch() -> Unavailable {
+    Unavailable
+}
+
+#[head("/unavailable")]
+pub fn unavailable_head() -> Unavailable {
+    Unavailable
+}
+
+#[options("/unavailable")]
+pub fn unavailable_options() -> Unavailable {
+    Unavailable
+}
 
 /// Registered as a catcher so that **every** `401` answers with the same body,
 /// whichever path produced it.
@@ -117,7 +174,9 @@ impl<'r> FromRequest<'r> for WantsHtml {
 
     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
         Outcome::Success(WantsHtml(
-            req.headers().get("Accept").any(|value| value.contains("text/html")),
+            req.headers()
+                .get("Accept")
+                .any(|value| value.contains("text/html")),
         ))
     }
 }
@@ -133,7 +192,11 @@ fn mode_config(mode: &AuthMode) -> Option<&super::OidcConfig> {
 /// Start the login: stash `state`/`nonce`/PKCE verifier in a short-lived private
 /// cookie and redirect to the provider.
 #[get("/login")]
-pub async fn login(mode: &State<AuthMode>, cookies: &CookieJar<'_>) -> LoginOutcome {
+pub async fn login(
+    mode: &State<AuthMode>,
+    cookies: &CookieJar<'_>,
+    wants: WantsHtml,
+) -> LoginOutcome {
     let Some(cfg) = mode_config(mode) else {
         // `AUTH_MODE=disabled` has no provider to redirect to; the guard already
         // serves every request as the placeholder user.
@@ -146,7 +209,13 @@ pub async fn login(mode: &State<AuthMode>, cookies: &CookieJar<'_>) -> LoginOutc
         }
         Err(e) => {
             eprintln!("ERROR: could not start OIDC login: {e}");
-            LoginOutcome::BrowserFailure
+            // Same branch as `/auth/callback`: a script that asked for JSON gets a
+            // status it can test, not a `303` it will silently follow to a page.
+            if wants.0 {
+                LoginOutcome::BrowserFailure
+            } else {
+                LoginOutcome::ApiFailure
+            }
         }
     }
 }
@@ -203,21 +272,26 @@ pub async fn callback(
             .clone();
         let claims = oidc::validate_id_token(cfg, &id_token, &expected.nonce).await?;
         let (sub, email, name) = oidc::identity_from(&claims);
-        anyhow::Ok(oidc::provision_or_update(
-            pool.inner(),
-            &cfg.issuer,
-            &sub,
-            email.as_deref(),
-            name.as_deref(),
-            cfg.bootstrap_subj.as_deref(),
+        anyhow::Ok(
+            oidc::provision_or_update(
+                pool.inner(),
+                &cfg.issuer,
+                &sub,
+                email.as_deref(),
+                name.as_deref(),
+                cfg.bootstrap_subj.as_deref(),
+            )
+            .await?,
         )
-        .await?)
     }
     .await;
 
     match outcome {
         Ok(user) => {
-            session::issue(cookies, user.id as i64, 0);
+            // Not `session::issue(.., 0)`: a literal version is rejected by the guard
+            // the moment the user has used `logout-all` once, and the call site that
+            // names no version cannot make that mistake.
+            user.issue_session(cookies);
             LoginOutcome::Success(Redirect::to("/"))
         }
         Err(e) => fail(&format!("identity could not be established: {e}")),
@@ -246,7 +320,10 @@ pub async fn logout_all(
     oidc::bump_token_version(pool.inner(), user.id)
         .await
         .map_err(|e| {
-            eprintln!("ERROR: could not bump token_version for user {}: {e}", user.id);
+            eprintln!(
+                "ERROR: could not bump token_version for user {}: {e}",
+                user.id
+            );
             Status::InternalServerError
         })?;
     session::clear(cookies);

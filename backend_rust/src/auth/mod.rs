@@ -63,7 +63,9 @@ pub enum AuthMode {
     /// build cannot run with authentication disabled even if the environment
     /// asks for it.
     #[cfg(debug_assertions)]
-    Disabled { as_user: i32 },
+    Disabled {
+        as_user: i32,
+    },
 }
 
 impl StartupConfig {
@@ -77,9 +79,7 @@ impl StartupConfig {
     /// `std::env::set_var` is `unsafe` in edition 2024 and integration tests run
     /// multi-threaded, so the environment cannot be mutated to test refusals.
     /// Every rule lives here and takes the values as arguments instead.
-    pub fn from_env_with(
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> anyhow::Result<StartupConfig> {
+    pub fn from_env_with(env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<StartupConfig> {
         let mode_raw = env("AUTH_MODE").map(|v| v.trim().to_string());
         let requested = match mode_raw.as_deref() {
             None | Some("") | Some("oidc") => AuthRequest::Oidc,
@@ -110,14 +110,20 @@ impl StartupConfig {
             .filter(|v| !v.is_empty());
 
         if requested != AuthRequest::Oidc {
-            return Ok(StartupConfig { requested, oidc: None, bootstrap_subj: None });
+            return Ok(StartupConfig {
+                requested,
+                oidc: None,
+                bootstrap_subj: None,
+            });
         }
 
         // Deny by default: there is no degraded anonymous mode, and naming every
         // missing variable at once beats four restarts.
         let mut missing: Vec<String> = Vec::new();
         let mut required = |key: &str| -> Option<String> {
-            let value = env(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            let value = env(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
             if value.is_none() {
                 missing.push(key.to_string());
             }
@@ -130,7 +136,13 @@ impl StartupConfig {
         if !missing.is_empty() {
             anyhow::bail!(
                 "AUTH_MODE=oidc requires every of: {}; missing {missing:?}",
-                ["OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URI"].join(", ")
+                [
+                    "OIDC_ISSUER",
+                    "OIDC_CLIENT_ID",
+                    "OIDC_CLIENT_SECRET",
+                    "OIDC_REDIRECT_URI"
+                ]
+                .join(", ")
             );
         }
 
@@ -146,7 +158,9 @@ impl StartupConfig {
         }
         let issuer = issuer.unwrap();
         if !issuer.starts_with("https://") && !is_local_issuer(&issuer) {
-            anyhow::bail!("OIDC_ISSUER={issuer:?} must be https (or http to localhost for development)");
+            anyhow::bail!(
+                "OIDC_ISSUER={issuer:?} must be https (or http to localhost for development)"
+            );
         }
 
         let post_logout_redirect_uri = origin_of(&redirect_uri);
@@ -221,9 +235,19 @@ fn is_acceptable_redirect_uri(uri: &str) -> bool {
 }
 
 fn is_local_issuer(uri: &str) -> bool {
-    ["http://localhost", "http://127.0.0.1"]
-        .iter()
-        .any(|p| uri.starts_with(p))
+    // Compare the *authority*, not a prefix: `starts_with("http://localhost")` is
+    // satisfied by `http://localhost.attacker.example`, which would let a plain-http
+    // issuer or redirect URI through the check that exists to keep http off the
+    // network.
+    let Some(rest) = uri.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.parse::<u16>().is_ok() => h,
+        _ => authority,
+    };
+    host == "localhost" || host == "127.0.0.1"
 }
 
 /// The scheme + authority of `uri`, e.g. `https://app.example.com` from
@@ -245,10 +269,18 @@ mod tests {
 
     /// Build an environment source from a fixed map.
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let owned: Vec<(String, String)> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         // Last write wins, so a test can override one entry of a base set.
-        move |key: &str| owned.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        move |key: &str| {
+            owned
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        }
     }
 
     fn full_oidc_env() -> Vec<(&'static str, &'static str)> {
@@ -261,6 +293,31 @@ mod tests {
     }
 
     #[test]
+    fn only_a_real_localhost_authority_passes_the_local_check() {
+        // The check exists to let plain http off the loopback and nowhere else. A
+        // prefix match satisfied it for any host *beginning* with `localhost`, which
+        // is a hostname an attacker can register: `http://localhost.attacker.example`
+        // is not local, and neither is anything else that merely starts with the word.
+        for ok in [
+            "http://localhost",
+            "http://localhost:8080/.well-known/openid-configuration",
+            "http://127.0.0.1:9000/iss",
+        ] {
+            assert!(is_local_issuer(ok), "{ok} should count as local");
+        }
+        for not_ok in [
+            "http://localhost.attacker.example/",
+            "http://localhostx:8080",
+            "http://notlocalhost:8080",
+            "http://127.0.0.1.evil.example",
+            "http://localhost:notaport",
+            "https://localhost",
+        ] {
+            assert!(!is_local_issuer(not_ok), "{not_ok} must not count as local");
+        }
+    }
+
+    #[test]
     fn defaults_to_oidc_when_auth_mode_is_absent() {
         let cfg = StartupConfig::from_env_with(&env_from(&full_oidc_env())).unwrap();
         assert_eq!(cfg.requested, AuthRequest::Oidc);
@@ -270,21 +327,33 @@ mod tests {
     #[test]
     fn post_logout_redirect_uri_is_the_origin_of_the_callback() {
         let cfg = StartupConfig::from_env_with(&env_from(&full_oidc_env())).unwrap();
-        assert_eq!(cfg.oidc.unwrap().post_logout_redirect_uri, "https://pp.example.com");
+        assert_eq!(
+            cfg.oidc.unwrap().post_logout_redirect_uri,
+            "https://pp.example.com"
+        );
     }
 
     #[test]
     fn an_unknown_auth_mode_is_refused_naming_the_value() {
         let mut pairs = full_oidc_env();
         pairs.push(("AUTH_MODE", "magic"));
-        let err = StartupConfig::from_env_with(&env_from(&pairs)).unwrap_err().to_string();
+        let err = StartupConfig::from_env_with(&env_from(&pairs))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("AUTH_MODE") && err.contains("magic"), "{err}");
     }
 
     #[test]
     fn every_missing_oidc_variable_is_named_at_once() {
-        let err = StartupConfig::from_env_with(&env_from(&[])).unwrap_err().to_string();
-        for key in ["OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URI"] {
+        let err = StartupConfig::from_env_with(&env_from(&[]))
+            .unwrap_err()
+            .to_string();
+        for key in [
+            "OIDC_ISSUER",
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_REDIRECT_URI",
+        ] {
             assert!(err.contains(key), "missing {key} from {err}");
         }
     }
@@ -293,7 +362,9 @@ mod tests {
     fn a_blank_oidc_variable_counts_as_missing() {
         let mut pairs = full_oidc_env();
         pairs.push(("OIDC_CLIENT_SECRET", "   "));
-        let err = StartupConfig::from_env_with(&env_from(&pairs)).unwrap_err().to_string();
+        let err = StartupConfig::from_env_with(&env_from(&pairs))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("OIDC_CLIENT_SECRET"), "{err}");
     }
 
@@ -322,12 +393,18 @@ mod tests {
         pairs.push(("BOOTSTRAP_OWNER_SUBJ", "authlib:42"));
         let cfg = StartupConfig::from_env_with(&env_from(&pairs)).unwrap();
         assert_eq!(cfg.bootstrap_subj.as_deref(), Some("authlib:42"));
-        assert_eq!(cfg.oidc.unwrap().bootstrap_subj.as_deref(), Some("authlib:42"));
+        assert_eq!(
+            cfg.oidc.unwrap().bootstrap_subj.as_deref(),
+            Some("authlib:42")
+        );
     }
 
     #[test]
     fn origin_of_handles_port_and_path() {
         assert_eq!(origin_of("https://a.b/x/y"), "https://a.b");
-        assert_eq!(origin_of("http://localhost:8000/auth/callback"), "http://localhost:8000");
+        assert_eq!(
+            origin_of("http://localhost:8000/auth/callback"),
+            "http://localhost:8000"
+        );
     }
 }
