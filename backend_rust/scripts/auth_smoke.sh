@@ -143,7 +143,27 @@ else
   bad "/auth/login did not redirect — provider unreachable? see /tmp/authsmoke.log"
 fi
 
-echo "== 6. the failure path (the only provider path testable without a browser) =="
+echo "== 6. does the provider accept this client at all? =="%s
+# Worth its own check because the failure is invisible from the app's side: /auth/login
+# succeeds, the browser is handed a perfectly well-formed authorize URL, and the
+# provider answers with an error page the app never sees. The usual cause is that the
+# provider's SLUG is what appears in the issuer URL, while its CLIENT ID is a separate
+# field that authentik fills with a random string unless you overwrite it.
+if [ -n "${LOCATION:-}" ]; then
+  AR=$(curl -s -o /tmp/smoke_authorize -w "%{http_code}" --max-time 25 "$LOCATION")
+  if grep -qiE 'client (identifier|ID).*(missing|invalid)|invalid_client|unauthorized_client' /tmp/smoke_authorize; then
+    bad "the provider rejected client_id=${CLIENT_ID} — open the provider in authentik and read its Client ID field; it is not necessarily the slug"
+  elif [ "$AR" = "302" ] || [ "$AR" = "200" ]; then
+    ok "the provider accepted client_id and the redirect URI (http $AR)"
+  else
+    bad "provider answered http $AR for the authorize request — check the redirect URI registration"
+    head -c 300 /tmp/smoke_authorize; echo
+  fi
+else
+  bad "no authorize URL to test (check 5 failed)"
+fi
+
+echo "== 7. the failure path (the only provider path testable without a browser) =="
 # A browser's Accept header, not curl's `*/*`. `WantsHtml` branches on it, and `*/*`
 # means "not a browser" — asserting the browser shape with `*/*` asserts the opposite
 # of what it looks like.

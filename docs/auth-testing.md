@@ -196,7 +196,14 @@ another app's issuer as a stand-in, since this app's provider does not exist yet
 automated: 20 passed, 0 failed
 ```
 
-Note what check 6 proves: the two callback failure shapes are **different on purpose**
+Check 6 is the one that earns its place: it follows the authorize URL to the provider and
+reads the answer. It caught a real misconfiguration on first use — the provider's **slug**
+is what appears in the issuer URL, while its **client ID** is a separate field that
+authentik fills with a random string unless you overwrite it. From the app's side that
+failure is invisible: `/auth/login` succeeds, the browser gets a well-formed authorize
+URL, and the provider shows an error page the app never sees.
+
+Note what check 7 proves: the two callback failure shapes are **different on purpose**
 — a browser gets a redirect to a banner, a script gets a status it can test. A test
 that accepted either would pass on a build that got the branch backwards.
 
