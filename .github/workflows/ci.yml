@@ -20,20 +20,38 @@ jobs:
           cd backend_rust
           cargo test
 
+      - name: Access-control gate
+        # Static rules over the handler surface. Prints what it inspected, so a
+        # gate that silently matched nothing fails instead of passing.
+        run: bash backend_rust/scripts/check_access_gate.sh
+
       - name: Generate and Validate OpenAPI Spec
         run: |
-          # Create a dummy DB for the server to start at the expected path
-          touch portfolio.db
-          
-          # Run server in background and fetch spec
+          # `--print-openapi` exits before reading configuration, the database, or
+          # the network, so this needs no dummy portfolio.db, no background server,
+          # no sleep, and no kill. The previous version of this step started the
+          # real server, which since the auth work refuses to launch without OIDC
+          # configuration — the gate would have been checking nothing.
           cd backend_rust
-          cargo run --bin backend_rust &
-          sleep 10
-          curl http://127.0.0.1:8000/api-docs/openapi.json > current_openapi.json
-          kill $(jobs -p)
-          
-          # Compare with the committed spec
-          diff current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
+          cargo run --bin backend_rust -- --print-openapi > /tmp/current_openapi.json
+          diff /tmp/current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
+
+  release-build:
+    # Compilation only. It proves the release binary builds with
+    # `AuthMode::Disabled` compiled out; it does not run the release binary, so it
+    # cannot prove the runtime refusal of `AUTH_MODE=disabled` in release. That is
+    # checked by a test, not here. `cargo test --release` is deliberately not used:
+    # the integration tests need the `Disabled` variant and do not compile without it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+        working-directory: backend_rust
 
   frontend-tests:
     runs-on: ubuntu-latest
@@ -54,6 +72,14 @@ jobs:
       - name: Generate API types
         run: npm run generate-types
         working-directory: frontend
+
+      - name: Auth proxy is configured
+        # Both proxy files sit outside every test suite, so a missing `/auth` rule
+        # only shows up as a login that silently loops in production. Grep is the
+        # cheapest thing that can notice.
+        run: |
+          grep -q 'location /auth' frontend/nginx.conf || { echo "frontend/nginx.conf has no 'location /auth' block: /auth/login would serve index.html and login would loop"; exit 1; }
+          grep -q "'/auth'" frontend/vite.config.js || { echo "frontend/vite.config.js has no '/auth' proxy: ./start.sh cannot complete a login"; exit 1; }
 
       - name: Typecheck
         # `vite build` strips types without checking them, so without this step nothing in
