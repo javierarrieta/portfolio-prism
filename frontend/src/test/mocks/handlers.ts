@@ -19,6 +19,7 @@ export const handlers = [
             asset_type: 'STOCK',
             sector: 'Technology',
             currency: 'USD',
+            isin: null,
             transactions: []
           }
         ]
@@ -49,6 +50,7 @@ export const handlers = [
           asset_type: 'STOCK',
           sector: 'Technology',
           currency: 'USD',
+          isin: null,
           transactions: []
         }
       ]
@@ -76,6 +78,7 @@ export const handlers = [
       asset_type: 'STOCK',
       sector: 'Technology',
       currency: 'USD',
+      isin: null,
       transactions: []
     }
     return HttpResponse.json(mockAsset)
@@ -91,6 +94,7 @@ export const handlers = [
       asset_type: body.asset_type.toUpperCase() as AssetType,
       sector: undefined,
       currency: body.currency || 'USD',
+      isin: null,
       transactions: []
     }
     return HttpResponse.json(newAsset, { status: 201 })

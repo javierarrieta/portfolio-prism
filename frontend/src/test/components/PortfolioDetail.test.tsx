@@ -18,6 +18,7 @@ const mockPortfolio: Portfolio = {
       asset_type: 'STOCK',
       sector: 'Technology',
       currency: 'USD',
+      isin: null,
       transactions: [],
     },
   ],
@@ -59,6 +60,7 @@ describe('PortfolioDetail', () => {
   it('shows "Log Transaction" button when assets exist', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -78,6 +80,7 @@ describe('PortfolioDetail', () => {
   it('hides "Log Transaction" button when no assets exist', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={{ ...mockPortfolio, assets: [] }}
         taxSummary={emptyTaxSummary}
         onAddAsset={noop}
@@ -97,6 +100,7 @@ describe('PortfolioDetail', () => {
   it('shows "Add Asset Symbol" button always', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={{ ...mockPortfolio, assets: [] }}
         taxSummary={emptyTaxSummary}
         onAddAsset={noop}
@@ -117,6 +121,7 @@ describe('PortfolioDetail', () => {
     const user = userEvent.setup()
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -139,6 +144,7 @@ describe('PortfolioDetail', () => {
     const user = userEvent.setup()
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={{ ...mockPortfolio, assets: [] }}
         taxSummary={emptyTaxSummary}
         onAddAsset={noop}
@@ -191,6 +197,7 @@ describe('PortfolioDetail', () => {
 
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={taxSummaryWithLots}
         onAddAsset={noop}
@@ -215,6 +222,7 @@ describe('PortfolioDetail', () => {
   it('shows empty state message when no assets are registered', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={{ ...mockPortfolio, assets: [] }}
         taxSummary={emptyTaxSummary}
         onAddAsset={noop}
@@ -237,6 +245,7 @@ describe('PortfolioDetail', () => {
     const user = userEvent.setup()
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -266,6 +275,7 @@ describe('PortfolioDetail', () => {
     const user = userEvent.setup()
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -297,6 +307,7 @@ describe('PortfolioDetail', () => {
 
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -357,6 +368,7 @@ describe('PortfolioDetail', () => {
 
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -412,6 +424,7 @@ describe('PortfolioDetail', () => {
 
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -460,6 +473,7 @@ describe('PortfolioDetail', () => {
   it('does not show Delete Portfolio button when portfolio has assets', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={mockPortfolio}
         taxSummary={mockTaxSummary}
         onAddAsset={noop}
@@ -479,6 +493,7 @@ describe('PortfolioDetail', () => {
   it('shows Delete Portfolio button when portfolio has no assets', () => {
     render(
       <PortfolioDetail
+        onFetchPortfolioData={noop}
         portfolio={{ ...mockPortfolio, assets: [] }}
         taxSummary={emptyTaxSummary}
         onAddAsset={noop}

@@ -411,7 +411,6 @@ export default function App() {
               <Dashboard 
                 performance={performance} 
                 taxSummary={taxSummary} 
-                portfolioName={currentPortfolio.name} 
               />
             )}
 
@@ -423,13 +422,17 @@ export default function App() {
                   onDeleteAsset={handleDeleteAsset}
                   onDeletePortfolio={handleDeletePortfolio}
                   onAddTransaction={handleAddTransaction}
-                  onDeleteTransaction={handleDeleteTransaction}
-                  onFetchPortfolioData={() => fetchPortfolioData(selectedId)}
+                  onFetchPortfolioData={() => {
+                    // currentPortfolio is derived from selectedId, so this branch cannot
+                    // render with selectedId null -- but the state type says otherwise and
+                    // fetchPortfolioData takes a number. Guard instead of asserting.
+                    if (selectedId === null) return Promise.resolve();
+                    return fetchPortfolioData(selectedId);
+                  }}
                   strategy={strategy}
                   setStrategy={setStrategy}
                   thresholdDays={thresholdDays}
                   setThresholdDays={setThresholdDays}
-                  transactions={transactions}
                 />
               )}
 
