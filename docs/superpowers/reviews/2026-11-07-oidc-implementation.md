@@ -394,12 +394,17 @@ This section is the honest boundary of the work. Reviewers should attack it.
 13. **The access levels are inert** (§2.5). `Viewer`, `Editor` and `Owner` are one
     predicate. Nothing tests that a `Viewer` is denied at an `Editor` call site,
     because nothing can be.
-14. **Logout is local-only.** No `id_token_hint` is sent to the provider's
-    `end_session_endpoint` because the ID token is deliberately not retained, so the
-    provider session survives: after "logging out" on a shared browser,
-    `/auth/login` returns the user straight in with no credentials. Either the ID
-    token is kept for the session's life and sent, or this is the documented meaning
-    of the logout button.
+14. **Logout sends no `id_token_hint`, and there is no logout affordance at all.**
+    `/auth/logout` clears the local cookie and redirects to the provider's
+    `end_session_endpoint` with only `post_logout_redirect_uri`. Per RP-initiated
+    logout 1.0, without a hint the OP **MUST NOT perform post-logout redirection**
+    unless it can confirm the target another way — in practice that means the provider
+    shows its own confirmation page rather than ending the session silently. Whether
+    Authentik then ends the provider session is version-dependent and **has not been
+    tested against a real provider**, so this is an open question, not a known defect.
+    The unambiguous gap is smaller: nothing in the SPA links to `/auth/logout`, so no
+    user can reach any of this. Storing the ID token in browser storage was considered
+    and rejected — see §10.
 15. **The OAuth `state` cookie is cleared by the response, not consumed.** A second
     callback arriving before the first response lands still carries it. The real
     single-use guarantees are the authorization code at the provider and the nonce.
@@ -411,16 +416,21 @@ This section is the honest boundary of the work. Reviewers should attack it.
 17. **The session is bound to nothing but `ROCKET_SECRET_KEY`.** The payload carries
     no issuer, audience, or environment tag, so if the same Secret is ever applied to
     two deployments, a cookie minted in staging authenticates in production as the
-    same `uid`. The fix is a constant environment string in the payload; it is not
-    done here because it invalidates every existing session and there is no
-    migration need yet.
+    same `uid`. **Closed by the operator on 2026-11-07: each environment has its own
+    `ROCKET_SECRET_KEY`**, which is the property the whole scheme rests on. The
+    payload binding is therefore not implemented; if a Secret is ever copied between
+    environments, this becomes live again, and the fix is a constant environment
+    string in the payload.
 18. **The bootstrap handover is one-way and unverified.** `backfill_ownership`
     assigns every orphan portfolio to the placeholder as soon as
     `BOOTSTRAP_OWNER_SUBJ` is merely *set* — it is never checked against the IdP —
     and the first login whose `sub` matches takes that row and everything it owns.
     A mistyped subject plus an unrelated first login means all pre-existing
     financial data belongs to the wrong person, and with no admin surface (§9.12)
-    the recovery is hand-editing SQLite with the pod scaled to zero.
+    the recovery is hand-editing SQLite with the pod scaled to zero. **Accepted by the
+    operator on 2026-11-07**: the operator is the first identity to log in after
+    setting `BOOTSTRAP_OWNER_SUBJ`, so the mistyping scenario is the residual risk
+    rather than the expected path.
 19. **`OPTIONS` preflights are exempted from authentication on three client-supplied
     headers**, with no check that the `Origin` is on the allowlist, so an
     unauthenticated `OPTIONS` reveals the allowed method and header set. No data
@@ -438,3 +448,29 @@ This section is the honest boundary of the work. Reviewers should attack it.
     spellings, case variants, `//api/…`, or `/api/./portfolios`. Every handler also
     carries the guard, so this is defence in depth, but the layer `guard.rs` calls
     primary is the one with no URI-form coverage.
+
+## 10. Rejected alternative — keeping the ID token in browser storage
+
+Raised when deciding how to send an `id_token_hint` at logout, and rejected.
+
+The `id_token_hint` is only ever needed by the **server**, at the moment it builds
+the redirect to the provider's end-session endpoint. The browser never needs to
+construct it, so browser storage buys nothing that a server-side store does not.
+
+What it costs:
+
+- `localStorage` and `sessionStorage` are readable by any cross-site scripting bug
+  in the SPA, and they survive the session — a token parked there outlives both the
+  tab and the cookie that authorises it. The design constraint this change is built
+  on is that JavaScript never reads, stores, or sends a token; this would break it to
+  buy a convenience.
+- The backend could not treat a browser-supplied hint as proof of anything, so
+  server-side validation would still be required. The result is strictly more
+  exposure than keeping the token server-side, for the same behaviour.
+
+If one-click silent logout turns out to matter, the token goes server-side: encrypted
+with `ROCKET_SECRET_KEY`, scoped to the session, cleared on logout. The private
+cookie jar is the obvious carrier, with the caveat that ID tokens run 1–2 KB against
+a ~4 KB per-cookie budget. The decision is deferred behind a real test against
+Authentik (§9.14), because the no-hint path may already be adequate at the cost of
+one confirmation click.

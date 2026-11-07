@@ -253,9 +253,8 @@ Applied: 26. Contested: 3. Recorded as accepted risk, not fixed: 8. Declined: 2.
 Nothing in `PROPOSE FIX` is unapplied. The open items are the ones that were
 deliberately not fixed:
 
-1. **M14 — are `ROCKET_SECRET_KEY` values actually distinct per environment?** If
-   they are not, a staging cookie authenticates in production. This is the one finding
-   whose severity depends on a fact outside the repository.
+1. **M14 — RESOLVED by the operator 2026-11-07: each environment has its own
+   `ROCKET_SECRET_KEY`.** The payload binding stays unimplemented; recorded in §9.17.
 2. **M13 — is local-only logout acceptable to you?** If the app is ever used on a
    shared browser, "log out" currently does not end the provider session.
 3. **M15 — the bootstrap handover has no undo.** Acceptable if you are the first
