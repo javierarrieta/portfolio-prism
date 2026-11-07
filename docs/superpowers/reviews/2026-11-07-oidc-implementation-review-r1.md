@@ -1,4 +1,5 @@
-Status: awaiting operator decision (egm-resolve step 4)
+Status: resolved — operator approved the round-1 dispositions 2026-11-07
+Outcome: 26 fixes applied (all `PROPOSE FIX`), 3 contested with evidence, 8 recorded as accepted risk, 2 declined. CI green on PR #34 including the two new release-refusal steps and the lint gate, verified as executed rather than skipped.
 Round: 1 of the implementation review
 Reviewed: `docs/superpowers/reviews/2026-11-07-oidc-implementation.md` (full file), and the implementation in this worktree
 Fixes landed in: `d97878d`
