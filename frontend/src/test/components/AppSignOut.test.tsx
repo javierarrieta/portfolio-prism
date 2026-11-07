@@ -25,4 +25,22 @@ describe('sign out', () => {
     render(<App />)
     expect(screen.getByRole('link', { name: /sign out/i })).toBeInTheDocument()
   })
+
+  it('says the provider session survives this logout', () => {
+    // Measured: the provider offers "Log back into portfolio-prism" with no
+    // credential prompt, because the logout sends no id_token_hint. A user who
+    // believes they signed out completely is a user who leaves a shared browser
+    // re-enterable, so the UI has to say what the button does and does not do.
+    render(<App />)
+    expect(
+      screen.getByText(/sign-in provider stays signed in/i),
+    ).toBeInTheDocument()
+  })
+
+  it('keeps the link name free of the explanation', () => {
+    // The hint sits beside the link, not inside it. Folding it into the anchor would
+    // make the accessible name a paragraph and read worse on every screen reader.
+    render(<App />)
+    expect(screen.getByRole('link', { name: 'Sign out' })).toBeInTheDocument()
+  })
 })

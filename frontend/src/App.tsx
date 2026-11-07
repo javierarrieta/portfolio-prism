@@ -434,6 +434,20 @@ export default function App() {
             <a href="/auth/logout" className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
               <LogOut size={14} /> Sign out
             </a>
+            {/*
+              Measured against the live provider, not guessed: this clears the app
+              session and the provider then shows a page that offers to log you back
+              in without asking for credentials, because the logout carries no
+              `id_token_hint` — the ID token is deliberately not retained. The full
+              sign-out is one more click on that page. Saying so is cheaper than
+              leaving the user to discover that "signed out" still leaves the browser
+              able to re-enter. Kept outside the anchor so the link's accessible name
+              stays "Sign out".
+            */}
+            <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.4 }}>
+              Ends this app&apos;s session. Your sign-in provider stays signed in —
+              choose its log-out option on the page that follows to end that too.
+            </p>
           </div>
         </div>
       </aside>

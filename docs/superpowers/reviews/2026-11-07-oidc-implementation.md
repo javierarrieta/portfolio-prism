@@ -417,12 +417,22 @@ This section is the honest boundary of the work. Reviewers should attack it.
     exposure**: on a machine the next person sits down at, "log out" leaves the door
     unlocked one click away. On a single-user laptop it costs nothing.
 
-    The fix, if wanted, is to retain the ID token server-side (Rocket's private cookie
-    jar is encrypted, so browser-readable is not the concern — cookie size and
-    lifetime are) and append it as `id_token_hint`. Whether Authentik then ends its own
-    session rather than merely redirecting silently is **still unmeasured**; it should
-    be probed before the work is committed to. Storing the ID token in *browser*
+    A fix was available — retain the ID token server-side (Rocket's private cookie jar
+    is encrypted, so browser-readable is not the concern; cookie size and lifetime are)
+    and append it as `id_token_hint` — and **the operator chose not to build it.** The
+    reasoning, recorded so this does not get reopened by the next reader: the exposure
+    needs physical access to an unlocked browser after an explicit sign-out, the full
+    sign-out is already one click away on the provider's own page, and the fix's
+    benefit is unverified — whether Authentik would end its session with a hint rather
+    than merely redirect silently was never measured. Storing the ID token in *browser*
     storage was considered and rejected — see §10.
+
+    **What was done instead:** the sign-out control now says what it does — *"Ends this
+    app's session. Your sign-in provider stays signed in — choose its log-out option on
+    the page that follows to end that too."* A user who believes they signed out
+    completely is the failure mode; telling them is most of the mitigation. Pinned by
+    `AppSignOut.test.tsx`, including that the explanation sits outside the anchor so the
+    link's accessible name stays "Sign out".
 15. **The OAuth `state` cookie is cleared by the response, not consumed.** A second
     callback arriving before the first response lands still carries it. The real
     single-use guarantees are the authorization code at the provider and the nonce.
