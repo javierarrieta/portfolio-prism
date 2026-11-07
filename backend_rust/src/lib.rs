@@ -273,9 +273,13 @@ async fn backfill_ownership(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::R
     .fetch_one(pool)
     .await?;
 
+    // A blank `BOOTSTRAP_OWNER_SUBJ` counts as unset here too, exactly as it does in
+    // the handover rule. If it did not, `BOOTSTRAP_OWNER_SUBJ=" "` would silently
+    // satisfy the refusal condition and hand pre-existing data to the placeholder.
+    let bootstrap = cfg.bootstrap_subj.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let assign = match cfg.requested {
         crate::auth::AuthRequest::Disabled => true,
-        crate::auth::AuthRequest::Oidc => cfg.bootstrap_subj.is_some(),
+        crate::auth::AuthRequest::Oidc => bootstrap.is_some(),
     };
 
     if !assign {
@@ -465,7 +469,11 @@ pub fn build_rocket(
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same
         // handler serves both mounts; the duplicate `/openapi.json` mount is gone.
-        .mount("/api-docs", routes![openapi_json]);
+        .mount("/api-docs", routes![openapi_json])
+        // Every `401` answers with the same body, whichever path produced it. Rocket
+        // prefers a registered catcher over a guard's error responder, so without
+        // this a guard rejection would render Rocket's HTML error page.
+        .register("/", auth::routes::catchers());
 
     if oidc_routes {
         rocket.mount("/auth", routes![

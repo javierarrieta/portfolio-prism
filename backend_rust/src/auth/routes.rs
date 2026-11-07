@@ -28,6 +28,22 @@ pub(crate) const AUTH_FAILED_REDIRECT: &str = "/?auth_error=auth_failed";
 // requirement is 401)
 // --------------------------------------------------------------------------------------
 
+/// Registered as a catcher so that **every** `401` answers with the same body,
+/// whichever path produced it.
+///
+/// Required, not cosmetic: Rocket prefers a registered catcher over a request
+/// guard's error responder, and with no catcher it falls back to its own HTML error
+/// page. Without this, a guard rejection on `/auth/me` rendered HTML and the shared
+/// JSON body was never seen by a client.
+#[catch(401)]
+pub fn unauthenticated_catcher() -> Unauthenticated {
+    Unauthenticated
+}
+
+pub fn catchers() -> Vec<rocket::Catcher> {
+    rocket::catchers![unauthenticated_catcher]
+}
+
 #[get("/denied")]
 pub fn denied_get() -> Unauthenticated {
     Unauthenticated

@@ -244,7 +244,9 @@ pub async fn provision_or_update(
     // 2. Bootstrap handover. Fires only on an exact match with the configured
     // subject *and* the placeholder's existence — never on row existence alone,
     // which is what makes the handover impossible to repeat.
-    if bootstrap_subj == Some(sub) {
+    // A blank configured subject counts as unset, matching the backfill rule.
+    let bootstrap = bootstrap_subj.map(str::trim).filter(|s| !s.is_empty());
+    if bootstrap == Some(sub) {
         let placeholder: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'",
         )
