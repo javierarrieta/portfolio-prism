@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   FolderOpen,
   Sparkles,
+  LogOut,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
@@ -423,6 +424,16 @@ export default function App() {
                 <Sparkles size={14} /> Load Demo Fund
               </button>
             )}
+            {/*
+              A plain anchor, not `apiFetch`. Logout is a redirect chain that leaves
+              the origin for the identity provider and comes back; a `fetch` would
+              follow those hops invisibly and the browser would never end its session
+              there. The backend clears the cookie and forwards to the provider's
+              end-session endpoint.
+            */}
+            <a href="/auth/logout" className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
+              <LogOut size={14} /> Sign out
+            </a>
           </div>
         </div>
       </aside>
