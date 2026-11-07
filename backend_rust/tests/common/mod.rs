@@ -2,30 +2,112 @@ use chrono::{DateTime, Utc};
 use rocket::{Rocket, Build};
 use sqlx::SqlitePool;
 use backend_rust::{build_rocket as lib_build_rocket, init_db, get_cors_options};
+use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::services::currency_service::CurrencyService;
 
-pub fn build_rocket(pool: SqlitePool) -> Rocket<Build> {
-    let currency_service = CurrencyService::new();
-    let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
-    lib_build_rocket(pool, currency_service, cors)
+/// The user every existing test runs as: the placeholder row `init_db` creates
+/// unconditionally, which is `id = 1` on a fresh in-memory database.
+pub const DEFAULT_USER: i32 = 1;
+
+/// A `StartupConfig` asking for `disabled` mode, built through the injectable
+/// environment source rather than by mutating the process environment (which is
+/// `unsafe` in edition 2024 and racy across parallel tests).
+pub fn disabled_config() -> StartupConfig {
+    StartupConfig::from_env_with(&|key| {
+        (key == "AUTH_MODE").then(|| "disabled".to_string())
+    })
+    .expect("AUTH_MODE=disabled parses in a debug build")
 }
 
-pub async fn setup_db() -> SqlitePool {
+/// An `OidcConfig` that parses but is never contacted: provider discovery is lazy,
+/// so tests that only assert "no session means 401" need no provider.
+pub fn oidc_cfg() -> OidcConfig {
+    OidcConfig {
+        issuer: "https://auth.example.invalid/application/o/pp".to_string(),
+        client_id: "test-client".to_string(),
+        client_secret: "test-secret".to_string(),
+        redirect_uri: "https://pp.example.invalid/auth/callback".to_string(),
+        post_logout_redirect_uri: "https://pp.example.invalid".to_string(),
+        bootstrap_subj: None,
+    }
+}
+
+/// A config that asks for OIDC, for the tests that must exercise the authenticated
+/// path rather than the development shortcut.
+pub fn oidc_config() -> StartupConfig {
+    StartupConfig {
+        requested: backend_rust::auth::AuthRequest::Oidc,
+        oidc: Some(oidc_cfg()),
+        bootstrap_subj: None,
+    }
+}
+
+/// Build the app running as `as_user` (development mode). Tests that need the
+/// cookie path construct `AuthMode::Oidc(oidc_cfg())` themselves.
+pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
+    let currency_service = CurrencyService::new();
+    let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
+    #[cfg(debug_assertions)]
+    let mode = AuthMode::Disabled { as_user };
+    lib_build_rocket(pool, currency_service, cors, mode)
+}
+
+/// Build the app in OIDC mode — the mode production runs in, and the only one in
+/// which unauthenticated requests are actually denied.
+pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
+    let currency_service = CurrencyService::new();
+    let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
+    lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
+}
+
+/// Migrate a fresh in-memory database under `cfg`, exactly as `main` does.
+pub async fn setup_db(cfg: &StartupConfig) -> SqlitePool {
     let pool = SqlitePool::connect(":memory:").await.unwrap();
-    
-    init_db(&pool).await.unwrap();
-    
+    init_db(&pool, cfg).await.unwrap();
     pool
 }
 
-pub async fn seed_portfolio(pool: &SqlitePool, name: &str, currency: &str) -> i32 {
+/// A session cookie pair for `LocalRequest::private_cookie`.
+pub fn session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
+    (
+        backend_rust::auth::session::SESSION_COOKIE,
+        backend_rust::auth::session::value(uid, tv, backend_rust::auth::session::expiry_now()),
+    )
+}
+
+/// A session cookie that is already expired, with a matching token version.
+pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
+    (
+        backend_rust::auth::session::SESSION_COOKIE,
+        backend_rust::auth::session::value(uid, tv, 1_000_000),
+    )
+}
+
+/// Create a user row and return its id.
+pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO users (issuer, subj, email, name, created_at) \
+         VALUES ('https://auth.example.invalid', ?, 'user@example.com', ?, datetime('now')) \
+         RETURNING id",
+    )
+    .bind(subj)
+    .bind(format!("User {subj}"))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    res.0 as i32
+}
+
+/// Create a portfolio owned by `owner_id`.
+pub async fn seed_portfolio(pool: &SqlitePool, owner_id: i32, name: &str, currency: &str) -> i32 {
     let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO portfolios (name, description, currency, base_currency) VALUES (?, ?, ?, ?) RETURNING id"
+        "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES (?, ?, ?, ?, ?) RETURNING id"
     )
     .bind(name)
     .bind(None::<String>)
     .bind(currency)
     .bind(currency)
+    .bind(owner_id as i64)
     .fetch_one(pool)
     .await
     .unwrap();

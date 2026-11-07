@@ -1,15 +1,15 @@
 mod common;
 
-use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction};
+use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::serde::json::Json;
 
 #[tokio::test]
 async fn test_create_asset() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Tx Test", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Tx Test", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -44,10 +44,10 @@ async fn test_create_asset() {
 
 #[tokio::test]
 async fn test_create_duplicate_asset_returns_400() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Dup Test", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Dup Test", "USD").await;
     let _asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -70,10 +70,10 @@ async fn test_create_duplicate_asset_returns_400() {
 
 #[tokio::test]
 async fn test_create_transaction() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Create Tx", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Create Tx", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "GOOGL", "Google").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -104,10 +104,10 @@ async fn test_create_transaction() {
 
 #[tokio::test]
 async fn test_create_split_transaction_forces_fee_to_zero() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Split Tx", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Tx", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "NVDA", "Nvidia").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -135,10 +135,10 @@ async fn test_create_split_transaction_forces_fee_to_zero() {
 
 #[tokio::test]
 async fn test_create_split_transaction_rejects_non_positive_ratio() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Bad Split", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Bad Split", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "INTC", "Intel").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -160,9 +160,9 @@ async fn test_create_split_transaction_rejects_non_positive_ratio() {
 
 #[tokio::test]
 async fn test_create_transaction_nonexistent_asset_returns_404() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "404 Tx", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "404 Tx", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -184,12 +184,12 @@ async fn test_create_transaction_nonexistent_asset_returns_404() {
 
 #[tokio::test]
 async fn test_list_portfolio_transactions() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "List Tx", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "List Tx", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "MSFT", "Microsoft").await;
     seed_transaction(&pool, asset_id, "BUY", 50.0, 300.0, 10.0).await;
     seed_transaction(&pool, asset_id, "BUY", 25.0, 320.0, 8.0).await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/transactions", port_id)).dispatch().await;
@@ -211,10 +211,10 @@ async fn test_list_portfolio_transactions() {
 
 #[tokio::test]
 async fn test_delete_asset() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Del Asset", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Del Asset", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "TSLA", "Tesla").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete(format!("/api/assets/{}", asset_id)).dispatch().await;
@@ -223,8 +223,8 @@ async fn test_delete_asset() {
 
 #[tokio::test]
 async fn test_delete_asset_not_found() {
-    let pool = setup_db().await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete("/api/assets/9999").dispatch().await;
@@ -233,11 +233,11 @@ async fn test_delete_asset_not_found() {
 
 #[tokio::test]
 async fn test_delete_transaction() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Del Tx", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Del Tx", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "NVDA", "Nvidia").await;
     let tx_id = seed_transaction(&pool, asset_id, "BUY", 10.0, 500.0, 5.0).await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete(format!("/api/transactions/{}", tx_id)).dispatch().await;
@@ -246,8 +246,8 @@ async fn test_delete_transaction() {
 
 #[tokio::test]
 async fn test_delete_transaction_not_found() {
-    let pool = setup_db().await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete("/api/transactions/9999").dispatch().await;
@@ -256,10 +256,10 @@ async fn test_delete_transaction_not_found() {
 
 #[tokio::test]
 async fn test_update_asset_currency() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Update Asset Cur", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Update Asset Cur", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "SAP", "SAP").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -289,10 +289,10 @@ async fn test_update_asset_currency() {
 
 #[tokio::test]
 async fn test_create_transaction_invalid_date_returns_400() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Invalid Date", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Invalid Date", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "INVALID", "Invalid Asset").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     // Test date from year 11 AD
@@ -315,9 +315,9 @@ async fn test_create_transaction_invalid_date_returns_400() {
 
 #[tokio::test]
 async fn test_update_asset_not_found() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Update Asset 404", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Update Asset 404", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -335,9 +335,9 @@ async fn test_update_asset_not_found() {
 
 #[tokio::test]
 async fn test_create_asset_currency_detection_fallback() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Detect Cur", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Detect Cur", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     // Send asset with empty currency — backend should detect from symbol
@@ -366,9 +366,9 @@ async fn test_create_asset_currency_detection_fallback() {
 
 #[tokio::test]
 async fn test_create_asset_null_sector() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Null Sector", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Null Sector", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -397,11 +397,11 @@ async fn test_create_asset_null_sector() {
 
 #[tokio::test]
 async fn test_cross_portfolio_transaction_rejected() {
-    let pool = setup_db().await;
-    let port_a = seed_portfolio(&pool, "Port A", "USD").await;
-    let port_b = seed_portfolio(&pool, "Port B", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_a = seed_portfolio(&pool, DEFAULT_USER, "Port A", "USD").await;
+    let port_b = seed_portfolio(&pool, DEFAULT_USER, "Port B", "USD").await;
     let asset_id = seed_asset(&pool, port_a, "AAPL", "Apple").await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     // Try to add transaction via portfolio B's URL but asset belongs to A

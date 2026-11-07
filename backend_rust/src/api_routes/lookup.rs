@@ -1,4 +1,5 @@
 use rocket::{serde::json::Json, http::Status};
+use crate::auth::guard::AuthedUser;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -43,6 +44,10 @@ struct OpenFigiRecord {
 )]
 #[get("/assets/lookup?<isin>")]
 pub async fn lookup_isin(
+    // Authenticated but with no id to check: this route touches none of
+    // portfolios/assets/transactions, so there is nothing for the chokepoint to
+    // grade. Rate limiting it is a separate issue, not this change.
+    _user: AuthedUser,
     isin: String,
 ) -> Result<Json<AssetLookupResult>, Status> {
     if !is_valid_isin(&isin) {

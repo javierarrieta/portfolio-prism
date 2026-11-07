@@ -1,6 +1,6 @@
 mod common;
 
-use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction_at};
+use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction_at};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::{Build, Rocket};
@@ -24,14 +24,14 @@ fn d(s: &str) -> Decimal {
 // FIFO fixture: two buys, one sell of 80 units split across both lots.
 // Returns the unlaunched Rocket; each test wraps it in its own tracked Client.
 async fn fifo_fixture() -> (Rocket<Build>, i32, i32, i32) {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Sell PnL", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Sell PnL", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     let buy1 = seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let buy2 = seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
     let _ = buy2;
-    (build_rocket(pool), sell, buy1, asset_id)
+    (build_rocket(pool, DEFAULT_USER), sell, buy1, asset_id)
 }
 
 #[tokio::test]
@@ -90,13 +90,13 @@ async fn test_sell_pnl_split_before_every_buy_is_not_claimed() {
     // The replay rescales lots that already exist, so a split older than every buy
     // adjusted nothing. Claiming otherwise would tell the user the table shows
     // split-adjusted prices when it shows exactly what they typed.
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Split Too Early", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Too Early", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "EARLY", "Early Split").await;
     seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, "2023-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -127,12 +127,12 @@ async fn test_sell_pnl_defaults_to_fifo_when_params_omitted() {
 
 #[tokio::test]
 async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Unmatched", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Unmatched", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "TSLA", "Tesla").await;
     seed_transaction_at(&pool, asset_id, "BUY", 50.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -144,11 +144,11 @@ async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
 
 #[tokio::test]
 async fn test_sell_pnl_roi_is_null_when_cost_basis_is_zero() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "No Buys", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "No Buys", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "NOBUYS", "No Buys").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
@@ -173,14 +173,14 @@ async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
     // SPLIT rows and this endpoint is read-only, so the breakdown only agrees when the
     // summary has run first -- which is what the UI guarantees. Do not reorder this test
     // as a "cleanup"; that is the ordering this pins.
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Reconcile", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Reconcile", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "RECON", "Reconcile").await;
     seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell1 = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 130.0, 0.0, "2024-08-01T00:00:00Z").await;
     let sell2 = seed_transaction_at(&pool, asset_id, "SELL", 40.0, 150.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
     for strategy in ["FIFO", "LIFO", "HYBRID"] {
         let tax_resp = client
@@ -224,13 +224,13 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
     // attribution method, so it must name the method actually used -- not echo back
     // whatever the caller typed. FIFO and LIFO differ on this fixture (2000 vs
     // 1600), so the figure proves which one ran.
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Strategy Echo", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Strategy Echo", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=moon-time&threshold_days=30", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
@@ -240,13 +240,13 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
 }
 
 async fn split_fixture(split_date: &str) -> (Client, i32) {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Split Flag", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Flag", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, split_date).await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     (client, sell)
 }
 

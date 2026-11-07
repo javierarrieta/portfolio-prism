@@ -1,14 +1,14 @@
 mod common;
 
-use common::{build_rocket, setup_db, seed_portfolio, seed_asset, seed_transaction};
+use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 
 #[tokio::test]
 async fn test_tax_summary_empty_portfolio() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Empty Tax", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Empty Tax", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/tax-summary?strategy=FIFO&threshold_days=30", port_id)).dispatch().await;
@@ -20,11 +20,11 @@ async fn test_tax_summary_empty_portfolio() {
 
 #[tokio::test]
 async fn test_tax_summary_with_assets_fifo() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "FIFO Tax", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "FIFO Tax", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     seed_transaction(&pool, asset_id, "BUY", 100.0, 150.0, 0.0).await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/tax-summary?strategy=FIFO&threshold_days=30", port_id)).dispatch().await;
@@ -54,11 +54,11 @@ async fn test_tax_summary_with_assets_fifo() {
 
 #[tokio::test]
 async fn test_tax_summary_with_assets_lifo() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "LIFO Tax", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "LIFO Tax", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "GOOGL", "Google").await;
     seed_transaction(&pool, asset_id, "BUY", 50.0, 200.0, 0.0).await;
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/tax-summary?strategy=LIFO&threshold_days=30", port_id)).dispatch().await;
@@ -73,8 +73,8 @@ async fn test_tax_summary_with_assets_lifo() {
 
 #[tokio::test]
 async fn test_tax_summary_404() {
-    let pool = setup_db().await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/9999/tax-summary?strategy=FIFO&threshold_days=30").dispatch().await;
@@ -83,8 +83,8 @@ async fn test_tax_summary_404() {
 
 #[tokio::test]
 async fn test_performance_404() {
-    let pool = setup_db().await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/9999/performance").dispatch().await;
@@ -93,9 +93,9 @@ async fn test_performance_404() {
 
 #[tokio::test]
 async fn test_performance_endpoint_fields() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Perf Fields", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Perf Fields", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/performance", port_id)).dispatch().await;
@@ -116,9 +116,9 @@ async fn test_performance_endpoint_fields() {
 
 #[tokio::test]
 async fn test_performance_endpoint() {
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Perf Test", "USD").await;
-    let rocket = build_rocket(pool);
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Perf Test", "USD").await;
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/performance", port_id)).dispatch().await;
@@ -133,8 +133,8 @@ async fn test_performance_endpoint() {
 async fn test_performance_value_reflects_split_transaction() {
     use chrono::{NaiveDate, Utc};
 
-    let pool = setup_db().await;
-    let port_id = seed_portfolio(&pool, "Perf Split", "USD").await;
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Perf Split", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "SPLITINTTEST", "Split Int").await;
 
     let symbol = "SPLITINTTEST";
@@ -188,7 +188,7 @@ async fn test_performance_value_reflects_split_transaction() {
         .await
         .unwrap();
 
-    let rocket = build_rocket(pool);
+    let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}/performance", port_id)).dispatch().await;
