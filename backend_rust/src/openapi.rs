@@ -83,7 +83,7 @@ pub fn document() -> utoipa::openapi::OpenApi {
         if !path.starts_with("/api") {
             continue;
         }
-        for (_method, operation) in item.operations.iter_mut() {
+        for operation in item.operations.values_mut() {
             operation.responses.responses.insert(
                 "401".to_string(),
                 RefOr::T(Response::new("Not authenticated")),

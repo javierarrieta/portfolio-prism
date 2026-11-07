@@ -52,6 +52,9 @@ impl Responder<'_, 'static> for Unauthenticated {
     }
 }
 
+/// The columns `resolve_caller` reads, in select order.
+pub(crate) type UserRow = (i64, Option<String>, Option<String>, String, i64, i64);
+
 /// Resolve the caller, or explain why there is none.
 ///
 /// `Ok(None)` means "no valid session" — deny. `Err(db)` means the database
@@ -85,7 +88,8 @@ pub async fn resolve_caller(
         AuthMode::Disabled { as_user } => (*as_user as i64, None),
     };
 
-    let row: Option<(i64, Option<String>, Option<String>, String, i64, i64)> = sqlx::query_as(
+    // (id, email, name, subj, is_active, token_version)
+    let row: Option<UserRow> = sqlx::query_as(
         "SELECT id, email, name, subj, is_active, token_version FROM users WHERE id = ?",
     )
     .bind(uid)

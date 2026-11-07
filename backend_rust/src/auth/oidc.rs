@@ -57,10 +57,10 @@ fn http_client() -> reqwest::Client {
 /// that is what keeps a mistyped `OIDC_ISSUER` from crash-looping the pod, and
 /// what lets the test suite run with no provider reachable.
 pub async fn provider(cfg: &OidcConfig) -> anyhow::Result<ProviderMetadata> {
-    if let Some((issuer, md)) = PROVIDER_CACHE.lock().expect("provider cache lock").as_ref() {
-        if *issuer == cfg.issuer {
-            return Ok(md.clone());
-        }
+    if let Some((issuer, md)) = PROVIDER_CACHE.lock().expect("provider cache lock").as_ref()
+        && *issuer == cfg.issuer
+    {
+        return Ok(md.clone());
     }
     let issuer = IssuerUrl::new(cfg.issuer.clone())
         .with_context(|| format!("OIDC_ISSUER={:?} is not a valid issuer URL", cfg.issuer))?;
@@ -72,10 +72,10 @@ pub async fn provider(cfg: &OidcConfig) -> anyhow::Result<ProviderMetadata> {
 }
 
 async fn jwks(cfg: &OidcConfig, md: &ProviderMetadata) -> anyhow::Result<CoreJsonWebKeySet> {
-    if let Some((issuer, set)) = JWKS_CACHE.lock().expect("jwks cache lock").as_ref() {
-        if *issuer == cfg.issuer {
-            return Ok(set.clone());
-        }
+    if let Some((issuer, set)) = JWKS_CACHE.lock().expect("jwks cache lock").as_ref()
+        && *issuer == cfg.issuer
+    {
+        return Ok(set.clone());
     }
     let set = CoreJsonWebKeySet::fetch_async(md.jwks_uri(), &http_client())
         .await
@@ -216,7 +216,7 @@ pub async fn provision_or_update(
     let now = chrono::Utc::now().to_rfc3339();
 
     // 1. Known identity.
-    let existing: Option<(i64, Option<String>, Option<String>, String, i64, i64)> = sqlx::query_as(
+    let existing: Option<crate::auth::guard::UserRow> = sqlx::query_as(
         "SELECT id, email, name, subj, is_active, token_version FROM users \
          WHERE issuer = ? AND subj = ?",
     )

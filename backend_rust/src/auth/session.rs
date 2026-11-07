@@ -60,7 +60,7 @@ pub fn parse(raw: &str) -> Option<SessionPayload> {
 
 /// Unix seconds at which a session issued `now` expires.
 pub fn expiry_now() -> i64 {
-    chrono::Utc::now().timestamp() + SESSION_MAX_AGE.whole_seconds() as i64
+    chrono::Utc::now().timestamp() + SESSION_MAX_AGE.whole_seconds()
 }
 
 /// One place that builds the shared cookie attributes, so the two cookies cannot

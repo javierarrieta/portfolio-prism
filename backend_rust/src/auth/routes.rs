@@ -79,6 +79,11 @@ pub fn denied_options() -> Unauthenticated {
 
 /// What a login attempt can end as. One type so the browser and API-client
 /// branches cannot drift into two different handlers.
+///
+/// `large_enum_variant` is silenced rather than boxing: `Redirect` is a few strings,
+/// boxing it would allocate on every redirect to save a fixed amount of stack in a
+/// type that exists once per request, and the enum is not on a hot path.
+#[allow(clippy::large_enum_variant)]
 pub enum LoginOutcome {
     /// Session issued; go to the app.
     Success(Redirect),

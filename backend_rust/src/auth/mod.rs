@@ -172,6 +172,10 @@ impl StartupConfig {
 /// `init_db` creates it unconditionally. Reaching this error means the order of
 /// operations in `main` is wrong, not that the operator misconfigured something.
 pub async fn finalise_auth(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<AuthMode> {
+    // `pool` is read only by the `disabled` branch, which a release build compiles
+    // out; without this the release build warns about an unused parameter.
+    #[cfg(not(debug_assertions))]
+    let _ = pool;
     match cfg.requested {
         AuthRequest::Oidc => match &cfg.oidc {
             Some(oidc) => Ok(AuthMode::Oidc(oidc.clone())),
@@ -198,6 +202,16 @@ pub async fn finalise_auth(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Re
                 ),
             }
         }
+        // Unreachable in a release build: `StartupConfig::from_env_with` refuses
+        // `AUTH_MODE=disabled` before this is ever called, so no operator reaches
+        // this arm by configuration. It exists because the *request* enum must keep
+        // its `Disabled` variant in every profile — that is what lets the refusal
+        // name the variable instead of failing to parse it.
+        #[cfg(not(debug_assertions))]
+        AuthRequest::Disabled => anyhow::bail!(
+            "internal: `disabled` was requested in a release build, which \
+             from_env_with is supposed to reject"
+        ),
     }
 }
 
