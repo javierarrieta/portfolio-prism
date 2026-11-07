@@ -143,7 +143,7 @@ else
   bad "/auth/login did not redirect — provider unreachable? see /tmp/authsmoke.log"
 fi
 
-echo "== 6. does the provider accept this client at all? =="%s
+echo "== 6. does the provider accept this client at all? =="
 # Worth its own check because the failure is invisible from the app's side: /auth/login
 # succeeds, the browser is handed a perfectly well-formed authorize URL, and the
 # provider answers with an error page the app never sees. The usual cause is that the
