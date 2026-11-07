@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'vitest';
+import Papa from 'papaparse';
 import { detectColumns, detectDateFormat } from './csvParser';
 
 describe('detectColumns', () => {
@@ -53,6 +54,52 @@ describe('detectColumns', () => {
     expect(result[0]).toBe('date');
     expect(result[1]).toBeNull();
     expect(result[2]).toBe('symbol');
+  });
+});
+
+// Excel writes a BOM when you save CSV from a UTF-8 workbook, so every Excel-authored
+// upload starts with U+FEFF. Two layers swallow it: Papa strips it before the header row is
+// built (Papa.BYTE_ORDER_MARK / stripBom), and detectColumns' `[^a-z0-9_]` sanitizer drops it
+// a second time. What this file owns is the seam between them -- `meta.fields` feeds both
+// detectColumns and every `row[h]` lookup after it -- so that is what gets pinned. Papa's own
+// strip is a third-party guarantee, pinned here only so a bump that changes it fails in CI
+// rather than on a user's upload, where the symptom is `Symbol is required` on every row and
+// points at their data instead of at the parser.
+describe('BOM on upload', () => {
+  // CsvImportModal parses the uploaded File, not a string, and Papa's BOM strip is on a
+  // different code path for each (stripBom on the string input, stripBom per header on the
+  // chunked FileReader route). Pin the path the app actually uses.
+  const parseFile = (csv: string) =>
+    new Promise<Papa.ParseResult<Record<string, string>>>((resolve, reject) => {
+      Papa.parse(new File([csv], 'transactions.csv', { type: 'text/csv' }), {
+        header: true,
+        skipEmptyLines: true,
+        complete: (results) => resolve(results as Papa.ParseResult<Record<string, string>>),
+        error: (err) => reject(err),
+      });
+    });
+
+  test('a BOM-prefixed upload maps every column and keeps its data', async () => {
+    const result = await parseFile(
+      '\uFEFFdate,symbol,type,quantity,price,fee\r\n2024-01-02,AAPL,buy,10,100,1\r\n'
+    );
+    const headers = result.meta.fields ?? [];
+
+    expect(headers[0]?.codePointAt(0)).not.toBe(0xfeff);
+    expect(headers).toEqual(['date', 'symbol', 'type', 'quantity', 'price', 'fee']);
+
+    const mapping = detectColumns(headers);
+    expect(mapping[0]).toBe('date');
+    expect(mapping[1]).toBe('symbol');
+    // The row keys come from the same header strings, so a BOM surviving into `headers`
+    // would also break every row[h] lookup downstream (detectDateFormat, the confirm step).
+    expect(result.data[0]?.symbol).toBe('AAPL');
+    expect(result.data[0]?.[headers[0]]).toBe('2024-01-02');
+  });
+
+  test('detectColumns tolerates a BOM even if one reaches it', () => {
+    expect(detectColumns(['\uFEFFdate', '\uFEFFsymbol'])[0]).toBe('date');
+    expect(detectColumns(['\uFEFFdate', '\uFEFFsymbol'])[1]).toBe('symbol');
   });
 });
 

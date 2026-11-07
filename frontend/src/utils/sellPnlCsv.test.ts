@@ -215,6 +215,14 @@ describe('sellPnlToCsv', () => {
     // Papa.unparse's default, and what RFC 4180 asks for. Pinned so nobody "fixes" it.
     expect(sellPnlToCsv(breakdown())).toContain('\r\n')
   })
+
+  it('emits no byte-order mark', () => {
+    // downloadCsv owns the BOM (see its comment) and refuses to add a second one, so a BOM
+    // here would be swallowed rather than doubled. Still pinned: this output is also what
+    // every assertion in this file reads, and a leading U+FEFF would corrupt the header row
+    // for all of them.
+    expect(sellPnlToCsv(breakdown()).startsWith('\uFEFF')).toBe(false)
+  })
 })
 
 describe('sellPnlFilename', () => {

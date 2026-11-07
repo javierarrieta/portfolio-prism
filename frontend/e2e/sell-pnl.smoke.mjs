@@ -224,6 +224,11 @@ try {
   if (!filePath) fail('download produced no file (acceptDownloads off?)')
   else {
     const csvText = readFileSync(filePath, 'utf8')
+    // Node's utf8 decode keeps the BOM (a browser's FileReader would have eaten it), so this
+    // is the only place the file the user actually gets is checked for it. Papa on the next
+    // line strips it silently, so a regression here would otherwise pass every assertion below.
+    if (!csvText.startsWith('\uFEFF')) fail('export has no UTF-8 BOM -- Excel falls back to the ANSI codepage and mojibake returns')
+    else ok('export starts with a UTF-8 BOM')
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true })
     if (parsed.errors.length) fail(`csv did not parse cleanly: ${parsed.errors.map((e) => e.message).join(' | ')}`)
     const rows = parsed.data
