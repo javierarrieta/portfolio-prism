@@ -69,7 +69,7 @@ network or a provider.
 | Does discovery resolve against a real provider? | yes | §4 |
 | Is the authorization request well-formed (PKCE, state, nonce)? | yes | §4 |
 | Do the failure paths answer the way the frontend expects? | yes | §4 |
-| Does a real login provision a user and produce a working session? | **no** | §5, browser |
+| Does a real login provision a user and produce a working session? | answered: **yes** | §5 |
 | Does `logout` end the provider's session? | **no** | §5, browser |
 | Does per-user isolation hold against real data? | partially | §6 |
 
@@ -281,6 +281,29 @@ To settle it:
      not mean what a user expects on a shared browser. The fix is to keep the ID token
      server-side (encrypted, session-scoped) and send it as `id_token_hint`. Browser
      storage was considered and rejected — implementation record §10.
+
+### ANSWERED — measured against the live Authentik, 2026-11-07
+
+Authentik shows a logout-complete page: *"You've logged out of portfolio-prism"*, with
+three choices — *Go back to overview*, *Log out of authentik*, *Log back into
+portfolio-prism*. **"Log back into portfolio-prism" re-enters the app with no
+credential prompt.**
+
+So the provider session survives an app logout. The app session genuinely ends (cookie
+cleared, `/api` answers `401`), but re-entry is one silent click away, and the page's
+wording describes the application rather than the identity provider — which is exactly
+why it reads as finished when it isn't.
+
+Whether that matters is a deployment question, not a bug: on a single-user laptop it
+costs nothing; on a shared browser it is a real exposure. The fix is a server-side ID
+token store so the logout can carry `id_token_hint` — see implementation record §9.14
+for the trade-off and what remains unmeasured about it.
+
+**Dev note found on the way:** `post_logout_redirect_uri` is derived from the origin of
+`OIDC_REDIRECT_URI`. If the backend runs on `:8000` while you browse via vite on
+`:5173`, logout bounces you to the backend instead of the app, and Authentik may refuse
+the unregistered URI. Set `OIDC_REDIRECT_URI=http://localhost:5173/auth/callback` so
+login, callback and logout all stay on one origin.
 
 Either answer is useful. Neither can be found from here.
 

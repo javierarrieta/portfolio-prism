@@ -394,17 +394,35 @@ This section is the honest boundary of the work. Reviewers should attack it.
 13. **The access levels are inert** (§2.5). `Viewer`, `Editor` and `Owner` are one
     predicate. Nothing tests that a `Viewer` is denied at an `Editor` call site,
     because nothing can be.
-14. **Logout sends no `id_token_hint`, and there is no logout affordance at all.**
-    `/auth/logout` clears the local cookie and redirects to the provider's
+14. **Logout ends the app session and not the provider session — measured, not
+    guessed.** `/auth/logout` clears the local cookie and redirects to the provider's
     `end_session_endpoint` with only `post_logout_redirect_uri`. Per RP-initiated
     logout 1.0, without a hint the OP **MUST NOT perform post-logout redirection**
-    unless it can confirm the target another way — in practice that means the provider
-    shows its own confirmation page rather than ending the session silently. Whether
-    Authentik then ends the provider session is version-dependent and **has not been
-    tested against a real provider**, so this is an open question, not a known defect.
-    The unambiguous gap is smaller: nothing in the SPA links to `/auth/logout`, so no
-    user can reach any of this. Storing the ID token in browser storage was considered
-    and rejected — see §10.
+    unless it can confirm the target another way.
+
+    **Observed against the live Authentik on 2026-11-07.** The flow works: the local
+    cookie is cleared, Authentik answers with a logout-complete page reading
+    *"You've logged out of portfolio-prism"*, and that page offers three actions —
+    *Go back to overview*, *Log out of authentik*, *Log back into portfolio-prism*.
+    Clicking the third returns to the app **without any credential prompt**. So:
+
+    - the app session really ends — the cookie is gone, `/api` is `401` again;
+    - the Authentik session does **not** end, and re-entry is one silent click;
+    - the wording of that page is about the *application*, not the *identity provider*,
+      which is why it reads as a completed logout while being only half of one.
+
+    This is the specified behaviour of a hint-less logout, not a defect in the
+    implementation: the ID token is deliberately not retained (§10), and without it
+    the OP cannot be asked to end anything. The consequence is a **shared-browser
+    exposure**: on a machine the next person sits down at, "log out" leaves the door
+    unlocked one click away. On a single-user laptop it costs nothing.
+
+    The fix, if wanted, is to retain the ID token server-side (Rocket's private cookie
+    jar is encrypted, so browser-readable is not the concern — cookie size and
+    lifetime are) and append it as `id_token_hint`. Whether Authentik then ends its own
+    session rather than merely redirecting silently is **still unmeasured**; it should
+    be probed before the work is committed to. Storing the ID token in *browser*
+    storage was considered and rejected — see §10.
 15. **The OAuth `state` cookie is cleared by the response, not consumed.** A second
     callback arriving before the first response lands still carries it. The real
     single-use guarantees are the authorization code at the provider and the nonce.
