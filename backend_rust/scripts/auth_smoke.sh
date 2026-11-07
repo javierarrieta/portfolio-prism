@@ -156,8 +156,15 @@ if [ -n "${LOCATION:-}" ]; then
   elif [ "$AR" = "302" ] || [ "$AR" = "200" ]; then
     ok "the provider accepted client_id and the redirect URI (http $AR)"
   else
-    bad "provider answered http $AR for the authorize request — check the redirect URI registration"
-    head -c 300 /tmp/smoke_authorize; echo
+    bad "provider answered http $AR for the authorize request"
+    # Quote the provider's own sentence rather than guessing at the cause. Both live
+    # failures found by this check were diagnosable only from that sentence.
+    python3 -c "
+import re,html,sys
+t=open(sys.argv[1],encoding='utf-8',errors='replace').read()
+t=re.sub(r'<(script|style).*?</\\1>',' ',t,flags=re.S|re.I); t=re.sub(r'<[^>]+>',' ',t)
+print('        authentik says:', html.unescape(re.sub(r'\\s+',' ',t)).strip()[:220])
+" /tmp/smoke_authorize
   fi
 else
   bad "no authorize URL to test (check 5 failed)"
