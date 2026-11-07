@@ -57,5 +57,17 @@ From root:
   - `refactor/...` — code refactoring with no behavior change
 - After finishing work, commit your changes. The user will create the PR and merge manually.
 
+## Testing
+
+- **Full gate list and the OIDC walkthrough**: `docs/auth-testing.md`. It is the
+  entry point for verifying the auth work, including the two things CI cannot check
+  (a real login, and whether the provider ends its own session on logout).
+- **Backend gates**: `cargo test`, `bash scripts/check_access_gate.sh`,
+  `cargo clippy --all-targets`, `cargo build --release` — all from `backend_rust/`.
+- **Provider smoke (no browser)**: `bash scripts/auth_smoke.sh` from `backend_rust/`,
+  with `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` set.
+- **Local OIDC harness**: `docker-compose.auth-test.yml` with `.auth-test.env`
+  (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
+
 ## Roadmap / Current Focus
 - **Multi-Currency Support**: Implementing asset currency tracking and exchange rate conversion for tax and stats (see `docs/implementation_plan.md`).
