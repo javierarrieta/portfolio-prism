@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   FolderOpen,
   Sparkles,
+  LogOut,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
@@ -16,7 +17,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
-import { API_BASE } from './utils/api';
+import { apiFetch, API_BASE } from './utils/apiFetch';
 import { 
   Portfolio, 
   PortfolioPerformance, 
@@ -46,6 +47,17 @@ export default function App() {
   // UI state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set when the backend bounced us back with `?auth_error=auth_failed` after a
+  // failed sign-in. Deliberately a fixed string rather than anything from the URL:
+  // the backend emits exactly this one value and reflects no IdP detail, and
+  // echoing a query parameter into the page would be a reflection point for free.
+  // Read once during initialisation rather than set from an effect: the URL is
+  // already the whole input, and a state update in an effect would repaint the page
+  // for a fact that was true before the first render.
+  const [authFailed] = useState(
+    () => new URLSearchParams(window.location.search).get('auth_error') === 'auth_failed',
+  );
+
   const [showNewPortfolioModal, setShowNewPortfolioModal] = useState(false);
   // Which sell's breakdown is open, and which portfolio it belonged to. The modal
   // renders only while that still matches the selected portfolio, so switching
@@ -69,7 +81,7 @@ export default function App() {
   const fetchPortfolios = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/portfolios/`);
+      const res = await apiFetch(`${API_BASE}/portfolios/`);
       if (!res.ok) throw new Error('Failed to fetch portfolios');
       const data = await res.json();
       setPortfolios(data);
@@ -89,26 +101,26 @@ export default function App() {
       setError(null);
       
       // 1. Fetch performance (which also syncs/caches historical prices in backend)
-      const perfRes = await fetch(`${API_BASE}/portfolios/${id}/performance`);
+      const perfRes = await apiFetch(`${API_BASE}/portfolios/${id}/performance`);
       if (!perfRes.ok) throw new Error('Failed to load portfolio performance');
       const perfData = await perfRes.json();
       const normalizedPerf = normalizePerformance(perfData);
       setPerformance(normalizedPerf);
 
       // 2. Fetch tax lot details
-      const taxRes = await fetch(`${API_BASE}/portfolios/${id}/tax-summary?strategy=${strategy}&threshold_days=${thresholdDays}`);
+      const taxRes = await apiFetch(`${API_BASE}/portfolios/${id}/tax-summary?strategy=${strategy}&threshold_days=${thresholdDays}`);
       if (!taxRes.ok) throw new Error('Failed to load tax lot summary');
       const taxData = await taxRes.json();
       setTaxSummary(normalizeTaxSummary(taxData));
 
       // 3. Fetch transactions list
-      const txRes = await fetch(`${API_BASE}/portfolios/${id}/transactions/`);
+      const txRes = await apiFetch(`${API_BASE}/portfolios/${id}/transactions/`);
       if (!txRes.ok) throw new Error('Failed to load transactions');
       const txData = await txRes.json();
       setTransactions(normalizeTransactionList(txData));
 
       // 4. Refresh portfolio object to keep assets list in sync
-      const portfolioRes = await fetch(`${API_BASE}/portfolios/${id}`);
+      const portfolioRes = await apiFetch(`${API_BASE}/portfolios/${id}`);
       if (portfolioRes.ok) {
         const portfolioData = await portfolioRes.json();
         setPortfolios(prev => prev.map(p => p.id === id ? { ...p, assets: normalizeAssetList(portfolioData.assets) } : p));
@@ -143,7 +155,7 @@ export default function App() {
     if (!newPortfolioName) return;
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/portfolios/`, {
+      const res = await apiFetch(`${API_BASE}/portfolios/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newPortfolioName, description: newPortfolioDesc, currency: newPortfolioCurrency })
@@ -166,7 +178,7 @@ export default function App() {
   const handleAddAsset = async (assetData: Partial<Asset>) => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/portfolios/${selectedId}/assets/`, {
+      const res = await apiFetch(`${API_BASE}/portfolios/${selectedId}/assets/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(assetData)
@@ -186,7 +198,7 @@ export default function App() {
     if (!confirm('Are you sure you want to delete this asset? All associated transactions will be removed.')) return;
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/assets/${assetId}`, { method: 'DELETE' });
+      const res = await apiFetch(`${API_BASE}/assets/${assetId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete asset');
       if (selectedId) await fetchPortfolioData(selectedId);
     } catch (err) {
@@ -198,7 +210,7 @@ export default function App() {
   const handleAddTransaction = async (assetId: number, txData: CreateTxPayload) => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/portfolios/${selectedId}/assets/${assetId}/transactions/`, {
+      const res = await apiFetch(`${API_BASE}/portfolios/${selectedId}/assets/${assetId}/transactions/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(txData)
@@ -215,7 +227,7 @@ export default function App() {
     if (!confirm('Delete this transaction?')) return;
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/transactions/${txId}`, { method: 'DELETE' });
+      const res = await apiFetch(`${API_BASE}/transactions/${txId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete transaction');
       // Only close the breakdown if this is the sell it is showing; deleting an
       // unrelated row should not dismiss a figure someone is reading.
@@ -230,7 +242,7 @@ export default function App() {
   const handleDeletePortfolio = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/portfolios/${selectedId}`, { method: 'DELETE' });
+      const res = await apiFetch(`${API_BASE}/portfolios/${selectedId}`, { method: 'DELETE' });
       if (res.status === 409) {
         alert('Cannot delete portfolio: it still contains assets. Remove all assets first.')
         setLoading(false);
@@ -253,7 +265,7 @@ export default function App() {
       setError(null);
 
       // 1. Create portfolio
-      const pRes = await fetch(`${API_BASE}/portfolios/`, {
+      const pRes = await apiFetch(`${API_BASE}/portfolios/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -273,7 +285,7 @@ export default function App() {
 
        const createdAssets: Record<string, number> = {};
       for (const s of symbols) {
-        const aRes = await fetch(`${API_BASE}/portfolios/${p.id}/assets/`, {
+        const aRes = await apiFetch(`${API_BASE}/portfolios/${p.id}/assets/`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(s)
@@ -307,7 +319,7 @@ export default function App() {
 
       for (const tx of txs) {
         const txDate = new Date(now.getTime() - tx.daysAgo * 24 * 60 * 60 * 1000);
-        await fetch(`${API_BASE}/portfolios/${p.id}/assets/${createdAssets[tx.symbol]}/transactions/`, {
+        await apiFetch(`${API_BASE}/portfolios/${p.id}/assets/${createdAssets[tx.symbol]}/transactions/`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -331,8 +343,38 @@ export default function App() {
 
   const currentPortfolio = portfolios.find(p => p.id === selectedId);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('auth_error') === 'auth_failed') {
+      params.delete('auth_error');
+      // Strip it so a refresh, a bookmark, or a shared URL does not resurrect a
+      // sign-in failure that has already been resolved.
+      const query = params.toString();
+      window.history.replaceState({}, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
+  }, []);
+
   return (
     <div className="app-container">
+      {authFailed && (
+        <div
+          role="alert"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 1000,
+            padding: '12px 16px',
+            background: 'var(--danger-color, #b3261e)',
+            color: '#fff',
+            textAlign: 'center',
+            fontWeight: 600,
+          }}
+        >
+          Sign-in failed. Please try again.
+        </div>
+      )}
       {/* Sidebar Navigation */}
       <aside className="sidebar">
         <div className="brand">
@@ -382,6 +424,30 @@ export default function App() {
                 <Sparkles size={14} /> Load Demo Fund
               </button>
             )}
+            {/*
+              A plain anchor, not `apiFetch`. Logout is a redirect chain that leaves
+              the origin for the identity provider and comes back; a `fetch` would
+              follow those hops invisibly and the browser would never end its session
+              there. The backend clears the cookie and forwards to the provider's
+              end-session endpoint.
+            */}
+            <a href="/auth/logout" className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
+              <LogOut size={14} /> Sign out
+            </a>
+            {/*
+              Measured against the live provider, not guessed: this clears the app
+              session and the provider then shows a page that offers to log you back
+              in without asking for credentials, because the logout carries no
+              `id_token_hint` — the ID token is deliberately not retained. The full
+              sign-out is one more click on that page. Saying so is cheaper than
+              leaving the user to discover that "signed out" still leaves the browser
+              able to re-enter. Kept outside the anchor so the link's accessible name
+              stays "Sign out".
+            */}
+            <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.4 }}>
+              Ends this app&apos;s session. Your sign-in provider stays signed in —
+              choose its log-out option on the page that follows to end that too.
+            </p>
           </div>
         </div>
       </aside>

@@ -1,0 +1,72 @@
+# Local OIDC test harness. NOT a production manifest.
+#
+# WHY THE FRONTEND SHARES THE BACKEND'S NETWORK NAMESPACE
+# `frontend/nginx.conf` proxies `/api`, `/api-docs` and `/auth` to
+# `http://127.0.0.1:8000` — a loopback address, because in production the two
+# containers are sidecars in one pod and share a network namespace. A plain
+# two-service compose file gives each container its own namespace, so `127.0.0.1:8000`
+# inside nginx points at nothing and every proxied call fails with 502 in a way that
+# looks like a backend bug. `network_mode: service:backend` reproduces the pod model
+# instead of approximating it, which also means the `Origin` the backend sees matches
+# what it will see in production — the thing that silently breaks writes when
+# `ALLOWED_ORIGINS` is wrong.
+#
+# NO VALIDATION WAS POSSIBLE HERE
+# The workspace this was written in has no docker, so this file has never been run.
+# The backend and its smoke script are tested; this orchestration is not. If a build
+# fails, the Dockerfiles are the place to look first — they are unchanged by this
+# branch and are known to build in CI.
+#
+# USAGE (see docs/auth-testing.md for the full walkthrough)
+#   cp docker-compose.auth-test.env.example .auth-test.env
+#   $EDITOR .auth-test.env          # the OIDC_* values come from your provider
+#   docker compose -f docker-compose.auth-test.yml --env-file .auth-test.env up --build
+#
+# Then open http://localhost:8080/auth/login
+services:
+  backend:
+    build:
+      context: ./backend_rust
+    # The release binary is what this image contains, and the release binary refuses
+    # AUTH_MODE=disabled. That is the intended production shape; do not "fix" it by
+    # switching the mode, or you are testing something production cannot do.
+    environment:
+      AUTH_MODE: oidc
+      OIDC_ISSUER: ${OIDC_ISSUER:?set OIDC_ISSUER in .auth-test.env}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID in .auth-test.env}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?set OIDC_CLIENT_SECRET in .auth-test.env}
+      # There is no separate post-logout variable: the backend derives the
+      # post-logout redirect from this value's origin (`origin_of` in auth/mod.rs),
+      # so setting it here is enough and a second variable would be free to disagree.
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}
+      # Empty means unset, and unset is what makes the backend refuse to start when
+      # pre-existing rows have no owner. Put your provider's `sub` here only when you
+      # mean to hand those rows to that identity.
+      BOOTSTRAP_OWNER_SUBJ: ${BOOTSTRAP_OWNER_SUBJ:-}
+      # Must match the origin the browser actually uses. rocket_cors answers before
+      # authentication, so a mismatch is a 403 on writes, not a 401.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      ROCKET_SECRET_KEY: ${ROCKET_SECRET_KEY:?set ROCKET_SECRET_KEY in .auth-test.env}
+      DATABASE_URL: sqlite:///data/portfolio.db?mode=rwc
+    ports:
+      - "8000:8000"
+      # Published here, not on the frontend, because they share a namespace.
+      - "8080:80"
+    volumes:
+      - auth-test-db:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  frontend:
+    build:
+      context: ./frontend
+    network_mode: "service:backend"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  auth-test-db:

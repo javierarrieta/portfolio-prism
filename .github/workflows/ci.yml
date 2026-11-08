@@ -20,20 +20,69 @@ jobs:
           cd backend_rust
           cargo test
 
+      - name: Access-control gate
+        # Static rules over the handler surface. Prints what it inspected, so a
+        # gate that silently matched nothing fails instead of passing.
+        run: bash backend_rust/scripts/check_access_gate.sh
+
       - name: Generate and Validate OpenAPI Spec
         run: |
-          # Create a dummy DB for the server to start at the expected path
-          touch portfolio.db
-          
-          # Run server in background and fetch spec
+          # `--print-openapi` exits before reading configuration, the database, or
+          # the network, so this needs no dummy portfolio.db, no background server,
+          # no sleep, and no kill. The previous version of this step started the
+          # real server, which since the auth work refuses to launch without OIDC
+          # configuration — the gate would have been checking nothing.
           cd backend_rust
-          cargo run --bin backend_rust &
-          sleep 10
-          curl http://127.0.0.1:8000/api-docs/openapi.json > current_openapi.json
-          kill $(jobs -p)
-          
-          # Compare with the committed spec
-          diff current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
+          cargo run --bin backend_rust -- --print-openapi > /tmp/current_openapi.json
+          diff /tmp/current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
+
+  release-build:
+    # Compiles the release binary with `AuthMode::Disabled` compiled out, and then
+    # actually runs it to prove the runtime refusal. The refusal is behind
+    # `!cfg!(debug_assertions)`, so no `cargo test` in the debug profile can reach
+    # it and the claim would otherwise be unverified. `cargo test --release` is
+    # deliberately not used: the integration tests need the `Disabled` variant and
+    # do not compile without it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+        working-directory: backend_rust
+
+      - name: Release binary refuses AUTH_MODE=disabled
+        # Exit 1 and a message naming the variable. Anything else — a clean start, a
+        # panic, or a silent exit 0 — means the release image can be talked into
+        # running with no authentication, which is the one configuration that must be
+        # impossible to reach by environment alone.
+        run: |
+          set +e
+          out=$(AUTH_MODE=disabled ./target/release/backend_rust 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "release binary started with AUTH_MODE=disabled; it must refuse"; exit 1
+          fi
+          echo "$out" | grep -q "AUTH_MODE=disabled" || { echo "refusal did not name AUTH_MODE"; exit 1; }
+        working-directory: backend_rust
+
+      - name: Release binary refuses a missing OIDC configuration
+        run: |
+          set +e
+          out=$(AUTH_MODE=oidc ./target/release/backend_rust 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "release binary started with no OIDC configuration"; exit 1; fi
+          for v in OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_REDIRECT_URI; do
+            echo "$out" | grep -q "$v" || { echo "refusal did not name $v"; exit 1; }
+          done
+        working-directory: backend_rust
 
   frontend-tests:
     runs-on: ubuntu-latest
@@ -41,7 +90,13 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        # v4 runs the action itself on Node 20, which GitHub is retiring; the runner
+        # prints a warning annotation on every frontend job because of it. v7 targets
+        # Node 24 and takes the same inputs used here (`node-version`, `cache`,
+        # `cache-dependency-path`). This is the action's runtime, not the app's —
+        # `node-version: '20'` below stays, because frontend/Dockerfile builds on
+        # node:20-alpine and CI must keep matching the image it tests.
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
@@ -55,10 +110,25 @@ jobs:
         run: npm run generate-types
         working-directory: frontend
 
+      - name: Auth proxy is configured
+        # Both proxy files sit outside every test suite, so a missing `/auth` rule
+        # only shows up as a login that silently loops in production. Grep is the
+        # cheapest thing that can notice.
+        run: |
+          grep -q 'location /auth' frontend/nginx.conf || { echo "frontend/nginx.conf has no 'location /auth' block: /auth/login would serve index.html and login would loop"; exit 1; }
+          grep -q "'/auth'" frontend/vite.config.js || { echo "frontend/vite.config.js has no '/auth' proxy: ./start.sh cannot complete a login"; exit 1; }
+
       - name: Typecheck
         # `vite build` strips types without checking them, so without this step nothing in
         # CI ever ran tsc and the test files were never type-checked at all.
         run: npm run typecheck
+        working-directory: frontend
+
+      - name: Lint
+        # The plan's own gate list, and the reason the local check and CI cannot
+        # diverge. Without it a lint error ships and only shows up on someone's
+        # machine.
+        run: npm run lint
         working-directory: frontend
 
       - name: Run tests

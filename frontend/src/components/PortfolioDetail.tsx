@@ -9,6 +9,7 @@ import {
   AssetType
 } from '../types';
 import { isValidIsin } from '../utils/isinValidator';
+import { apiFetch } from '../utils/apiFetch';
 import CsvImportModal from './CsvImportModal';
 
 export interface CreateTxPayload {
@@ -35,7 +36,7 @@ function detectCurrencyFromSymbol(symbol: string): string {
 
 async function lookupIsin(isin: string): Promise<{ symbol: string; name: string; asset_type: string } | null> {
   try {
-    const res = await fetch(`/api/assets/lookup?isin=${isin.toUpperCase()}`);
+    const res = await apiFetch(`/api/assets/lookup?isin=${isin.toUpperCase()}`);
     if (!res.ok) return null;
     return res.json();
   } catch {

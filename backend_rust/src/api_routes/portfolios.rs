@@ -3,6 +3,8 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use crate::models::{Portfolio as DbPortfolio, Asset as DbAsset, Transaction as DbTransaction};
 use crate::schemas::{AssetOut, PortfolioCreate, PortfolioOut, PortfolioUpdate, TransactionOut};
+use crate::access::{require, Access};
+use crate::auth::guard::AuthedUser;
 
 #[utoipa::path(
     post,
@@ -14,17 +16,21 @@ use crate::schemas::{AssetOut, PortfolioCreate, PortfolioOut, PortfolioUpdate, T
 )]
 #[post("/", data = "<portfolio>")]
 pub async fn create_portfolio(
+    user: AuthedUser,
     pool: &State<SqlitePool>,
     portfolio: Json<PortfolioCreate>
 ) -> Result<Json<PortfolioOut>, Status> {
+    // The creator is the owner. There is no other write path for owner_id in this
+    // change, which is what makes ownership trustworthy.
     let res = sqlx::query_as::<_, DbPortfolio>(
-        "INSERT INTO portfolios (name, description, currency, base_currency) 
-         VALUES (?, ?, ?, ?) RETURNING *"
+        "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) 
+         VALUES (?, ?, ?, ?, ?) RETURNING *"
     )
     .bind(&portfolio.name)
     .bind(&portfolio.description)
     .bind(&portfolio.currency)
     .bind(&portfolio.currency) // Using currency as base_currency default
+    .bind(user.id as i64)
     .fetch_one(pool.inner())
     .await;
 
@@ -104,13 +110,21 @@ async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_i
 )]
 #[get("/")]
 pub async fn list_portfolios(
-pool: &State<SqlitePool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
-    let portfolios = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios")
+    user: AuthedUser,
+    pool: &State<SqlitePool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
+    // Both queries are scoped. Filtering only the portfolios would still return
+    // every other user's asset rows, because the assets query had no filter at
+    // all and the handler groups them by portfolio_id afterwards.
+    let portfolios = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE owner_id = ?")
+        .bind(user.id as i64)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    let all_assets = sqlx::query_as::<_, DbAsset>("SELECT * FROM assets")
+    let all_assets = sqlx::query_as::<_, DbAsset>(
+        "SELECT * FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = ?)",
+    )
+        .bind(user.id as i64)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -153,8 +167,11 @@ pool: &State<SqlitePool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
     )
 )]
 #[get("/<id>")]
-pub async fn get_portfolio(id: i32, pool: &State<SqlitePool>) -> Result<Json<PortfolioOut>, Status> {
+pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Json<PortfolioOut>, Status> {
+    require(pool.inner(), user.id, id, Access::Viewer).await?;
 
+    // Kept deliberately: `require` answers whether the caller may touch this id and
+    // never returns the row, so the read below is the response body, not a check.
     let p = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = ?")
         .bind(id)
         .fetch_optional(pool.inner())
@@ -187,10 +204,13 @@ pub async fn get_portfolio(id: i32, pool: &State<SqlitePool>) -> Result<Json<Por
 )]
 #[patch("/<id>", data = "<update>")]
 pub async fn update_portfolio(
+    user: AuthedUser,
     id: i32,
     pool: &State<SqlitePool>,
     update: Json<PortfolioUpdate>
 ) -> Result<Json<PortfolioOut>, Status> {
+    require(pool.inner(), user.id, id, Access::Owner).await?;
+
     let new_currency = &update.currency;
 
     sqlx::query("UPDATE portfolios SET currency = ?, base_currency = ? WHERE id = ?")
@@ -232,7 +252,12 @@ pub async fn update_portfolio(
     )
 )]
 #[delete("/<id>")]
-pub async fn delete_portfolio(id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+pub async fn delete_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+    // Before the asset-count check: otherwise a non-owner could tell "exists and is
+    // empty" (409) from "does not exist" (404) and use the difference as an
+    // existence oracle.
+    require(pool.inner(), user.id, id, Access::Owner).await?;
+
     let portfolio = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = ?")
         .bind(id)
         .fetch_optional(pool.inner())

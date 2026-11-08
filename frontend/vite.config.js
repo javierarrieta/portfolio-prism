@@ -14,6 +14,13 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      // Without this, `./start.sh` cannot complete a login: the dev server serves
+      // index.html for /auth/login and the browser never reaches the backend's
+      // redirect to the identity provider.
+      '/auth': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
   test: {

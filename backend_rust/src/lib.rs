@@ -6,6 +6,8 @@ pub mod schemas;
 pub mod services;
 pub mod engines;
 pub mod openapi;
+pub mod access;
+pub mod auth;
 pub mod api_routes {
     pub mod portfolios;
     pub mod transactions;
@@ -14,12 +16,11 @@ pub mod api_routes {
 }
 
 use rocket::{Rocket, Build};
-use rocket::serde::json::Json;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnection;
 use crate::services::currency_service::CurrencyService;
-use crate::openapi::ApiDoc;
-use utoipa::OpenApi;
+use crate::auth::{AuthMode, StartupConfig};
+use crate::auth::fairing::AuthFairing;
 use rocket_cors::{CorsOptions, AllowedOrigins, AllowedHeaders, Cors};
 
 #[get("/")]
@@ -28,8 +29,10 @@ pub fn index() -> &'static str {
 }
 
 #[get("/openapi.json")]
-pub fn openapi_json() -> Json<serde_json::Value> {
-    Json(serde_json::to_value(ApiDoc::openapi()).unwrap())
+pub fn openapi_json() -> (rocket::http::ContentType, String) {
+    // Same serialiser as `--print-openapi`, so the served document and the
+    // committed file are byte-identical.
+    (rocket::http::ContentType::JSON, crate::openapi::document_json())
 }
 
 /// Origins allowed when `ALLOWED_ORIGINS` is unset or holds no usable entry.
@@ -99,7 +102,20 @@ pub fn get_cors_options(origins: Vec<String>) -> Cors {
     ))
 }
 
-pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+/// Placeholder identity: the row that owns anything with no owner yet.
+///
+/// `subj` is a marker, not a subject any provider issues. It is handed to a real
+/// identity by [`crate::auth::oidc::provision_or_update`] when the configured
+/// bootstrap subject signs in, and that handover can happen only once, because
+/// the handover updates this row in place and so removes the condition for it.
+pub const PLACEHOLDER_ISSUER: &str = "local";
+pub const PLACEHOLDER_SUBJ: &str = "bootstrap";
+
+/// Create/upgrade the schema and reconcile ownership.
+///
+/// Returns `Err` rather than exiting, so "startup refuses" is testable; `main`
+/// turns an error into `exit(1)`.
+pub async fn init_db(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS portfolios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -168,6 +184,120 @@ pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     migrate_decimal_columns(pool).await?;
 
+    // --- identity -------------------------------------------------------------
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issuer TEXT NOT NULL,
+            subj TEXT NOT NULL,
+            email TEXT,
+            name TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            token_version INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_issuer_subj ON users(issuer, subj)")
+        .execute(pool)
+        .await?;
+
+    add_owner_id_column(pool).await?;
+
+    // The placeholder row is created **unconditionally**, not only when orphans
+    // exist: `finalise_auth` must be able to name a real row in `disabled` mode on
+    // a fresh database, or `./start.sh` dies on the empty database it just created.
+    sqlx::query(
+        "INSERT INTO users (issuer, subj, email, name, created_at) \
+         VALUES (?1, ?2, NULL, 'Placeholder owner', ?3) \
+         ON CONFLICT (issuer, subj) DO NOTHING",
+    )
+    .bind(PLACEHOLDER_ISSUER)
+    .bind(PLACEHOLDER_SUBJ)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    backfill_ownership(pool, cfg).await?;
+
+    Ok(())
+}
+
+/// Add `portfolios.owner_id`.
+///
+/// Runs on a dedicated connection with `legacy_alter_table = ON`, the same
+/// mitigation `migrate_decimal_columns` uses: the bundled SQLite's stale
+/// per-connection schema makes an `ALTER` that follows a `DROP COLUMN` + `RENAME`
+/// fail on file-backed databases, and a fresh `ALTER` on a pooled connection is
+/// the same class of hazard. `migrate_one_column` is deliberately untouched.
+async fn add_owner_id_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA legacy_alter_table = ON").execute(&mut *conn).await?;
+    let result = async {
+        if !column_exists(&mut conn, "portfolios", "owner_id").await? {
+            sqlx::query("ALTER TABLE portfolios ADD COLUMN owner_id INTEGER")
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    sqlx::query("PRAGMA legacy_alter_table = OFF").execute(&mut *conn).await?;
+    Ok(result?)
+}
+
+/// Assign portfolios that have no owner, or refuse to start.
+///
+/// The rule is the spec's: an unowned portfolio is either handed to the
+/// placeholder (development, or OIDC with a designated bootstrap subject) or it
+/// stops the process. Silently leaving it unowned would make it invisible to every
+/// user while still consuming the one ISIN lookup quota per symbol.
+async fn backfill_ownership(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<()> {
+    let (orphans,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id IS NULL")
+            .fetch_one(pool)
+            .await?;
+
+    if orphans == 0 {
+        return Ok(());
+    }
+
+    let placeholder: (i64,) = sqlx::query_as(
+        "SELECT id FROM users WHERE issuer = ?1 AND subj = ?2",
+    )
+    .bind(PLACEHOLDER_ISSUER)
+    .bind(PLACEHOLDER_SUBJ)
+    .fetch_one(pool)
+    .await?;
+
+    // A blank `BOOTSTRAP_OWNER_SUBJ` counts as unset here too, exactly as it does in
+    // the handover rule. If it did not, `BOOTSTRAP_OWNER_SUBJ=" "` would silently
+    // satisfy the refusal condition and hand pre-existing data to the placeholder.
+    let bootstrap = cfg.bootstrap_subj.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let assign = match cfg.requested {
+        crate::auth::AuthRequest::Disabled => true,
+        crate::auth::AuthRequest::Oidc => bootstrap.is_some(),
+    };
+
+    if !assign {
+        anyhow::bail!(
+            "{orphans} portfolio(s) have no owner and no bootstrap owner is configured. \
+             Set BOOTSTRAP_OWNER_SUBJ to the Authentik subject that should take ownership \
+             of pre-existing data, then restart."
+        );
+    }
+
+    sqlx::query("UPDATE portfolios SET owner_id = ? WHERE owner_id IS NULL")
+        .bind(placeholder.0)
+        .execute(pool)
+        .await?;
+    eprintln!(
+        "WARN: assigned {orphans} pre-existing portfolio(s) to the placeholder owner \
+         (user {}); they transfer on bootstrap handover", placeholder.0
+    );
     Ok(())
 }
 
@@ -287,12 +417,47 @@ pub async fn migrate_decimal_columns(pool: &SqlitePool) -> Result<(), sqlx::Erro
     result
 }
 
-pub fn build_rocket(pool: SqlitePool, currency_service: CurrencyService, cors: Cors) -> Rocket<Build> {
-    rocket::build()
+pub fn build_rocket(
+    pool: SqlitePool,
+    currency_service: CurrencyService,
+    cors: Cors,
+    auth: AuthMode,
+) -> Rocket<Build> {
+    // The OIDC-only routes are mounted only when there is a provider to talk to;
+    // `/auth/me` exists in both modes so the frontend can always ask who it is.
+    let oidc_routes = matches!(auth, AuthMode::Oidc(_));
+
+    let rocket = rocket::build()
         .attach(cors)
+        .attach(AuthFairing)
         .manage(pool)
         .manage(currency_service)
-        .mount("/", routes![index, openapi_json])
+        .manage(auth)
+        .mount("/", routes![index])
+        // The sentinel the fairing rewrites denied requests to. Outside `/api`, so
+        // it is neither covered by the prefix rule nor part of the API surface, and
+        // mounted for every method so no method can answer 405 where 401 is required.
+        .mount("/_auth", routes![
+            auth::routes::denied_get,
+            auth::routes::denied_post,
+            auth::routes::denied_put,
+            auth::routes::denied_delete,
+            auth::routes::denied_patch,
+            auth::routes::denied_head,
+            auth::routes::denied_options,
+        ])
+        // The outage sentinel: same seven methods, so no method can answer 405
+        // where 503 is the truth.
+        .mount("/_auth", routes![
+            auth::routes::unavailable_get,
+            auth::routes::unavailable_post,
+            auth::routes::unavailable_put,
+            auth::routes::unavailable_delete,
+            auth::routes::unavailable_patch,
+            auth::routes::unavailable_head,
+            auth::routes::unavailable_options,
+        ])
+        .mount("/auth", routes![auth::routes::me])
         .mount("/api/portfolios", routes![
             api_routes::portfolios::create_portfolio,
             api_routes::portfolios::list_portfolios,
@@ -312,7 +477,25 @@ pub fn build_rocket(pool: SqlitePool, currency_service: CurrencyService, cors: C
             api_routes::transactions::delete_transaction,
             api_routes::analytics::get_transaction_sell_pnl,
         ])
+        // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
+        // stays on the handler because the attribute *is* the route path and the same
+        // handler serves both mounts; the duplicate `/openapi.json` mount is gone.
         .mount("/api-docs", routes![openapi_json])
+        // Every `401` answers with the same body, whichever path produced it. Rocket
+        // prefers a registered catcher over a guard's error responder, so without
+        // this a guard rejection would render Rocket's HTML error page.
+        .register("/", auth::routes::catchers());
+
+    if oidc_routes {
+        rocket.mount("/auth", routes![
+            auth::routes::login,
+            auth::routes::callback,
+            auth::routes::logout,
+            auth::routes::logout_all,
+        ])
+    } else {
+        rocket
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,8 @@ use crate::models::{Asset, Transaction};
 use crate::schemas::{AssetCreate, AssetOut, AssetUpdate, TransactionCreate, TransactionOut};
 use crate::api_routes::lookup::is_valid_isin;
 use crate::services::currency_service::CurrencyService;
+use crate::access::{require, require_asset, require_asset_in, require_transaction, Access};
+use crate::auth::guard::AuthedUser;
 use rust_decimal::Decimal;
 
 #[utoipa::path(
@@ -17,11 +19,17 @@ use rust_decimal::Decimal;
 )]
 #[post("/portfolios/<portfolio_id>/assets", data = "<asset>")]
 pub async fn create_asset(
+    user: AuthedUser,
     portfolio_id: i32,
     pool: &State<SqlitePool>,
     _currency_service: &State<CurrencyService>,
     asset: Json<AssetCreate>
 ) -> Result<Json<AssetOut>, Status> {
+    // This also fixes a pre-existing hole: the insert used to accept any
+    // `portfolio_id`, creating an asset pointing at a portfolio that does not
+    // exist. A nonexistent portfolio is now 404 instead of 201-with-a-dangling-row.
+    require(pool.inner(), user.id, portfolio_id, Access::Editor).await?;
+
     let existing = sqlx::query_as::<_, Asset>(
         "SELECT * FROM assets WHERE portfolio_id = ? AND symbol = ?"
     )
@@ -95,11 +103,17 @@ pub async fn create_asset(
 )]
 #[patch("/portfolios/<portfolio_id>/assets/<asset_id>", data = "<update>")]
 pub async fn update_asset(
+    user: AuthedUser,
     portfolio_id: i32,
     asset_id: i32,
     pool: &State<SqlitePool>,
     update: Json<AssetUpdate>
 ) -> Result<Json<AssetOut>, Status> {
+    require_asset_in(pool.inner(), user.id, portfolio_id, asset_id, Access::Editor).await?;
+
+    // The `AND portfolio_id = ?` predicate below stays on purpose. The guard and the
+    // write are two statements; the predicate is what makes the write itself
+    // incapable of crossing portfolios if the guard is ever refactored away.
     sqlx::query("UPDATE assets SET currency = ? WHERE id = ? AND portfolio_id = ?")
         .bind(&update.currency)
         .bind(asset_id)
@@ -142,7 +156,8 @@ pub async fn update_asset(
     )
 )]
 #[delete("/assets/<id>")]
-pub async fn delete_asset(id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+pub async fn delete_asset(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+    require_asset(pool.inner(), user.id, id, Access::Owner).await?;
     let res = sqlx::query("DELETE FROM assets WHERE id = ?")
         .bind(id)
         .execute(pool.inner())
@@ -166,11 +181,16 @@ pub async fn delete_asset(id: i32, pool: &State<SqlitePool>) -> Result<Status, S
 )]
 #[post("/portfolios/<portfolio_id>/assets/<asset_id>/transactions", data = "<tx>")]
 pub async fn create_transaction(
+    user: AuthedUser,
     portfolio_id: i32,
     asset_id: i32,
     pool: &State<SqlitePool>,
     tx: Json<TransactionCreate>
 ) -> Result<Json<TransactionOut>, Status> {
+    require_asset_in(pool.inner(), user.id, portfolio_id, asset_id, Access::Editor).await?;
+
+    // Kept: this row is the data the handler validates against (asset type, symbol),
+    // not the authorization decision.
     let asset = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = ? AND portfolio_id = ?")
         .bind(asset_id)
         .bind(portfolio_id)
@@ -232,7 +252,8 @@ pub async fn create_transaction(
     )
 )]
 #[get("/portfolios/<portfolio_id>/transactions")]
-pub async fn list_portfolio_transactions(portfolio_id: i32, pool: &State<SqlitePool>) -> Result<Json<Vec<TransactionOut>>, Status> {
+pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i32, pool: &State<SqlitePool>) -> Result<Json<Vec<TransactionOut>>, Status> {
+    require(pool.inner(), user.id, portfolio_id, Access::Viewer).await?;
     let assets = sqlx::query_as::<_, (i32,)>("SELECT id FROM assets WHERE portfolio_id = ?")
         .bind(portfolio_id)
         .fetch_all(pool.inner())
@@ -279,7 +300,8 @@ pub async fn list_portfolio_transactions(portfolio_id: i32, pool: &State<SqliteP
     )
 )]
 #[delete("/transactions/<id>")]
-pub async fn delete_transaction(id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+pub async fn delete_transaction(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+    require_transaction(pool.inner(), user.id, id, Access::Editor).await?;
     let res = sqlx::query("DELETE FROM transactions WHERE id = ?")
         .bind(id)
         .execute(pool.inner())

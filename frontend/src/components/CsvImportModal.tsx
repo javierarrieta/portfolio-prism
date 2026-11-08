@@ -6,6 +6,7 @@ import { detectColumns, detectDateFormat, dateToISO } from '../utils/csvParser';
 import { validateCsvFile } from '../utils/csvValidator';
 import type { ColumnMapping, CsvImportResult, CsvTransactionField } from '../types/csv';
 import type { ValidationReport } from '../utils/csvValidator';
+import { apiFetch } from '../utils/apiFetch';
 
 interface CsvImportModalProps {
   portfolioId: number;
@@ -114,7 +115,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
 
       if (!asset) {
         try {
-          const res = await fetch(`/api/portfolios/${portfolioId}/assets`, {
+          const res = await apiFetch(`/api/portfolios/${portfolioId}/assets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -130,7 +131,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
               asset = existing;
             } else {
               try {
-                const portfolioRes = await fetch(`/api/portfolios/${portfolioId}`);
+                const portfolioRes = await apiFetch(`/api/portfolios/${portfolioId}`);
                 if (portfolioRes.ok) {
                   const portfolio = (await portfolioRes.json()) as { assets: Asset[] };
                   const found = portfolio.assets.find((a) => a.symbol.toUpperCase() === row.symbol.toUpperCase());
@@ -175,7 +176,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
       };
 
       try {
-        const res = await fetch(`/api/portfolios/${portfolioId}/assets/${asset.id}/transactions`, {
+        const res = await apiFetch(`/api/portfolios/${portfolioId}/assets/${asset.id}/transactions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(txPayload),

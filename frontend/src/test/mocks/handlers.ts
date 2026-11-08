@@ -154,3 +154,15 @@ export const handlers = [
      return HttpResponse.json({ error: 'not implemented' }, { status: 501 })
    })
  ]
+
+/**
+ * Opt-in `401` for every `/api` route.
+ *
+ * Not in `handlers`: the existing suites assume an authenticated backend, so a
+ * global `401` would fail all of them. Tests that want the unauthenticated
+ * behaviour install this with `server.use(...)`, which is also how it stays honest
+ * about matching what the backend actually sends.
+ */
+export const unauthorizedAll = http.all('/api/*', () =>
+  HttpResponse.json({ error: 'unauthenticated' }, { status: 401 }),
+)

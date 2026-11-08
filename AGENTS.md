@@ -16,23 +16,31 @@ From root:
 ```
 
 ### Backend
-- **Start API**: `cargo run` (run from `backend_rust/`)
+- **Start API**: `cargo run` (run from `backend_rust/`). In development this needs
+  `AUTH_MODE=disabled` in the environment — `./start.sh` exports it. Without it the
+  backend refuses to start, naming what is missing.
 - **Test**: `cargo test` (run from `backend_rust/`)
 - **Update OpenAPI Spec**: When API routes or schemas change, regenerate and save:
   ```bash
   cd backend_rust
-  touch portfolio.db
-  cargo run --release &
-  sleep 12
-  curl -s http://127.0.0.1:8000/api-docs/openapi.json > ../docs/openapi/openapi.json
-  kill $(jobs -p)
+  cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
   ```
+  `--print-openapi` is checked before configuration, the database, and the network,
+  so it needs no `portfolio.db`, no running server, and no OIDC configuration. The
+  previous procedure started the real server and curled it; that server now refuses
+  to launch without OIDC configuration, so the old command no longer works.
 
 ### Frontend
 - **Dev Server**: `npm run dev` (run from `frontend/`)
 - **Lint**: `npm run lint` (run from `frontend/`)
 
 ## Key Context
+- **Authentication**: OIDC via Authentik. `backend_rust/src/auth/` holds the flow
+  (login, callback, session cookie, guard); `backend_rust/src/access.rs` is the
+  single chokepoint every data route goes through. New `/api` routes must take
+  `AuthedUser` and call a `require*` function — `bash backend_rust/scripts/check_access_gate.sh`
+  fails the build if one does not. `AUTH_MODE=disabled` exists only in debug builds;
+  the release image refuses to start without OIDC configuration.
 - **API Prefix**: All routes are under `/api`.
 - **Tax Logic**: `backend_rust/src/engines/tax_engine.rs` contains the core `TaxLotEngine` supporting `FIFO`, `LIFO`, and `HYBRID` (using `hybrid_threshold_days`) strategies.
 - **Database**: Persistent storage is in `backend/portfolio.db`.
@@ -48,6 +56,18 @@ From root:
   - `chore/...` — configuration, tooling, docs
   - `refactor/...` — code refactoring with no behavior change
 - After finishing work, commit your changes. The user will create the PR and merge manually.
+
+## Testing
+
+- **Full gate list and the OIDC walkthrough**: `docs/auth-testing.md`. It is the
+  entry point for verifying the auth work, including the two things CI cannot check
+  (a real login, and whether the provider ends its own session on logout).
+- **Backend gates**: `cargo test`, `bash scripts/check_access_gate.sh`,
+  `cargo clippy --all-targets`, `cargo build --release` — all from `backend_rust/`.
+- **Provider smoke (no browser)**: `bash scripts/auth_smoke.sh` from `backend_rust/`,
+  with `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` set.
+- **Local OIDC harness**: `docker-compose.auth-test.yml` with `.auth-test.env`
+  (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
 
 ## Roadmap / Current Focus
 - **Multi-Currency Support**: Implementing asset currency tracking and exchange rate conversion for tax and stats (see `docs/implementation_plan.md`).

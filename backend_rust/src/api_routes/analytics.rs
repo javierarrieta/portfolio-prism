@@ -7,6 +7,8 @@ use crate::schemas::SellPnlResponse;
 use crate::engines::stats_engine::StatsEngine;
 use rust_decimal::Decimal;
 use anyhow::Result;
+use crate::access::{require, require_transaction, Access};
+use crate::auth::guard::AuthedUser;
 
 #[utoipa::path(
     get,
@@ -18,12 +20,15 @@ use anyhow::Result;
 )]
 #[get("/<id>/tax-summary?<strategy>&<threshold_days>")]
 pub async fn get_portfolio_tax_summary(
+    user: AuthedUser,
     id: i32,
     pool: &State<SqlitePool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
 ) -> Result<Json<serde_json::Value>, Status> {
+    require(pool.inner(), user.id, id, Access::Viewer).await?;
+
     let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
         .bind(id)
         .fetch_optional(pool.inner())
@@ -106,10 +111,16 @@ pub async fn get_portfolio_tax_summary(
 )]
 #[get("/<id>/performance")]
 pub async fn get_portfolio_performance(
+    user: AuthedUser,
     id: i32,
     pool: &State<SqlitePool>,
     currency_service: &State<CurrencyService>,
 ) -> Result<Json<serde_json::Value>, Status> {
+    // Before the `WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = ?)`
+    // subquery: that shape is invisible to the gate script's grep, so this call is
+    // the only thing keeping it honest.
+    require(pool.inner(), user.id, id, Access::Viewer).await?;
+
     let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
         .bind(id)
         .fetch_optional(pool.inner())
@@ -164,12 +175,17 @@ pub async fn get_portfolio_performance(
 )]
 #[get("/transactions/<id>/pnl?<strategy>&<threshold_days>")]
 pub async fn get_transaction_sell_pnl(
+    user: AuthedUser,
     id: i32,
     pool: &State<SqlitePool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
 ) -> Result<Json<SellPnlResponse>, Status> {
+    require_transaction(pool.inner(), user.id, id, Access::Viewer).await?;
+
+    // The three lookups below (transaction -> asset -> portfolio) stay: they are the
+    // response's data source, not the authorization decision.
     let tx = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = ?")
         .bind(id)
         .fetch_optional(pool.inner())

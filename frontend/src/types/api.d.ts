@@ -29,6 +29,9 @@ export interface paths {
   "/api/portfolios/<portfolio_id>/assets": {
     post: operations["create_asset"];
   };
+  "/api/portfolios/<portfolio_id>/assets/<asset_id>": {
+    patch: operations["update_asset"];
+  };
   "/api/portfolios/<portfolio_id>/assets/<asset_id>/transactions": {
     post: operations["create_transaction"];
   };
@@ -248,6 +251,10 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description Asset not found */
       404: {
         content: never;
@@ -272,6 +279,10 @@ export interface operations {
       400: {
         content: never;
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description ISIN not found */
       404: {
         content: never;
@@ -285,6 +296,10 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["PortfolioOut"][];
         };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
       };
     };
   };
@@ -305,6 +320,10 @@ export interface operations {
       400: {
         content: never;
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
     };
   };
   get_portfolio: {
@@ -319,6 +338,10 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["PortfolioOut"];
         };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
       };
       /** @description Portfolio not found */
       404: {
@@ -335,6 +358,10 @@ export interface operations {
     responses: {
       /** @description Portfolio deleted */
       204: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
         content: never;
       };
       /** @description Portfolio not found */
@@ -361,6 +388,10 @@ export interface operations {
           "application/json": components["schemas"]["PortfolioOut"];
         };
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description Portfolio not found */
       404: {
         content: never;
@@ -379,6 +410,10 @@ export interface operations {
         content: {
           "application/json": unknown;
         };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
       };
       /** @description Portfolio not found */
       404: {
@@ -402,6 +437,10 @@ export interface operations {
         content: {
           "application/json": unknown;
         };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
       };
       /** @description Portfolio not found */
       404: {
@@ -431,7 +470,40 @@ export interface operations {
       400: {
         content: never;
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description Portfolio not found */
+      404: {
+        content: never;
+      };
+    };
+  };
+  update_asset: {
+    parameters: {
+      path: {
+        asset_id: number;
+        portfolio_id: number;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["AssetUpdate"];
+      };
+    };
+    responses: {
+      /** @description Asset updated */
+      200: {
+        content: {
+          "application/json": components["schemas"]["AssetOut"];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description Asset not found */
       404: {
         content: never;
       };
@@ -456,6 +528,10 @@ export interface operations {
           "application/json": components["schemas"]["TransactionOut"];
         };
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description Asset not found */
       404: {
         content: never;
@@ -475,6 +551,10 @@ export interface operations {
           "application/json": components["schemas"]["TransactionOut"][];
         };
       };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
       /** @description Portfolio not found */
       404: {
         content: never;
@@ -490,6 +570,10 @@ export interface operations {
     responses: {
       /** @description Transaction deleted */
       204: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
         content: never;
       };
       /** @description Transaction not found */
@@ -520,6 +604,10 @@ export interface operations {
       };
       /** @description Transaction is not a SELL */
       400: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
         content: never;
       };
       /** @description Transaction not found */
