@@ -374,15 +374,15 @@ impl CurrencyService {
     }
 
     /// The FX rate to convert `from_curr` into `to_curr` for `date`: the last close
-    /// on or before that date *within the window already stored for the pair*,
-    /// within `FX_LOOKBACK_DAYS`, together with the date actually used.
+    /// on or before that date *within a window that actually reaches `date`*, within
+    /// `FX_LOOKBACK_DAYS`, together with the date actually used.
     ///
-    /// "Within the stored window" is a real limit, not a figure of speech. Neither
-    /// the cache nor `historical_prices` records which dates a pair's rows actually
-    /// cover, so a window that stops short of `date` answers with its own last close
-    /// instead of fetching the gap. A per-symbol coverage record is the follow-up
-    /// that closes it; until then a stale-but-in-lookback close is possible for a
-    /// date past whatever was last fetched.
+    /// "A window that actually reaches `date`" is a real limit, not a figure of
+    /// speech. Neither the cache nor `historical_prices` records which dates a pair's
+    /// rows cover, so both read paths apply the same proxy: the newest row must be
+    /// within `PRICE_WINDOW_FRESH_DAYS` of `date`, or the window is treated as
+    /// incomplete and the provider is asked for the tail. A per-symbol coverage
+    /// record is the follow-up that would replace the proxy.
     ///
     /// Read order is database first, provider second — the same order
     /// [`get_historical_prices`](Self::get_historical_prices) now uses, and for the same
@@ -424,10 +424,10 @@ impl CurrencyService {
         // get_historical_prices already builds the range URL, parses the chart
         // response, persists the series through the upsert, and merges what it
         // fetched over stored rows it found too stale to answer with. Reaching this
-        // line means `rate_from_db` found nothing inside `FX_LOOKBACK_DAYS`, so any
-        // stored row in the window is past `PRICE_WINDOW_FRESH_DAYS` and will be
-        // merged under whatever the provider returns. Reusing it is why this change
-        // is small.
+        // line means `rate_from_db` found nothing it was allowed to answer with — no
+        // row inside `FX_LOOKBACK_DAYS`, or a newest row past
+        // `PRICE_WINDOW_FRESH_DAYS` — so any stored row in the window is merged under
+        // whatever the provider returns. Reusing it is why this change is small.
         let series = self
             .get_historical_prices(&symbol, window_start, date_naive, pool)
             .await?;
@@ -454,9 +454,10 @@ impl CurrencyService {
             .ok_or_else(|| no_rate_error(&symbol, date_naive, FX_LOOKBACK_DAYS))
     }
 
-    /// The pair's dated closes as already stored, narrowed to the same rule
-    /// `select_rate` applies. `None` means "the database cannot answer", which is not
-    /// the same as "no rate exists" — only the provider can say that.
+    /// The pair's dated closes as already stored, narrowed to the same rules
+    /// `select_rate` and `stored_window_is_fresh` apply. `None` means "the database
+    /// cannot answer", which is not the same as "no rate exists" — only the provider
+    /// can say that.
     async fn rate_from_db(
         &self,
         symbol: &str,
@@ -478,6 +479,19 @@ impl CurrencyService {
             .into_iter()
             .map(|(d, p)| (d, crate::db_types::str_to_decimal(&p)))
             .collect();
+
+        // The same coverage rule `get_historical_prices` applies to its stored
+        // window, and for the same reason: rows that stop short of `date` are an
+        // incomplete window, not an answer. Without this gate the two DB-first read
+        // paths disagree about the same database — `get_historical_prices` asks the
+        // provider for the tail while this one serves a close from inside the
+        // lookback — and `replay` walks transactions ascending, so the first FX call
+        // pins the earliest transaction's rate over every later date within the
+        // lookback that has no stored close of its own.
+        let newest = series.iter().map(|(d, _)| *d).max();
+        if !stored_window_is_fresh(newest, date) {
+            return Ok(None);
+        }
 
         Ok(
             select_rate(&series, date, FX_LOOKBACK_DAYS)
@@ -1125,6 +1139,48 @@ mod tests {
         let got = svc.get_rate("EUR", "USD", ts_utc("2024-03-25"), &pool).await.unwrap();
         assert_eq!(got.rate, dec("1.0500"), "a cached window must not price a date past its end");
         assert_eq!(got.date_used, date_of("2024-03-22"));
+    }
+
+    /// C1: `rate_from_db` is the other DB-first read path `get_rate` takes, and it
+    /// must apply the same coverage rule `get_historical_prices` applies. The stale
+    /// row here sits 10 days before the requested date — inside `FX_LOOKBACK_DAYS`,
+    /// so `select_rate` alone serves it and the provider is never asked.
+    #[tokio::test]
+    async fn rate_from_db_refuses_a_stored_window_that_stops_short_of_the_date() {
+        let svc = CurrencyService::new();
+        let requested = date_of("2024-03-25");
+        let window_start = requested - chrono::Duration::days(FX_SERIES_WINDOW_DAYS);
+
+        // Incomplete coverage: the newest stored close is 10 days short of the date.
+        let stale_pool = empty_pool().await;
+        let stale = requested - chrono::Duration::days(10);
+        let stale_str = stale.format("%Y-%m-%d").to_string();
+        seed_prices(&stale_pool, "EURUSD=X", &[(&stale_str, "0.9125")]).await;
+        let incomplete = svc
+            .rate_from_db("EURUSD=X", window_start, requested, &stale_pool)
+            .await
+            .unwrap();
+        assert!(
+            incomplete.is_none(),
+            "a window whose newest close is 10 days short of the requested date is \
+             incomplete coverage, not an answer; got {incomplete:?}"
+        );
+
+        // Honest coverage, same distance from the lookback bound: a newest close
+        // within `PRICE_WINDOW_FRESH_DAYS` still answers, with its own date.
+        let fresh_pool = empty_pool().await;
+        let fresh = requested - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
+        let fresh_str = fresh.format("%Y-%m-%d").to_string();
+        seed_prices(&fresh_pool, "EURUSD=X", &[(&fresh_str, "1.0500")]).await;
+        let complete = svc
+            .rate_from_db("EURUSD=X", window_start, requested, &fresh_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete,
+            Some(RateAt { rate: dec("1.0500"), date_used: fresh }),
+            "a window that runs up to the freshness bound must still answer from the database"
+        );
     }
 
     #[tokio::test]

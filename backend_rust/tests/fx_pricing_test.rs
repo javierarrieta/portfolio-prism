@@ -70,11 +70,18 @@ async fn get_rate_does_not_return_todays_rate_for_a_past_date() {
     // The bug this task exists to fix: the old get_rate keyed its cache on the
     // requested date and then returned the last close in the series, so the stored
     // value looked correctly dated and was not.
+    //
+    // The stored close sits three days before the requested date, not twenty-three:
+    // a window whose newest row stops short of the date is incomplete coverage, so
+    // `get_rate` sends it to the provider rather than serving a close from inside the
+    // lookback (see `rate_from_db`). Three days is inside `PRICE_WINDOW_FRESH_DAYS`,
+    // so this window is honest and answers hermetically, and the claim is unchanged:
+    // the latest close in the table must not price a past date.
     let pool = pool_with_prices().await;
     seed_pair(
         &pool,
         "EURUSD=X",
-        &[("2024-03-08", "0.9125"), ("2026-11-09", "1.1000")],
+        &[("2024-03-28", "0.9125"), ("2026-11-09", "1.1000")],
     )
     .await;
 
@@ -82,7 +89,7 @@ async fn get_rate_does_not_return_todays_rate_for_a_past_date() {
     let got = svc.get_rate("EUR", "USD", ts("2024-03-31"), &pool).await.unwrap();
 
     assert_eq!(got.rate, dec("0.9125"), "a past date must not pick up the latest close");
-    assert_eq!(got.date_used, NaiveDate::parse_from_str("2024-03-08", "%Y-%m-%d").unwrap());
+    assert_eq!(got.date_used, NaiveDate::parse_from_str("2024-03-28", "%Y-%m-%d").unwrap());
 }
 
 #[tokio::test]
