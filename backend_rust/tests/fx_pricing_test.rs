@@ -125,13 +125,22 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SELL", 10.0, 130.0, 0.0, "2024-03-08T00:00:00Z").await;
 
-    // USD -> EUR closes: 0.8700 on the buy date, 0.9125 on the sell date.
-    seed_pair(&pool, "USDEUR=X", &[("2024-01-02", "0.8700"), ("2024-03-08", "0.9125")]).await;
+    let today = Utc::now().date_naive();
+    let today_str = today.format("%Y-%m-%d").to_string();
+    // USD -> EUR closes: 0.8700 on the buy date, 0.9125 on the sell date, and today's
+    // rate for the market-value leg, which marks a current price and therefore
+    // converts at the valuation date. Without the last row this test would ask the
+    // live provider for `USDEUR=X` and stop being hermetic.
+    seed_pair(
+        &pool,
+        "USDEUR=X",
+        &[("2024-01-02", "0.8700"), ("2024-03-08", "0.9125"), (&today_str, "1.0000")],
+    )
+    .await;
     // The asset's own close, as the route-level caller would read it before calling
     // the engine. `calculate_lots` takes the current price as an argument, so this
     // row completes the fixture rather than being read by the assertion below.
-    let today = Utc::now().date_naive();
-    seed_pair(&pool, "AAPL", &[(today.format("%Y-%m-%d").to_string().as_str(), "130.00")]).await;
+    seed_pair(&pool, "AAPL", &[(today_str.as_str(), "130.00")]).await;
 
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
         "SELECT * FROM transactions WHERE asset_id = ?",
@@ -161,6 +170,74 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     // Realized = 316.25 EUR. Under the old code both legs used one undated rate and
     // the difference between the two dates never existed.
     assert_eq!(summary.realized_pnl, dec("316.25"));
+}
+
+#[tokio::test]
+async fn market_value_is_converted_at_the_valuation_date_not_the_last_transaction_date() {
+    // The market-value leg of `calculate_lots` marks the position at *today's* price,
+    // so it has to convert at today's rate. Converting it at the rate recorded on the
+    // latest transaction date mixes a current price with a stale exchange rate — and
+    // after `get_rate` became honest about dates, that is exactly what it did.
+    //
+    // The two rates are deliberately far apart, and the seeded pair is the only thing
+    // that keeps this hermetic: the stale one sits on the latest transaction date, the
+    // fresh one on today.
+    use backend_rust::engines::tax_engine::TaxLotEngine;
+
+    let pool = pool_with_prices().await;
+
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "FX", "EUR").await;
+    let asset_id = seed_asset_currency(&pool, port_id, "AAPL", "Apple", "USD").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 10.0, 110.0, 0.0, "2024-03-08T00:00:00Z").await;
+
+    let today = Utc::now().date_naive();
+    let today_str = today.format("%Y-%m-%d").to_string();
+    seed_pair(
+        &pool,
+        "USDEUR=X",
+        &[
+            ("2024-01-02", "0.8700"),
+            // The rate at the latest transaction date: 20 shares at 130 would mark at
+            // 2372.50 EUR if the market-value leg used it.
+            ("2024-03-08", "0.9125"),
+            // Today's rate: the correct one for a current price. 2600.00 EUR.
+            (&today_str, "1.0000"),
+        ],
+    )
+    .await;
+
+    let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
+        "SELECT * FROM transactions WHERE asset_id = ?",
+    )
+    .bind(asset_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let svc = CurrencyService::new();
+    let summary = TaxLotEngine::calculate_lots(
+        "AAPL",
+        "STOCK",
+        &txs,
+        dec("130.00"),
+        "USD",
+        "EUR",
+        &svc,
+        "FIFO",
+        30,
+        &pool,
+    )
+    .await
+    .unwrap();
+
+    // 20 shares x 130 USD x 1.0000 = 2600 EUR. At the 2024-03-08 rate it is 2372.50.
+    assert_eq!(
+        summary.market_value,
+        dec("2600"),
+        "the market-value leg must convert today's price at today's rate"
+    );
+    assert_eq!(summary.current_price, dec("130"), "the quoted current price converts at today's rate");
 }
 
 #[tokio::test]

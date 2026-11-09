@@ -567,9 +567,15 @@ impl TaxLotEngine {
         let sorted_txs = Self::sorted_transactions(transactions);
 
         let current_price_base = if asset_currency != base_currency {
-            let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
+            // The market-value leg marks the position at the price the caller is
+            // quoting *now*, so the FX leg has to be the rate that prices now: a
+            // current close converted at the rate recorded on the latest transaction
+            // date would mark a 2026 price with a 2023 exchange rate. The realized
+            // legs in `replay` are each converted at their own transaction date, which
+            // is the correct rule for a historical figure and the reason the two legs
+            // cannot share one rate lookup.
             let rate = currency_service
-                .get_rate(asset_currency, base_currency, latest_date, pool)
+                .get_rate(asset_currency, base_currency, Utc::now(), pool)
                 .await?
                 .rate;
             current_price * rate
