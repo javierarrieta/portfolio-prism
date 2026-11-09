@@ -394,7 +394,8 @@ impl CurrencyService {
 
     async fn cache_price(&self, symbol: &str, date: NaiveDate, price: Decimal, pool: &SqlitePool) {
         let _ = sqlx::query(
-            "INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                 ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
         )
         .bind(symbol)
         .bind(date)
@@ -487,7 +488,8 @@ impl CurrencyService {
             let mut tx = pool.begin().await?;
             for (date, price) in &daily_prices {
                 let _ = sqlx::query(
-                    "INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+                    "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                         ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
                 )
                 .bind(symbol)
                 .bind(*date)
@@ -719,10 +721,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_price_uses_today_cached_price() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let today = chrono::Utc::now().date_naive();
         let _ = sqlx::query(
@@ -742,10 +752,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_price_ignores_stale_cache() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let stale_date = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let _ = sqlx::query(
