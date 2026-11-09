@@ -82,6 +82,7 @@ pub async fn get_portfolio_tax_summary(
             currency_service,
             &strategy_val,
             threshold_val,
+            pool.inner(),
         ).await.map_err(|_| Status::InternalServerError)?;
 
         total_value += summary.market_value;
@@ -244,6 +245,7 @@ pub async fn get_transaction_sell_pnl(
         currency_service.inner(),
         &strategy_val,
         threshold_val,
+        pool.inner(),
     )
     .await
     .map_err(|_| Status::InternalServerError)?

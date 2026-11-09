@@ -26,9 +26,8 @@ pub(crate) const FX_SERIES_WINDOW_DAYS: i64 = 365;
 pub(crate) const FX_LOOKBACK_DAYS: i64 = 30;
 
 /// Yahoo's FX pair symbology. `EUR=USD` returns "No data found"; `EURUSD=X`
-/// returns data. `get_rate` built the first form (`currency_service.rs:235`),
-/// which is why every asset whose currency differed from the portfolio's base
-/// currency failed to price at all.
+/// returns data. `get_rate` built the first form, which is why every asset whose
+/// currency differed from the portfolio's base currency failed to price at all.
 pub(crate) fn fx_symbol(from: &str, to: &str) -> String {
     format!("{}{}=X", from.to_uppercase(), to.to_uppercase())
 }
@@ -161,9 +160,49 @@ struct EodhdSearchResult {
 pub struct CurrencyService {
     client: Client,
     timeout: Duration,
-    cache: Arc<RwLock<HashMap<(String, String, NaiveDate), Decimal>>>,
+    cache: Arc<RwLock<HashMap<(String, String), FxSeries>>>,
     last_request: Mutex<Option<Instant>>,
     eodhd_api_key: Option<String>,
+}
+
+/// One fetched window of a pair's dated closes. Keyed by pair, not by pair-and-date:
+/// the old key (`(from, to, date)`) meant every distinct transaction date was its own
+/// outbound call, and the value was never the date it claimed.
+///
+/// The cache is process-local and dies with the process, so it needs no key version:
+/// entries written by the old buggy code cannot outlive a deploy. The persistent store
+/// is `historical_prices`, and it is versioned by symbology — `EURUSD=X` rows cannot
+/// have been written by the `EUR=USD` code path.
+struct FxSeries {
+    /// First date of the fetched window. A request earlier than this needs a new
+    /// fetch rather than a wrong answer from a window that never covered it.
+    window_start: NaiveDate,
+    series: Vec<(NaiveDate, Decimal)>,
+}
+
+/// Bound on cached pairs. Unbounded is not an option in a 256Mi pod once past dates
+/// became reachable; 64 pairs is far beyond any portfolio in this app, and the
+/// eviction is a full clear rather than an LRU because a miss is one cheap call.
+const MAX_FX_SERIES_CACHED: usize = 64;
+
+/// A rate and the date that produced it. The date is not decoration: a report that
+/// says "as of 2024-03-31" has to be able to state that a Friday close priced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateAt {
+    pub rate: Decimal,
+    pub date_used: NaiveDate,
+}
+
+/// The error for "this pair has no close near that date", built separately from the
+/// `ok_or_else` in `get_rate` so the message is testable without a provider. Public so
+/// the integration test can assert on it; `select_rate` stays `pub(crate)`.
+pub fn no_rate_error(symbol: &str, date: NaiveDate, lookback_days: i64) -> anyhow::Error {
+    anyhow!(
+        "No {} close on or before {} within {} days",
+        symbol,
+        date,
+        lookback_days
+    )
 }
 
 impl CurrencyService {
@@ -256,51 +295,103 @@ impl CurrencyService {
         Err(anyhow!("Max retries exceeded for {}", Self::redact_url(url)))
     }
 
-    pub async fn get_rate(&self, from_curr: &str, to_curr: &str, date: DateTime<Utc>) -> Result<Decimal> {
+    /// The FX rate to convert `from_curr` into `to_curr` for `date`: the last close
+    /// on or before that date, within `FX_LOOKBACK_DAYS`, together with the date
+    /// actually used.
+    ///
+    /// Read order is database first, provider second. That is what makes a past-dated
+    /// conversion testable without a network, and it is the same order
+    /// `get_historical_prices` uses.
+    pub async fn get_rate(
+        &self,
+        from_curr: &str,
+        to_curr: &str,
+        date: DateTime<Utc>,
+        pool: &SqlitePool,
+    ) -> Result<RateAt> {
         let date_naive = date.date_naive();
-        let cache_key = (from_curr.to_string(), to_curr.to_string(), date_naive);
+
+        if from_curr == to_curr {
+            return Ok(RateAt { rate: Decimal::ONE, date_used: date_naive });
+        }
+
+        let key = (from_curr.to_uppercase(), to_curr.to_uppercase());
 
         {
             let cache = self.cache.read().await;
-            if let Some(rate) = cache.get(&cache_key) {
-                return Ok(*rate);
+            let hit = cache
+                .get(&key)
+                .filter(|fx| date_naive >= fx.window_start)
+                .and_then(|fx| select_rate(&fx.series, date_naive, FX_LOOKBACK_DAYS));
+            if let Some((date_used, rate)) = hit {
+                return Ok(RateAt { rate, date_used });
             }
         }
 
-        if from_curr == to_curr {
-            return Ok(Decimal::ONE);
+        let symbol = fx_symbol(from_curr, to_curr);
+        let window_start = date_naive - chrono::Duration::days(FX_SERIES_WINDOW_DAYS);
+
+        // Database first: a seeded or previously fetched window answers with no
+        // outbound call at all.
+        if let Some(hit) = self.rate_from_db(&symbol, window_start, date_naive, pool).await? {
+            return Ok(hit);
         }
 
-        let symbol = format!("{}={}", from_curr, to_curr);
-        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
+        // get_historical_prices already builds the range URL, parses the chart
+        // response, persists the series through the upsert, and merges database rows.
+        // Reusing it is why this change is small.
+        let series = self
+            .get_historical_prices(&symbol, window_start, date_naive, pool)
+            .await?;
 
-        let response = self.fetch_with_retry(&url).await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Yahoo Finance returned status {} for symbol {}",
-                response.status(),
-                symbol
-            ));
+        {
+            let mut cache = self.cache.write().await;
+            if cache.len() >= MAX_FX_SERIES_CACHED && !cache.contains_key(&key) {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                FxSeries {
+                    window_start: series.first().map(|(d, _)| *d).unwrap_or(window_start),
+                    series: series.clone(),
+                },
+            );
         }
 
-        let yahoo_resp: YahooChartResponse = response.json().await?;
+        select_rate(&series, date_naive, FX_LOOKBACK_DAYS)
+            .map(|(date_used, rate)| RateAt { rate, date_used })
+            .ok_or_else(|| no_rate_error(&symbol, date_naive, FX_LOOKBACK_DAYS))
+    }
 
-        let result = yahoo_resp.chart.result.first()
-            .ok_or_else(|| anyhow!("No result found for symbol {}", symbol))?;
+    /// The pair's dated closes as already stored, narrowed to the same rule
+    /// `select_rate` applies. `None` means "the database cannot answer", which is not
+    /// the same as "no rate exists" — only the provider can say that.
+    async fn rate_from_db(
+        &self,
+        symbol: &str,
+        window_start: NaiveDate,
+        date: NaiveDate,
+        pool: &SqlitePool,
+    ) -> Result<Option<RateAt>> {
+        let rows: Vec<(NaiveDate, String)> = sqlx::query_as(
+            "SELECT date, close_price FROM historical_prices
+                 WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date",
+        )
+        .bind(symbol)
+        .bind(window_start)
+        .bind(date)
+        .fetch_all(pool)
+        .await?;
 
-        let close_prices = &result.indicators.quote.first()
-            .ok_or_else(|| anyhow!("No quote data found for symbol {}", symbol))?
-            .close;
+        let series: Vec<(NaiveDate, Decimal)> = rows
+            .into_iter()
+            .map(|(d, p)| (d, crate::db_types::str_to_decimal(&p)))
+            .collect();
 
-        let rate = close_prices.iter().rev()
-            .find_map(|x| x.map(f64_to_decimal))
-            .ok_or_else(|| anyhow!("No close price found for symbol {}", symbol))?;
-
-        let mut cache = self.cache.write().await;
-        cache.insert(cache_key, rate);
-
-        Ok(rate)
+        Ok(
+            select_rate(&series, date, FX_LOOKBACK_DAYS)
+                .map(|(date_used, rate)| RateAt { rate, date_used }),
+        )
     }
 
     pub async fn get_price(&self, symbol: &str, isin: Option<&str>, pool: &SqlitePool) -> Decimal {
@@ -737,13 +828,27 @@ mod tests {
         assert_eq!(CurrencyService::redact_url(url), url);
     }
 
+    /// Same-currency requests short-circuit in `get_rate` before any query, so an
+    /// empty in-memory pool is the whole fixture — there are no seeded prices here.
+    async fn empty_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     #[tokio::test]
     async fn test_same_currency_returns_one() {
         let svc = CurrencyService::new();
         let date = DateTime::from_timestamp(1705312200, 0).unwrap();
-        let result = svc.get_rate("USD", "USD", date).await;
+        let pool = empty_pool().await;
+        let result = svc.get_rate("USD", "USD", date, &pool).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Decimal::ONE);
+        assert_eq!(result.unwrap().rate, Decimal::ONE);
     }
 
     #[tokio::test]
@@ -751,9 +856,10 @@ mod tests {
         let svc = CurrencyService::new();
         let date1 = DateTime::from_timestamp(1700000001, 0).unwrap();
         let date2 = DateTime::from_timestamp(1700000001, 0).unwrap();
+        let pool = empty_pool().await;
 
-        let r1 = svc.get_rate("GBP", "GBP", date1).await.unwrap();
-        let r2 = svc.get_rate("GBP", "GBP", date2).await.unwrap();
+        let r1 = svc.get_rate("GBP", "GBP", date1, &pool).await.unwrap().rate;
+        let r2 = svc.get_rate("GBP", "GBP", date2, &pool).await.unwrap().rate;
         assert_eq!(r1, r2);
     }
 

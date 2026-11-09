@@ -4,6 +4,7 @@ use crate::services::currency_service::CurrencyService;
 use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
 use anyhow::Result;
+use sqlx::sqlite::SqlitePool;
 
 #[cfg(test)]
 mod tests {
@@ -24,10 +25,18 @@ mod tests {
         }
     }
 
+    /// Every in-file fixture is USD/USD, which `get_rate` short-circuits before it
+    /// touches the database, so an empty pool is a real pool that answers nothing.
+    /// There are no seeded prices in this file to look for.
+    async fn empty_pool() -> SqlitePool {
+        SqlitePool::connect(":memory:").await.unwrap()
+    }
+
     async fn run_engine(transactions: &[Transaction], strategy: &str, threshold_days: i64) -> AssetTaxSummary {
         let svc = CurrencyService::new();
+        let pool = empty_pool().await;
         TaxLotEngine::calculate_lots(
-            "TEST", "STOCK", transactions, Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, strategy, threshold_days,
+            "TEST", "STOCK", transactions, Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, strategy, threshold_days, &pool,
         ).await.unwrap()
     }
 
@@ -205,8 +214,9 @@ mod tests {
 
     async fn run_breakdown(txs: &[Transaction], sell_id: i32, strategy: &str, threshold: i64) -> Option<SellBreakdown> {
         let svc = CurrencyService::new();
+        let pool = empty_pool().await;
         TaxLotEngine::sell_breakdown(
-            sell_id, txs, "USD", "USD", &svc, strategy, threshold,
+            sell_id, txs, "USD", "USD", &svc, strategy, threshold, &pool,
         ).await.unwrap()
     }
 
@@ -339,14 +349,15 @@ mod tests {
         ];
         for strategy in ["FIFO", "LIFO", "HYBRID"] {
             let svc = CurrencyService::new();
+            let pool = empty_pool().await;
             let summary = TaxLotEngine::calculate_lots(
                 "TEST", "STOCK", &txs, Decimal::from_str("110.0").unwrap(),
-                "USD", "USD", &svc, strategy, 30,
+                "USD", "USD", &svc, strategy, 30, &pool,
             ).await.unwrap();
 
             let sorted = TaxLotEngine::sorted_transactions(&txs);
             let (_, breakdowns) = TaxLotEngine::replay(
-                &sorted, &svc, "USD", "USD", strategy, 30,
+                &sorted, &pool, &svc, "USD", "USD", strategy, 30,
             ).await.unwrap();
 
             let summed: Decimal = breakdowns.iter().map(|b| b.realized_pnl).sum();
@@ -389,6 +400,7 @@ impl TaxLotEngine {
     /// breakdowns by the caller, never accumulated on a separate path.
     async fn replay(
         sorted_txs: &[Transaction],
+        pool: &SqlitePool,
         currency_service: &CurrencyService,
         asset_currency: &str,
         base_currency: &str,
@@ -400,7 +412,10 @@ impl TaxLotEngine {
 
         for tx in sorted_txs {
             let tx_rate = if asset_currency != base_currency {
-                currency_service.get_rate(asset_currency, base_currency, tx.date).await?
+                currency_service
+                    .get_rate(asset_currency, base_currency, tx.date, pool)
+                    .await?
+                    .rate
             } else {
                 Decimal::ONE
             };
@@ -543,12 +558,16 @@ impl TaxLotEngine {
         currency_service: &CurrencyService,
         strategy: &str,
         hybrid_threshold_days: i64,
+        pool: &SqlitePool,
     ) -> Result<AssetTaxSummary> {
         let sorted_txs = Self::sorted_transactions(transactions);
 
         let current_price_base = if asset_currency != base_currency {
             let latest_date = sorted_txs.last().map(|tx| tx.date).unwrap_or_else(Utc::now);
-            let rate = currency_service.get_rate(asset_currency, base_currency, latest_date).await?;
+            let rate = currency_service
+                .get_rate(asset_currency, base_currency, latest_date, pool)
+                .await?
+                .rate;
             current_price * rate
         } else {
             current_price
@@ -556,6 +575,7 @@ impl TaxLotEngine {
 
         let (buy_lots, breakdowns) = Self::replay(
             &sorted_txs,
+            pool,
             currency_service,
             asset_currency,
             base_currency,
@@ -624,10 +644,12 @@ impl TaxLotEngine {
         currency_service: &CurrencyService,
         strategy: &str,
         hybrid_threshold_days: i64,
+        pool: &SqlitePool,
     ) -> Result<Option<SellBreakdown>> {
         let sorted_txs = Self::sorted_transactions(transactions);
         let (_, breakdowns) = Self::replay(
             &sorted_txs,
+            pool,
             currency_service,
             asset_currency,
             base_currency,

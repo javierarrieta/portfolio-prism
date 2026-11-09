@@ -155,8 +155,9 @@ impl StatsEngine {
                 if !rate_cache.contains_key(&key) {
                     let date_utc = Utc.from_utc_datetime(&end_date.and_hms_opt(0, 0, 0).unwrap());
                     let rate = currency_service
-                        .get_rate(&asset.currency, base_currency, date_utc)
+                        .get_rate(&asset.currency, base_currency, date_utc, pool)
                         .await
+                        .map(|r| r.rate)
                         .unwrap_or(Decimal::ONE);
                     rate_cache.insert(key, rate);
                 }
