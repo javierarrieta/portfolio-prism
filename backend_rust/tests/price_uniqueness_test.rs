@@ -14,6 +14,13 @@ async fn create_legacy_prices(pool: &sqlx::sqlite::SqlitePool) {
     .execute(pool)
     .await
     .unwrap();
+    // The plain index `init_db` used to create before the unique index superseded it.
+    // Without it the "the old index is gone" assertion below is true whether or not
+    // the drop exists, which is the whole assertion's point.
+    sqlx::query("CREATE INDEX idx_historical_prices_symbol_date ON historical_prices(symbol, date)")
+        .execute(pool)
+        .await
+        .unwrap();
 
     for (symbol, date, price) in [
         ("AAPL", "2024-01-02", "100.0"),
