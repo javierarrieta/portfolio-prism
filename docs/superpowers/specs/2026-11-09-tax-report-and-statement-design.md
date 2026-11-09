@@ -124,10 +124,10 @@ signal.
 | Risk | What it is | Mitigating section |
 | :-- | :-- | :-- |
 | Existing figures move | The pricing-layer document's four changes each move numbers on endpoints the owner already trusts | Goal 7 and the Dependency section: those changes ship alone, with their own notes |
-| Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing resolution work-set shrink; Cost guard. The guard bounds call count, not wall clock: an elapsed deadline is tracked under Open Questions |
+| Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing-layer work-set shrink; the route's elapsed deadline, which fails closed |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
 | Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints | The Playwright smoke is the only honest check; it is not currently a CI gate |
-| Single-replica assumptions | The guard and SQLite write behaviour both assume one pod; a rolling update with default maxSurge runs two for a window | Cost guard; state the dependency in the deployment manifest review |
+| Single-replica assumptions | SQLite write behaviour assumes one pod; a rolling update with default maxSurge runs two for a window | State the dependency in the deployment manifest review |
 
 ## Technical Plan (Architecture)
 
@@ -322,7 +322,7 @@ touches no network.
 
 ### Decided during drafting
 
-Four items were open when the Technical Plan was first written. They are settled here, and
+Five items were open when the Technical Plan was first written. They are settled here, and
 the predecessor RFC is the source for the first one.
 
 **Route.** Reports extend `GET /api/portfolios/<id>/tax-summary` with two optional query
@@ -339,22 +339,28 @@ as a `Viewer` can — so it would only have restricted who gets to be slow. The 
 access gate cannot see a parameter-dependent rule on an existing route, so
 `tests/isolation_test.rs` covers the dated variant.
 
-**Cost guard.** Two bounds, both on the dated path only, so the existing screen is
-untouched. One report may be in flight per authenticated subject (the `sub` claim) at a
-time; a second concurrent request is rejected with HTTP 429 and `retryable: true`. And each
-report carries an outbound-request budget; exceeding it fails with the 503 contract rather
-than continuing to consume the process-wide throttle. The budget is the outbound cap the
-pricing section needs anyway (see Pricing resolution). The in-flight slot must be released
-on every exit path, including a panic, or one slow report permanently blocks that user. The
-guard is per-process state and therefore depends on `k8s/app-deployment.yaml` keeping
-`replicas: 1`; raising it gives each subject one slot per pod.
+**Elapsed deadline, not a concurrency guard.** An earlier revision of this draft carried a
+per-user in-flight slot plus a per-request outbound budget in a new `report_guard.rs`. Both
+are removed. The slot bounds concurrency rather than cost — the same objection this document
+raises against an `Editor` rule — the budget duplicates a bound the pricing-layer series
+cache already enforces structurally (about 22 outbound calls for the flagship portfolio),
+and neither could reach the code that would decrement it.
+
+What remains is a wall-clock bound, because the real hazard is elapsed time. The ingress
+carries no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly
+33 s worst case per unreachable host. The route records its start and stops attempting
+further assets once elapsed time passes a stated constant near 20 s, then **fails closed**:
+the existing 503 with `retryable: true` and no partial payload. A partial tax report is the
+outcome Goal 5 exists to prevent, so "return what was collected" is not an option. The
+deadline cannot preempt an in-flight outbound call, and it is only checkable between assets,
+which bounds anything only once the pricing-layer cache is genuinely per-pair.
 
 **Error contract.** Two failure classes, one typed body, produced by a custom Rocket
 `Responder` in the style of the auth `Unavailable` responder
 (`backend_rust/src/auth/routes.rs:33-52`): HTTP 422 for "no data exists at or before this
 date for this symbol or currency pair", HTTP 503 for "provider unreachable or throttled".
-`retryable` is `false` for 422 and `true` for 503. Guard rejections use HTTP 429 with
-`retryable: true`. Validation failures — `from > to`, a future date, an unparseable date, an
+`retryable` is `false` for 422 and `true` for 503. An elapsed-deadline failure uses the same
+503 with `retryable: true`. Validation failures — `from > to`, a future date, an unparseable date, an
 unrecognized strategy, a negative `threshold_days` — also return 422, with
 `ErrorBody.error` naming the offending parameter and `missing_prices` and `missing_rates`
 empty; no-data failures return 422 with those lists populated. On any error the route
@@ -394,15 +400,18 @@ The draft was compared against the RFC after drafting. It contained one contradi
 six additions; each is resolved below.
 
 The RFC's non-goals excluded *"concurrency work, batching frameworks, cache layers or
-timeout knobs beyond the work-set shrink."* The cost guard is beyond that shrink. The owner
-kept the guard and amended the RFC's non-goal, narrowing it to batching frameworks,
-concurrent fan-out and new timeout knobs, with the reason recorded in the RFC itself
-(`2026-11-09-tax-report-and-statement-concepts.md`, Non-Goals).
+timeout knobs beyond the work-set shrink."* The removed cost guard was beyond that shrink,
+and the RFC was amended while it was in the plan. With the guard gone the amendment is no
+longer needed for a guard, but the replacement is still a cache layer and a timeout knob, so
+the amended wording in the RFC
+(`2026-11-09-tax-report-and-statement-concepts.md`, Non-Goals) still has to be revisited
+rather than simply reverted.
 
 The owner accepted six decisions the RFC did not raise: the pricing result types (now the
 pricing-layer document's responsibility); the `TaxLot` fix; strict strategy and threshold
 validation; bounding and versioning the FX cache (also the pricing-layer document's);
-HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. Two of them
+HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. The 429 decision is now
+reversed — see Elapsed deadline above — leaving five standing. Two of those
 change existing endpoint behaviour — the result types and strict strategy validation — and were decided
 individually rather than folded in. `TaxLot` is corrected in place rather than worked
 around, because the Holdings table renders "Remaining Qty" and "Original Qty" as two
@@ -435,10 +444,9 @@ Open from this draft, each needing a decision before the slice that depends on i
     `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` and contradicts "absent
     parameters reproduce current behaviour". Keep it dated-path-only, or cite the record and
     amend Goal 7.
-5.  **Elapsed deadline versus the guard.** The guard bounds call count. Two unreachable
-    symbols exceed the ingress cutoff, the browser receives an HTML gateway error instead of
-    the typed 503, and the slot stays held so the next click returns 429. Does an elapsed
-    deadline replace the guard, supplement it, or is the gateway case accepted?
+5.  **The elapsed-deadline constant.** Near 20 s is the reviewer's suggestion, not a
+    measured value. It needs a number, a place it is defined, and a test that trips it
+    without waiting 20 s.
 6.  **CSV summable-column disclosure.** `sellPnlCsv.ts:13-16` deliberately puts caveats in
     columns because a leading `#` row breaks naive parsers, including this app's own
     `detectColumns`. Which convention does the report CSV use?
@@ -555,15 +563,15 @@ and `backend_rust/src/lib.rs` — carried the dated-FX rebuild, the
 specified in **`2026-11-09-pricing-layer-truthfulness.md`**, which this design depends
 on. Nothing in this document edits those two files.
 
-#### 3. `backend_rust/src/report_guard.rs` (Create) — slice 4
-#### 3. `backend_rust/src/report_guard.rs` (Create) — slice 4
+#### 3. Deleted — no report guard
 
-*   **Type / Scope**: per-user concurrency slot and per-request outbound budget.
-*   **Proposed Changes**: a small stateful type held in Rocket managed state. Acquire returns
-    a guard that releases the user's slot on drop, so a panic or an early return cannot leak
-    the slot; the budget is a counter decremented by the pricing layer before each outbound
-    call, and exhausting it produces the `ProviderUnavailable` variant. Keep it in its own
-    module rather than in `currency_service.rs` so the two concerns stay testable separately.
+The original plan put a per-user in-flight slot and a per-request outbound budget in a new
+`backend_rust/src/report_guard.rs`. It is removed. The slot bounds concurrency rather than
+cost, which is the argument this document itself uses to reject an `Editor` rule; the
+outbound budget duplicates a bound the pricing-layer series cache enforces structurally; and
+the type could not reach the code that would decrement it, because `CurrencyService::new()`
+takes no arguments and has 24 call sites. What replaces it is the elapsed deadline in the
+route, described under Error contract and in file 6.
 
 #### 4. `backend_rust/src/engines/tax_engine.rs` (Modify) — slices 2, 4
 
@@ -631,11 +639,12 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 
 *   **Type / Scope**: the `tax-summary` handler.
 *   **Proposed Changes**: add optional `from` and `to`. Access stays `Access::Viewer` for
-    every call, dated or not. When the parameters are present: acquire the per-user report
-    slot, returning 429 if one is already in flight; validate the dates and the strategy
-    strictly; filter transactions to `date <= to`; call `replay_at`; build
+    every call, dated or not. When the parameters are present: validate the dates and the
+    strategy strictly; filter transactions to `date <= to`; call `replay_at`; build
     `AssetTotals` and rows server-side so no renderer sums anything; resolve prices with the
-    collected-failure rule and return the typed error body with 422 or 503. Replace the
+    collected-failure rule and return the typed error body with 422 or 503. Stop attempting
+    further assets once elapsed time passes the stated deadline and return the 503 with no
+    partial payload. Replace the
     `.map_err(|_| Status::InternalServerError)` erasure on this handler.
 
 #### 7. `backend_rust/src/openapi.rs` (Modify) — slice 4
@@ -685,11 +694,8 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     case proving a non-owner cannot request a dated report. Note that `access.rs:37-57`
     grants `Access::Owner` to the owner and nothing to anyone else — there is no membership
     table — so a "`Viewer` collaborator can request a dated report" case cannot be written
-    until sharing exists. Add guard cases only if guard tests are writable: a second
-    concurrent report returning 429 needs two overlapping dispatches with a stall seam, and
-    a panicking handler under Rocket's local `Client` unwinds the test thread rather than
-    producing a response. The grep-based gate cannot see an access-level choice on an
-    existing route.
+    until sharing exists. No guard cases: the guard was removed, so there is no slot to test.
+    The grep-based gate cannot see an access-level choice on an
 
 #### 10. `backend_rust/tests/route_coverage_test.rs` and `backend_rust/tests/auth_test.rs` (Modify) — slice 4
 
@@ -773,8 +779,8 @@ expectation there assumes FX conversion at the latest rate.
     default of January 1 to December 31 is a future `to` for most of the year and the route
     rejects it. No calendar widget is added; the native `<input type="date">` picker remains
     available. Controls stay enabled for every access level, since the route requires only
-    `Viewer`; when the guard rejects with 429 the UI says a report is already running and
-    offers a retry.
+    `Viewer`. If the route fails with the elapsed-deadline 503 the UI says the report took too
+    long and offers a retry.
 
 #### 19. `frontend/src/components/PortfolioStatement.tsx` (Create) — slices 1, 5
 
@@ -849,15 +855,12 @@ its own decisions land is mis-cut.
 | `backend_rust/tests/analytics_test.rs` | Pins `original_qty == remaining_qty` at `:51-52` |
 | `frontend/src/components/PortfolioDetail.tsx` | Renders the two lot columns from one value (`:322-323`, `:333-334`) |
 | `frontend/src/test/components/PortfolioDetail.test.tsx` | Pins the buggy equality at `:184-185` |
-| `backend_rust/src/main.rs` | `build_rocket(...)` call site at `:63` if managed state changes the signature |
-| `backend_rust/tests/common/mod.rs` | Three `build_rocket` sites at `:46`, `:56`, `:65` |
-| `backend_rust/tests/cors_test.rs` | Five `CurrencyService::new()` sites if the constructor changes |
 | `frontend/src/types.ts` | The hand-written types every renderer actually uses; `api.d.ts` has zero importers |
 | `frontend/package.json` | Required for any `e2e:statement` script |
 | `frontend/src/main.tsx` | The only entry-import site for a stylesheet (`main.tsx:3`) |
 | `frontend/src/utils/csvCells.ts` (new) | Holds the formula-lead and exponent-free guards extracted from `sellPnlCsv.ts` |
 | `docs/superpowers/reviews/2026-11-09-tax-report.md` | Decision and rejection record, following the convention in `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` |
-| `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md` | The amended non-goal at its Non-Goals section must be edited if the guard changes |
+| `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md` | The amended non-goal at its Non-Goals section still needs revisiting now the guard is gone |
 
 ### Verification Plan
 
