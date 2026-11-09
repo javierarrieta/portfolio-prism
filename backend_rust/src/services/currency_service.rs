@@ -57,6 +57,37 @@ pub(crate) fn select_rate(
         .cloned()
 }
 
+/// Does a stored window answer for `end_date`? Only if its newest row is within
+/// `PRICE_WINDOW_FRESH_DAYS` of it; an empty window is never fresh.
+///
+/// Pure for the same reason as [`select_rate`]: the rule is what needs testing, and
+/// a test of it must not need a pool, a provider, or a network.
+fn stored_window_is_fresh(newest: Option<NaiveDate>, end_date: NaiveDate) -> bool {
+    matches!(newest, Some(d) if (end_date - d).num_days() <= PRICE_WINDOW_FRESH_DAYS)
+}
+
+/// Combine what the provider returned for the tail of a window with the rows
+/// already stored for its head. Provider rows win on a shared date; the result is
+/// ascending by date.
+///
+/// Pure so the merge is testable too: it only runs in production when a real
+/// provider answers, and this crate has no dev-dependencies to mock one with.
+fn merge_series(
+    fetched: Vec<(NaiveDate, Decimal)>,
+    stored: Vec<(NaiveDate, Decimal)>,
+) -> Vec<(NaiveDate, Decimal)> {
+    let fetched_dates: std::collections::HashSet<NaiveDate> =
+        fetched.iter().map(|(date, _)| *date).collect();
+    let mut merged = fetched;
+    for (date, price) in stored {
+        if !fetched_dates.contains(&date) {
+            merged.push((date, price));
+        }
+    }
+    merged.sort_by_key(|(date, _)| *date);
+    merged
+}
+
 fn f64_to_decimal(v: f64) -> Decimal {
     Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
 }
@@ -394,8 +425,9 @@ impl CurrencyService {
         // response, persists the series through the upsert, and merges what it
         // fetched over stored rows it found too stale to answer with. Reaching this
         // line means `rate_from_db` found nothing inside `FX_LOOKBACK_DAYS`, so any
-        // stored row in the window is past `PRICE_WINDOW_FRESH_DAYS` and there is a
-        // merge to do. Reusing it is why this change is small.
+        // stored row in the window is past `PRICE_WINDOW_FRESH_DAYS` and will be
+        // merged under whatever the provider returns. Reusing it is why this change
+        // is small.
         let series = self
             .get_historical_prices(&symbol, window_start, date_naive, pool)
             .await?;
@@ -662,14 +694,11 @@ impl CurrencyService {
             .await
             .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
 
-        // The freshness rule. No stored row at all is the most incomplete window
-        // there is, so it falls through too.
+        // The freshness rule. It lives in `stored_window_is_fresh` so the predicate
+        // under test is the predicate that runs; no stored row at all is the most
+        // incomplete window there is, so it falls through too.
         let newest = db_prices.iter().map(|(date, _)| *date).max();
-        let incomplete = match newest {
-            Some(newest) => (end_date - newest).num_days() > PRICE_WINDOW_FRESH_DAYS,
-            None => true,
-        };
-        if !incomplete {
+        if stored_window_is_fresh(newest, end_date) {
             db_prices.sort_by_key(|(date, _)| *date);
             return Ok(db_prices);
         }
@@ -777,17 +806,7 @@ impl CurrencyService {
         // kept rather than discarded. Re-reading the window here would return these
         // same rows plus the ones just persisted, which are already in
         // `daily_prices`.
-        let fetched: std::collections::HashSet<NaiveDate> =
-            daily_prices.iter().map(|(date, _)| *date).collect();
-        let mut merged: Vec<(NaiveDate, Decimal)> = daily_prices;
-        for (date, price) in db_prices {
-            if !fetched.contains(&date) {
-                merged.push((date, price));
-            }
-        }
-        merged.sort_by_key(|(date, _)| *date);
-
-        Ok(merged)
+        Ok(merge_series(daily_prices, db_prices))
     }
 
     async fn get_historical_prices_from_db(
@@ -1058,18 +1077,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stored_window_answers_only_while_it_is_fresh() {
-        // The read order decided at the level it is decided. Both halves seed a
-        // symbol that cannot resolve, so the stored rows are the only difference
-        // between them.
+    async fn a_fresh_stored_window_answers_without_the_provider() {
+        // The hermetic half of the read order, at the level it is decided. The symbol
+        // cannot resolve, so the provider could not have produced this answer: the
+        // newest row sits exactly on the freshness bound, which means the database
+        // returned and no outbound call was made. The stale side of the rule is a
+        // pure predicate now (`stored_window_is_fresh_up_to_the_bound_and_stale_past_it`)
+        // rather than a test that has to reach the network to fail.
         let pool = empty_pool().await;
         let end = date_of("2024-06-14");
         let window_start = end - chrono::Duration::days(30);
         let svc = CurrencyService::new();
 
-        // Fresh: the newest row sits exactly on the bound, so the database answers
-        // and no provider call is made — the same unreachable symbol fails in the
-        // stale half below, so an `Ok` here can only have come from the rows.
         let fresh_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
         let fresh_newest_str = fresh_newest.format("%Y-%m-%d").to_string();
         seed_prices(&pool, "FRESHWINDOW", &[(&fresh_newest_str, "1.0500")]).await;
@@ -1078,20 +1097,6 @@ mod tests {
             .await
             .expect("a window whose newest row is PRICE_WINDOW_FRESH_DAYS old answers from the database");
         assert_eq!(fresh, vec![(fresh_newest, dec("1.0500"))]);
-
-        // Stale: one day past the bound the window is incomplete, so the provider is
-        // asked for the tail instead. Nothing can answer for this symbol, so the call
-        // fails — and what this pins is that the failure is reported rather than the
-        // stale rows served as a success, which is the exact shape of the bug the
-        // freshness rule closes. Which of the two failures a sandbox produces depends
-        // on whether DNS resolves; neither is the stale series.
-        let stale_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS + 1);
-        let stale_newest_str = stale_newest.format("%Y-%m-%d").to_string();
-        seed_prices(&pool, "STALEWINDOW", &[(&stale_newest_str, "0.9000")]).await;
-        match svc.get_historical_prices("STALEWINDOW", window_start, end, &pool).await {
-            Ok(rows) => panic!("a stale window must not be served as a success, got {rows:?}"),
-            Err(PricingError::NoData) | Err(PricingError::ProviderUnavailable(_)) => {}
-        }
     }
 
     #[tokio::test]
@@ -1462,6 +1467,57 @@ mod tests {
         let s = series(&[("2024-03-08", "0.9125"), ("2024-03-06", "0.9075"), ("2024-03-07", "0.9100")]);
         assert_eq!(select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS).map(|(d, _)| d), Some(day("2024-03-08")));
         assert_eq!(select_rate(&[], day("2024-03-09"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn stored_window_is_fresh_up_to_the_bound_and_stale_past_it() {
+        // The rule that decides whether a stored window answers, tested on its own so
+        // that pinning it costs no pool, no provider and no outbound call.
+        let end = day("2024-06-14");
+        assert!(
+            stored_window_is_fresh(Some(end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS)), end),
+            "a newest row exactly on the bound still answers"
+        );
+        assert!(
+            !stored_window_is_fresh(Some(end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS + 1)), end),
+            "one day past the bound the window is incomplete and the provider is asked"
+        );
+        assert!(stored_window_is_fresh(Some(end), end), "a window that ends on the date is fresh");
+        assert!(
+            !stored_window_is_fresh(None, end),
+            "no stored row at all is the most incomplete window there is"
+        );
+        // A newest row *after* `end_date` is not reachable at the only call site:
+        // `get_historical_prices_from_db` reads `date >= start_date AND date <=
+        // end_date`, so the newest row it can hand back never passes `end_date`. Said
+        // rather than tested, because inventing the case would test a shape that
+        // cannot occur.
+    }
+
+    #[test]
+    fn merge_series_keeps_both_sides_of_the_window_and_sorts_them() {
+        // The provider answers the tail; the stored rows are the head. Both survive,
+        // the fetched row wins where they overlap (the upsert just rewrote it), and
+        // the result is ascending even though both inputs came in unordered — the
+        // ordering `get_rate` depends on when it records a window.
+        let merged = merge_series(
+            series(&[("2024-06-13", "1.0700"), ("2024-06-10", "1.0600")]),
+            series(&[("2024-06-10", "0.9000"), ("2024-06-07", "0.9100")]),
+        );
+        assert_eq!(
+            merged,
+            series(&[
+                ("2024-06-07", "0.9100"),
+                ("2024-06-10", "1.0600"),
+                ("2024-06-13", "1.0700"),
+            ])
+        );
+
+        // The first-fetch case: nothing stored, so the merge is the fetched rows.
+        assert_eq!(
+            merge_series(series(&[("2024-06-10", "1.0600")]), vec![]),
+            series(&[("2024-06-10", "1.0600")])
+        );
     }
 
     #[test]
