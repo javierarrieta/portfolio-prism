@@ -20,7 +20,7 @@ loss at that date.
 
 The **portfolio statement** is a page the owner reads or hands to someone. It shows
 realized P&L cumulative from inception to a chosen date and unrealized P&L as of that
-date, for one portfolio, optionally narrowed to a subset of its assets. The browser
+date, for one portfolio in full. The browser
 prints it to PDF; the server never produces a PDF.
 
 They are not two features. They are one dated-calculation change plus two renderers, and
@@ -308,8 +308,7 @@ usable outside this frontend.
 The statement is a React view with a print stylesheet. There is no `@media print` rule
 anywhere in the frontend (verified: no `@media print` in `frontend/src/`), so this
 stylesheet does not exist yet. It renders the payload's totals through
-`frontend/src/utils/formatters.ts`, and its printed subtree contains no buttons or inputs;
-the asset-subset control sits outside the printed subtree.
+`frontend/src/utils/formatters.ts`, and its printed subtree contains no buttons or inputs.
 
 ### Sequencing
 
@@ -542,9 +541,14 @@ Open from this draft, each needing a decision before the slice that depends on i
     answer while still presenting as complete. It also needs `require_asset_in` rather than
     a portfolio-level `require`, or it is an IDOR that the grep-based access gate will not
     catch.
-*   **Reason for rejection**: the subset solves the statement's problem and not the tax
-    report's. A subset is kept for the statement only, as a client-side filter over data
-    already fetched. The pricing failure it was meant to soften is handled by Goal 5
+*   **Reason for rejection**: a tax report is definitionally portfolio-wide, so narrowing it
+    changes the tax answer while still presenting as complete. The same objection applies to
+    the statement: the payload carries per-asset totals plus a portfolio rollup, and
+    renderers must not sum, so a client-side subset filter can either sum the selected
+    assets' totals — the forbidden arithmetic, and a double by Alternative C's own argument
+    — or print a rollup describing a different asset set than the rows beneath it. That is
+    the worst place to do it, because the statement is the artifact handed to an adviser. No
+    subset anywhere. The pricing failure this was meant to soften is handled by Goal 5
     instead.
 
 ### Future Improvements
@@ -802,8 +806,10 @@ existing screen.
 #### 19. `frontend/src/components/PortfolioStatement.tsx` (Create) — slices 1, 5
 
 *   **Type / Scope**: printable statement view.
-*   **Proposed Changes**: renders portfolio totals and per-asset figures through the shared
-    formatter, with an asset subset filter applied client-side. Slice 1 renders the existing
+*   **Proposed Changes**: renders portfolio totals and per-asset figures through
+    `frontend/src/utils/formatters.ts`, for the portfolio in full — there is no asset-subset
+    filter, because the only arithmetic that would make a filtered headline honest is the
+    arithmetic renderers are forbidden from doing. Slice 1 renders the existing
     `taxSummary` payload at today's date; slice 5 switches it to the dated payload. It
     derives no totals of its own and contains no buttons or inputs inside the printed
     subtree.
