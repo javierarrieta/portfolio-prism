@@ -4,6 +4,9 @@
 *   **Status:** Proposed
 *   **Date:** 2026-11-09
 *   **Predecessor:** `2026-11-09-tax-report-and-statement-concepts.md`
+*   **Blocked on:** `2026-11-09-pricing-layer-truthfulness.md` — dated FX,
+    `historical_prices` uniqueness and the pricing result types. This document does not
+    edit `currency_service.rs` or `lib.rs`.
 
 ## Overview
 
@@ -79,7 +82,8 @@ signal.
     threshold, the portfolio base currency, the requested date range, the
     `price_date_used` and `fx_rate_date_used` per asset, and a `price_source` flag saying
     where each value came from; the statement prints the same run context in its header
-    block. P1–P4 are what make this hold; a split recorded after the fact legitimately
+    block. The pricing-layer fixes are what make this hold; a split recorded after the fact
+    legitimately
     changes a regenerated file, and the run context is where that is visible.
 *   **Goal 5 — no silent wrong numbers.** A price or FX rate that cannot be obtained fails
     the request and enumerates the missing symbols and currency pairs in one response, up
@@ -91,10 +95,10 @@ signal.
     cumulative realized P&L and unrealized P&L — are the payload totals rendered through
     `frontend/src/utils/formatters.ts`, not arithmetic invented by the print view.
 *   **Goal 7 — existing figures move only where declared.** Every change to numbers on
-    existing endpoints is named and ships with its own note. The set is P1 (dated FX), P2
-    (de-duplicated historical closes), P3 (splits no longer written on a read path) and P4
-    (failed lookups stop returning zero). Each lands as its own reviewed change with a
-    commit-message note naming which figures move.
+    existing endpoints is named and ships with its own note. Within this document the set is
+    P3 (splits no longer written on a report path) and the `TaxLot` fix. The dated-FX fix,
+    the `historical_prices` uniqueness fix and the pricing result types move figures too,
+    but they belong to `2026-11-09-pricing-layer-truthfulness.md` and are declared there.
 
 ## Non-Goals
 
@@ -119,7 +123,7 @@ signal.
 
 | Risk | What it is | Mitigating section |
 | :-- | :-- | :-- |
-| Existing figures move | P1–P4 each change numbers on endpoints the owner already trusts | Goal 7 and Prerequisites: each ships alone with a commit-message note naming the figures |
+| Existing figures move | The pricing-layer document's four changes each move numbers on endpoints the owner already trusts | Goal 7 and the Dependency section: those changes ship alone, with their own notes |
 | Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing resolution work-set shrink; Cost guard. The guard bounds call count, not wall clock: an elapsed deadline is tracked under Open Questions |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
 | Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints | The Playwright smoke is the only honest check; it is not currently a CI gate |
@@ -167,50 +171,42 @@ date, `valuation_date = end`. There is no `as_of` parameter. Per-asset close dat
 `AssetTotals.unrealized_at_end`. The sold-lot P&L column is `lot_pnl`, which is
 `LotMatch.pnl` renamed for the CSV.
 
-### Prerequisites (P1–P4)
+### Dependency: the pricing layer
 
-Four defects block this design and each is its own reviewed change.
+Four defects block this design. Three of them — dated FX, `historical_prices` uniqueness,
+and honest pricing result types — are not part of this feature. They are a live bug fix
+with their own blast radius and their own release note, and they are specified in
+**`2026-11-09-pricing-layer-truthfulness.md`**, which this design is **blocked on** rather
+than a subset of.
 
-**P1 — dated FX.** `CurrencyService::get_rate` must request a date range and select the
-rate for the requested date, using Yahoo's FX symbology (`EURUSD=X`, not `EUR=USD`). The
-current implementation ignores its date argument and returns the latest close while
-caching it under the requested date's key. Because `tax_engine.rs:403` already calls it
-per transaction with past dates, fixing it changes existing realized and unrealized
-figures for every foreign-currency asset, including figures asserted by
-`test_sell_pnl_sums_to_tax_summary_realized_pnl` and `backend_rust/tests/sell_pnl_test.rs`.
-That is the intended outcome and the change must name it. It also makes the sentence in
-`SellPnlModal.tsx:283` ("at the latest available rate") false.
+What this design takes from that document:
 
-**P2 — `historical_prices` uniqueness.** There is no migration mechanism in this repo: no
-`migrations/` directory and no `sqlx::migrate!`. Every schema change is raw SQL inside
-`init_db` (`lib.rs:118-206`) plus the bespoke helpers `migrate_decimal_columns`
-(`lib.rs:399-416`) and `add_owner_id_column` (`lib.rs:236-238`). SQLite has no
-`ALTER TABLE … ADD CONSTRAINT UNIQUE`, and editing the `CREATE TABLE` text is a no-op on
-every existing database. The change is therefore: dedupe existing rows, then
-`CREATE UNIQUE INDEX IF NOT EXISTS uq_historical_prices_symbol_date ON
-historical_prices(symbol, date)`, run idempotently from `init_db`, and make the write a
-real upsert. Two consequences the implementer must not invent: the dedupe needs a stated
-tie-break for which duplicate survives — the table has no write timestamp, so the only
-deterministic choice is `max(rowid)`, and that choice is itself a figure decision because
-Yahoo revises closes around corporate actions — and it must be ordered against
-`migrate_decimal_columns`, which renames this same table's `close_price` column. A dedupe
-that misses a duplicate makes `init_db` return `Err` and the app refuses to boot, so this
-ships with a migration test in the shape of `tests/decimal_migration_test.rs`. The existing
-plain index `idx_historical_prices_symbol_date` (`lib.rs:176`) becomes redundant. Today the
-table has no primary key and only that plain index, so `INSERT OR REPLACE` always inserts
-and reads return an arbitrary duplicate.
+*   `get_rate` that actually honours its date argument, with `EURUSD=X` symbology and a
+    per-pair series cache. Without it, a dated multi-currency report issues roughly one
+    outbound call per transaction — about 200 for the flagship portfolio — against a
+    process-wide throttle of roughly five requests per second
+    (`currency_service.rs:14`).
+*   `UNIQUE` `(symbol, date)` on `historical_prices`, so "the close on date X" is one row
+    rather than an arbitrary one among N. Without it no as-of price is reproducible and
+    Goal 4 is unreachable.
+*   Pricing result types distinguishing `NoData` from `ProviderUnavailable`. The error
+    contract below is meaningless without them.
+*   A seedable FX store. Rates currently live only in a process `HashMap`
+    (`currency_service.rs:125`), so no dated multi-currency test can be hermetic until they
+    are persisted.
 
-**P3 — no split writes on a report path.** `sync_splits_for_asset` must not run inside a
-report request. Its dedupe is a `SELECT COUNT(*)` then `INSERT` with no transaction and no
-unique constraint (`currency_service.rs:46`, `:60`), so concurrent requests can both insert
-the same split row and double the adjusted share count, and a split dated after `end` that
-gets inserted retroactively changes in-window cost basis. The rule this design follows is
-the one the single-sell P&L route already follows: the dated path does not sync splits, and
-the run context states that splits are as recorded. Where the split call should go instead
-is an open question with no destination in this deployment — `main.rs:63` is a plain
-`.launch()` with no Rocket tasks and `k8s/` has no CronJob or Job — and is tracked under
-Open Questions rather than solved here. This design does not detect unrecorded splits; it
-reports the split rows that exist.
+The fourth defect stays here. **P3 — no split writes on a report path.**
+`sync_splits_for_asset` must not run inside a report request. Its dedupe is a
+`SELECT COUNT(*)` then `INSERT` with no transaction and no unique constraint
+(`currency_service.rs:46`, `:60`), so concurrent requests can both insert the same split row
+and double the adjusted share count, and a split dated after `end` that gets inserted
+retroactively changes in-window cost basis. The rule this design follows is the one the
+single-sell P&L route already follows: the dated path does not sync splits, and the run
+context states that splits are as recorded. Where the split call should go instead is an
+open question with no destination in this deployment — `main.rs:63` is a plain `.launch()`
+with no Rocket tasks and `k8s/` has no CronJob or Job — and is tracked under Open Questions
+rather than solved here. This design does not detect unrecorded splits; it reports the split
+rows that exist.
 
 ### The engine change: one public dated replay
 
@@ -317,11 +313,11 @@ touches no network.
 
 | Slice | Ships | Reaches network in tests? | Blast radius on existing figures | New-code risk |
 | :-- | :-- | :-- | :-- | :-- |
-| 0 | P1, P2, P3, each separately reviewed | no | figures move for every foreign-currency asset | moderate |
+| Out | The pricing-layer changes: dated FX, `historical_prices` uniqueness, pricing result types | no | figures move for every foreign-currency asset | moderate |
 | 1 | Statement at today's date, pure frontend over the existing tax-summary payload | no | none | low |
 | 2 | `replay_at` in the engine, unit tests only | no | none | contained |
 | 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure | no | none | moderate |
-| 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | P4 stops failed lookups returning zero | **the risky piece** |
+| 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | none new here — the pricing-layer document's result types stop failed lookups returning zero | **the risky piece** |
 | 5 | Statement switches to the report payload and accepts a past `to` | yes | none | low |
 
 ### Decided during drafting
@@ -366,16 +362,15 @@ returns only the error body, and the frontend does not call `downloadCsv` when t
 fails, so no partial file reaches the owner. The missing-item list is capped, with a count
 of what was omitted.
 
-This choice carries a fourth prerequisite, **P4**. The pricing layer cannot currently
+This choice depends on the pricing-layer document's P4. The pricing layer cannot currently
 distinguish "no data" from "could not ask": `get_price` returns `Decimal::ZERO` on every
 failure (`currency_service.rs:267`), and `get_historical_prices` already returns a
 `Result` (`:406`) but swallows the failure at five sites (`:429`, `:442`, `:449`, `:467`,
-`:502`) and hands back the database fallback as `Ok`. `get_price` changes to a typed result
-distinguishing `NoData` from `ProviderUnavailable`; `get_historical_prices` keeps its
-signature and stops swallowing. Both changes reach the existing screen: `get_price` is
-called from `analytics.rs:73` and `stats_engine.rs:180`, and `get_historical_prices` from
-`stats_engine.rs:139`, so those call sites move in the same change and the plan must say
-whether the undated path keeps today's permissive behaviour.
+`:502`) and hands back the database fallback as `Ok`. That document changes them; this one
+consumes the distinction. It is named here because the error contract is meaningless
+without it, and because the change reaches the existing screen: `get_price` is called from
+`analytics.rs:73` and `stats_engine.rs:180`, and `get_historical_prices` from
+`stats_engine.rs:139`.
 
 **Date parameter semantics.** `from` and `to` are `YYYY-MM-DD`, both inclusive, evaluated in
 UTC. `Transaction.date` is a `DateTime<Utc>` (`models.rs:35`), not a date, so "a sell at any
@@ -404,10 +399,11 @@ kept the guard and amended the RFC's non-goal, narrowing it to batching framewor
 concurrent fan-out and new timeout knobs, with the reason recorded in the RFC itself
 (`2026-11-09-tax-report-and-statement-concepts.md`, Non-Goals).
 
-The owner accepted six decisions the RFC did not raise: the P4 result types for the pricing
-layer; the `TaxLot` fix; strict strategy and threshold validation; bounding and versioning
-the FX cache; HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. Two of them
-change existing endpoint behaviour — P4 and strict strategy validation — and were decided
+The owner accepted six decisions the RFC did not raise: the pricing result types (now the
+pricing-layer document's responsibility); the `TaxLot` fix; strict strategy and threshold
+validation; bounding and versioning the FX cache (also the pricing-layer document's);
+HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. Two of them
+change existing endpoint behaviour — the result types and strict strategy validation — and were decided
 individually rather than folded in. `TaxLot` is corrected in place rather than worked
 around, because the Holdings table renders "Remaining Qty" and "Original Qty" as two
 columns fed from one value (`PortfolioDetail.tsx:322-323`, `:333-334`), so Original Qty is
@@ -551,55 +547,15 @@ appearing in more than one slice is touched more than once.
 
 ### Target Files to Create/Modify
 
-#### 1. `backend_rust/src/services/currency_service.rs` (Modify) — slices 0, 4
+### Moved to the pricing-layer document
 
-*   **Type / Scope**: pricing and FX service, outbound HTTP.
-*   **Proposed Changes**:
-    *   **P1, dated FX.** Rebuild `get_rate` to request a date range with `period1` and
-        `period2` and select the rate on or before the requested date within a bounded
-        lookback. Correct the symbol form from `EUR=USD` to `EURUSD=X`. Today the URL
-        carries no range, so a past date is not in the response and no selector change can
-        fix it. This moves existing realized and unrealized figures for every
-        foreign-currency asset and must be landed and released on its own.
-    *   **P4, distinguishing no-data from provider-unavailable.** `get_price` (`:267`)
-        returns `Decimal::ZERO` on every failure and must change to a typed result
-        distinguishing `NoData` from `ProviderUnavailable`. `get_historical_prices`
-        **already returns `Result`** (`:406`); its defect is five sites that swallow the
-        failure and return the database fallback as `Ok` (`:429`, `:442`, `:449`, `:467`,
-        `:502`). The error contract depends on the distinction. Call sites that must move in
-        the same change: `analytics.rs:73`, `stats_engine.rs:139` and `stats_engine.rs:180`.
-        Note that the existing hermetic pricing test works *because* of the network-first
-        fallback (`tests/analytics_test.rs:169-171`), so this change inverts the mechanism
-        that test depends on and the DB-first rule must be stated with it.
-    *   **Work-set shrink.** A per-currency-pair range fetch already exists:
-        `get_historical_prices` builds `chart/{symbol}?period1=…&period2=…&interval=1d`
-        (`:406-424`), writes the series into `historical_prices` (`:488-497`) and merges
-        database and provider rows (`:505-516`). The new work is pointing it at `EURUSD=X`
-        and adding a **per-pair series cache** — the existing cache value is a single
-        `Decimal` keyed by date (`:125`), and that path has no cache at all. A dated report
-        must issue one close per asset and one FX range per pair rather than one call per
-        transaction date, which means the shrink has to reach the engine's per-transaction
-        `get_rate` call site (`tax_engine.rs:403`) or it shrinks nothing that matters. Note
-        also that `get_price` hardcodes `Utc::now().date_naive()` (`:268`), so a past-close
-        lookup cannot be built on it; state which function the dated lookup wraps.
-    *   **Cache hygiene.** The in-memory FX cache is keyed by date and never evicted; once
-        past dates become reachable it grows without bound in a 256Mi pod. Bound it, and
-        version the key so entries written by the current buggy behaviour cannot be read as
-        correct after the fix.
+Files 1 and 2 of the original list — `backend_rust/src/services/currency_service.rs`
+and `backend_rust/src/lib.rs` — carried the dated-FX rebuild, the
+`historical_prices` uniqueness fix, the cache work and the result-type change. They are
+specified in **`2026-11-09-pricing-layer-truthfulness.md`**, which this design depends
+on. Nothing in this document edits those two files.
 
-#### 2. `backend_rust/src/lib.rs` (Modify) — slice 0
-
-*   **Type / Scope**: schema creation and idempotent `init_db` DDL. There is no migrations
-    directory in this repo.
-*   **Proposed Changes**: **P2.** Dedupe `historical_prices` with a stated tie-break, then
-    `CREATE UNIQUE INDEX IF NOT EXISTS` on `(symbol, date)`, and make the write a real
-    upsert. Without it, `INSERT OR REPLACE` always inserts and reads return an arbitrary
-    duplicate, which makes any as-of price non-reproducible. Order it after
-    `migrate_decimal_columns`, which renames this table's `close_price` column, and ship a
-    migration test in the shape of `tests/decimal_migration_test.rs`. Registering the report
-    guard from file 3 in managed state belongs in slice 4, when that module exists; doing it
-    here would not compile.
-
+#### 3. `backend_rust/src/report_guard.rs` (Create) — slice 4
 #### 3. `backend_rust/src/report_guard.rs` (Create) — slice 4
 
 *   **Type / Scope**: per-user concurrency slot and per-request outbound budget.
@@ -708,7 +664,8 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     `historical_prices` and pre-seed `split_sync`. Two gaps must be closed before this file
     can deliver what it claims. **There is no FX table** — `get_rate` takes no pool and reads
     only the process cache (`currency_service.rs:125`) — so a dated multi-currency test
-    cannot be hermetic unless P1 persists rates into `historical_prices` under
+    cannot be hermetic unless the pricing-layer document persists rates into
+    `historical_prices` under
     `EURUSD=X`; and **there is no provider seam** — `CurrencyService::new()` takes no
     configuration and the Yahoo URL is hardcoded at `:236`, `:303`, `:421` and `:574` — so
     "an unreachable provider returns 503" cannot be written today. Seed every date the way
@@ -746,16 +703,11 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     require a strategy is already false — `analytics.rs:59` defaults to FIFO — and must be
     corrected in the same change.
 
-#### 11. `backend_rust/tests/sell_pnl_test.rs` (Modify) — slice 0
+#### 11. Moved to the pricing-layer document
 
-*   **Type / Scope**: existing reconciliation tests.
-*   **Proposed Changes**: as written this is a no-op. Every fixture in the suite is
-    single-currency — `tests/common/mod.rs:120` hardcodes `'USD'` and `seed_portfolio` sets
-    `base_currency` to the same string — and `sell_pnl_test.rs:67` asserts
-    `fx_applied == false`. There is therefore no expectation assuming conversion at the
-    latest rate for P1 to move, and nothing in the suite distinguishes a correct dated-FX
-    implementation from the broken one. This file instead gains the **first multi-currency
-    test**, which depends on P1 making rates seedable.
+The existing reconciliation tests move with the dated-FX fix, which lives in
+2026-11-09-pricing-layer-truthfulness.md. Nothing in this document needs that file: no
+expectation there assumes FX conversion at the latest rate.
 
 #### 12. `docs/openapi/openapi.json` (Regenerate) — slice 4
 
@@ -874,11 +826,11 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     `.github/workflows/ci.yml` has **no browser job at all**, so this smoke test is a local
     step requiring a chromium binary, not a gate.
 
-#### 24. `frontend/src/components/SellPnlModal.tsx` (Modify) — slice 0
+#### 24. Moved to the pricing-layer document
 
-*   **Type / Scope**: existing single-sell export UI.
-*   **Proposed Changes**: its footnote says figures are converted "at the latest available
-    rate". That sentence becomes false when P1 lands and is corrected in the same change.
+The single-sell export UI carries a footnote reading "at the latest available rate".
+That sentence becomes false when the dated-FX fix lands, and it is corrected there,
+not here.
 
 #### 25. `docs/superpowers/plans/2026-11-09-tax-report.md` (Create) — all slices
 
@@ -894,14 +846,12 @@ its own decisions land is mis-cut.
 
 | File | Why it is forced |
 | :-- | :-- |
-| `backend_rust/src/engines/stats_engine.rs` | Calls `get_historical_prices` (`:139`), `get_rate` (`:158`) and `get_price` (`:180`); breaks on P4 |
 | `backend_rust/tests/analytics_test.rs` | Pins `original_qty == remaining_qty` at `:51-52` |
 | `frontend/src/components/PortfolioDetail.tsx` | Renders the two lot columns from one value (`:322-323`, `:333-334`) |
 | `frontend/src/test/components/PortfolioDetail.test.tsx` | Pins the buggy equality at `:184-185` |
 | `backend_rust/src/main.rs` | `build_rocket(...)` call site at `:63` if managed state changes the signature |
 | `backend_rust/tests/common/mod.rs` | Three `build_rocket` sites at `:46`, `:56`, `:65` |
 | `backend_rust/tests/cors_test.rs` | Five `CurrencyService::new()` sites if the constructor changes |
-| `backend_rust/tests/decimal_migration_test.rs` | Hand-rolled `historical_prices` DDL at `:21`, `:86` that P2's index must also cover |
 | `frontend/src/types.ts` | The hand-written types every renderer actually uses; `api.d.ts` has zero importers |
 | `frontend/package.json` | Required for any `e2e:statement` script |
 | `frontend/src/main.tsx` | The only entry-import site for a stylesheet (`main.tsx:3`) |
