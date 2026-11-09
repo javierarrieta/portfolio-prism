@@ -76,7 +76,7 @@ past FX rate cannot be seeded.
     shrunk instead.
 *   **No split-sync redesign.** `sync_splits_for_asset` running inside read paths is a
     separate investigation with no destination in this deployment — `main.rs:63` is a plain
-    `.launch()` with no Rocket tasks and `k8s/` has no CronJob or Job.
+    `.launch()` with no Rocket tasks and `k8s/` has no CronJob or Job. Tracked as issue #50.
 
 ## Technical Plan
 

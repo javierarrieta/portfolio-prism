@@ -96,10 +96,11 @@ signal.
     cumulative realized P&L and unrealized P&L — are the payload totals rendered through
     `frontend/src/utils/formatters.ts`, not arithmetic invented by the print view.
 *   **Goal 7 — existing figures move only where declared.** Every change to numbers on
-    existing endpoints is named and ships with its own note. Within this document the set is
-    P3 (splits no longer written on a report path) and the `TaxLot` fix. The dated-FX fix,
-    the `historical_prices` uniqueness fix and the pricing result types move figures too,
-    but they belong to `2026-11-09-pricing-layer-truthfulness.md` and are declared there.
+    existing endpoints is named and ships with its own note. Within this document the only
+    such change is the `TaxLot` fix, which corrects two Holdings columns currently fed from
+    one value. The dated-FX fix, the `historical_prices` uniqueness fix and the pricing
+    result types move figures too, but they belong to
+    `2026-11-09-pricing-layer-truthfulness.md` and are declared there.
 
 ## Non-Goals
 
@@ -125,6 +126,7 @@ signal.
 | Risk | What it is | Mitigating section |
 | :-- | :-- | :-- |
 | Existing figures move | The pricing-layer document's four changes each move numbers on endpoints the owner already trusts | Goal 7 and the Dependency section: those changes ship alone, with their own notes |
+| Late-recorded splits | A split entered after a period is filed changes in-window cost basis on regeneration, and concurrent first-sync requests can double a split | Out of scope, issue #50. The run context states splits are as recorded; the dated path does not sync |
 | Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing-layer work-set shrink; the route's elapsed deadline, which fails closed |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
 | Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints. **This slice ships unverified by design** — see issue #45, *Run the sell P&L Playwright smoke in CI* | The Playwright smoke is the only honest check and it is a local step until #45 lands; the print hook and chrome selectors are named in file 21 so a future gate has something to assert on |
@@ -196,18 +198,22 @@ What this design takes from that document:
     (`currency_service.rs:125`), so no dated multi-currency test can be hermetic until they
     are persisted.
 
-The fourth defect stays here. **P3 — no split writes on a report path.**
-`sync_splits_for_asset` must not run inside a report request. Its dedupe is a
-`SELECT COUNT(*)` then `INSERT` with no transaction and no unique constraint
-(`currency_service.rs:46`, `:60`), so concurrent requests can both insert the same split row
-and double the adjusted share count, and a split dated after `end` that gets inserted
-retroactively changes in-window cost basis. The rule this design follows is the one the
-single-sell P&L route already follows: the dated path does not sync splits, and the run
-context states that splits are as recorded. Where the split call should go instead is an
-open question with no destination in this deployment — `main.rs:63` is a plain `.launch()`
-with no Rocket tasks and `k8s/` has no CronJob or Job — and is tracked under Open Questions
-rather than solved here. This design does not detect unrecorded splits; it reports the split
-rows that exist.
+The fourth defect is **out of scope**, tracked as issue #50.
+
+**Known limitation — split sync runs on read paths.** `sync_splits_for_asset` is a `GET`
+that writes: `analytics.rs:65` calls it per asset, and its dedupe is a `SELECT COUNT(*)`
+then `INSERT` with no transaction and no unique constraint (`currency_service.rs:46`, `:60`),
+so concurrent requests can both insert the same split row and double the adjusted share
+count, and a split dated after `end` that gets inserted retroactively changes in-window cost
+basis. The rule this design follows is the one the single-sell P&L route already follows: the
+dated path does not sync splits, and the run context states that splits are as recorded.
+This design does not detect unrecorded splits; it reports the split rows that exist.
+
+What that rule does **not** do is fix the race or make a late-recorded split impossible. It
+makes the report honest about which split rows it saw. Where the write should go instead has
+no answer in this deployment — `main.rs:63` is a plain `.launch()` with no Rocket tasks and
+`k8s/` has no CronJob or Job — and is issue #50, along with the transaction and unique
+constraint that would make a double insert impossible rather than unlikely.
 
 ### The engine change: one public dated replay
 
@@ -443,9 +449,8 @@ Open from this draft, each needing a decision before the slice that depends on i
 2.  **Numeric constants.** The bounded lookback length, the per-report outbound budget, the
     missing-item cap, the FX cache bound, and the print page count are named nowhere. Each
     needs a value and a place it is asserted by a test.
-3.  **P3's destination.** With no Rocket tasks and no CronJob, where does the split sync
-    go — a mutation endpoint, a background job, or nowhere, with the dated path simply not
-    syncing as the single-sell route already does not?
+3.  **~~P3's destination~~** — moved to issue #50. The interim rule is stated under
+    Known limitation above.
 4.  **Strict validation on the undated path.** Adopting it reverses the standing rejection of
     an input-validation matrix in
     `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` and contradicts "absent
@@ -563,7 +568,7 @@ Open from this draft, each needing a decision before the slice that depends on i
 
 *   Column metadata on the payload (Alternative D), once a third consumer exists.
 *   A `price_source` breakdown richer than a flag, if a second pricing provider ever exists.
-*   The split-sync destination that P3 leaves open.
+*   The split-sync destination, now issue #50.
 
 --------------------------------------------------------------------------------
 
