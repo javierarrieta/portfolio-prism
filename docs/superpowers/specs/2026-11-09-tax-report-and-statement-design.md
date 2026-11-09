@@ -113,7 +113,7 @@ typed payload whose totals are owned by the server, and the frontend renders tha
 two ways without doing arithmetic of its own.
 
 ```text
-                    frontend/src/components/ReportView.tsx
+                    frontend/src/components/ReportControls.tsx
                     (date range, strategy, quarter presets)
                          |
             +------------+-------------+
@@ -126,7 +126,7 @@ two ways without doing arithmetic of its own.
                          |  reads one payload, derives nothing
      GET /api/portfolios/<id>/tax-summary
               ?strategy&threshold_days[&from&to]
-                    |  Viewer when undated; Editor when dated
+                    |  Access::Viewer, dated or not
         route: filter transactions to date <= end
                     |
         TaxLotEngine::replay_at(end)  -> (open_lots, sell_breakdowns)
