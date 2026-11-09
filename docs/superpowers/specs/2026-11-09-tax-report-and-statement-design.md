@@ -21,7 +21,7 @@ date, for one portfolio, optionally narrowed to a subset of its assets. The brow
 prints it to PDF; the server never produces a PDF.
 
 They are not two features. They are one dated-calculation change plus two renderers, and
-one renderer needs no backend change at all until it is asked about the past.
+one renderer needs no backend change until it is given a past date.
 
 ## The Problem
 
@@ -34,13 +34,13 @@ Today the app cannot answer either question for a past date. `GET
 prices everything at the latest available close. There is no date parameter anywhere. The
 numbers exist on screen for "now" and cannot be asked about "31 December".
 
-Getting numbers out is worse. The only export in the app covers **one sell at a time**
+The only export in the app covers **one sell at a time**
 (`frontend/src/utils/sellPnlCsv.ts`, reached from `SellPnlModal.tsx`). Producing a
 quarterly report means opening the breakdown for every sell in the quarter and
 assembling them by hand.
 
-Three defects found during the brainstorm make the situation worse than it looks, and
-they are outside this feature's scope but block it:
+Three defects block this design. Each is a separate reviewed change that lands before any
+report code, and each is enumerated under Prerequisites:
 
 1.  **Foreign-currency assets cannot be priced at all.** `CurrencyService::get_rate`
     builds the Yahoo symbol as `EUR=USD`; the live endpoint returns "No data found" for
@@ -54,42 +54,52 @@ they are outside this feature's scope but block it:
     inserts, so every fetch appends duplicate rows and "the close on date X" becomes an
     arbitrary row among N.
 
-A dated report built on top of those three would produce numbers that are wrong in a way
-nobody would notice, which is the specific outcome this design exists to prevent.
+A dated report built on top of those three changes figures without changing any visible
+signal.
 
 ## Goals
 
 *   **Goal 1 — windowed realized P&L.** For any `[start, end]`, the sum of per-lot P&L
-    over the sold-lot rows of an asset equals that asset's `realized_pnl` from
-    `tax-summary` under the same strategy and threshold, compared as exact decimals, and
-    the sum over assets equals `total_realized_pnl`. This holds for FIFO, LIFO and HYBRID.
+    over the sold-lot rows of an asset equals that asset's `realized_in_window`, compared
+    as exact decimals at the stored scale, and the sum over assets equals the portfolio
+    rollup. This holds for FIFO, LIFO and HYBRID. Separately: when `start` is the
+    portfolio's first transaction date and `end` is the `tax-summary` pricing date, that
+    same sum equals the asset's `realized_pnl` from `tax-summary` under the same strategy
+    and threshold. `tax-summary` has no window, so that second equality is only claimed
+    for inception-to-date; it is not claimed for a mid-year window.
 *   **Goal 2 — unrealized as of a date.** For any `end`, the sum of per-lot unrealized
-    gain over the open-lot rows equals that asset's `unrealized_pnl` computed at the same
-    as-of date and price source.
-*   **Goal 3 — the quarterly workflow is a few clicks.** Quarter presets fill `start` and
-    `end`; the default is the current year. No calendar component, no manual date typing
-    for the four common cases.
-*   **Goal 4 — reproducibility.** Every emitted file records the strategy, the threshold,
-    the portfolio base currency, the requested date range, and the date each price was
-    actually taken from. Same inputs, same numbers, regardless of when the report is
-    regenerated.
+    gain over the open-lot rows equals that asset's `unrealized_at_end`, computed at the
+    same date and the same close (`price_date_used`).
+*   **Goal 3 — the quarterly workflow is a few clicks.** Quarter and current-year presets
+    fill `start` and `end`; the default is the current year to date, not December 31, so
+    the default request is never rejected as a future date. The two date inputs remain for
+    every case a preset does not cover.
+*   **Goal 4 — reproducibility.** Given the same inputs *and the same recorded pricing
+    inputs*, the same numbers come out on regeneration. The CSV records the strategy, the
+    threshold, the portfolio base currency, the requested date range, the
+    `price_date_used` and `fx_rate_date_used` per asset, and a `price_source` flag saying
+    where each value came from; the statement prints the same run context in its header
+    block. P1–P4 are what make this hold; a split recorded after the fact legitimately
+    changes a regenerated file, and the run context is where that is visible.
 *   **Goal 5 — no silent wrong numbers.** A price or FX rate that cannot be obtained fails
-    the request and enumerates every missing symbol and every missing currency pair in one
-    response. Where a date falls on a non-trading day, the file states the date actually
-    used. No column is silently substituted, and the file states which columns are legal
-    to sum.
+    the request and enumerates the missing symbols and currency pairs in one response, up
+    to a stated cap, with a count of what was omitted. Where a date falls on a non-trading
+    day, the file states the date actually used. No column is silently substituted, and the
+    file states which columns are legal to sum.
 *   **Goal 6 — a printable statement.** The printed page contains no navigation, no
-    buttons and no dead controls, and its two headline figures are the payload totals
-    rendered through the shared formatter, not arithmetic invented by the print view.
-*   **Goal 7 — existing figures move only where declared.** The only change to numbers on
-    existing endpoints is the dated-FX fix, which lands as its own reviewed change with a
-    note naming which figures move.
+    buttons, no inputs and no interactive controls, and its two headline figures —
+    cumulative realized P&L and unrealized P&L — are the payload totals rendered through
+    `frontend/src/utils/formatters.ts`, not arithmetic invented by the print view.
+*   **Goal 7 — existing figures move only where declared.** Every change to numbers on
+    existing endpoints is named and ships with its own note. The set is P1 (dated FX), P2
+    (de-duplicated historical closes), P3 (splits no longer written on a read path) and P4
+    (failed lookups stop returning zero). Each lands as its own reviewed change with a
+    commit-message note naming which figures move.
 
 ## Non-Goals
 
-*   **No server-side PDF, and no PDF dependency.** Browser print-to-PDF only. Every
-    realistic Rust PDF option adds a large dependency tree or a second runtime to a 256Mi
-    container, and font embedding and page-break layout are permanent maintenance.
+*   **No server-side PDF, and no PDF dependency.** Browser print-to-PDF only; see
+    Alternative A for the cost.
 *   **No tax computation.** The reports emit realized and unrealized figures and the
     short-term/long-term bucket the engine already produces for HYBRID. They do not apply
     tax rates, thresholds or allowances, and they do not know the owner's jurisdiction.
@@ -102,8 +112,18 @@ nobody would notice, which is the specific outcome this design exists to prevent
 *   **No re-anchoring of HYBRID `threshold_days` to the as-of date.** It is measured from
     each sell, as the engine already does, so an already-filed quarter cannot reclassify
     itself when regenerated.
-*   **No term classification on open-lot rows.** The engine has no such field and one is
-    not invented here.
+*   **No term classification on open-lot rows.** The engine has no such field, and this
+    design does not add one.
+
+## Risks and Non-Functional Requirements
+
+| Risk | What it is | Mitigating section |
+| :-- | :-- | :-- |
+| Existing figures move | P1–P4 each change numbers on endpoints the owner already trusts | Goal 7 and Prerequisites: each ships alone with a commit-message note naming the figures |
+| Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing resolution work-set shrink; Cost guard. The guard bounds call count, not wall clock: an elapsed deadline is tracked under Open Questions |
+| Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
+| Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints | The Playwright smoke is the only honest check; it is not currently a CI gate |
+| Single-replica assumptions | The guard and SQLite write behaviour both assume one pod; a rolling update with default maxSurge runs two for a window | Cost guard; state the dependency in the deployment manifest review |
 
 ## Technical Plan (Architecture)
 
@@ -119,8 +139,8 @@ two ways without doing arithmetic of its own.
             +------------+-------------+
             |                          |
    CSV builder (taxReportCsv.ts)   Statement print view
-   strings verbatim + BOM          shared formatter, display rounding
-   + downloadCsv                   no summation, no controls
+   strings verbatim, no BOM       formatters.ts, display rounding
+   (downloadCsv prepends BOM)     no summation, no controls
             |                          |
             +------------+-------------+
                          |  reads one payload, derives nothing
@@ -137,9 +157,19 @@ two ways without doing arithmetic of its own.
         Yahoo chart (period1/period2) + historical_prices
 ```
 
-### Prerequisites, landed first and separately
+**Terminology.** The query parameters are `from` and `to`. Prose writes the window as
+`[start, end]`. `replay_at(transactions, end, valuation_date, …)` takes `end` for
+transaction filtering and `valuation_date` for FX; when the caller passes no valuation
+date, `valuation_date = end`. There is no `as_of` parameter. Per-asset close dates are
+`price_date_used` everywhere, including on rows; per-pair FX dates are
+`fx_rate_date_used`. The open-lot gain fields are `unrealized_gain_loss` and
+`unrealized_roi`, and they are the per-lot components of
+`AssetTotals.unrealized_at_end`. The sold-lot P&L column is `lot_pnl`, which is
+`LotMatch.pnl` renamed for the CSV.
 
-Three defects block this design and each is its own reviewed change.
+### Prerequisites (P1–P4)
+
+Four defects block this design and each is its own reviewed change.
 
 **P1 — dated FX.** `CurrencyService::get_rate` must request a date range and select the
 rate for the requested date, using Yahoo's FX symbology (`EURUSD=X`, not `EUR=USD`). The
@@ -151,21 +181,41 @@ figures for every foreign-currency asset, including figures asserted by
 That is the intended outcome and the change must name it. It also makes the sentence in
 `SellPnlModal.tsx:283` ("at the latest available rate") false.
 
-**P2 — `historical_prices` uniqueness.** Add `UNIQUE(symbol, date)`, dedupe existing
-rows, and make the write a real upsert. Today the table has no primary key and only a
-plain index, so `INSERT OR REPLACE` always inserts and reads return an arbitrary duplicate.
+**P2 — `historical_prices` uniqueness.** There is no migration mechanism in this repo: no
+`migrations/` directory and no `sqlx::migrate!`. Every schema change is raw SQL inside
+`init_db` (`lib.rs:118-206`) plus the bespoke helpers `migrate_decimal_columns`
+(`lib.rs:399-416`) and `add_owner_id_column` (`lib.rs:236-238`). SQLite has no
+`ALTER TABLE … ADD CONSTRAINT UNIQUE`, and editing the `CREATE TABLE` text is a no-op on
+every existing database. The change is therefore: dedupe existing rows, then
+`CREATE UNIQUE INDEX IF NOT EXISTS uq_historical_prices_symbol_date ON
+historical_prices(symbol, date)`, run idempotently from `init_db`, and make the write a
+real upsert. Two consequences the implementer must not invent: the dedupe needs a stated
+tie-break for which duplicate survives — the table has no write timestamp, so the only
+deterministic choice is `max(rowid)`, and that choice is itself a figure decision because
+Yahoo revises closes around corporate actions — and it must be ordered against
+`migrate_decimal_columns`, which renames this same table's `close_price` column. A dedupe
+that misses a duplicate makes `init_db` return `Err` and the app refuses to boot, so this
+ships with a migration test in the shape of `tests/decimal_migration_test.rs`. The existing
+plain index `idx_historical_prices_symbol_date` (`lib.rs:176`) becomes redundant. Today the
+table has no primary key and only that plain index, so `INSERT OR REPLACE` always inserts
+and reads return an arbitrary duplicate.
 
-**P3 — no split writes on a read path.** `sync_splits_for_asset` must not run inside a
+**P3 — no split writes on a report path.** `sync_splits_for_asset` must not run inside a
 report request. Its dedupe is a `SELECT COUNT(*)` then `INSERT` with no transaction and no
-unique constraint, so concurrent requests can both insert the same split and double share
-quantity, and a split dated after `end` that gets inserted retroactively changes in-window
-cost basis. Moving it off the read path is a prerequisite; a report that detects an
-unrecorded split inside the window names it rather than fixing it.
+unique constraint (`currency_service.rs:46`, `:60`), so concurrent requests can both insert
+the same split row and double the adjusted share count, and a split dated after `end` that
+gets inserted retroactively changes in-window cost basis. The rule this design follows is
+the one the single-sell P&L route already follows: the dated path does not sync splits, and
+the run context states that splits are as recorded. Where the split call should go instead
+is an open question with no destination in this deployment — `main.rs:63` is a plain
+`.launch()` with no Rocket tasks and `k8s/` has no CronJob or Job — and is tracked under
+Open Questions rather than solved here. This design does not detect unrecorded splits; it
+reports the split rows that exist.
 
 ### The engine change: one public dated replay
 
 `calculate_lots` is not parameterised. Three separate changes are required, and doing the
-obvious thing — adding an `as_of` argument — produces three bugs.
+obvious thing — adding a single date argument — introduces three bugs.
 
 1.  A new public entry point, `replay_at(transactions, end, ...)`, returning **both** the
     open lots and the per-sell breakdowns from a single pass. Today `replay` is private
@@ -173,81 +223,106 @@ obvious thing — adding an `as_of` argument — produces three bugs.
     only reachable through `sell_breakdown`, which replays the entire asset history per
     sell and re-enters the FX lookup per transaction.
 2.  The valuation date becomes an explicit parameter. Today the FX rate for market value
-    is taken at `latest_date`, derived from the last transaction in the list, so
-    truncating the list silently moves the FX date to the last transaction before `end`
-    — the nearby-day substitution the pricing rule forbids.
+    is taken at `latest_date`, derived from the last transaction in the list
+    (`tax_engine.rs:549-551`), so truncating the list silently moves the FX date to the
+    last transaction before `end`. That is a different date from the one the caller
+    requested, and it is not the on-or-before lookup the pricing rule defines.
 3.  The `date <= end` filter runs **before** sorting and matching, because the split branch
     rescales every lot in scope.
 
 Prefix replay itself needs no engine change: the engine already documents that a sell's
-matches depend only on transactions at or before it. Both report shapes are then filters
+matches depend only on transactions at or before it (`tax_engine.rs`, matching loop). Both report shapes are then filters
 over one result — cumulative realized is the sum of all breakdowns, window realized is
 the sum of breakdowns whose sell date falls in `[start, end]`. There is one engine
 function and two selections.
 
 ### Pricing resolution
 
-Realized P&L needs no market quote; it is computed from recorded transaction prices.
-Only the unrealized half needs a close, and it needs exactly one close per asset: the
-last close **on or before** the requested date, within a bounded lookback. A bounded
-lookback is what stops a symbol delisted years ago from pricing off a stale close it is
-technically entitled to.
+Realized P&L needs no market quote: it is computed from recorded transaction prices. It
+is **not** quote-free for a foreign-currency asset, however — `replay` converts each
+transaction at its own date's rate (`tax_engine.rs:403`), so realized conversion is the
+largest outbound consumer in this design, roughly one `get_rate` call per transaction on a
+cold cache. The work-set shrink below has to reach that call site or it shrinks nothing
+that matters.
+
+Only the unrealized half needs a close, and it needs exactly one close per asset: the last
+close **on or before** the requested date, within a bounded lookback. A bounded lookback is
+what stops a symbol delisted years ago from pricing off a stale close it is technically
+entitled to.
 
 The same on-or-before rule applies to FX, which has no quote on weekends or market
 holidays. FX is fetched **once per currency pair as a range** and looked up locally, not
-once per transaction date, which is what keeps a 20-asset multi-currency portfolio from
-issuing hundreds of requests through a process-wide throttle that caps the whole
-process near five requests per second.
+once per transaction date. That requires the cache to stop being keyed by date: it is
+currently `HashMap<(String, String, NaiveDate), Decimal>` (`currency_service.rs:125`) and
+the URL carries no range (`:236`), so "one range per pair" is a change of cache value type
+to a dated series, not a key version. Without that change the per-transaction path keeps
+issuing one call per distinct transaction date — about 200 for the flagship 20-asset
+multi-currency portfolio — against a process-wide throttle of roughly five requests per
+second (`currency_service.rs:14`).
 
-Failures are collected, not raised on the first one: the request resolves every asset,
-then returns one error enumerating every missing symbol and every missing currency pair.
-A missing FX rate is a pair, not a symbol, and the response says which it is.
+Failures are collected, not raised on the first one: the route resolves every asset first,
+then returns one error naming the missing symbols and currency pairs, up to the cap in the
+error contract. A missing FX rate is a pair, not a symbol, and the response says which it
+is.
 
 ### The payload
 
 The backend owns every number. The response is a typed `ToSchema` struct — not
 `serde_json::Value`, which is what `tax-summary` declares today and which leaves the
-generated OpenAPI schemaless — with every money field serialized as a decimal string.
+generated schema empty (`analytics.rs:16`, producing `"schema": {}` in the committed
+spec) — with every money field serialized as a decimal string: `decimal_json` for
+required money (`db_types.rs:22`) and `decimal_opt_json` for nullable money
+(`db_types.rs:73`, the helper `schemas.rs:199-216` already uses for `roi`).
 
 It carries three groups:
 
 *   **Run context:** portfolio id and name, base currency, strategy, `threshold_days`,
-    the requested `[start, end]`, and the pricing date actually used per asset.
-*   **Totals:** per-asset realized-in-window, realized-cumulative, unrealized-at-`end`,
-    market value and cost basis, plus portfolio-level totals of each. Computed in Rust
-    from the same replay that produced the rows.
-*   **Rows:** `SOLD_LOT`, `OPEN_LOT` and `UNMATCHED`, each carrying only lot-level values.
+    the requested `[start, end]`, the `price_date_used` and `fx_rate_date_used` per asset,
+    a `price_source` flag per asset, and a statement that splits are as recorded.
+*   **Totals:** per-asset `realized_in_window`, `realized_cumulative`,
+    `unrealized_at_end`, `market_value` and `cost_basis`, plus a portfolio rollup carrying
+    exactly those five fields summed across assets. Computed in Rust from the same replay
+    that produced the rows. `ReportContext` is the single authority for `strategy` and
+    `threshold_days`; the response does not repeat them at top level.
+*   **Rows:** `SOLD_LOT` and `OPEN_LOT` carry lot-level values only; `UNMATCHED` carries a
+    sell id and an unmatched quantity — the quantity no buy lot covers — with all money
+    cells null.
 
-Renderers are forbidden from summing. The CSV writes the server-computed totals verbatim
-and states in its header which columns are legal to sum. This is the decision that keeps
-Goal 1 satisfiable: a total derived in TypeScript is a double and cannot reproduce exact
-decimal equality against `tax-summary`.
+Renderers must not sum row values. The CSV writes the server-computed totals verbatim and
+states which columns are legal to sum. A total derived in TypeScript is a double and
+cannot reproduce exact decimal equality against `tax-summary`.
 
 ### The renderers
 
-The CSV builder follows the existing single-sell export's conventions — UTF-8 BOM, the
-formula-lead guard on free-text cells, exponent-free numeric output — with one
-deliberate difference: report money fields travel as strings end to end and never pass
-through `normalizeTaxSummary` or `normalizeSellPnl`, which coerce every field through
-`Number()` and would reduce the file to double precision.
+The CSV builder follows the existing single-sell export's conventions — the formula-lead
+guard on free-text cells and exponent-free numeric output — and emits **no BOM**, because
+`downloadCsv` prepends it (`frontend/src/utils/download.ts:25`) and a second one corrupts
+the header row. Both guards are module-private in `sellPnlCsv.ts` (`FORMULA_LEAD` at `:55`,
+`text` at `:56`, `num` at `:62`) and `num` takes a `number`, so they are extracted into a
+shared module and re-derived for strings rather than "reused" as written. Report money
+fields travel as strings end to end and must not pass through `normalizeTaxSummary` or
+`normalizeSellPnl`, which coerce every field through `Number()` and would reduce the file
+to double precision.
 
 The statement is a React view with a print stylesheet. There is no `@media print` rule
-anywhere in the frontend today, so this is net-new. It renders the payload's totals
-through the shared formatter, and its printed subtree contains no buttons or inputs.
+anywhere in the frontend (verified: no `@media print` in `frontend/src/`), so this
+stylesheet does not exist yet. It renders the payload's totals through
+`frontend/src/utils/formatters.ts`, and its printed subtree contains no buttons or inputs;
+the asset-subset control sits outside the printed subtree.
 
 ### Sequencing
 
 The cut line is the realized/unrealized seam, not the two reports. Everything left of it
 touches no network.
 
-| Slice | Ships | Network? | Risk |
-| :-- | :-- | :-- | :-- |
-| 0 | P1, P2, P3, each separately reviewed | no | low |
-| 1 | Statement at `as_of = today`, pure frontend over the existing tax-summary payload | no | zero backend |
-| 2 | `replay_at` in the engine, unit tests only | no | contained |
-| 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure | no | moderate |
-| 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | **the risky piece** |
-| 5 | Statement switches to the report payload and accepts a past `as_of` | yes | low |
+| Slice | Ships | Reaches network in tests? | Blast radius on existing figures | New-code risk |
+| :-- | :-- | :-- | :-- | :-- |
+| 0 | P1, P2, P3, each separately reviewed | no | figures move for every foreign-currency asset | moderate |
+| 1 | Statement at today's date, pure frontend over the existing tax-summary payload | no | none | low |
+| 2 | `replay_at` in the engine, unit tests only | no | none | contained |
+| 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure | no | none | moderate |
+| 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | P4 stops failed lookups returning zero | **the risky piece** |
+| 5 | Statement switches to the report payload and accepts a past `to` | yes | none | low |
 
 ### Decided during drafting
 
@@ -260,66 +335,117 @@ as it does today. This is the RFC's decision; an earlier revision of this draft 
 separate `/tax-report` route, which contradicted the rejection recorded as Alternative B.
 
 **Access level.** Every call to `tax-summary` requires `Access::Viewer`, dated or not. There
-is no parameter-dependent access rule. An earlier revision of this draft required `Editor`
-for dated calls, and that was dropped on review for two reasons. It does not bound cost —
-an `Editor` can issue the same expensive request as often as a `Viewer` can — so it
-restricted who gets to be slow rather than how slow the app gets. And it locked the
-read-only collaborator, which is the accountant or tax adviser case that motivates sharing
-a portfolio at all, out of the past-dated statement they exist to receive. Cost is bounded
-by the guard below instead, where the cost actually is.
+is no parameter-dependent access rule, and the route already requires `Viewer`
+(`analytics.rs:30`), so this is a statement of intent rather than a behaviour change. An
+earlier revision of this draft required `Editor` for dated calls, and that was dropped on
+review: it does not bound cost — an `Editor` can issue the same expensive request as often
+as a `Viewer` can — so it would only have restricted who gets to be slow. The grep-based
+access gate cannot see a parameter-dependent rule on an existing route, so
+`tests/isolation_test.rs` covers the dated variant.
 
 **Cost guard.** Two bounds, both on the dated path only, so the existing screen is
-untouched. One report may be in flight per user at a time; a second concurrent request is
-rejected with HTTP 429 and `retryable: true`. And each report carries an outbound-request
-budget; exceeding it fails with the 503 contract rather than continuing to grind through
-the process-wide throttle. The budget is the same cap the pricing section needs to keep a
-20-asset multi-currency portfolio from issuing hundreds of calls, so it is not extra
-machinery for its own sake. The in-flight slot must be released on every exit path,
-including a panic, or one slow report permanently blocks that user.
+untouched. One report may be in flight per authenticated subject (the `sub` claim) at a
+time; a second concurrent request is rejected with HTTP 429 and `retryable: true`. And each
+report carries an outbound-request budget; exceeding it fails with the 503 contract rather
+than continuing to consume the process-wide throttle. The budget is the outbound cap the
+pricing section needs anyway (see Pricing resolution). The in-flight slot must be released
+on every exit path, including a panic, or one slow report permanently blocks that user. The
+guard is per-process state and therefore depends on `k8s/app-deployment.yaml` keeping
+`replicas: 1`; raising it gives each subject one slot per pod.
 
 **Error contract.** Two failure classes, one typed body, produced by a custom Rocket
-`Responder` in the style of the auth `Unavailable` responder: HTTP 422 for "no data exists
-at or before this date for this symbol or currency pair", HTTP 503 for "provider
-unreachable or throttled", with a `retryable` flag that agrees with the status. Guard
-rejections use HTTP 429 with `retryable: true`. No partial
-file is produced. The missing-item list is capped, with a count of what was omitted.
+`Responder` in the style of the auth `Unavailable` responder
+(`backend_rust/src/auth/routes.rs:33-52`): HTTP 422 for "no data exists at or before this
+date for this symbol or currency pair", HTTP 503 for "provider unreachable or throttled".
+`retryable` is `false` for 422 and `true` for 503. Guard rejections use HTTP 429 with
+`retryable: true`. Validation failures — `from > to`, a future date, an unparseable date, an
+unrecognized strategy, a negative `threshold_days` — also return 422, with
+`ErrorBody.error` naming the offending parameter and `missing_prices` and `missing_rates`
+empty; no-data failures return 422 with those lists populated. On any error the route
+returns only the error body, and the frontend does not call `downloadCsv` when the request
+fails, so no partial file reaches the owner. The missing-item list is capped, with a count
+of what was omitted.
 
-This choice carries a fourth prerequisite. The pricing layer cannot currently distinguish
-"no data" from "could not ask": `get_price` returns `Decimal::ZERO` on every failure and
-`get_historical_prices` logs to stderr and returns `Ok(...)` from the database fallback.
-Both must return a real result type, and that change also affects the existing screen.
+This choice carries a fourth prerequisite, **P4**. The pricing layer cannot currently
+distinguish "no data" from "could not ask": `get_price` returns `Decimal::ZERO` on every
+failure (`currency_service.rs:267`), and `get_historical_prices` already returns a
+`Result` (`:406`) but swallows the failure at five sites (`:429`, `:442`, `:449`, `:467`,
+`:502`) and hands back the database fallback as `Ok`. `get_price` changes to a typed result
+distinguishing `NoData` from `ProviderUnavailable`; `get_historical_prices` keeps its
+signature and stops swallowing. Both changes reach the existing screen: `get_price` is
+called from `analytics.rs:73` and `stats_engine.rs:180`, and `get_historical_prices` from
+`stats_engine.rs:139`, so those call sites move in the same change and the plan must say
+whether the undated path keeps today's permissive behaviour.
 
-**Date parameter semantics.** `from` and `to` are `YYYY-MM-DD`, both inclusive, and the day
-boundary is evaluated in UTC — the same zone transaction timestamps are stored in, so no
-conversion is involved. A sell at any time on `to` is inside the window. Absent parameters
-mean today's behaviour. `from > to`, a `to` in the future, and an unparseable date are all
-HTTP 422. `strategy` is validated strictly: absent means FIFO, present-but-unrecognized is a
-422 naming the accepted values, rather than today's silent fallback to FIFO. The single-sell
-P&L route already normalizes strictly, so the app currently runs two rules on one axis.
-`threshold_days` must be non-negative; a negative HYBRID threshold classifies every holding
-as long-term and is not a meaningful input. A typo'd strategy in a tax file is a defect, not
-a default.
+**Date parameter semantics.** `from` and `to` are `YYYY-MM-DD`, both inclusive, evaluated in
+UTC. `Transaction.date` is a `DateTime<Utc>` (`models.rs:35`), not a date, so "a sell at any
+time on `to` is inside the window" requires an explicit conversion — `date.date_naive() <=
+to` — and `replay_at`'s `end` parameter is a `NaiveDate`. Absent parameters reproduce
+current behaviour: all transactions, priced at the latest available close. `from > to`, a
+`from` or `to` in the future, and an unparseable date are all HTTP 422. Whether `to` alone
+or `from` alone is legal is an open question, not a settled rule; see Open Questions.
+`strategy` is validated strictly on the dated path: absent means FIFO,
+present-but-unrecognized is a 422 naming the accepted values, rather than the silent
+fallback to FIFO that both `tax-summary` (`analytics.rs:217-221`) and the single-sell P&L
+route do today. Extending strict validation to the undated path reverses a standing
+rejection recorded in
+`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` and is tracked under Open
+Questions. `threshold_days` must be non-negative; a negative HYBRID threshold classifies
+every holding as long-term and is not a meaningful input.
 
 ### Reconciliation with the predecessor
 
-The draft was compared against the RFC after drafting. One contradiction and six additions
-were found; all are resolved.
+The draft was compared against the RFC after drafting. It contained one contradiction and
+six additions; each is resolved below.
 
 The RFC's non-goals excluded *"concurrency work, batching frameworks, cache layers or
 timeout knobs beyond the work-set shrink."* The cost guard is beyond that shrink. The owner
 kept the guard and amended the RFC's non-goal, narrowing it to batching frameworks,
-concurrent fan-out and new timeout knobs, with the reason recorded in the RFC itself.
+concurrent fan-out and new timeout knobs, with the reason recorded in the RFC itself
+(`2026-11-09-tax-report-and-statement-concepts.md`, Non-Goals).
 
-Six decisions the RFC did not raise were accepted: the P4 result types for the pricing
+The owner accepted six decisions the RFC did not raise: the P4 result types for the pricing
 layer; the `TaxLot` fix; strict strategy and threshold validation; bounding and versioning
 the FX cache; HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. Two of them
-change existing endpoint behaviour and were decided individually rather than folded in.
-`TaxLot` is corrected in place rather than worked around, because the Holdings table already
-renders "Remaining Qty" and "Original Qty" as two columns fed from one value, so one of
-those columns is meaningless today and the fix makes it correct. Strategy validation is
-strict on both paths rather than only on the dated one, because one endpoint with two input
-contracts is the same shape as the parameter-dependent access rule this draft already
-rejected once.
+change existing endpoint behaviour — P4 and strict strategy validation — and were decided
+individually rather than folded in. `TaxLot` is corrected in place rather than worked
+around, because the Holdings table renders "Remaining Qty" and "Original Qty" as two
+columns fed from one value (`PortfolioDetail.tsx:322-323`, `:333-334`), so Original Qty is
+meaningless today and the fix makes it correct. Strategy validation is strict on the dated
+path, which has no back-compatibility obligation; extending it to the undated path is
+tracked under Open Questions.
+
+## Open Questions
+
+None open from the predecessor RFC. Its five items are discharged here: totals ownership by
+The payload and Alternative C; the error contract shape by Error contract; the access level
+by Access level; date parameter semantics by Date parameter semantics; and the trading
+calendar question by Pricing resolution's bounded lookback.
+
+Open from this draft, each needing a decision before the slice that depends on it:
+
+1.  **Single-parameter dates.** Is `to` alone legal, meaning cumulative from the
+    portfolio's first transaction, and is `from` alone legal with an open end? Or is it
+    both-or-neither with a 422 otherwise? The statement's cumulative figure and the CSV's
+    `realized_cumulative` column both depend on this.
+2.  **Numeric constants.** The bounded lookback length, the per-report outbound budget, the
+    missing-item cap, the FX cache bound, and the print page count are named nowhere. Each
+    needs a value and a place it is asserted by a test.
+3.  **P3's destination.** With no Rocket tasks and no CronJob, where does the split sync
+    go — a mutation endpoint, a background job, or nowhere, with the dated path simply not
+    syncing as the single-sell route already does not?
+4.  **Strict validation on the undated path.** Adopting it reverses the standing rejection of
+    an input-validation matrix in
+    `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` and contradicts "absent
+    parameters reproduce current behaviour". Keep it dated-path-only, or cite the record and
+    amend Goal 7.
+5.  **Elapsed deadline versus the guard.** The guard bounds call count. Two unreachable
+    symbols exceed the ingress cutoff, the browser receives an HTML gateway error instead of
+    the typed 503, and the slot stays held so the next click returns 429. Does an elapsed
+    deadline replace the guard, supplement it, or is the gateway case accepted?
+6.  **CSV summable-column disclosure.** `sellPnlCsv.ts:13-16` deliberately puts caveats in
+    columns because a leading `#` row breaks naive parsers, including this app's own
+    `detectColumns`. Which convention does the report CSV use?
 
 ## Alternatives Considered
 
@@ -367,9 +493,9 @@ rejected once.
     in a comment becomes machine-checked; a third renderer inherits the rule for free.
 *   **Cons**: the metadata is a second contract that must be kept in sync with the rows, and
     a wrong metadata entry is worse than none because it is authoritative.
-*   **Reason for rejection**: deferred rather than rejected on merit. There is one renderer
-    family today and the rule can be enforced by test; the metadata earns its place if a
-    third consumer appears.
+*   **Reason for deferral**: deferred rather than rejected on merit. There is one renderer
+    family today and the rule can be enforced by test; add the metadata when a third
+    consumer exists. See Future Improvements.
 
 ### Alternative E: two engine functions, one for window-realized and one for cumulative-realized
 
@@ -410,6 +536,12 @@ rejected once.
     already fetched. The pricing failure it was meant to soften is handled by Goal 5
     instead.
 
+### Future Improvements
+
+*   Column metadata on the payload (Alternative D), once a third consumer exists.
+*   A `price_source` breakdown richer than a flag, if a second pricing provider ever exists.
+*   The split-sync destination that P3 leaves open.
+
 --------------------------------------------------------------------------------
 
 ## Detailed Implementation Plan
@@ -429,14 +561,27 @@ appearing in more than one slice is touched more than once.
         carries no range, so a past date is not in the response and no selector change can
         fix it. This moves existing realized and unrealized figures for every
         foreign-currency asset and must be landed and released on its own.
-    *   **P4, honest failure types.** Change `get_price` and `get_historical_prices` to
-        return a result distinguishing `NoData` from `ProviderUnavailable` instead of
-        `Decimal::ZERO` and a swallowed `Ok`. The error contract depends on this
-        distinction, and the existing screen inherits the honesty as a side effect.
-    *   **Work-set shrink.** Add a per-asset single-close lookup (narrow window around the
-        requested date) and a per-currency-pair range fetch with local date lookup, so a
-        dated report issues one close per asset and one FX range per pair rather than one
-        call per transaction date.
+    *   **P4, distinguishing no-data from provider-unavailable.** `get_price` (`:267`)
+        returns `Decimal::ZERO` on every failure and must change to a typed result
+        distinguishing `NoData` from `ProviderUnavailable`. `get_historical_prices`
+        **already returns `Result`** (`:406`); its defect is five sites that swallow the
+        failure and return the database fallback as `Ok` (`:429`, `:442`, `:449`, `:467`,
+        `:502`). The error contract depends on the distinction. Call sites that must move in
+        the same change: `analytics.rs:73`, `stats_engine.rs:139` and `stats_engine.rs:180`.
+        Note that the existing hermetic pricing test works *because* of the network-first
+        fallback (`tests/analytics_test.rs:169-171`), so this change inverts the mechanism
+        that test depends on and the DB-first rule must be stated with it.
+    *   **Work-set shrink.** A per-currency-pair range fetch already exists:
+        `get_historical_prices` builds `chart/{symbol}?period1=…&period2=…&interval=1d`
+        (`:406-424`), writes the series into `historical_prices` (`:488-497`) and merges
+        database and provider rows (`:505-516`). The new work is pointing it at `EURUSD=X`
+        and adding a **per-pair series cache** — the existing cache value is a single
+        `Decimal` keyed by date (`:125`), and that path has no cache at all. A dated report
+        must issue one close per asset and one FX range per pair rather than one call per
+        transaction date, which means the shrink has to reach the engine's per-transaction
+        `get_rate` call site (`tax_engine.rs:403`) or it shrinks nothing that matters. Note
+        also that `get_price` hardcodes `Utc::now().date_naive()` (`:268`), so a past-close
+        lookup cannot be built on it; state which function the dated lookup wraps.
     *   **Cache hygiene.** The in-memory FX cache is keyed by date and never evicted; once
         past dates become reachable it grows without bound in a 256Mi pod. Bound it, and
         version the key so entries written by the current buggy behaviour cannot be read as
@@ -444,12 +589,16 @@ appearing in more than one slice is touched more than once.
 
 #### 2. `backend_rust/src/lib.rs` (Modify) — slice 0
 
-*   **Type / Scope**: schema creation and migrations.
-*   **Proposed Changes**: **P2.** Add `UNIQUE(symbol, date)` to `historical_prices`, with a
-    one-off dedupe of existing rows before the constraint is created. Without it, `INSERT OR
-    REPLACE` always inserts and reads return an arbitrary duplicate, which makes any
-    as-of price non-reproducible. Also register the report guard from file 3 in managed
-    state alongside the existing `CurrencyService`.
+*   **Type / Scope**: schema creation and idempotent `init_db` DDL. There is no migrations
+    directory in this repo.
+*   **Proposed Changes**: **P2.** Dedupe `historical_prices` with a stated tie-break, then
+    `CREATE UNIQUE INDEX IF NOT EXISTS` on `(symbol, date)`, and make the write a real
+    upsert. Without it, `INSERT OR REPLACE` always inserts and reads return an arbitrary
+    duplicate, which makes any as-of price non-reproducible. Order it after
+    `migrate_decimal_columns`, which renames this table's `close_price` column, and ship a
+    migration test in the shape of `tests/decimal_migration_test.rs`. Registering the report
+    guard from file 3 in managed state belongs in slice 4, when that module exists; doing it
+    here would not compile.
 
 #### 3. `backend_rust/src/report_guard.rs` (Create) — slice 4
 
@@ -472,10 +621,18 @@ appearing in more than one slice is touched more than once.
         the list silently moves the FX date.
     *   Filter to `date <= end` before sorting and matching, because the split branch
         rescales every lot in scope.
-    *   Fix `TaxLot`: `original_qty` and `remaining_qty` are both set to the already-
-        decremented `lot.qty`, so the originally-bought quantity is unrecoverable, and the
-        struct carries no buy transaction id. Both are needed for a sold-lot and open-lot row
-        to be traceable to a transaction.
+    *   Fix `TaxLot` — **assigned to slice 3, not slice 2**, because `TaxLot` is defined in
+        `schemas.rs:89-102`, is registered in `openapi.rs:35`, and appears in the committed
+        `docs/openapi/openapi.json`, which CI diffs byte-for-byte. Landing it in slice 2
+        fails CI and ships an undeclared change to a live endpoint's response shape.
+        `original_qty` and `remaining_qty` are both set to the already-decremented `lot.qty`
+        (`tax_engine.rs:587-588`), so the originally-bought quantity is unrecoverable, and
+        the struct carries no buy transaction id. The buy id already exists upstream as
+        `InternalLot.source_tx_id` (`tax_engine.rs:366`) and `LotMatch.buy_transaction_id`
+        (`schemas.rs:134`), so this is a field addition, not new plumbing. Existing
+        assertions that pin the buggy equality and must move with it:
+        `tests/analytics_test.rs:51-52` and
+        `frontend/src/test/components/PortfolioDetail.test.tsx:184-185`.
     *   Unit tests: prefix replay equals full replay for realized P&L under FIFO, LIFO and
         HYBRID; a sell after `end` is excluded; a **split after `end`** does not move
         in-window cost basis; HYBRID matches are unchanged, pinning that `threshold_days`
@@ -483,29 +640,36 @@ appearing in more than one slice is touched more than once.
 
 #### 5. `backend_rust/src/schemas.rs` (Modify) — slice 4
 
-*   **Type / Scope**: request and response types.
+*   **Type / Scope**: request and response types, plus the `TaxLot` fix moved from file 4.
 *   **Proposed Changes**: typed report payload, every money field serialized as a decimal
-    string via the existing `decimal_json` helper. Shape:
+    string — `decimal_json` (`db_types.rs:22`) for required money and `decimal_opt_json`
+    (`db_types.rs:73`) for nullable money, since `UNMATCHED` carries nulls and "nulls are
+    nulls" is a stated rule. Shape:
 
 ```text
 ReportContext   portfolio_id, portfolio_name, base_currency, strategy, threshold_days,
                 requested_from, requested_to
 AssetTotals     asset_id, symbol, realized_in_window, realized_cumulative,
                 unrealized_at_end, market_value, cost_basis,
-                price_date_used, fx_rate_date_used, fx_applied, split_applied
+                price_date_used, fx_rate_date_used, price_source, fx_applied, split_applied
 ReportRow       row_type: SOLD_LOT | OPEN_LOT | UNMATCHED
-                SOLD_LOT: sell + lot fields, mirroring LotMatch
+                SOLD_LOT: sell + lot fields, mirroring LotMatch; LotMatch.pnl is
+                          exposed as lot_pnl
                 OPEN_LOT: buy_date, buy_transaction_id, original_qty, remaining_qty,
-                          unit_cost, price_date, market_value, latent_gain_loss, latent_roi
+                          unit_cost, price_date_used, market_value,
+                          unrealized_gain_loss, unrealized_roi
                 UNMATCHED: sell id, unmatched_qty, money cells null
-ReportResponse  context, asset_totals: [AssetTotals], totals: portfolio rollup,
-                rows: [ReportRow], strategy, threshold_days
+ReportResponse  context, asset_totals: [AssetTotals],
+                totals: {realized_in_window, realized_cumulative, unrealized_at_end,
+                         market_value, cost_basis},
+                rows: [ReportRow]
 ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
                 retryable, omitted_count
 ```
 
     `row_type` is an exhaustive enum both renderers must switch on. Nulls are nulls, not
-    zeros, so a consumer can tell "not applicable" from "zero".
+    zeros, so a consumer can tell "not applicable" from "zero". `price_date_used` on a row is
+    the asset-level `price_date_used` repeated — one close per asset, not one per lot.
 
 #### 6. `backend_rust/src/api_routes/analytics.rs` (Modify) — slices 3, 4
 
@@ -521,44 +685,77 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 #### 7. `backend_rust/src/openapi.rs` (Modify) — slice 4
 
 *   **Type / Scope**: OpenAPI registration.
-*   **Proposed Changes**: document the new query parameters and replace the
-    `body = serde_json::Value` declaration for this route with the typed response, so the
-    generated schema is no longer empty and the frontend can generate real types.
+*   **Proposed Changes**: register the new report types in `components(schemas(...))` in
+    `openapi.rs:26-40` — utoipa derives the query parameters from the Rocket route
+    attribute (`analytics.rs:21`), so adding `&<from>&<to>` documents them automatically;
+    what does not happen automatically is schema registration, and an unregistered type
+    produces a `$ref` to nothing. Also replace the `body = serde_json::Value` declaration
+    for this route with the typed response, so the generated schema is no longer empty.
 
 #### 8. `backend_rust/tests/tax_report_test.rs` (Create) — slices 3, 4
 
 *   **Type / Scope**: integration tests, hermetic.
-*   **Proposed Changes**: invariants I1, I2 and I4 from the predecessor RFC, compared as
-    exact decimals. Seed `historical_prices` for every date and pre-seed `split_sync` for
-    every symbol, following the pattern the prior review record established after the
-    sell-pnl suite went from 1.33 s to 5.67 s by reaching the network. Cover: window equals
-    the sum of per-sell breakdowns; cumulative equals all-time `tax-summary`; a non-trading
-    `to` resolves to the prior trading day and reports the date used; a missing price
-    returns 422 naming every missing symbol; an unreachable provider returns 503 with
-    `retryable: true`; `from > to`, a future `to`, and an unknown strategy each return 422.
+*   **Proposed Changes**: the three reconciliation equalities, inlined rather than referred
+    to by number: (a) the sum of sold-lot `lot_pnl` for an asset equals that asset's
+    `realized_in_window`; (b) with `from` at the first transaction date, that sum equals
+    `tax-summary`'s `realized_pnl` for the asset; (c) the sum of open-lot
+    `unrealized_gain_loss` equals `unrealized_at_end`. All compared as exact decimals under
+    FIFO, LIFO and HYBRID.
+
+    Seeding follows the pattern the prior review record
+    (`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md`) established after the
+    sell-pnl suite went from 1.33 s to 5.67 s by reaching the network: seed
+    `historical_prices` and pre-seed `split_sync`. Two gaps must be closed before this file
+    can deliver what it claims. **There is no FX table** — `get_rate` takes no pool and reads
+    only the process cache (`currency_service.rs:125`) — so a dated multi-currency test
+    cannot be hermetic unless P1 persists rates into `historical_prices` under
+    `EURUSD=X`; and **there is no provider seam** — `CurrencyService::new()` takes no
+    configuration and the Yahoo URL is hardcoded at `:236`, `:303`, `:421` and `:574` — so
+    "an unreachable provider returns 503" cannot be written today. Seed every date the way
+    `analytics_test.rs:171-183` does and there are no calendar gaps, so the non-trading-day
+    case needs a deliberately gapped seed.
+
+    Cases: window equals the sum of per-sell breakdowns; cumulative equals all-time
+    `tax-summary`; a non-trading `to` resolves to the prior trading day and reports the date
+    used; a missing price returns 422 naming every missing symbol; an unreachable provider
+    returns 503 with `retryable: true`; and `from > to`, a future `from` or `to`, an
+    unparseable date, an unknown strategy and a negative `threshold_days` each return 422.
 
 #### 9. `backend_rust/tests/isolation_test.rs` (Modify) — slice 4
 
 *   **Type / Scope**: the real cross-user authorization matrix.
-*   **Proposed Changes**: add the dated variant of `tax-summary` to the path list, and add
-    cases proving a `Viewer` collaborator can request a dated report and a non-collaborator
-    cannot. Add guard cases: a second concurrent report for the same user returns 429 with
-    `retryable: true`, and the slot is free again after the first request completes or
-    panics. The grep-based gate cannot see an access-level choice on an existing route.
+*   **Proposed Changes**: add the dated variant of `tax-summary` to the path list, and add a
+    case proving a non-owner cannot request a dated report. Note that `access.rs:37-57`
+    grants `Access::Owner` to the owner and nothing to anyone else — there is no membership
+    table — so a "`Viewer` collaborator can request a dated report" case cannot be written
+    until sharing exists. Add guard cases only if guard tests are writable: a second
+    concurrent report returning 429 needs two overlapping dispatches with a stall seam, and
+    a panicking handler under Rocket's local `Client` unwinds the test thread rather than
+    producing a response. The grep-based gate cannot see an access-level choice on an
+    existing route.
 
 #### 10. `backend_rust/tests/route_coverage_test.rs` and `backend_rust/tests/auth_test.rs` (Modify) — slice 4
 
 *   **Type / Scope**: route surface and unauthenticated sweep.
-*   **Proposed Changes**: no route is added, so the three hard counts stay at 15 and 13.
-    `auth_test.rs` special-cases the tax routes to append strategy parameters; extend that
-    to the dated variant so the sweep still proves what its comment claims.
+*   **Proposed Changes**: no route is added, so the three hard counts stay at 15 and 13
+    (`route_coverage_test.rs:140`, `:262`, `:275-278`; `to_document_path` at `:86-92`
+    truncates at `?`, so added query parameters leave them intact). `auth_test.rs:46`
+    special-cases the tax routes to append strategy parameters; there is one tax-summary
+    route, so covering the dated variant means a second parameterised pass over the same
+    path, not a new entry. The comment at `auth_test.rs:43-45` claiming the tax routes
+    require a strategy is already false — `analytics.rs:59` defaults to FIFO — and must be
+    corrected in the same change.
 
 #### 11. `backend_rust/tests/sell_pnl_test.rs` (Modify) — slice 0
 
 *   **Type / Scope**: existing reconciliation tests.
-*   **Proposed Changes**: expectations that assume FX conversion at the latest rate are
-    updated as part of P1, in the same commit as the fix, with the delta explained in the
-    commit message.
+*   **Proposed Changes**: as written this is a no-op. Every fixture in the suite is
+    single-currency — `tests/common/mod.rs:120` hardcodes `'USD'` and `seed_portfolio` sets
+    `base_currency` to the same string — and `sell_pnl_test.rs:67` asserts
+    `fx_applied == false`. There is therefore no expectation assuming conversion at the
+    latest rate for P1 to move, and nothing in the suite distinguishes a correct dated-FX
+    implementation from the broken one. This file instead gains the **first multi-currency
+    test**, which depends on P1 making rates seedable.
 
 #### 12. `docs/openapi/openapi.json` (Regenerate) — slice 4
 
@@ -568,26 +765,38 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 #### 13. `frontend/src/types/api.d.ts` (Regenerate) — slice 4
 
 *   **Type / Scope**: generated API types.
-*   **Proposed Changes**: regenerate via `npm run generate-types` so the renderers type
-    against the real schema instead of a hand-maintained approximation.
+*   **Proposed Changes**: regenerate via `npm run generate-types`. Note that nothing
+    currently imports `api.d.ts` — a repo-wide grep finds only the package.json script line
+    — while every renderer uses the hand-written types in `frontend/src/types.ts`
+    (`TaxLot` :42, `AssetTaxSummary` :51, `TaxSummary` :89, `LotMatch` :97). Regenerating
+    alone changes nothing for the renderers; either `types.ts` gains the report types or the
+    renderers are repointed at the generated ones, and that choice needs naming here.
 
 #### 14. `frontend/src/utils/taxReportCsv.ts` (Create) — slice 3
 
 *   **Type / Scope**: CSV builder, pure, no DOM.
 *   **Proposed Changes**: one row per `ReportRow`, sell context repeated on sold-lot rows,
-    a header comment naming which columns are legal to sum, the run context (strategy,
-    threshold, requested range, pricing dates used) as columns, and money written verbatim
-    from the payload strings. Reuses the formula-lead guard and the exponent-free formatting
-    rule from `sellPnlCsv.ts`. It must not call `normalizeTaxSummary` or `normalizeSellPnl`,
-    which would reduce the file to double precision.
+    the run context (strategy, threshold, requested range, pricing dates used) as columns,
+    and money written verbatim from the payload strings. **The column list, order and the
+    summable-column disclosure are not specified anywhere in this document and must be
+    written down here** — the CSV is the deliverable and the owner archives it. Note the
+    convention conflict to resolve: `sellPnlCsv.ts:13-16` deliberately carries caveats as
+    columns rather than a leading `#` row, because a comment row breaks naive parsers
+    including this app's own `detectColumns`. The formula-lead guard and the exponent-free
+    rule live in a shared module extracted from `sellPnlCsv.ts` (`:55`, `:56`, `:62`),
+    re-derived for strings. Emit no BOM; `downloadCsv` prepends it. Report money must not
+    call `normalizeTaxSummary` or `normalizeSellPnl`.
 
 #### 15. `frontend/src/utils/taxReportCsv.test.ts` (Create) — slice 3
 
 *   **Type / Scope**: unit tests.
-*   **Proposed Changes**: mirror `sellPnlCsv.test.ts`: the `lot_pnl` column sums to the
-    payload's realized total, no BOM in the builder output, formula characters escaped,
-    exponent notation never emitted, nulls rendered as empty cells, and every row kind
-    present.
+*   **Proposed Changes**: mirror `sellPnlCsv.test.ts`: the `lot_pnl` column sums to
+    `AssetTotals.realized_in_window` for that asset, no BOM in the builder output, formula
+    characters escaped, exponent notation never emitted, nulls rendered as empty cells, and
+    every row kind present. The float-summed assertion pattern in
+    `sellPnlCsv.test.ts:184-194` uses `toBeCloseTo(…, 9)` because that payload went through
+    `Number()`; with strings preserved this test must compare decimal strings or state which
+    decimal helper it uses.
 
 #### 16. `frontend/src/utils/decimal.ts` (Modify) — slice 3
 
@@ -608,9 +817,12 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 
 *   **Type / Scope**: date range selection.
 *   **Proposed Changes**: two date inputs plus four quarter presets and a current-year
-    preset. No calendar component. Controls stay enabled for every access level, since the
-    route requires only `Viewer`; when the guard rejects with 429 the UI says a report is
-    already running and offers a retry.
+    preset — five presets, not four. The default is the current year **to date**, because a
+    default of January 1 to December 31 is a future `to` for most of the year and the route
+    rejects it. No calendar widget is added; the native `<input type="date">` picker remains
+    available. Controls stay enabled for every access level, since the route requires only
+    `Viewer`; when the guard rejects with 429 the UI says a report is already running and
+    offers a retry.
 
 #### 19. `frontend/src/components/PortfolioStatement.tsx` (Create) — slices 1, 5
 
@@ -634,8 +846,14 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 *   **Type / Scope**: component tests and API mocks.
 *   **Proposed Changes**: assert the statement root carries the hook the print stylesheet
     targets, that the printed subtree contains no `button` or `input`, and that the two
-    headline figures equal the payload totals rendered through the shared formatter. Add
-    the report route to the mock server, respecting its existing ordering comment.
+    headline figures equal the payload totals rendered through
+    `frontend/src/utils/formatters.ts`. **Name the selectors here rather than at
+    implementation time**, or a CI grep can pass while hiding nothing: statement hook
+    `data-print="statement"`; chrome selectors `.nav-menu`, `.nav-item` and
+    `header.app-header` (`App.tsx:385-396`). `handlers.ts` already registers
+    `/api/portfolios/:id/tax-summary` and MSW matches on path, so the change is branching
+    that handler on `from`/`to`, not adding a route; respect the existing ordering comment at
+    `handlers.ts:130-131`.
 
 #### 22. `frontend/scripts/check_print_styles.sh` (Create) and `.github/workflows/` (Modify) — slice 1
 
@@ -649,8 +867,12 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 *   **Type / Scope**: browser smoke, following the existing sell-pnl e2e pattern.
 *   **Proposed Changes**: load the statement, emulate print media, assert chrome is
     `display: none`, that there is no horizontal overflow, and that `page.pdf()` returns a
-    non-empty buffer within a stated page count. This is the only honest check that printing
-    works; there is no server artifact to assert on.
+    non-empty buffer within a stated page count (**state the count**). This is the only
+    honest check that printing works; there is no server artifact to assert on. Note the
+    prerequisites: `frontend/package.json` is not in this list and must gain an
+    `e2e:statement` script — `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` — and
+    `.github/workflows/ci.yml` has **no browser job at all**, so this smoke test is a local
+    step requiring a chromium binary, not a gate.
 
 #### 24. `frontend/src/components/SellPnlModal.tsx` (Modify) — slice 0
 
@@ -665,21 +887,52 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     above, plus a *Deviations* section for any sanctioned exception, matching the shape of
     the prior feature's plan.
 
+### Files This Plan Must Add and Currently Omits
+
+Each of these is forced by a change already in the list. A file list that cannot name where
+its own decisions land is mis-cut.
+
+| File | Why it is forced |
+| :-- | :-- |
+| `backend_rust/src/engines/stats_engine.rs` | Calls `get_historical_prices` (`:139`), `get_rate` (`:158`) and `get_price` (`:180`); breaks on P4 |
+| `backend_rust/tests/analytics_test.rs` | Pins `original_qty == remaining_qty` at `:51-52` |
+| `frontend/src/components/PortfolioDetail.tsx` | Renders the two lot columns from one value (`:322-323`, `:333-334`) |
+| `frontend/src/test/components/PortfolioDetail.test.tsx` | Pins the buggy equality at `:184-185` |
+| `backend_rust/src/main.rs` | `build_rocket(...)` call site at `:63` if managed state changes the signature |
+| `backend_rust/tests/common/mod.rs` | Three `build_rocket` sites at `:46`, `:56`, `:65` |
+| `backend_rust/tests/cors_test.rs` | Five `CurrencyService::new()` sites if the constructor changes |
+| `backend_rust/tests/decimal_migration_test.rs` | Hand-rolled `historical_prices` DDL at `:21`, `:86` that P2's index must also cover |
+| `frontend/src/types.ts` | The hand-written types every renderer actually uses; `api.d.ts` has zero importers |
+| `frontend/package.json` | Required for any `e2e:statement` script |
+| `frontend/src/main.tsx` | The only entry-import site for a stylesheet (`main.tsx:3`) |
+| `frontend/src/utils/csvCells.ts` (new) | Holds the formula-lead and exponent-free guards extracted from `sellPnlCsv.ts` |
+| `docs/superpowers/reviews/2026-11-09-tax-report.md` | Decision and rejection record, following the convention in `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` |
+| `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md` | The amended non-goal at its Non-Goals section must be edited if the guard changes |
+
 ### Verification Plan
 
 *   **Compilation/Build**: `cargo build --release` and `cargo build` from `backend_rust/`;
     `npm run build` from `frontend/`.
 *   **Unit Tests**: `cargo test` from `backend_rust/`, which now includes
     `tax_report_test.rs` and the prefix-replay engine tests; `npm test` from `frontend/`.
-*   **Static Analysis & Linting**: `cargo clippy --all-targets`;
-    `bash scripts/check_access_gate.sh`; `npm run lint`; `npm run typecheck`.
+*   **Static Analysis & Linting**: `cargo clippy --all-targets` — **local only; CI does not
+    run clippy**; `bash scripts/check_access_gate.sh`; `npm run lint`; `npm run typecheck`.
+    In this workspace `frontend/node_modules` is absent and there is no chromium binary, so
+    the frontend checks need a networked `npm ci` and the print smoke cannot run at all.
 *   **Access gate**: `tests/isolation_test.rs` must cover the dated variant, since the
-    grep-based script cannot see an access-level choice on an existing route.
-*   **Reconciliation**: invariants I1 through I5, asserted as exact decimals with no
-    tolerance, under FIFO, LIFO and HYBRID.
-*   **Print**: `bash scripts/check_print_styles.sh` and `npm run e2e:statement`.
-*   **Manual, cannot be automated**: a real OIDC login and a real browser print preview,
-    both listed in `docs/auth-testing.md` as the two things CI cannot check.
+    grep-based script cannot see an access-level choice on an existing route. The gate's real
+    constraints on a refactored `analytics.rs`: Rule B ends a handler at the first column-0
+    `}` and requires a `require*` call before any `WHERE id` query; Rule C inspects the
+    signature only up to the first `->`; a new file under `src/api_routes/` must import
+    `crate::access` to satisfy Rule A.
+*   **Reconciliation**: the three equalities inlined in file 8, asserted as exact decimals
+    with no tolerance, under FIFO, LIFO and HYBRID.
+*   **Print**: `bash frontend/scripts/check_print_styles.sh` (note the path — the backend
+    gate is invoked from `backend_rust/`) and `npm run e2e:statement` from `frontend/`. Both
+    are local steps: CI has no browser job and no CSS check today.
+*   **Manual, cannot be automated**: a real OIDC login and a real browser print preview. The
+    login is the item `docs/auth-testing.md` lists as unverifiable in CI; the print preview is
+    new to this document and is not listed there.
 *   **Provider smoke**: `bash scripts/auth_smoke.sh` is unrelated; pricing changes are
     verified hermetically against seeded `historical_prices` rows, never against the live
     endpoint, so the suite has no network dependency.
