@@ -259,6 +259,16 @@ async fn get_rate_short_circuits_the_same_currency() {
 }
 
 #[tokio::test]
+async fn get_rate_short_circuits_a_case_difference() {
+    // The cache key and the FX symbology both uppercase, so a case difference is the
+    // same currency. Compared raw, "eur" -> "EUR" asked the provider for EUREUR=X.
+    let pool = pool_with_prices().await;
+    let svc = CurrencyService::new();
+    let got = svc.get_rate("eur", "EUR", ts("2020-01-01"), &pool).await.unwrap();
+    assert_eq!(got.rate, Decimal::ONE);
+}
+
+#[tokio::test]
 async fn get_price_answers_from_the_database_without_the_provider() {
     // What is pinned here is existing behaviour now carried by the new `Result`:
     // `get_price` already read today's row before this change, so the point is that a
