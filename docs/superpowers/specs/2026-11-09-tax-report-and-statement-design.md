@@ -19,12 +19,13 @@ lots each sell consumed, plus every lot still open at `end` with its unrealized 
 loss at that date.
 
 The **portfolio statement** is a page the owner reads or hands to someone. It shows
-realized P&L cumulative from inception to a chosen date and unrealized P&L as of that
-date, for one portfolio in full. The browser
-prints it to PDF; the server never produces a PDF.
+realized P&L cumulative from inception and unrealized P&L as of today, for one portfolio in
+full. The browser prints it to PDF; the server never produces a PDF. It takes no date: the
+tax report is the dated artifact, and a printable page about a past quarter is not on the
+roadmap this document covers.
 
-They are not two features. They are one dated-calculation change plus two renderers, and
-one renderer needs no backend change until it is given a past date.
+They are not two features. They are one dated-calculation change plus two renderers, and the
+statement renderer needs no backend change at all.
 
 ## The Problem
 
@@ -126,7 +127,7 @@ signal.
 | Existing figures move | The pricing-layer document's four changes each move numbers on endpoints the owner already trusts | Goal 7 and the Dependency section: those changes ship alone, with their own notes |
 | Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing-layer work-set shrink; the route's elapsed deadline, which fails closed |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
-| Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints | The Playwright smoke is the only honest check; it is not currently a CI gate |
+| Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints. **This slice ships unverified by design** — see issue #45, *Run the sell P&L Playwright smoke in CI* | The Playwright smoke is the only honest check and it is a local step until #45 lands; the print hook and chrome selectors are named in file 21 so a future gate has something to assert on |
 | Single-replica assumptions | SQLite write behaviour assumes one pod; a rolling update with default maxSurge runs two for a window | State the dependency in the deployment manifest review |
 
 ## Technical Plan (Architecture)
@@ -322,7 +323,9 @@ touches no network.
 | 2 | `replay_at` in the engine, unit tests only | no | none | contained |
 | 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure, served by the route | no | none | moderate |
 | 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | none new here — the pricing-layer document's result types stop failed lookups returning zero | **the risky piece** |
-| 5 | Statement switches to the report payload and accepts a past `to` | yes | none | low |
+
+There is no slice 5. An earlier revision had the statement switch to the dated payload; the
+statement now renders today's figures only, so the dated work never reaches it.
 
 ### Decided during drafting
 
@@ -456,6 +459,11 @@ Open from this draft, each needing a decision before the slice that depends on i
     `detectColumns`. The report CSV is now server-generated, which removes the BOM and
     float questions but not this one: which convention, and does the file stay parseable by
     the app's own importer?
+
+7.  **The print slice's verification gap.** It ships with no automated check. Issue #45
+    (*Run the sell P&L Playwright smoke in CI*) is the prerequisite for making it a gate;
+    until then `npm run e2e:statement` is a manual step needing a chromium binary, and
+    `check_print_styles.sh` was dropped as a gate that can pass while printing is broken.
 
 ## Alternatives Considered
 
@@ -782,7 +790,7 @@ preserve strings for, so this file is untouched. The `normalizeTaxSummary` and
 `normalizeSellPnl` coercion through `Number()` stays exactly where it is, serving the
 existing screen.
 
-#### 17. `frontend/src/App.tsx` (Modify) — slices 1, 4, 5
+#### 17. `frontend/src/App.tsx` (Modify) — slices 1, 4
 
 *   **Type / Scope**: data fetching and top-level state.
 *   **Proposed Changes**: hold the report payload separately from `taxSummary` so the
@@ -809,8 +817,8 @@ existing screen.
 *   **Proposed Changes**: renders portfolio totals and per-asset figures through
     `frontend/src/utils/formatters.ts`, for the portfolio in full — there is no asset-subset
     filter, because the only arithmetic that would make a filtered headline honest is the
-    arithmetic renderers are forbidden from doing. Slice 1 renders the existing
-    `taxSummary` payload at today's date; slice 5 switches it to the dated payload. It
+    arithmetic renderers are forbidden from doing. It renders the existing `taxSummary`
+    payload at today's date and takes no date parameter; the dated artifact is the CSV. It
     derives no totals of its own and contains no buttons or inputs inside the printed
     subtree.
 
@@ -836,12 +844,12 @@ existing screen.
     that handler on `from`/`to`, not adding a route; respect the existing ordering comment at
     `handlers.ts:130-131`.
 
-#### 22. `frontend/scripts/check_print_styles.sh` (Create) and `.github/workflows/` (Modify) — slice 1
+#### 22. Deleted — no print-CSS grep gate
 
-*   **Type / Scope**: CI gate. CI runs `cargo test` and frontend checks and sees no CSS.
-*   **Proposed Changes**: a grep-style script in the spirit of
-    `backend_rust/scripts/check_access_gate.sh` asserting the print stylesheet exists and
-    hides the chrome selectors, wired into the existing frontend job.
+The original plan added `frontend/scripts/check_print_styles.sh` wired into CI. It is
+removed: a grep asserting that a stylesheet mentions some selectors goes green while the
+page still prints badly, which is the failure mode the analogous `check_access_gate.sh`
+exists to prevent. The Playwright smoke in file 23 is the honest check.
 
 #### 23. `frontend/e2e/statement.smoke.mjs` (Create) and `frontend/e2e/run.sh` (Modify) — slice 1
 
@@ -849,11 +857,13 @@ existing screen.
 *   **Proposed Changes**: load the statement, emulate print media, assert chrome is
     `display: none`, that there is no horizontal overflow, and that `page.pdf()` returns a
     non-empty buffer within a stated page count (**state the count**). This is the only
-    honest check that printing works; there is no server artifact to assert on. Note the
+    honest check that printing works; there is no server artifact to assert on. The
     prerequisites: `frontend/package.json` is not in this list and must gain an
     `e2e:statement` script — `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` — and
     `.github/workflows/ci.yml` has **no browser job at all**, so this smoke test is a local
-    step requiring a chromium binary, not a gate.
+    step requiring a chromium binary, not a gate. Making it a gate is issue #45, *Run the
+    sell P&L Playwright smoke in CI*; this file is written so it drops straight into whatever
+    job #45 adds.
 
 #### 24. Moved to the pricing-layer document
 
@@ -904,9 +914,8 @@ its own decisions land is mis-cut.
     with no tolerance, under FIFO, LIFO and HYBRID.
 *   **Byte reproducibility**: two `format=csv` dispatches over unchanged data produce
     identical bytes. This is Goal 4, and it is only testable because the file is server-side.
-*   **Print**: `bash frontend/scripts/check_print_styles.sh` (note the path — the backend
-    gate is invoked from `backend_rust/`) and `npm run e2e:statement` from `frontend/`. Both
-    are local steps: CI has no browser job and no CSS check today.
+*   **Print**: `npm run e2e:statement` from `frontend/`. It is a local step, not a gate — CI
+    has no browser job and no CSS check today (issue #45).
 *   **Manual, cannot be automated**: a real OIDC login and a real browser print preview. The
     login is the item `docs/auth-testing.md` lists as unverifiable in CI; the print preview is
     new to this document and is not listed there.
