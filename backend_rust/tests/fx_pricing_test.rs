@@ -169,8 +169,14 @@ async fn get_rate_short_circuits_the_same_currency() {
 
 #[tokio::test]
 async fn get_price_answers_from_the_database_without_the_provider() {
-    // The hermetic half of Review Focus 4: a seeded row answers with no outbound
-    // call, which is what the previous provider-first order could not promise.
+    // What is pinned here is existing behaviour now carried by the new `Result`:
+    // `get_price` already read today's row before this change, so the point is that a
+    // seeded row answers with no outbound call and without an error. The endpoint
+    // whose order really changed was `get_historical_prices` — provider-first with a
+    // database fallback — and that half is pinned by
+    // performance_resolves_a_weekend_from_the_prior_weekday_close in
+    // tests/analytics_test.rs and by the freshness tests in the service's own unit
+    // tests.
     let pool = pool_with_prices().await;
     let today = chrono::Utc::now().date_naive();
     seed_pair(&pool, "SEEDED", &[(today.format("%Y-%m-%d").to_string().as_str(), "42.0")]).await;

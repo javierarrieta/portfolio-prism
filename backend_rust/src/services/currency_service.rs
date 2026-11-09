@@ -25,6 +25,11 @@ pub(crate) const FX_SERIES_WINDOW_DAYS: i64 = 365;
 /// silently used as a tax figure.
 pub(crate) const FX_LOOKBACK_DAYS: i64 = 30;
 
+/// How stale a stored series may be and still answer for a window ending at
+/// `end_date`. Four days covers a long market weekend; beyond that the window is
+/// treated as incomplete and the provider is asked for the tail.
+pub(crate) const PRICE_WINDOW_FRESH_DAYS: i64 = 4;
+
 /// Yahoo's FX pair symbology. `EUR=USD` returns "No data found"; `EURUSD=X`
 /// returns data. `get_rate` built the first form, which is why every asset whose
 /// currency differed from the portfolio's base currency failed to price at all.
@@ -386,8 +391,11 @@ impl CurrencyService {
         }
 
         // get_historical_prices already builds the range URL, parses the chart
-        // response, persists the series through the upsert, and merges database rows.
-        // Reusing it is why this change is small.
+        // response, persists the series through the upsert, and merges what it
+        // fetched over stored rows it found too stale to answer with. Reaching this
+        // line means `rate_from_db` found nothing inside `FX_LOOKBACK_DAYS`, so any
+        // stored row in the window is past `PRICE_WINDOW_FRESH_DAYS` and there is a
+        // merge to do. Reusing it is why this change is small.
         let series = self
             .get_historical_prices(&symbol, window_start, date_naive, pool)
             .await?;
@@ -618,19 +626,27 @@ impl CurrencyService {
 
     /// Daily closes for `symbol` in `[start_date, end_date]`.
     ///
-    /// Read order, stated rather than inherited: **the database answers if it holds any
-    /// row in the window**; the provider is asked only when it holds none. The previous
-    /// order was provider-first with a database fallback on every failure, which is the
-    /// only reason the hermetic pricing tests worked. With the fallback gone, a seeded
-    /// window has to answer on its own.
+    /// Read order, stated rather than inherited: **the database answers when its
+    /// newest row in the window is within `PRICE_WINDOW_FRESH_DAYS` of
+    /// `end_date`**; otherwise the provider is asked for the tail and what it returns
+    /// is merged over the stored rows. "Any row in the window" is not enough, because
+    /// a window whose stored rows stop short of `end_date` is incomplete, not an
+    /// answer: [`calculate_portfolio_performance`](crate::engines::stats_engine::StatsEngine::calculate_portfolio_performance)
+    /// asks for a window that ends today and prices a date with no close as zero, so
+    /// answering from a series that stopped days ago reports today's value as zero —
+    /// the headline figure freezes the day after any fetch. Four days is a rule, not a
+    /// parameter: it has to cover a market holiday weekend and nothing longer, because
+    /// a longer gap means the series really was not updated.
     ///
-    /// The same rule has a cost worth naming: a stored series that stops short of
-    /// `end_date` is returned as it stands rather than refreshed, because nothing
-    /// records which dates a symbol's rows actually cover. That coverage record is the
-    /// follow-up [`get_rate`](Self::get_rate) already points at.
+    /// The previous order was provider-first with a database fallback on every
+    /// failure, which is the only reason the hermetic pricing tests worked. With the
+    /// fallback gone, a seeded window has to answer on its own — which it does, as
+    /// long as it runs up to `end_date`.
     ///
     /// `Err(ProviderUnavailable)` means we could not ask. `Err(NoData)` means we asked
-    /// and there is nothing.
+    /// and there is nothing. Neither is papered over with the stale rows: an
+    /// incomplete window the provider could not top up stays an error rather than
+    /// being promoted to a success.
     ///
     /// Either way the returned series is in ascending date order, which `get_rate`
     /// depends on when it records the window a fetch covered.
@@ -645,7 +661,15 @@ impl CurrencyService {
             .get_historical_prices_from_db(symbol, start_date, end_date, pool)
             .await
             .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
-        if !db_prices.is_empty() {
+
+        // The freshness rule. No stored row at all is the most incomplete window
+        // there is, so it falls through too.
+        let newest = db_prices.iter().map(|(date, _)| *date).max();
+        let incomplete = match newest {
+            Some(newest) => (end_date - newest).num_days() > PRICE_WINDOW_FRESH_DAYS,
+            None => true,
+        };
+        if !incomplete {
             db_prices.sort_by_key(|(date, _)| *date);
             return Ok(db_prices);
         }
@@ -746,13 +770,24 @@ impl CurrencyService {
             return Err(PricingError::NoData);
         }
 
-        // The provider is only asked when the database held nothing in the window, so
-        // the rows just persisted are the whole answer. The code before this read the
-        // window back a second time and merged it in; that window was empty by
-        // construction, so it could only add rows written since the first read.
-        daily_prices.sort_by_key(|(date, _)| *date);
+        // The provider was asked because the stored window stopped short of
+        // `end_date`, so what came back is the tail, not the whole series. Merge it
+        // over the rows read above — the fetched rows win on a shared date, since the
+        // provider just wrote them through the upsert — so a partial stored window is
+        // kept rather than discarded. Re-reading the window here would return these
+        // same rows plus the ones just persisted, which are already in
+        // `daily_prices`.
+        let fetched: std::collections::HashSet<NaiveDate> =
+            daily_prices.iter().map(|(date, _)| *date).collect();
+        let mut merged: Vec<(NaiveDate, Decimal)> = daily_prices;
+        for (date, price) in db_prices {
+            if !fetched.contains(&date) {
+                merged.push((date, price));
+            }
+        }
+        merged.sort_by_key(|(date, _)| *date);
 
-        Ok(daily_prices)
+        Ok(merged)
     }
 
     async fn get_historical_prices_from_db(
@@ -1020,6 +1055,43 @@ mod tests {
             series: vec![(date_of("2024-02-20"), dec("0.8700"))],
         };
         assert_eq!(late_window.rate_at(date_of("2024-02-26"), 30), None);
+    }
+
+    #[tokio::test]
+    async fn a_stored_window_answers_only_while_it_is_fresh() {
+        // The read order decided at the level it is decided. Both halves seed a
+        // symbol that cannot resolve, so the stored rows are the only difference
+        // between them.
+        let pool = empty_pool().await;
+        let end = date_of("2024-06-14");
+        let window_start = end - chrono::Duration::days(30);
+        let svc = CurrencyService::new();
+
+        // Fresh: the newest row sits exactly on the bound, so the database answers
+        // and no provider call is made — the same unreachable symbol fails in the
+        // stale half below, so an `Ok` here can only have come from the rows.
+        let fresh_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
+        let fresh_newest_str = fresh_newest.format("%Y-%m-%d").to_string();
+        seed_prices(&pool, "FRESHWINDOW", &[(&fresh_newest_str, "1.0500")]).await;
+        let fresh = svc
+            .get_historical_prices("FRESHWINDOW", window_start, end, &pool)
+            .await
+            .expect("a window whose newest row is PRICE_WINDOW_FRESH_DAYS old answers from the database");
+        assert_eq!(fresh, vec![(fresh_newest, dec("1.0500"))]);
+
+        // Stale: one day past the bound the window is incomplete, so the provider is
+        // asked for the tail instead. Nothing can answer for this symbol, so the call
+        // fails — and what this pins is that the failure is reported rather than the
+        // stale rows served as a success, which is the exact shape of the bug the
+        // freshness rule closes. Which of the two failures a sandbox produces depends
+        // on whether DNS resolves; neither is the stale series.
+        let stale_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS + 1);
+        let stale_newest_str = stale_newest.format("%Y-%m-%d").to_string();
+        seed_prices(&pool, "STALEWINDOW", &[(&stale_newest_str, "0.9000")]).await;
+        match svc.get_historical_prices("STALEWINDOW", window_start, end, &pool).await {
+            Ok(rows) => panic!("a stale window must not be served as a success, got {rows:?}"),
+            Err(PricingError::NoData) | Err(PricingError::ProviderUnavailable(_)) => {}
+        }
     }
 
     #[tokio::test]
