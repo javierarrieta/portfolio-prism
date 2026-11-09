@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use sqlx::sqlite::SqlitePool;
 use std::str::FromStr;
 
-use backend_rust::services::currency_service::{no_rate_error, CurrencyService};
+use backend_rust::services::currency_service::{no_rate_error, CurrencyService, PricingError};
 
 async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
     for (date, price) in rows {
@@ -165,4 +165,29 @@ async fn get_rate_short_circuits_the_same_currency() {
     let got = svc.get_rate("USD", "USD", ts("2020-01-01"), &pool).await.unwrap();
     assert_eq!(got.rate, Decimal::ONE);
     assert_eq!(got.date_used, NaiveDate::parse_from_str("2020-01-01", "%Y-%m-%d").unwrap());
+}
+
+#[tokio::test]
+async fn get_price_answers_from_the_database_without_the_provider() {
+    // The hermetic half of Review Focus 4: a seeded row answers with no outbound
+    // call, which is what the previous provider-first order could not promise.
+    let pool = pool_with_prices().await;
+    let today = chrono::Utc::now().date_naive();
+    seed_pair(&pool, "SEEDED", &[(today.format("%Y-%m-%d").to_string().as_str(), "42.0")]).await;
+    let svc = CurrencyService::new();
+    assert_eq!(svc.get_price("SEEDED", None, &pool).await.unwrap(), dec("42.0"));
+}
+
+#[test]
+fn the_two_pricing_failures_are_distinguishable() {
+    // Review Focus 1 and 4 at the type level. The end-to-end version of this needs
+    // a mock provider, and this crate has no dev-dependencies to build one with; see
+    // Out of Scope. What is pinned here is that the two failures are different values
+    // with different messages, so a caller can branch on them and a user can be told
+    // something different — which is the whole point of the change.
+    assert_ne!(PricingError::NoData, PricingError::ProviderUnavailable("timeout".into()));
+    assert_eq!(PricingError::NoData.to_string(), "no price data available");
+    assert!(PricingError::ProviderUnavailable("timeout".into())
+        .to_string()
+        .contains("timeout"));
 }

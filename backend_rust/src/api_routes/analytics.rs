@@ -70,7 +70,19 @@ pub async fn get_portfolio_tax_summary(
             .await
             .map_err(|_| Status::InternalServerError)?;
 
-        let current_price = currency_service.get_price(&asset.symbol, asset.isin.as_deref(), pool.inner()).await;
+        // A pricing failure is still exactly what it was: a zero, and a 200 response.
+        // This endpoint is undated, so the type change must not move a number here; a
+        // dated report is where an `Err` becomes an error instead.
+        let current_price = match currency_service
+            .get_price(&asset.symbol, asset.isin.as_deref(), pool.inner())
+            .await
+        {
+            Ok(price) => price,
+            Err(e) => {
+                eprintln!("WARN: no price for {}: {}", asset.symbol, e);
+                Decimal::ZERO
+            }
+        };
 
         let summary = TaxLotEngine::calculate_lots(
             &asset.symbol,

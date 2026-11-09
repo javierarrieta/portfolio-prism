@@ -136,6 +136,8 @@ impl StatsEngine {
 
         let mut price_map: HashMap<(NaiveDate, String), Decimal> = HashMap::new();
         for symbol in &symbols {
+            // A pricing failure contributes nothing, as it did when the pricing layer
+            // returned an empty window instead of naming the failure.
             match currency_service.get_historical_prices(symbol, start_date, end_date, pool).await {
                 Ok(daily_prices) => {
                     for (date, price) in daily_prices {
@@ -178,7 +180,13 @@ impl StatsEngine {
             let has_prices = price_map.keys().any(|(_, s)| s == symbol);
             if !has_prices {
                 let isin = symbol_isin.get(symbol.as_str()).and_then(|&i| i);
-                let current_price = currency_service.get_price(symbol, isin, pool).await;
+                let current_price = match currency_service.get_price(symbol, isin, pool).await {
+                    Ok(price) => price,
+                    Err(e) => {
+                        eprintln!("WARN: no price for {}: {}", symbol, e);
+                        Decimal::ZERO
+                    }
+                };
                 if current_price > Decimal::ZERO {
                     for date in &dates {
                         price_map.insert((*date, symbol.clone()), current_price);

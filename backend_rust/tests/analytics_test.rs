@@ -1,8 +1,10 @@
 mod common;
 
 use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction};
+use chrono::{Datelike, NaiveDate, Utc};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
+use sqlx::sqlite::SqlitePool;
 
 #[tokio::test]
 async fn test_tax_summary_empty_portfolio() {
@@ -131,8 +133,33 @@ async fn test_performance_endpoint() {
 
 #[tokio::test]
 async fn test_performance_value_reflects_split_transaction() {
-    use chrono::{NaiveDate, Utc};
+    let (port_id, pool, _today) = seeded_performance_fixture().await;
 
+    let rocket = build_rocket(pool, DEFAULT_USER);
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let resp = client.get(format!("/api/portfolios/{}/performance", port_id)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body_str = resp.into_string().await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+    let metrics = &parsed["metrics"];
+    let value = metrics.get("portfolio_value").unwrap().as_str().unwrap();
+    // 100 shares before a 2:1 split become 200; the final value at the split-adjusted
+    // price of 50.0 is 200 * 50 = 10000, not 100 * 50 = 5000.
+    assert_eq!(value.parse::<f64>().unwrap(), 10000.0);
+}
+
+/// The shared performance fixture: a USD portfolio holding one asset that had a 2:1
+/// split, a split-adjusted close of 50.0 seeded from a year before the first BUY
+/// through today, and `split_sync` pinned so the route's split fetch stays offline.
+///
+/// The seed skips Saturdays and Sundays deliberately: seeding every date leaves no
+/// calendar gap, so the non-trading-day path is never exercised. With the provider
+/// fallback gone this seed is the only thing keeping these two tests offline, and the
+/// gaps are what make that claim mean something. Today is the one weekend day still
+/// seeded, because the endpoint reports the portfolio value as of today and the
+/// fixture has to cover the date it reads.
+async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
     let pool = setup_db(&disabled_config()).await;
     let port_id = seed_portfolio(&pool, DEFAULT_USER, "Perf Split", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "SPLITINTTEST", "Split Int").await;
@@ -169,13 +196,20 @@ async fn test_performance_value_reflects_split_transaction() {
     // live Yahoo fetch, and throttle split sync for this symbol so no network is hit.
     let mut curr = start_date;
     while curr <= today {
-        sqlx::query("INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+        let weekday = curr.weekday();
+        let is_weekend = weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun;
+        if !is_weekend || curr == today {
+            sqlx::query(
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                     ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
+            )
             .bind(symbol)
             .bind(curr)
             .bind("50.0")
             .execute(&pool)
             .await
             .unwrap();
+        }
         match curr.succ_opt() {
             Some(next) => curr = next,
             None => break,
@@ -188,16 +222,37 @@ async fn test_performance_value_reflects_split_transaction() {
         .await
         .unwrap();
 
+    (port_id, pool, today)
+}
+
+#[tokio::test]
+async fn performance_resolves_a_weekend_from_the_prior_weekday_close() {
+    // Review Focus 2 through the route rather than the helper: the seeded series has
+    // no weekend rows, so a weekend in the window must be answered by Friday's close
+    // rather than a hole or a network call.
+    let (port_id, pool, _today) = seeded_performance_fixture().await;
     let rocket = build_rocket(pool, DEFAULT_USER);
     let client = Client::tracked(rocket).await.unwrap();
-
-    let resp = client.get(format!("/api/portfolios/{}/performance", port_id)).dispatch().await;
+    let resp = client
+        .get(format!("/api/portfolios/{}/performance", port_id))
+        .dispatch()
+        .await;
     assert_eq!(resp.status(), Status::Ok);
-    let body_str = resp.into_string().await.unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-    let metrics = &parsed["metrics"];
-    let value = metrics.get("portfolio_value").unwrap().as_str().unwrap();
-    // 100 shares before a 2:1 split become 200; the final value at the split-adjusted
-    // price of 50.0 is 200 * 50 = 10000, not 100 * 50 = 5000.
-    assert_eq!(value.parse::<f64>().unwrap(), 10000.0);
+    let body: serde_json::Value = resp.into_json().await.unwrap();
+    let history = body["history"].as_array().unwrap();
+    assert!(
+        !history.is_empty(),
+        "performance history must be populated from the gapped seed"
+    );
+
+    // The endpoint reports weekly points, each one its week's last day with a value.
+    // The week holding the first BUY starts Monday 2024-01-08 and has no close on the
+    // 13th or the 14th, so its point is Friday the 12th: 200 split-adjusted shares at
+    // 50.0. If a weekend hole propagated instead, the point would be dated the 14th
+    // and worth nothing.
+    let buy_week = history
+        .iter()
+        .find(|week| week["date"].as_str() == Some("2024-01-12"))
+        .expect("the week holding the first BUY must report Friday's close");
+    assert_eq!(buy_week["value"].as_str().unwrap().parse::<f64>().unwrap(), 10000.0);
 }

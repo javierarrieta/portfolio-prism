@@ -212,6 +212,29 @@ pub struct RateAt {
     pub date_used: NaiveDate,
 }
 
+/// "There is no close for this symbol" and "we could not ask" are different failures
+/// with different user actions. `get_price` returned `Decimal::ZERO` for both, and
+/// zero is a plausible price.
+///
+/// `std::error::Error` is what lets callers use `?` over it (notably `get_rate`, which
+/// keeps its `anyhow::Result` return type).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PricingError {
+    NoData,
+    ProviderUnavailable(String),
+}
+
+impl std::fmt::Display for PricingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PricingError::NoData => write!(f, "no price data available"),
+            PricingError::ProviderUnavailable(reason) => write!(f, "price provider unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PricingError {}
+
 /// The error for "this pair has no close near that date", built separately from the
 /// `ok_or_else` in `get_rate` so the message is testable without a provider. Public so
 /// the integration test can assert on it; `select_rate` stays `pub(crate)`.
@@ -325,10 +348,9 @@ impl CurrencyService {
     /// that closes it; until then a stale-but-in-lookback close is possible for a
     /// date past whatever was last fetched.
     ///
-    /// Read order is database first, provider second — deliberately the reverse of
-    /// `get_historical_prices`, which fetches and falls back to the database. The
-    /// database-first order is what makes a past-dated conversion testable without
-    /// a network.
+    /// Read order is database first, provider second — the same order
+    /// [`get_historical_prices`](Self::get_historical_prices) now uses, and for the same
+    /// reason: it is what makes a past-dated conversion testable without a network.
     pub async fn get_rate(
         &self,
         from_curr: &str,
@@ -423,7 +445,19 @@ impl CurrencyService {
         )
     }
 
-    pub async fn get_price(&self, symbol: &str, isin: Option<&str>, pool: &SqlitePool) -> Decimal {
+    /// The close for `symbol` as of today, or why there is none.
+    ///
+    /// Read order, stated rather than inherited: **the database answers when it holds
+    /// today's row**; the provider is asked only on a miss.
+    ///
+    /// `Err(ProviderUnavailable)` means we could not ask. `Err(NoData)` means we asked
+    /// and there is no close for this symbol.
+    pub async fn get_price(
+        &self,
+        symbol: &str,
+        isin: Option<&str>,
+        pool: &SqlitePool,
+    ) -> Result<Decimal, PricingError> {
         let today = chrono::Utc::now().date_naive();
         let existing = sqlx::query_as::<_, HistoricalPrice>(
             "SELECT * FROM historical_prices WHERE symbol = ? AND date = ?"
@@ -431,16 +465,25 @@ impl CurrencyService {
         .bind(symbol)
         .bind(today)
         .fetch_optional(pool)
-        .await;
+        .await
+        .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
 
-        if let Ok(Some(hp)) = existing {
-            return crate::db_types::str_to_decimal(&hp.close_price);
+        if let Some(hp) = existing {
+            return Ok(crate::db_types::str_to_decimal(&hp.close_price));
         }
 
-        let price = self.fetch_yahoo_price(symbol).await;
-        if price > Decimal::ZERO {
-            self.cache_price(symbol, today, price, pool).await;
-            return price;
+        // A provider outage is remembered rather than swallowed: the EODHD fallback
+        // below still gets its turn, exactly as it did when every failure was zero,
+        // but if neither source answers the caller is told we could not ask rather
+        // than that no such price exists.
+        let mut outage = None;
+        match self.fetch_yahoo_price(symbol).await {
+            Ok(price) => {
+                self.cache_price(symbol, today, price, pool).await;
+                return Ok(price);
+            }
+            Err(e @ PricingError::ProviderUnavailable(_)) => outage = Some(e),
+            Err(PricingError::NoData) => {}
         }
 
         if let Some(isin) = isin {
@@ -449,22 +492,25 @@ impl CurrencyService {
                     let price = self.fetch_eodhd_price(isin, eodhd_key).await;
                     if price > Decimal::ZERO {
                         self.cache_price(symbol, today, price, pool).await;
-                        return price;
+                        return Ok(price);
                     }
                 }
             }
         }
 
-        Decimal::ZERO
+        Err(outage.unwrap_or(PricingError::NoData))
     }
 
-    async fn fetch_yahoo_price(&self, symbol: &str) -> Decimal {
+    /// Yahoo's latest close for `symbol`. A request failure and an unknown symbol are
+    /// reported apart from each other, because `get_price` decides what to tell the
+    /// user from that difference.
+    async fn fetch_yahoo_price(&self, symbol: &str) -> Result<Decimal, PricingError> {
         let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
         let response = match self.fetch_with_retry(&url).await {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!("WARN: Failed to fetch Yahoo price for {}: {}", symbol, e);
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -476,14 +522,14 @@ impl CurrencyService {
                 status, symbol,
                 &body_preview[..body_preview.len().min(500)]
             );
-            return Decimal::ZERO;
+            return Err(PricingError::ProviderUnavailable(format!("status {status}")));
         }
 
         let body_bytes = match response.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("WARN: Failed to read Yahoo response for {}: {}", symbol, e);
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -496,7 +542,7 @@ impl CurrencyService {
                     symbol, e,
                     &body_preview[..body_preview.len().min(500)]
                 );
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -506,16 +552,23 @@ impl CurrencyService {
                 Some(q) => q.close.clone(),
                 None => {
                     eprintln!("WARN: No quote data for symbol: {}", symbol);
-                    return Decimal::ZERO;
+                    return Err(PricingError::NoData);
                 }
             },
             None => {
                 eprintln!("WARN: No price data for symbol: {}", symbol);
-                return Decimal::ZERO;
+                return Err(PricingError::NoData);
             }
         };
 
-        close_prices.iter().rev().find_map(|x| x.map(f64_to_decimal)).unwrap_or(Decimal::ZERO)
+        // A close of zero is not a price, it is a hole in the series: the same answer
+        // the old `price > Decimal::ZERO` test in `get_price` gave, now named.
+        close_prices
+            .iter()
+            .rev()
+            .find_map(|x| x.map(f64_to_decimal))
+            .filter(|price| *price > Decimal::ZERO)
+            .ok_or(PricingError::NoData)
     }
 
     async fn fetch_eodhd_price(&self, isin: &str, api_key: &str) -> Decimal {
@@ -563,13 +616,40 @@ impl CurrencyService {
         .await;
     }
 
+    /// Daily closes for `symbol` in `[start_date, end_date]`.
+    ///
+    /// Read order, stated rather than inherited: **the database answers if it holds any
+    /// row in the window**; the provider is asked only when it holds none. The previous
+    /// order was provider-first with a database fallback on every failure, which is the
+    /// only reason the hermetic pricing tests worked. With the fallback gone, a seeded
+    /// window has to answer on its own.
+    ///
+    /// The same rule has a cost worth naming: a stored series that stops short of
+    /// `end_date` is returned as it stands rather than refreshed, because nothing
+    /// records which dates a symbol's rows actually cover. That coverage record is the
+    /// follow-up [`get_rate`](Self::get_rate) already points at.
+    ///
+    /// `Err(ProviderUnavailable)` means we could not ask. `Err(NoData)` means we asked
+    /// and there is nothing.
+    ///
+    /// Either way the returned series is in ascending date order, which `get_rate`
+    /// depends on when it records the window a fetch covered.
     pub async fn get_historical_prices(
         &self,
         symbol: &str,
         start_date: NaiveDate,
         end_date: NaiveDate,
         pool: &SqlitePool,
-    ) -> Result<Vec<(NaiveDate, Decimal)>> {
+    ) -> Result<Vec<(NaiveDate, Decimal)>, PricingError> {
+        let mut db_prices = self
+            .get_historical_prices_from_db(symbol, start_date, end_date, pool)
+            .await
+            .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
+        if !db_prices.is_empty() {
+            db_prices.sort_by_key(|(date, _)| *date);
+            return Ok(db_prices);
+        }
+
         let start_ts = start_date
             .and_hms_opt(0, 0, 0)
             .unwrap()
@@ -586,7 +666,7 @@ impl CurrencyService {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!("WARN: Failed to fetch historical prices for {}: {}", symbol, e);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -599,14 +679,14 @@ impl CurrencyService {
                 symbol,
                 &body_preview[..body_preview.len().min(500)]
             );
-            return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+            return Err(PricingError::ProviderUnavailable(format!("status {status}")));
         }
 
         let yahoo_resp: YahooChartResponse = match response.json().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("WARN: Failed to parse historical Yahoo response for {}: {}", symbol, e);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -624,7 +704,7 @@ impl CurrencyService {
             }
             None => {
                 eprintln!("WARN: No chart result for symbol: {}", symbol);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::NoData);
             }
         };
 
@@ -644,7 +724,10 @@ impl CurrencyService {
         }
 
         if !daily_prices.is_empty() {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
             for (date, price) in &daily_prices {
                 let _ = sqlx::query(
                     "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
@@ -660,21 +743,16 @@ impl CurrencyService {
         }
 
         if daily_prices.is_empty() {
-            return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+            return Err(PricingError::NoData);
         }
 
-        let db_prices = self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await?;
-        let yahoo_dates: std::collections::HashSet<NaiveDate> = daily_prices.iter().map(|(d, _)| *d).collect();
+        // The provider is only asked when the database held nothing in the window, so
+        // the rows just persisted are the whole answer. The code before this read the
+        // window back a second time and merged it in; that window was empty by
+        // construction, so it could only add rows written since the first read.
+        daily_prices.sort_by_key(|(date, _)| *date);
 
-        let mut merged: Vec<(NaiveDate, Decimal)> = daily_prices;
-        for (date, price) in db_prices {
-            if !yahoo_dates.contains(&date) {
-                merged.push((date, price));
-            }
-        }
-        merged.sort_by_key(|(date, _)| *date);
-
-        Ok(merged)
+        Ok(daily_prices)
     }
 
     async fn get_historical_prices_from_db(
@@ -999,7 +1077,7 @@ mod tests {
         .await;
 
         let svc = CurrencyService::new();
-        let price = svc.get_price("TEST", None, &pool).await;
+        let price = svc.get_price("TEST", None, &pool).await.unwrap();
         assert_eq!(price, Decimal::from_str("42.0").unwrap());
     }
 
@@ -1030,8 +1108,11 @@ mod tests {
         .await;
 
         let svc = CurrencyService::new();
+        // The stale row must not answer for today. Whether the provider then has a
+        // price for `TEST` is not this test's business; what it pins is that the
+        // 2020 close is not the answer, whichever branch the provider takes.
         let price = svc.get_price("TEST", None, &pool).await;
-        assert_ne!(price, Decimal::from_str("99.0").unwrap());
+        assert_ne!(price.ok(), Some(Decimal::from_str("99.0").unwrap()));
     }
 
     async fn make_split_tx_table(pool: &SqlitePool) {
