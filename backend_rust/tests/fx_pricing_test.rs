@@ -1,10 +1,14 @@
 //! The FX rate contract: a rate is dated, the pair symbology is Yahoo's, and a
 //! missing rate is an error rather than a silent zero.
 //!
-//! These tests are hermetic — no network, ever. The seeded `EURUSD=X` rows are
-//! what make that possible: the new `get_rate` consults the database before the
-//! provider, so a seeded window answers with no outbound call at all.
+//! These tests are hermetic — no network, ever. The seeded FX rows are what make
+//! that possible (`EURUSD=X` for the rate tests, `USDEUR=X` for the engine test):
+//! the new `get_rate` consults the database before the provider, so a seeded window
+//! answers with no outbound call at all.
 
+mod common;
+
+use common::{seed_asset_currency, seed_portfolio, seed_transaction_at, DEFAULT_USER};
 use backend_rust::auth::StartupConfig;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -95,6 +99,61 @@ async fn a_rate_beyond_the_lookback_names_the_symbol_and_the_date() {
     assert!(msg.contains("EURUSD=X"), "error should name the symbol, got: {msg}");
     assert!(msg.contains("2024-03-31"), "error should name the date, got: {msg}");
     assert!(msg.contains("30"), "error should name the bound, got: {msg}");
+}
+
+/// Goal 5: a past-dated multi-currency conversion asserted through the engine, with
+/// every price and rate seeded. The portfolio base currency and the asset currency
+/// differ here, which no fixture in the suite did before: nothing single-currency
+/// can distinguish a conversion priced at each transaction's own date from one
+/// priced at a single undated rate.
+#[tokio::test]
+async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
+    use backend_rust::engines::tax_engine::TaxLotEngine;
+
+    let pool = pool_with_prices().await;
+
+    // Portfolio base EUR, asset priced in USD: the conversion is USD -> EUR.
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "FX", "EUR").await;
+    let asset_id = seed_asset_currency(&pool, port_id, "AAPL", "Apple", "USD").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "SELL", 10.0, 130.0, 0.0, "2024-03-08T00:00:00Z").await;
+
+    // USD -> EUR closes: 0.8700 on the buy date, 0.9125 on the sell date.
+    seed_pair(&pool, "USDEUR=X", &[("2024-01-02", "0.8700"), ("2024-03-08", "0.9125")]).await;
+    // The asset's own close, as the route-level caller would read it before calling
+    // the engine. `calculate_lots` takes the current price as an argument, so this
+    // row completes the fixture rather than being read by the assertion below.
+    let today = Utc::now().date_naive();
+    seed_pair(&pool, "AAPL", &[(today.format("%Y-%m-%d").to_string().as_str(), "130.00")]).await;
+
+    let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
+        "SELECT * FROM transactions WHERE asset_id = ?",
+    )
+    .bind(asset_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let svc = CurrencyService::new();
+    let summary = TaxLotEngine::calculate_lots(
+        "AAPL",
+        "STOCK",
+        &txs,
+        dec("130.00"),
+        "USD",
+        "EUR",
+        &svc,
+        "FIFO",
+        30,
+        &pool,
+    )
+    .await
+    .unwrap();
+
+    // Proceeds 1300 USD at 0.9125 = 1186.25 EUR; cost 1000 USD at 0.8700 = 870.00 EUR.
+    // Realized = 316.25 EUR. Under the old code both legs used one undated rate and
+    // the difference between the two dates never existed.
+    assert_eq!(summary.realized_pnl, dec("316.25"));
 }
 
 #[tokio::test]
