@@ -142,9 +142,9 @@ two ways without doing arithmetic of its own.
                          |
             +------------+-------------+
             |                          |
-   CSV builder (taxReportCsv.ts)   Statement print view
-   strings verbatim, no BOM       formatters.ts, display rounding
-   (downloadCsv prepends BOM)     no summation, no controls
+   CSV: ?format=csv, server       Statement print view
+   bytes from the same totals     formatters.ts, display rounding
+   curl-reproducible              no summation, no controls
             |                          |
             +------------+-------------+
                          |  reads one payload, derives nothing
@@ -290,15 +290,20 @@ cannot reproduce exact decimal equality against `tax-summary`.
 
 ### The renderers
 
-The CSV builder follows the existing single-sell export's conventions — the formula-lead
-guard on free-text cells and exponent-free numeric output — and emits **no BOM**, because
-`downloadCsv` prepends it (`frontend/src/utils/download.ts:25`) and a second one corrupts
-the header row. Both guards are module-private in `sellPnlCsv.ts` (`FORMULA_LEAD` at `:55`,
-`text` at `:56`, `num` at `:62`) and `num` takes a `number`, so they are extracted into a
-shared module and re-derived for strings rather than "reused" as written. Report money
-fields travel as strings end to end and must not pass through `normalizeTaxSummary` or
-`normalizeSellPnl`, which coerce every field through `Number()` and would reduce the file
-to double precision.
+The CSV is produced by the server, not assembled in the browser. The same route answers
+`?format=csv` and serializes the payload it already computed, so the file is emitted where
+the exact decimals live. This is the direct consequence of putting every number on the
+server: a total that must equal `tax-summary` to the decimal should not be re-rendered
+through a double on its way to a file. It also makes Goal 4 testable — `curl --cookie`
+reproduces the bytes — which the client-side builder could not promise. Feasibility is
+verified rather than assumed: authentication is an HttpOnly session cookie that the guard
+reads and never consults `Authorization` (`backend_rust/src/auth/guard.rs:103`), and `/api`
+is same-origin in both dev and prod (`frontend/nginx.conf:12`), so a plain `<a href>`
+carries the session. No route is added, so the route-surface counts do not move.
+
+The JSON variant stays a documented public surface, not an internal intermediate: the
+OpenAPI schema, the regenerated spec and the generated types are all kept, so the payload is
+usable outside this frontend.
 
 The statement is a React view with a print stylesheet. There is no `@media print` rule
 anywhere in the frontend (verified: no `@media print` in `frontend/src/`), so this
@@ -316,7 +321,7 @@ touches no network.
 | Out | The pricing-layer changes: dated FX, `historical_prices` uniqueness, pricing result types | no | figures move for every foreign-currency asset | moderate |
 | 1 | Statement at today's date, pure frontend over the existing tax-summary payload | no | none | low |
 | 2 | `replay_at` in the engine, unit tests only | no | none | contained |
-| 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure | no | none | moderate |
+| 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure, served by the route | no | none | moderate |
 | 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | none new here — the pricing-layer document's result types stop failed lookups returning zero | **the risky piece** |
 | 5 | Statement switches to the report payload and accepts a past `to` | yes | none | low |
 
@@ -449,7 +454,9 @@ Open from this draft, each needing a decision before the slice that depends on i
     without waiting 20 s.
 6.  **CSV summable-column disclosure.** `sellPnlCsv.ts:13-16` deliberately puts caveats in
     columns because a leading `#` row breaks naive parsers, including this app's own
-    `detectColumns`. Which convention does the report CSV use?
+    `detectColumns`. The report CSV is now server-generated, which removes the BOM and
+    float questions but not this one: which convention, and does the file stay parseable by
+    the app's own importer?
 
 ## Alternatives Considered
 
@@ -638,7 +645,13 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
 #### 6. `backend_rust/src/api_routes/analytics.rs` (Modify) — slices 3, 4
 
 *   **Type / Scope**: the `tax-summary` handler.
-*   **Proposed Changes**: add optional `from` and `to`. Access stays `Access::Viewer` for
+*   **Proposed Changes**: add optional `from` and `to`, and an optional `format` whose only
+    non-default value is `csv`; with `format=csv` the handler serializes the same payload
+    through `report_csv` and returns `text/csv` with a `Content-Disposition` filename, and
+    an error in that mode returns the typed JSON error body, not a CSV. Rocket's `Either`
+    responder or an enum responder in the style of `auth/routes.rs:33-52` carries the two
+    shapes; **whether utoipa can declare both content types for one status without a
+    hand-written `ToResponse` is unverified and must be settled in this slice.** Access stays `Access::Viewer` for
     every call, dated or not. When the parameters are present: validate the dates and the
     strategy strictly; filter transactions to `date <= to`; call `replay_at`; build
     `AssetTotals` and rows server-side so no renderer sums anything; resolve prices with the
@@ -730,46 +743,49 @@ expectation there assumes FX conversion at the latest rate.
     alone changes nothing for the renderers; either `types.ts` gains the report types or the
     renderers are repointed at the generated ones, and that choice needs naming here.
 
-#### 14. `frontend/src/utils/taxReportCsv.ts` (Create) — slice 3
+#### 14. `backend_rust/src/report_csv.rs` (Create) — slice 3
 
-*   **Type / Scope**: CSV builder, pure, no DOM.
-*   **Proposed Changes**: one row per `ReportRow`, sell context repeated on sold-lot rows,
-    the run context (strategy, threshold, requested range, pricing dates used) as columns,
-    and money written verbatim from the payload strings. **The column list, order and the
-    summable-column disclosure are not specified anywhere in this document and must be
-    written down here** — the CSV is the deliverable and the owner archives it. Note the
-    convention conflict to resolve: `sellPnlCsv.ts:13-16` deliberately carries caveats as
-    columns rather than a leading `#` row, because a comment row breaks naive parsers
-    including this app's own `detectColumns`. The formula-lead guard and the exponent-free
-    rule live in a shared module extracted from `sellPnlCsv.ts` (`:55`, `:56`, `:62`),
-    re-derived for strings. Emit no BOM; `downloadCsv` prepends it. Report money must not
-    call `normalizeTaxSummary` or `normalizeSellPnl`.
+*   **Type / Scope**: server-side CSV serialization of the report payload. Deliberately not
+    under `src/api_routes/`, because the access gate's Rule A requires every file in that
+    directory to import `crate::access` and a serializer has no business calling it.
+*   **Proposed Changes**: one row per `ReportRow`, sell context repeated on sold-lot
+    rows, the run context (strategy, threshold, requested range, `price_date_used` and
+    `fx_rate_date_used` per asset, `price_source`) as columns, and money written
+    verbatim from the `Decimal` values so no float is ever involved. **The column list,
+    order and the summable-column disclosure are specified here** — this is the
+    deliverable and the owner archives it. Formula-lead escaping on free-text cells and
+    exponent-free numeric output, both re-implemented over `Decimal` rather than shared
+    with `frontend/src/utils/sellPnlCsv.ts`, whose equivalents are module-private at
+    `:55`, `:56` and `:62`. The BOM question disappears: the server emits no BOM and the
+    browser does no post-processing, because the bytes are the response.
 
-#### 15. `frontend/src/utils/taxReportCsv.test.ts` (Create) — slice 3
+#### 15. `backend_rust/tests/report_csv_test.rs` (Create) — slice 3
 
-*   **Type / Scope**: unit tests.
-*   **Proposed Changes**: mirror `sellPnlCsv.test.ts`: the `lot_pnl` column sums to
-    `AssetTotals.realized_in_window` for that asset, no BOM in the builder output, formula
-    characters escaped, exponent notation never emitted, nulls rendered as empty cells, and
-    every row kind present. The float-summed assertion pattern in
-    `sellPnlCsv.test.ts:184-194` uses `toBeCloseTo(…, 9)` because that payload went through
-    `Number()`; with strings preserved this test must compare decimal strings or state which
-    decimal helper it uses.
+*   **Type / Scope**: integration tests, hermetic.
+*   **Proposed Changes**: dispatch the route with `format=csv` and assert on the bytes.
+    The `lot_pnl` column sums to `AssetTotals.realized_in_window` for that asset,
+    compared as decimal strings; formula characters escaped; exponent notation never
+    emitted; nulls rendered as empty cells; every row kind present; and two dispatches
+    over unchanged data produce byte-identical output, which is Goal 4 actually being
+    testable. This replaces the frontend builder test and its `toBeCloseTo(…, 9)`
+    float-summing pattern in `sellPnlCsv.test.ts:184-194`.
 
-#### 16. `frontend/src/utils/decimal.ts` (Modify) — slice 3
+#### 16. Deleted — no frontend numeric work for reports
 
-*   **Type / Scope**: numeric normalization.
-*   **Proposed Changes**: add a string-preserving path for the report payload, or leave this
-    file untouched and have the report builder bypass it. Either way the invariant is that
-    report money never passes through `Number()`.
+The original plan modified `frontend/src/utils/decimal.ts` to add a string-preserving
+path for report money. With the CSV produced server-side there is no frontend builder to
+preserve strings for, so this file is untouched. The `normalizeTaxSummary` and
+`normalizeSellPnl` coercion through `Number()` stays exactly where it is, serving the
+existing screen.
 
 #### 17. `frontend/src/App.tsx` (Modify) — slices 1, 4, 5
 
 *   **Type / Scope**: data fetching and top-level state.
 *   **Proposed Changes**: hold the report payload separately from `taxSummary` so the
-    normalized copy is never the source for an export; fetch the dated variant only when a
+    normalized copy is never the source for anything; fetch the dated variant only when a
     range is chosen; surface the typed error body to the user naming missing symbols and
-    pairs.
+    pairs. The download is a link to the `format=csv` URL, not a fetch followed by
+    `downloadCsv`, so the bytes the server produced reach the disk unchanged.
 
 #### 18. `frontend/src/components/ReportControls.tsx` (Create) — slice 3
 
@@ -779,8 +795,9 @@ expectation there assumes FX conversion at the latest rate.
     default of January 1 to December 31 is a future `to` for most of the year and the route
     rejects it. No calendar widget is added; the native `<input type="date">` picker remains
     available. Controls stay enabled for every access level, since the route requires only
-    `Viewer`. If the route fails with the elapsed-deadline 503 the UI says the report took too
-    long and offers a retry.
+    `Viewer`. The download control is an anchor to the `format=csv` URL built from the
+    current selection. If the route fails with the elapsed-deadline 503 the UI says the
+    report took too long and offers a retry.
 
 #### 19. `frontend/src/components/PortfolioStatement.tsx` (Create) — slices 1, 5
 
@@ -858,7 +875,6 @@ its own decisions land is mis-cut.
 | `frontend/src/types.ts` | The hand-written types every renderer actually uses; `api.d.ts` has zero importers |
 | `frontend/package.json` | Required for any `e2e:statement` script |
 | `frontend/src/main.tsx` | The only entry-import site for a stylesheet (`main.tsx:3`) |
-| `frontend/src/utils/csvCells.ts` (new) | Holds the formula-lead and exponent-free guards extracted from `sellPnlCsv.ts` |
 | `docs/superpowers/reviews/2026-11-09-tax-report.md` | Decision and rejection record, following the convention in `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` |
 | `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md` | The amended non-goal at its Non-Goals section still needs revisiting now the guard is gone |
 
@@ -880,6 +896,8 @@ its own decisions land is mis-cut.
     `crate::access` to satisfy Rule A.
 *   **Reconciliation**: the three equalities inlined in file 8, asserted as exact decimals
     with no tolerance, under FIFO, LIFO and HYBRID.
+*   **Byte reproducibility**: two `format=csv` dispatches over unchanged data produce
+    identical bytes. This is Goal 4, and it is only testable because the file is server-side.
 *   **Print**: `bash frontend/scripts/check_print_styles.sh` (note the path — the backend
     gate is invoked from `backend_rust/`) and `npm run e2e:statement` from `frontend/`. Both
     are local steps: CI has no browser job and no CSS check today.
