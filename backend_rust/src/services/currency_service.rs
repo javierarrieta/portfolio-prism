@@ -14,6 +14,45 @@ use rust_decimal::prelude::FromPrimitive;
 const RATE_LIMIT_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRIES: usize = 3;
 
+/// How far back a first fetch for a pair reaches. One wide window per pair, so a
+/// year of dated lookups costs a single outbound call instead of one per distinct
+/// transaction date.
+pub(crate) const FX_SERIES_WINDOW_DAYS: i64 = 365;
+
+/// How stale a close may be and still answer for a date. Thirty days is generous
+/// for a currency pair, which trades nearly every day, and tight enough that a
+/// delisted or mis-symbolled pair produces an error instead of a years-old rate
+/// silently used as a tax figure.
+pub(crate) const FX_LOOKBACK_DAYS: i64 = 30;
+
+/// Yahoo's FX pair symbology. `EUR=USD` returns "No data found"; `EURUSD=X`
+/// returns data. `get_rate` built the first form (`currency_service.rs:235`),
+/// which is why every asset whose currency differed from the portfolio's base
+/// currency failed to price at all.
+pub(crate) fn fx_symbol(from: &str, to: &str) -> String {
+    format!("{}{}=X", from.to_uppercase(), to.to_uppercase())
+}
+
+/// The last close on or before `date`, within `lookback_days`. Returns the date
+/// actually used alongside the value: a caller that reports a figure "as of" a
+/// date must be able to say which date priced it, and silent substitution is the
+/// failure this whole change exists to remove.
+///
+/// Pure and order-independent on purpose, so the rule is testable without a pool
+/// or a network.
+pub(crate) fn select_rate(
+    series: &[(NaiveDate, Decimal)],
+    date: NaiveDate,
+    lookback_days: i64,
+) -> Option<(NaiveDate, Decimal)> {
+    let earliest = date.checked_sub_signed(chrono::Duration::days(lookback_days))?;
+    series
+        .iter()
+        .filter(|(d, _)| *d <= date && *d >= earliest)
+        .max_by_key(|(d, _)| *d)
+        .cloned()
+}
+
 fn f64_to_decimal(v: f64) -> Decimal {
     Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
 }
@@ -991,5 +1030,77 @@ mod tests {
     fn test_detect_currency_case_insensitive() {
         assert_eq!(CurrencyService::detect_currency("sap.de"), "EUR");
         assert_eq!(CurrencyService::detect_currency("shel.l"), "GBP");
+    }
+
+    fn series(pairs: &[(&str, &str)]) -> Vec<(NaiveDate, Decimal)> {
+        pairs
+            .iter()
+            .map(|(d, p)| {
+                (
+                    NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap(),
+                    Decimal::from_str(p).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn select_rate_uses_the_exact_date_when_present() {
+        let s = series(&[("2024-03-01", "0.9000"), ("2024-03-04", "0.9050")]);
+        let (used, rate) = select_rate(&s, day("2024-03-04"), FX_LOOKBACK_DAYS).unwrap();
+        assert_eq!(used, day("2024-03-04"));
+        assert_eq!(rate, Decimal::from_str("0.9050").unwrap());
+    }
+
+    #[test]
+    fn select_rate_falls_back_to_the_prior_trading_day() {
+        // Review Focus 2: 2024-03-09 is a Saturday; the Friday close is the answer,
+        // and the caller learns which date was used instead of assuming its own.
+        let s = series(&[("2024-03-07", "0.9100"), ("2024-03-08", "0.9125")]);
+        let (used, rate) = select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS).unwrap();
+        assert_eq!(used, day("2024-03-08"));
+        assert_eq!(rate, Decimal::from_str("0.9125").unwrap());
+    }
+
+    #[test]
+    fn select_rate_rejects_a_date_before_every_close() {
+        let s = series(&[("2024-03-07", "0.9100")]);
+        assert_eq!(select_rate(&s, day("2024-03-01"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn select_rate_rejects_a_gap_wider_than_the_lookback() {
+        // Review Focus 1: a delisted pair whose last close is three years old must
+        // produce no rate at all rather than a stale one.
+        let s = series(&[("2021-01-04", "0.8800")]);
+        assert_eq!(select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn select_rate_accepts_a_gap_exactly_at_the_lookback_edge() {
+        let date = day("2024-03-09");
+        let edge = date - chrono::Duration::days(FX_LOOKBACK_DAYS);
+        let s = series(&[("2024-02-08", "0.8900")]);
+        assert_eq!(edge, day("2024-02-08"), "fixture must sit on the boundary");
+        assert_eq!(select_rate(&s, date, FX_LOOKBACK_DAYS).map(|(d, _)| d), Some(edge));
+    }
+
+    #[test]
+    fn select_rate_handles_an_unsorted_series_and_an_empty_one() {
+        let s = series(&[("2024-03-08", "0.9125"), ("2024-03-06", "0.9075"), ("2024-03-07", "0.9100")]);
+        assert_eq!(select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS).map(|(d, _)| d), Some(day("2024-03-08")));
+        assert_eq!(select_rate(&[], day("2024-03-09"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn fx_symbol_uses_yahoo_pair_symbology() {
+        // Review Focus 5: the live endpoint returns "No data found" for GBP=JPY and
+        // data for GBPJPY=X. The old form is why no foreign-currency asset priced.
+        assert_eq!(fx_symbol("EUR", "USD"), "EURUSD=X");
+        assert_eq!(fx_symbol("GBP", "JPY"), "GBPJPY=X");
     }
 }
