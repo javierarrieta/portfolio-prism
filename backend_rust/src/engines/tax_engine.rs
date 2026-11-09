@@ -548,6 +548,10 @@ impl TaxLotEngine {
         Ok((buy_lots, breakdowns))
     }
 
+    /// `too_many_arguments` is silenced rather than grouping the arguments into a
+    /// struct: the tenth is the `SqlitePool` threaded through so `replay`'s FX calls
+    /// can read dated closes, and a params struct is a wider refactor than this fix.
+    #[allow(clippy::too_many_arguments)]
     pub async fn calculate_lots(
         symbol: &str,
         asset_type: &str,
@@ -636,6 +640,10 @@ impl TaxLotEngine {
     /// rather than a prefix: a sell's matches depend only on transactions at or
     /// before it, so this is identical to a prefix replay and is the same call
     /// `calculate_lots` makes. Takes no current price — realized P&L needs none.
+    ///
+    /// `too_many_arguments` is silenced for the same reason as `calculate_lots`: the
+    /// eighth argument is the `SqlitePool` threaded through for `get_rate`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn sell_breakdown(
         sell_transaction_id: i32,
         transactions: &[Transaction],

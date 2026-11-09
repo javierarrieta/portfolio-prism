@@ -177,7 +177,26 @@ struct FxSeries {
     /// First date of the fetched window. A request earlier than this needs a new
     /// fetch rather than a wrong answer from a window that never covered it.
     window_start: NaiveDate,
+    /// Last date the fetch covered — the `date` whose request produced this series.
+    /// A cached series never holds closes after it, so it may not answer for a later
+    /// date either. See [`FxSeries::rate_at`].
+    window_end: NaiveDate,
     series: Vec<(NaiveDate, Decimal)>,
+}
+
+impl FxSeries {
+    /// The close this window is allowed to answer for `date`, or `None` when the
+    /// date falls outside the range the fetch actually covered. Both bounds are
+    /// load-bearing: a date before `window_start` was never in the window, and a
+    /// date after `window_end` would be priced by the window's last close, which
+    /// stopped days short of it — inside the lookback, so nothing downstream would
+    /// notice the substitution.
+    fn rate_at(&self, date: NaiveDate, lookback_days: i64) -> Option<(NaiveDate, Decimal)> {
+        if date < self.window_start || date > self.window_end {
+            return None;
+        }
+        select_rate(&self.series, date, lookback_days)
+    }
 }
 
 /// Bound on cached pairs. Unbounded is not an option in a 256Mi pod once past dates
@@ -296,12 +315,20 @@ impl CurrencyService {
     }
 
     /// The FX rate to convert `from_curr` into `to_curr` for `date`: the last close
-    /// on or before that date, within `FX_LOOKBACK_DAYS`, together with the date
-    /// actually used.
+    /// on or before that date *within the window already stored for the pair*,
+    /// within `FX_LOOKBACK_DAYS`, together with the date actually used.
     ///
-    /// Read order is database first, provider second. That is what makes a past-dated
-    /// conversion testable without a network, and it is the same order
-    /// `get_historical_prices` uses.
+    /// "Within the stored window" is a real limit, not a figure of speech. Neither
+    /// the cache nor `historical_prices` records which dates a pair's rows actually
+    /// cover, so a window that stops short of `date` answers with its own last close
+    /// instead of fetching the gap. A per-symbol coverage record is the follow-up
+    /// that closes it; until then a stale-but-in-lookback close is possible for a
+    /// date past whatever was last fetched.
+    ///
+    /// Read order is database first, provider second — deliberately the reverse of
+    /// `get_historical_prices`, which fetches and falls back to the database. The
+    /// database-first order is what makes a past-dated conversion testable without
+    /// a network.
     pub async fn get_rate(
         &self,
         from_curr: &str,
@@ -319,11 +346,10 @@ impl CurrencyService {
 
         {
             let cache = self.cache.read().await;
-            let hit = cache
+            if let Some((date_used, rate)) = cache
                 .get(&key)
-                .filter(|fx| date_naive >= fx.window_start)
-                .and_then(|fx| select_rate(&fx.series, date_naive, FX_LOOKBACK_DAYS));
-            if let Some((date_used, rate)) = hit {
+                .and_then(|fx| fx.rate_at(date_naive, FX_LOOKBACK_DAYS))
+            {
                 return Ok(RateAt { rate, date_used });
             }
         }
@@ -344,7 +370,9 @@ impl CurrencyService {
             .get_historical_prices(&symbol, window_start, date_naive, pool)
             .await?;
 
-        {
+        // An empty result is not a window. Caching one would spend a slot on a pair
+        // that produced nothing, and then answer nothing from it.
+        if !series.is_empty() {
             let mut cache = self.cache.write().await;
             if cache.len() >= MAX_FX_SERIES_CACHED && !cache.contains_key(&key) {
                 cache.clear();
@@ -353,6 +381,7 @@ impl CurrencyService {
                 key,
                 FxSeries {
                     window_start: series.first().map(|(d, _)| *d).unwrap_or(window_start),
+                    window_end: date_naive,
                     series: series.clone(),
                 },
             );
@@ -861,6 +890,86 @@ mod tests {
         let r1 = svc.get_rate("GBP", "GBP", date1, &pool).await.unwrap().rate;
         let r2 = svc.get_rate("GBP", "GBP", date2, &pool).await.unwrap().rate;
         assert_eq!(r1, r2);
+    }
+
+    fn date_of(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn ts_utc(s: &str) -> DateTime<Utc> {
+        date_of(s).and_hms_opt(0, 0, 0).unwrap().and_utc()
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    async fn seed_prices(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+        for (d, price) in rows {
+            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+                .bind(symbol)
+                .bind(date_of(d))
+                .bind(*price)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn fx_series_answers_only_dates_its_window_covered() {
+        // The shape a request for Saturday 2024-03-09 leaves behind: the window ends
+        // on the requested date, the last close inside it is Friday's.
+        let window = FxSeries {
+            window_start: date_of("2023-03-09"),
+            window_end: date_of("2024-03-09"),
+            series: vec![(date_of("2024-03-07"), dec("0.9100")), (date_of("2024-03-08"), dec("0.9125"))],
+        };
+
+        // Inside the window: the last close on or before the date, with its own date.
+        assert_eq!(window.rate_at(date_of("2024-03-08"), 30), Some((date_of("2024-03-08"), dec("0.9125"))));
+        assert_eq!(window.rate_at(date_of("2024-03-09"), 30), Some((date_of("2024-03-08"), dec("0.9125"))));
+
+        // Past the end: this window never fetched 2024-03-25, so its 2024-03-08 close
+        // — 17 days back, comfortably inside the lookback — must not price it.
+        assert_eq!(window.rate_at(date_of("2024-03-25"), 30), None);
+
+        // Before the start: the same rule on the other side, and it has to hold even
+        // though the series here holds a close the lookback would happily accept.
+        let late_window = FxSeries {
+            window_start: date_of("2024-03-01"),
+            window_end: date_of("2024-03-08"),
+            series: vec![(date_of("2024-02-20"), dec("0.8700"))],
+        };
+        assert_eq!(late_window.rate_at(date_of("2024-02-26"), 30), None);
+    }
+
+    #[tokio::test]
+    async fn get_rate_refuses_a_cached_window_that_stops_short_of_the_date() {
+        // The reachable version of the bug above: `replay` walks a foreign-currency
+        // asset's transactions in ascending date order, so a later transaction
+        // routinely asks a later date than the one that populated the cache, and
+        // `CurrencyService` is Rocket managed state — the cache is shared across
+        // requests for the whole process.
+        let pool = empty_pool().await;
+        seed_prices(&pool, "EURUSD=X", &[("2024-03-08", "0.9125"), ("2024-03-22", "1.0500")]).await;
+
+        let svc = CurrencyService::new();
+        // Exactly what a request for 2024-03-08 leaves behind.
+        svc.cache.write().await.insert(
+            ("EUR".to_string(), "USD".to_string()),
+            FxSeries {
+                window_start: date_of("2023-03-09"),
+                window_end: date_of("2024-03-08"),
+                series: vec![(date_of("2024-03-08"), dec("0.9125"))],
+            },
+        );
+
+        // An unbounded cache would answer 0.9125 here. The database has the real
+        // 2024-03-22 close, and refusing the stale window is what lets it answer.
+        let got = svc.get_rate("EUR", "USD", ts_utc("2024-03-25"), &pool).await.unwrap();
+        assert_eq!(got.rate, dec("1.0500"), "a cached window must not price a date past its end");
+        assert_eq!(got.date_used, date_of("2024-03-22"));
     }
 
     #[tokio::test]
