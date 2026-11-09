@@ -136,8 +136,6 @@ impl StatsEngine {
 
         let mut price_map: HashMap<(NaiveDate, String), Decimal> = HashMap::new();
         for symbol in &symbols {
-            // A pricing failure contributes nothing, as it did when the pricing layer
-            // returned an empty window instead of naming the failure.
             match currency_service.get_historical_prices(symbol, start_date, end_date, pool).await {
                 Ok(daily_prices) => {
                     for (date, price) in daily_prices {
@@ -146,6 +144,20 @@ impl StatsEngine {
                 }
                 Err(e) => {
                     eprintln!("WARN: Failed to get historical prices for {}: {}", symbol, e);
+                    // An outage must not erase the closes already in the database. The
+                    // pricing layer's `Err` is the honest answer about the provider, and
+                    // it stays honest; this is the consumer's own rule, and it is what
+                    // the pre-branch swallow used to do by accident — serve the stored
+                    // window so the series degrades to its last known value instead of
+                    // collapsing to zero for every date.
+                    if let Ok(stored) = currency_service
+                        .get_historical_prices_from_db(symbol, start_date, end_date, pool)
+                        .await
+                    {
+                        for (date, price) in stored {
+                            price_map.insert((date, symbol.clone()), price);
+                        }
+                    }
                 }
             }
         }
@@ -783,5 +795,92 @@ mod tests {
         let metrics = result.get("metrics").unwrap();
         let value = metrics.get("portfolio_value").unwrap().as_str().unwrap();
         assert_eq!(value, "0");
+    }
+
+    #[tokio::test]
+    async fn a_provider_outage_prices_from_the_stored_window_instead_of_zero() {
+        // I3. `get_historical_prices` now returns `Err` where it used to hand back the
+        // database rows, and an outage must not price the portfolio at zero: the
+        // pre-branch code served the stale rows, and the honest error has to be
+        // handled here, in the consumer, rather than by making the return type lie
+        // again.
+        //
+        // The stored window stops one day past the freshness bound, so the provider is
+        // asked for the tail; the symbol is one the provider cannot serve, so the
+        // outage is real whichever way the request fails. What the fix has to produce
+        // is the stored closes in the series instead of nothing at all.
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let today = Utc::now().date_naive();
+        let symbol = "NOSUCHSYMBOL-OUTAGE";
+        let newest = today
+            - chrono::Duration::days(crate::services::currency_service::PRICE_WINDOW_FRESH_DAYS + 1);
+        let mut date = newest - chrono::Duration::days(4);
+        while date <= newest {
+            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+                .bind(symbol)
+                .bind(date)
+                .bind("3.00")
+                .execute(&pool)
+                .await
+                .unwrap();
+            date = date.succ_opt().unwrap();
+        }
+
+        let asset = Asset {
+            id: 1,
+            portfolio_id: 1,
+            symbol: symbol.to_string(),
+            name: "Outage".to_string(),
+            asset_type: "STOCK".to_string(),
+            sector: None,
+            currency: "USD".to_string(),
+            isin: None,
+        };
+        let buy = Transaction {
+            id: 1,
+            asset_id: 1,
+            r#type: "BUY".to_string(),
+            quantity: "100.0".to_string(),
+            price: "100.0".to_string(),
+            fee: "0.0".to_string(),
+            date: (today - chrono::Duration::days(30)).and_hms_opt(0, 0, 0).unwrap().and_utc(),
+        };
+
+        let svc = CurrencyService::new();
+        let result = StatsEngine::calculate_portfolio_performance(
+            &pool,
+            &[asset],
+            &[buy],
+            "USD",
+            &svc,
+        )
+        .await
+        .unwrap();
+
+        // 100 shares x 3.00 = 300 on every date the stored window covers. Without the
+        // fallback the window is discarded, `get_price` fails for the same reason, and
+        // every point in the series is 0.
+        let history = result.get("history").unwrap().as_array().unwrap();
+        let values: Vec<Decimal> = history
+            .iter()
+            .filter_map(|entry| {
+                entry.get("value").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())
+            })
+            .collect();
+        let stale = Decimal::from_str("300").unwrap();
+        assert!(
+            values.contains(&stale),
+            "the stored closes must still price the series during an outage; got {values:?}"
+        );
+        assert_eq!(
+            values.iter().rev().find(|v| **v > Decimal::ZERO),
+            Some(&stale),
+            "the last priced point must be the stored close, not zero; got {values:?}"
+        );
     }
 }

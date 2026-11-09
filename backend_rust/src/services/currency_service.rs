@@ -823,7 +823,11 @@ impl CurrencyService {
         Ok(merge_series(daily_prices, db_prices))
     }
 
-    async fn get_historical_prices_from_db(
+    /// The rows already stored for `symbol` in `[start_date, end_date]`, with no
+    /// freshness rule and no provider. `pub(crate)` so
+    /// [`calculate_portfolio_performance`](crate::engines::stats_engine::StatsEngine::calculate_portfolio_performance)
+    /// can serve them when the provider is down.
+    pub(crate) async fn get_historical_prices_from_db(
         &self,
         symbol: &str,
         start_date: NaiveDate,
