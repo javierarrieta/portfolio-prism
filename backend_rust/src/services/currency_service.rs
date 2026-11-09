@@ -378,11 +378,13 @@ impl CurrencyService {
     /// `FX_LOOKBACK_DAYS`, together with the date actually used.
     ///
     /// "A window that actually reaches `date`" is a real limit, not a figure of
-    /// speech. Neither the cache nor `historical_prices` records which dates a pair's
-    /// rows cover, so both read paths apply the same proxy: the newest row must be
-    /// within `PRICE_WINDOW_FRESH_DAYS` of `date`, or the window is treated as
-    /// incomplete and the provider is asked for the tail. A per-symbol coverage
-    /// record is the follow-up that would replace the proxy.
+    /// speech, and the two read paths enforce it differently. The cache records the
+    /// window its fetch covered, so [`FxSeries::rate_at`](FxSeries::rate_at) rejects a
+    /// date outside those bounds exactly. `historical_prices` records no coverage, so
+    /// the database path uses a proxy: the newest stored row must be within
+    /// `PRICE_WINDOW_FRESH_DAYS` of `date`, or the window is treated as incomplete and
+    /// the provider is asked for the tail. A per-symbol coverage record is the
+    /// follow-up that would replace the proxy.
     ///
     /// Read order is database first, provider second — the same order
     /// [`get_historical_prices`](Self::get_historical_prices) now uses, and for the same
@@ -396,7 +398,7 @@ impl CurrencyService {
     ) -> Result<RateAt> {
         let date_naive = date.date_naive();
 
-        if from_curr == to_curr {
+        if from_curr.to_uppercase() == to_curr.to_uppercase() {
             return Ok(RateAt { rate: Decimal::ONE, date_used: date_naive });
         }
 

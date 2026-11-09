@@ -85,6 +85,11 @@ Recorded because each of these overturned a claim made during the review.
 1. **FX conversion path has no backend test.** Every fixture is USD-into-USD, so `get_rate` is never
    reached and the one path that can hit the network and 500 is unexercised. Recorded in the plan's
    Task 4 rather than left silent. Do not describe that path as verified.
+   **Discharged 2026-11-09** by `backend_rust/tests/fx_pricing_test.rs` on branch
+   `fix/pricing-layer-truthfulness`: a past-dated multi-currency sell is asserted against a
+   hand-computed figure with the provider unreachable, and the conversion is shown to
+   discriminate dated from undated rates. See
+   `docs/release-notes/2026-11-09-pricing-layer-truthfulness.md`.
 2. **Optional:** replace the hand-written `decimal_opt_json` with `rust_decimal::serde::str_option`
    behind `serde-with-str`. Steps are in the plan's Task 1.
 

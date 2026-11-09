@@ -398,8 +398,9 @@ async fn migrate_one_column(
 
 /// Collapse duplicate `historical_prices` rows and make `(symbol, date)` unique.
 ///
-/// The table was created with no primary key and only a non-unique index
-/// (`lib.rs:170-176`), so `INSERT OR REPLACE` always inserted and every fetch
+/// The table was created with no primary key and only a non-unique index (the
+/// `CREATE TABLE IF NOT EXISTS historical_prices` in `init_db`), so `INSERT OR
+/// REPLACE` always inserted and every fetch
 /// appended. Reads have no `ORDER BY`, which made "the close on date X" an
 /// arbitrary row among N.
 ///

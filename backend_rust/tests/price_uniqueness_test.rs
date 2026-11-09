@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-// Legacy shape: no primary key, no unique constraint, REAL close_price (pre-decimal).
+// Legacy shape: no primary key, no unique constraint. The fixture stores close_price as
+// TEXT because that is the shape the decimal migration leaves behind; the file-backed boot
+// test below is the one that builds the pre-migration REAL column.
 // Duplicate (symbol, date) rows are the whole point: they are what the current
 // INSERT OR REPLACE has been appending for every fetch since the table was created.
 async fn create_legacy_prices(pool: &sqlx::sqlite::SqlitePool) {

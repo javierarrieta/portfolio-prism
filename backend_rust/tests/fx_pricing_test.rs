@@ -93,7 +93,7 @@ async fn get_rate_does_not_return_todays_rate_for_a_past_date() {
 }
 
 #[tokio::test]
-async fn a_rate_beyond_the_lookback_names_the_symbol_and_the_date() {
+async fn no_rate_error_names_symbol_date_and_bound() {
     // Review Focus 1, tested at the message rather than the fetch. The gap case
     // cannot be produced hermetically at this level: the fetch window (365 days) is
     // wider than the lookback (30), so any row the lookback would reject is also
@@ -201,8 +201,10 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
             // The rate at the latest transaction date: 20 shares at 130 would mark at
             // 2372.50 EUR if the market-value leg used it.
             ("2024-03-08", "0.9125"),
-            // Today's rate: the correct one for a current price. 2600.00 EUR.
-            (&today_str, "1.0000"),
+            // Today's rate: the correct one for a current price. Not 1.0000 on
+            // purpose — at parity an unconverted leg produces the same number.
+            // 20 shares x 130 USD x 0.9500 = 2470.00 EUR.
+            (&today_str, "0.9500"),
         ],
     )
     .await;
@@ -231,13 +233,18 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     .await
     .unwrap();
 
-    // 20 shares x 130 USD x 1.0000 = 2600 EUR. At the 2024-03-08 rate it is 2372.50.
+    // 20 shares x 130 USD x 0.9500 = 2470 EUR. At the 2024-03-08 rate it is 2372.50;
+    // unconverted it is 2600.
     assert_eq!(
         summary.market_value,
-        dec("2600"),
+        dec("2470"),
         "the market-value leg must convert today's price at today's rate"
     );
-    assert_eq!(summary.current_price, dec("130"), "the quoted current price converts at today's rate");
+    assert_eq!(
+        summary.current_price,
+        dec("123.5"),
+        "the quoted current price converts at today's rate"
+    );
 }
 
 #[tokio::test]
