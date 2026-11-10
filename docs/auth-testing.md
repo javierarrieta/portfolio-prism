@@ -307,6 +307,22 @@ login, callback and logout all stay on one origin.
 
 Either answer is useful. Neither can be found from here.
 
+### Printing the statement
+
+`npm run dev`, open a portfolio, click **Printable Statement**, then Ctrl-P. Check:
+
+- no sidebar, no nav, no Print button
+- dark text on white, and the table's body rules visible (a half-inverted table means
+  the `.statement-table td` override in `print.css` is missing)
+- one page for a small portfolio
+- the three headline figures equal the payload shown in devtools -- **not** "match the
+  dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
+  is falsy, so a coincidental fallback can satisfy an eyeball comparison.
+- an empty portfolio prints two lines and no figures
+
+Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
+scoped, so printing from any other tab now also gets A4 with 14mm margins.
+
 ---
 
 ## 6. `BOOTSTRAP_OWNER_SUBJ` — read this before setting it
