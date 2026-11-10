@@ -2,11 +2,12 @@
 
 *   **Author:** javierarrieta, with EGM review support
 *   **Status:** Proposed — reviewed, **not implementation-ready**. Five stages of EGM review are
-    complete; Stages 5–8 findings are applied and Stage 9 findings are not. Five blockers and
-    sixteen majors remain open, all of them interface definitions rather than design objections: the
-    component's prop signature, hooks for the headline figures and holdings table, the nav item's
-    visible label, a self-contradictory rounding rule, and an unspecified null-payload state. Do not
-    write an implementation plan from this document without closing them first. See
+    complete; Stages 5–8 findings are applied and Stage 9 findings are mostly not. Four blockers
+    remain open, all interface definitions rather than design objections: the component's prop
+    signature, hooks for the headline figures and holdings table, the nav item's visible label, and a
+    self-contradictory rounding rule. A fifth (the null-payload state) is closed as an **accepted
+    gap** — see *When there is no payload at all*. Do not write an implementation plan from this
+    document without closing the four. See
     `docs/superpowers/reviews/2026-11-09-statement-print/consolidated_review_report.md`.
 *   **Date:** 2026-11-09
 *   **Inherits from:** `2026-11-09-pricing-layer-truthfulness.md` — the statement renders the same
@@ -198,6 +199,32 @@ figures, no `data-at`, no run-context, no splits note, no rounding note, no hold
 reading "No holdings in this portfolio" followed by "Split-adjusted history is as recorded…" is
 nonsense. The existing holdings table already makes the same branch for the same reason
 (`PortfolioDetail.tsx:238`), so this is a repo convention.
+
+### When there is no payload at all — an accepted gap
+
+There is a third state besides populated and `assets: []`: `taxSummary === null`. It is reached
+whenever the `tax-summary` request fails, and for a foreign-currency portfolio it fails today —
+`currency_service.rs:234` builds the malformed pair `EUR=USD`, `get_rate` returns `Err`, `replay`
+propagates it (`tax_engine.rs:403`), and `analytics.rs:86` turns it into a 500. `App.tsx:112` throws,
+`setTaxSummary` never runs, and the guard the mandated pattern produces renders nothing.
+
+**The decision is to accept this and say so, not to design around it.** In that state the statement
+tab renders nothing, so `:has([data-print="statement"])` does not match and Ctrl-P prints the
+dashboard — which is exactly the behaviour *Other tabs* already declares out of scope. The gap is
+therefore not a new failure mode but the absence of a designed one, and it is bounded: the same
+portfolio is equally unpriceable on the dashboard, and the pricing-layer change removes the cause for
+every foreign-currency holding. What this slice will not do is invent a fourth state, a copy string
+for it, and a test for it, to paper over a defect another document already owns.
+
+Two consequences are stated rather than left to be discovered:
+
+*   **The banner that would explain the blank tab is hidden in print.** It lives inside `.header-row`
+    (`App.tsx:458`), which print rule 2 hides. A user who prints from the statement tab after a
+    failed fetch gets the dashboard, not a blank page and not an explanation. On screen the banner is
+    visible, so the failure is not silent where the user is looking at it.
+*   **The smoke's fixture must be same-currency.** Seeded holdings are denominated in the portfolio's
+    base currency, or the harness 500s before any print assertion runs. That is a constraint on the
+    fixture, not a thing under test.
 
 ### Money: a display artifact, declared
 
@@ -500,6 +527,7 @@ the page still prints badly. The Playwright smoke is the check; see Alternative 
 | **A stale payload prints under the wrong portfolio name.** | `setTaxSummary` is called once (`App.tsx:114`) and never cleared | Target Files 4 gives the form: record the id beside the summary, guard the statement branch, following `App.tsx:68`. |
 | **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs print as today | Out of scope and stated under *Other tabs*. The one change for those tabs is `@page`, which no selector can scope. |
 | **Foreign-currency figures are wrong, inherited.** | The pricing-layer spec records that foreign-currency assets cannot be priced correctly today | Not this slice's fix and not this slice's regression. The statement inherits the dashboard's existing behaviour; the pricing-layer change corrects both at once. |
+| **A foreign-currency portfolio prints the dashboard, not a statement.** | `currency_service.rs:234` → `get_rate` `Err` → `analytics.rs:86` returns 500 → `taxSummary` stays `null` → the guard renders nothing → `:has()` does not match | **Accepted gap**, specified in *When there is no payload at all*. Behaviour in that state is the same as the other three tabs, already out of scope. The on-screen banner explains it; the print path hides that banner. Closed by the pricing-layer change. |
 
 ## Decided during drafting
 

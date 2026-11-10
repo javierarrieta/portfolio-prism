@@ -42,15 +42,16 @@ The architecture never changed and survived every stage: a fifth tab over alread
 
 ---
 
-## Open at conclusion — 5 blockers, 16 majors
+## Open at conclusion — 4 blockers, 16 majors
 
-**This document is not implementation-ready.** Stage 9's verdict was that a fresh engineer could not produce the correct change on a first attempt without inventing interfaces. The five blockers:
+**This document is not implementation-ready.** Stage 9's verdict was that a fresh engineer could not produce the correct change on a first attempt without inventing interfaces. Four blockers remain:
 
 1. **RB1 — the component's prop signature is undefined**, and "takes no date parameter" forbids the prop `data-at` needs. The two new optional type fields are provably insufficient: `run-context` needs the portfolio name, which the payload does not carry.
 2. **RB2 — no hook on any headline figure or the holdings table.** Four specified assertions cannot be written; print rule 5's "headline block" has no class to name; the nine-column table Decided item 1 argued for ships with no test.
 3. **RB3 — the nav item's visible label exists nowhere in the document**, and it is the smoke's only entry point.
 4. **RB4 — "The rounding note is unconditional"** contradicts four places that say it is not printed on the empty branch.
-5. **RB5 — the null-payload state is unspecified, and its justification is refuted by the code.** A foreign-currency portfolio returns **500** (`analytics.rs:86`), not a mispriced figure, so `taxSummary` stays `null`, the guard renders nothing, and the explanatory banner is hidden by print rule 2. Because both hide rules are gated on `:has([data-print="statement"])`, an unrendered statement makes the selector inert and **Ctrl-P on the statement tab prints the full dashboard including the sidebar**.
+
+**RB5 is closed as an accepted gap** (owner decision, after this report). A foreign-currency portfolio returns **500** (`analytics.rs:86`), not a mispriced figure, so `taxSummary` stays `null`, the guard renders nothing, and the explanatory banner is hidden by print rule 2. The spec now states this in *When there is no payload at all — an accepted gap*: in that state the tab behaves like the other three tabs, which are already out of scope, and the pricing-layer change removes the cause. Two consequences are recorded rather than left to be discovered — the hidden banner, and the smoke's same-currency fixture constraint.
 
 Sixteen majors cluster into three kinds: values the implementer must choose (print palette hexes, date formats, `page.pdf()` options, per-column renderers), assertions that cannot execute as written (document-level overflow check defeated by `body { overflow-x: hidden }`; the smoke cannot set strategy through seeding), and two files missing from the file boundary (`docs/auth-testing.md`, `frontend/e2e/README.md`).
 
@@ -85,8 +86,8 @@ Verified independently by two Stage 9 reviewers against the working tree:
 
 ## Consequences for what comes next
 
-1. **Do not write Doc C's implementation plan from this document as it stands.** The five blockers are interface definitions; an implementation plan built on this spec would inherit them and resolve them silently, which is how the Zero-Decision Rule gets violated in practice. Either close RB1–RB5 in the spec first, or make closing them Task 0 of the plan with the fixes specified here.
-2. **RB5 needs a decision, not just a fix.** The null-payload state is a product question — what should the statement tab do for a portfolio it cannot price? The pricing-layer change makes the question mostly moot for same-currency portfolios and fully moot for foreign-currency ones, so "accept the gap and say so" is a legitimate answer. It is not one this document currently gives.
+1. **Do not write Doc C's implementation plan from this document as it stands.** The four open blockers are interface definitions; an implementation plan built on this spec would inherit them and resolve them silently, which is how the Zero-Decision Rule gets violated in practice. Either close RB1–RB4 in the spec first, or make closing them Task 0 of the plan with the fixes specified here.
+2. ~~RB5 needs a decision.~~ **Done.** The owner chose "accept the gap and say so"; the spec now states it as such.
 3. **Two edits already landed in the parent design** as a result of Stage 8: its Goal 4 no longer claims the statement prints the same run context, and its Target File 6 now carries strategy normalization for the undated path.
 4. **`decision_records.md` §3 is destined for GitHub issue #45** and `frontend/e2e/README.md`. Not yet posted — that needs a network call.
 5. **Doc B (the tax report) is unchanged by this review** and remains the next design work: its design is settled except for four open values (single-parameter dates, the CSV summable-column convention, the elapsed-deadline constant, the missing-item cap).

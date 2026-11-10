@@ -69,3 +69,33 @@ fixture in the repo is USD-into-USD, so `get_rate` is never reached.
 CI would need a browser plus a booted backend on every push, for a check whose
 value is catching wiring mistakes rather than logic errors. Run it before
 releasing a change that touches the ledger, the modal, or the endpoint.
+
+This is a choice about CI cost, not an impossibility, and the details are worth
+recording before anyone tries to add the job:
+
+*   **A CI browser job is cheap to start.** CI runs `ubuntu-latest`, where
+    `npx playwright install chromium` is one line, and `emulateMedia` and
+    `page.pdf()` need no display server.
+*   **The job is not browser-only.** `run.sh` compiles and starts the Rust API
+    against a throwaway SQLite file and starts Vite, so the job costs a full
+    cargo build and needs seeded data. A `continue-on-error` job nobody reads
+    would read as a pass; the useful form is a blocking job.
+*   **The harness does not currently start.** `run.sh` sets no `AUTH_MODE` and
+    there is no `backend_rust/.env`, so the server asks for OIDC, bails naming
+    four missing variables (`backend_rust/src/auth/mod.rs:136-138`), and
+    `wait_for backend` burns its whole 420-second budget. The last commit to
+    touch `run.sh` predates the auth work. The fix is one line —
+    `export AUTH_MODE=disabled` beside the existing `DATABASE_URL` export at
+    `run.sh:74`, following the precedent at `start.sh:21`. It is safe only
+    because `run.sh` builds debug; `disabled` is compiled out of release builds
+    (`auth/mod.rs:96-101`).
+*   **Parameterising the target needs `${1:-sell-pnl}`, not `$1`.** `run.sh:16`
+    is `set -uo pipefail`, so a bare `$1` aborts the script when called with no
+    argument and breaks the existing `npm run e2e:sell-pnl`.
+*   **Do not pin prices by writing to `historical_prices`.** No API route writes
+    that table — the only writers are internal cache writes after a successful
+    provider fetch (`currency_service.rs:397`, `:490`) — so pinning would mean
+    writing SQLite out-of-band, against this harness's own REST-seeding rule.
+    It also couples the smoke to a schema the pricing-layer work is actively
+    revising. A smoke that asserts no figure cannot fail on a zero price, so
+    there is nothing for it to buy.
