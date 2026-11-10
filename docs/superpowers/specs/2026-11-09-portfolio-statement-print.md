@@ -21,8 +21,8 @@ not on the roadmap this document covers. Because it is always today, **it needs 
 change at all**: it renders the `tax-summary` payload the app already fetches.
 
 That is the whole appeal of this slice and also its limit. Everything hard here is about
-printing a dark-themed app honestly, and about the printed numbers agreeing with the CSV to
-the cent.
+printing a dark-themed app honestly, and about a page whose figures are rounded saying so
+instead of pretending to be the exact file next door.
 
 ## The Problem
 
@@ -35,14 +35,22 @@ the cent.
     turns on background graphics, so a naive print is near-white text on white paper —
     invisible, not merely ugly. The print stylesheet's real job is **palette inversion**,
     not hiding the nav. Hiding the nav is the easy third.
-*   **The frontend throws away the decimals before anything renders them.** The backend
-    sends money as decimal strings (`backend_rust/src/db_types.rs:31`,
-    `serializer.serialize_str(&d.to_string())`), and `normalizeTaxSummary` in
-    `frontend/src/utils/decimal.ts` then runs every money field through `num()`, which is
-    `Number(v)`. So `taxSummary.total_realized_pnl` is a JS double by the time any component
-    sees it. A statement printed from that value can disagree with the tax report CSV by a
-    cent — and the CSV is the file that goes to the tax authority. This is the one defect in
-    this slice that is a correctness problem rather than a formatting problem.
+*   **The printed page must say what it rounded.** The backend sends money as decimal
+    strings (`backend_rust/src/db_types.rs:31`, `serializer.serialize_str(&d.to_string())`)
+    at full precision, and the tax report CSV is written at that same full precision by
+    standing repo decision (`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md:18`,
+    "full precision, no quantisation"; per-field rounding is called "actively harmful" at
+    `:50`). The engine multiplies by the FX rate with no `set_scale` anywhere
+    (`tax_engine.rs:418`, `:422`, `:433`), so a realized figure genuinely carries more
+    decimals than a page should show. `normalizeTaxSummary` in
+    `frontend/src/utils/decimal.ts` runs every money field through `num()`, which is
+    `Number(v)`, and `formatCurrency` runs it through `toNumber` again
+    (`formatters.ts:4`) before quantising to 2 dp via `Intl`. So a printed figure and the
+    CSV's figure for the same holding are **already guaranteed to differ** — not by a
+    floating-point accident but by design, because one is quantised and the other is not.
+    A page that prints `1,234.57` next to a CSV cell reading `1234.56500000000000000000`
+    and claims to be the same number is the defect. The fix is to say the rounding out loud
+    on the page, not to pretend the page is exact.
 *   **There is no router.** `App.tsx:36` is `useState(DEFAULT_TAB)` and the nav is four
     `<li className="nav-item">` elements (`App.tsx:385-396`). There is no URL to open a
     statement at, so there is no link to re-open a printed page later and no way to bookmark
@@ -62,17 +70,21 @@ the cent.
     how a wrong filing starts.
 *   **Goal 2 — the printed page is a document.** No sidebar, no navigation, no buttons, no
     inputs, no charts, no error banner. One column. `@page { size: A4; margin: 14mm }`.
-*   **Goal 3 — the printed numbers are the payload's numbers.** Every money value on the
-    statement is the payload's decimal string rendered through
-    `frontend/src/utils/formatters.ts`. The statement performs no arithmetic: it sums
-    nothing, differences nothing, and rounds nothing that the payload did not already round.
-    For the same portfolio at the same moment, the statement's cumulative realized figure
-    and the tax report's cumulative realized column are the same decimal, and that equality
-    is a test.
+*   **Goal 3 — the printed numbers are the payload's numbers, quantised once and declared.**
+    The statement is a **display artifact**. Every money value is a payload value, rendered
+    through `frontend/src/utils/formatters.ts`, quantised to the cent at display and nowhere
+    else. The statement performs no arithmetic: it sums nothing, differences nothing, and
+    never re-derives a total. Because the tax report CSV is full-precision and this page is
+    not, the page carries a visible line saying figures are rounded to the cent and the CSV
+    carries full precision — the difference is declared rather than left for the adviser to
+    discover. For the same portfolio at the same moment, the statement's cumulative realized
+    figure equals the tax report's cumulative realized column **rounded to the cent**, and
+    that equality is a test.
 *   **Goal 4 — the page states its own provenance.** Portfolio name, base currency, the
-    strategy and `threshold_days` the request was made with — labelled as the strategy in
-    use, because the payload does not confirm them (Decided item 3) — the generation date,
-    and the standing caveat that splits are as recorded at that moment.
+    strategy and `threshold_days` **as the server echoed them**, the generation date, and the
+    standing caveat that splits are as recorded at that moment. The payload already carries
+    all three (`analytics.rs:97-99`); the normalizer drops two of them, which is a
+    field-pick, not a design question.
 *   **Goal 5 — no backend change.** No new route, no new field, no new figure on any
     existing endpoint, no OpenAPI regeneration. If this slice needs the backend, it has
     drifted out of scope and should stop.
@@ -105,24 +117,35 @@ The Print control is a button **outside** the printed subtree, marked `data-no-p
 calling `window.print()`. A statement whose print button prints itself with a print button
 on it is a statement that ships with a screenshot of its own UI.
 
-### Money fidelity: a second normalizer, not a patched one
+### Money: a display artifact, declared
 
-`normalizeTaxSummary` stays exactly as it is. Every existing screen keeps its doubles, so
-nothing on the dashboard or the holdings table moves.
+The statement renders the payload's numbers through `formatters.ts` and quantises to the
+cent at display. It does not attempt to be exact, and it says so on the page.
 
-A sibling, `normalizeTaxSummaryStrings`, keeps every money field as the payload's own
-string and is used only by the statement. Its type is a string-typed mirror of
-`AssetTaxSummary`/`TaxSummary` in `frontend/src/types.ts`.
-
-*   **Why not just fix `normalizeTaxSummary`?** Because that changes what every existing
-    component holds, and this slice's contract is that it moves no existing figure. It is
-    also a much larger test surface than a statement deserves.
-*   **Why not let the statement use doubles?** Goal 3. A statement that prints `1,234.56`
-    while the CSV says `1234.565` is the exact failure mode this whole design exists to
-    remove, and it is invisible when it happens.
-*   **The cost, stated:** two shapes for one payload, which can drift. The guard is a test
-    that renders both from one fixture and asserts they agree to the cent on every field.
-    That test is the reason this is a decision rather than a hazard.
+*   **Why not preserve the decimal strings?** Because the render path throws them away one
+    layer below where they would be preserved. `formatCurrency` is
+    `const v = toNumber(value)` (`formatters.ts:4`) and `toNumber` is `Number(v)`
+    (`decimal.ts:20-23`), so `formatCurrency("1234.565")` and `formatCurrency(1234.565)`
+    are byte-identical. A string-preserving normalizer would change nothing observable on
+    the printed page while adding a second shape for one payload and a drift duty to go with
+    it. That was this document's first design, and a review found it: the mechanism protected
+    a boundary the renderer had already crossed.
+*   **Why not make the page exact?** Because exactness is the CSV's job and the page would
+    then print `1234.56500000000000000000` to a person. The two artifacts have different
+    jobs: one is filed, one is read. Making the page exact also means a hand-written decimal
+    rounder that is right about scale, sign, `-0` and exponent input, in a repo that has no
+    such utility today.
+*   **The double is not the hazard, and the earlier claim that it was is corrected here.**
+    40,000 random 2-dp and 3-dp values up to 10^7 were run through `Number()` then
+    `Intl.NumberFormat('en-US', {style:'currency'})` against exact decimal half-up rounding:
+    zero mismatches. Doubles bite near 2^53, not at portfolio scale. The real divergence
+    between page and CSV is quantisation, which is why Goal 3 declares it instead of
+    denying it.
+*   **What is still required of the payload:** the statement reads `strategy`,
+    `threshold_days` and `currency` from the payload rather than from client state, since
+    the server echoes all three (`analytics.rs:97-99`) and `normalizeTaxSummary`
+    (`decimal.ts:64-68`) currently keeps only `currency`. That is two added fields on the
+    hand-written type and two lines in the normalizer — additive, and it moves no figure.
 
 ### Palette inversion
 
@@ -163,11 +186,14 @@ Three layers, weakest first, with the gap named at each:
 1.  **Vitest component test** (`frontend/src/test/components/PortfolioStatement.test.tsx`).
     jsdom does not apply print CSS, so this proves structure only: the statement root
     carries `data-print="statement"`, the printed subtree contains no `button`, `input`,
-    `select` or `svg`, the two headline figures equal the payload strings rendered through
-    `formatters.ts`, and the string normalizer and the numeric normalizer agree to the cent
-    on one fixture. `handlers.ts:121` already registers
-    `/api/portfolios/:id/tax-summary`; branching it is enough, and the existing handler
-    ordering comment at `handlers.ts:130-131` still applies.
+    `select` or `svg`, the two headline figures equal the payload values rendered through
+    `formatters.ts`, the rounding line is present, and the strategy line carries the
+    payload's echoed `strategy` and `threshold_days` rather than a client-side copy. The
+    mock at `handlers.ts:121` is branched, not duplicated, and its money fields are changed
+    to decimal strings to match what the server actually sends; the existing handler
+    ordering comment at `handlers.ts:130-131` still applies. **No assertion in this file may
+    compare two normalizers** — an earlier draft asked for that and it cannot fail, since
+    both read the same object and both end up doubles at render.
 2.  **Playwright smoke** (`frontend/e2e/statement.smoke.mjs`, following
     `sell-pnl.smoke.mjs`). `page.emulateMedia({ media: 'print' })`, then assert computed
     `display: none` on the named chrome selectors, assert the statement's computed text
@@ -190,19 +216,20 @@ style.
 
 | Slice | Ships | Reaches network in tests? | Moves an existing figure? |
 | :-- | :-- | :-- | :-- |
-| 1 | Statement tab, print stylesheet, string normalizer, component test, local smoke | no | no |
+| 1 | Statement tab, print stylesheet, two payload fields surfaced, component test, local smoke | no | no |
 
 ## Target Files
 
 #### 1. `frontend/src/components/PortfolioStatement.tsx` (Create)
 
 *   **Type / Scope:** the printable view.
-*   **Proposed Changes:** renders the string-typed summary: headline block (cumulative
-    realized since inception, unrealized as of today, portfolio value) and one row per
-    holding (Decided item 1). No asset-subset filter — the only arithmetic that would make a
-    filtered headline honest is the arithmetic renderers are forbidden from doing. Takes no
-    date parameter. Derives no totals. No `button`, `input` or hardcoded color inside the
-    printed subtree; the Print control sits outside it with `data-no-print`.
+*   **Proposed Changes:** renders the summary: headline block (cumulative
+    realized since inception, unrealized as of today, portfolio value), the rounding line
+    Goal 3 requires, and one row per holding (Decided item 1). No asset-subset filter — the
+    only arithmetic that would make a filtered headline honest is the arithmetic renderers
+    are forbidden from doing. Takes no date parameter. Derives no totals. No `button`,
+    `input` or hardcoded color inside the printed subtree; the Print control sits outside it
+    with `data-no-print`.
 
 #### 2. `frontend/src/styles/print.css` (Create) and `frontend/src/main.tsx` (Modify)
 
@@ -213,16 +240,21 @@ style.
 
 #### 3. `frontend/src/utils/decimal.ts` (Modify) and `frontend/src/types.ts` (Modify)
 
-*   **Type / Scope:** `normalizeTaxSummaryStrings` plus its string-typed mirror types.
-*   **Proposed Changes:** additive. `normalizeTaxSummary` is untouched.
+*   **Type / Scope:** surface the two run-context fields the payload already sends.
+*   **Proposed Changes:** `normalizeTaxSummary` keeps `strategy` and `threshold_days`
+    (`decimal.ts:64-68` currently keeps `currency` only) and `TaxSummary` in `types.ts` gains
+    both. Additive; no existing figure moves. There is **no** second normalizer and no
+    string-typed mirror type — see Money: a display artifact, declared, for why the first
+    draft of this document was wrong to add them.
 
 #### 4. `frontend/src/App.tsx` (Modify)
 
-*   **Type / Scope:** the fifth nav item, the tab branch, and the raw payload the statement
-    renders.
-*   **Proposed Changes:** `fetchPortfolioData` keeps the string-typed summary alongside the
-    normalized one it already sets. Base currency for the header comes from the portfolio
-    object, **not** from the payload: the empty-portfolio branch at
+*   **Type / Scope:** the fifth nav item and the tab branch.
+*   **Proposed Changes:** renders the statement from the `taxSummary` state
+    `fetchPortfolioData` already sets, guarded the way the sibling tab guards
+    (`activeTab === 'portfolios' && taxSummary`, `App.tsx:474`) so a refresh in flight cannot
+    print zeros. Base currency for the header comes from the portfolio object, **not** from
+    the payload: the empty-portfolio branch at
     `backend_rust/src/api_routes/analytics.rs:45-51` returns no `currency` key, and
     `normalizeTaxSummary` then defaults it to `USD` — so an empty EUR portfolio would print
     "USD".
@@ -230,9 +262,11 @@ style.
 #### 5. `frontend/src/test/components/PortfolioStatement.test.tsx` (Create) and `frontend/src/test/mocks/handlers.ts` (Modify)
 
 *   **Type / Scope:** structural tests and the mock branch.
-*   **Proposed Changes:** the four assertions listed above, including the two-normalizers
-    agree-to-the-cent test, which is what makes two shapes for one payload a decision rather
-    than a latent bug.
+*   **Proposed Changes:** the assertions listed under Verification layer 1. The mock at
+    `handlers.ts:122` must also be corrected: it returns `total_realized_pnl: 0` as a JSON
+    **number** while the backend always sends strings (`analytics.rs:95-97`,
+    `db_types.rs:31`), so the fixture has to carry decimal strings and the two echoed
+    context fields, or the statement is tested against a shape the server never emits.
 
 #### 6. `frontend/e2e/statement.smoke.mjs` (Create), `frontend/e2e/run.sh` (Modify), `frontend/package.json` (Modify)
 
@@ -254,10 +288,9 @@ that can pass while the feature is broken is a gate that teaches people to ignor
 | :-- | :-- | :-- |
 | **The print path ships unverified.** No CI browser job; the smoke is a local step needing a chromium binary. | `ci.yml` has no browser job; issue #45 open | Selectors and smoke assertions are named in this document, so the check exists and is specific the moment #45 lands. The manual print preview is listed in `docs/auth-testing.md`. |
 | **Palette override misses a hardcoded color.** | `SellPnlModal.tsx:132` uses inline `background: '#121929'` | The statement uses no hardcoded colors; the smoke asserts computed text color, which catches the failure regardless of cause. |
-| **Two normalizers drift.** | `decimal.ts` is hand-written per field | The agree-to-the-cent test on one fixture. |
+| **A printed figure differs from the CSV's.** | The CSV is full-precision (`reviews/2026-11-05-…:18`) and `formatCurrency` quantises to 2 dp (`formatters.ts:4`) | Goal 3: the page declares its rounding, so the difference is stated rather than discovered by an adviser |
 | **A4 on Letter hardware.** | `@page { size: A4 }` | Stated in the dialog, not hidden; the owner's portfolios are EUR-denominated. |
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
-| **The strategy line asserts more than the payload confirms.** | The undated payload echoes neither `strategy` nor `threshold_days` | Labelled "strategy in use", never "confirmed"; Decided item 3 states the condition that would retire it |
 | **Empty or failing portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Header currency from the portfolio object; the empty case prints an explicit "no holdings" line rather than three zeros. |
 
 ## Decided during drafting
@@ -269,22 +302,26 @@ reasons are recorded because each one trades something away.
     table is a second page and a second set of numbers to reconcile against the CSV. It
     lists them anyway: a statement without holdings is a receipt, and the owner's use case
     is handing something to a person who will ask "which positions?". The reconciliation
-    cost is real and is paid by Goal 3 — every printed row is a payload value, so the rows
-    cannot drift from the CSV; what they can do is run to a second page, which is a layout
-    fact, not a correctness one.
+    cost is real and is bounded by Goal 3 — every printed row is a payload value quantised
+    once at display, so a row cannot disagree with the CSV except by the rounding the page
+    declares. What the rows can do is run to a second page, which is a layout fact, not a
+    correctness one.
 2.  **The smoke asserts one page for its own fixture and says nothing about larger
     portfolios.** One page for a two-row fixture is checkable. A bound that holds for 50
     holdings is a layout claim nobody has measured, and an assertion that fails on the
     owner's real portfolio but passes in CI is an assertion that teaches people to ignore
     the smoke. The page-break rules still ship (`tr { break-inside: avoid }`); they are
     simply not claimed to produce a page count.
-3.  **The strategy line prints the value the frontend sent, labelled as the strategy in
-    use.** The undated payload echoes neither `strategy` nor `threshold_days`, so the
-    server's value is unavailable without a backend change this document refuses to make.
-    The sent value is honest as long as it is labelled as what it is; it stops being honest
-    the moment it is presented as confirmed by the server. If the tax report's payload ends
-    up echoing both, the statement should read them from the payload and this decision
-    should be revisited rather than left to rot.
+3.  **The strategy line prints what the server echoed.** An earlier draft of this document
+    claimed the payload does not carry `strategy` or `threshold_days`, and built a hedging
+    label and a risk row on that claim. It was wrong: `analytics.rs:97-99` returns
+    `strategy`, `threshold_days` and `currency`, and the route passes the query values
+    straight to `calculate_lots`, so the echoed value *is* the value used. The only gap was
+    that `normalizeTaxSummary` dropped two of the three fields. Nothing to hedge, and
+    nothing to decide beyond surfacing them — the wording precedent is already on screen at
+    `SellPnlModal.tsx:210` (`realized · FIFO (threshold 30d)`). Recorded because the false
+    claim was load-bearing in three places and a reader should be able to see what was
+    removed and why.
 
 ## Alternatives Considered
 
@@ -307,14 +344,26 @@ reasons are recorded because each one trades something away.
     fine". The Playwright smoke is the gate; it is waiting on issue #45, which is the same
     blocker as the existing sell-P&L smoke.
 
-### Alternative C: fix `normalizeTaxSummary` to keep strings
+### Alternative C: make the printed page exact
 
-*   **Pros**: one shape for the payload; the doubles bug is gone everywhere, not just here.
-*   **Cons**: every component that does arithmetic on those fields changes, which is most of
-    them, and every one of those numbers is a figure this slice promised not to move.
-*   **Reason for rejection**: correct but out of scope. Recorded here so the next person
-    does not rediscover it. If it is ever done, it should be its own change with its own
-    figure note.
+Two variants were considered for making the page match the CSV to the decimal rather than
+declaring a rounding.
+
+*   **C1 — a string-preserving normalizer for the statement.** This was the first draft's
+    choice. **Rejected on verification, not on taste:** `formatCurrency` calls `toNumber`
+    (`formatters.ts:4`), so the preserved string is converted to a double one layer below the
+    boundary it was preserved to protect, and the printed output is byte-identical either way.
+    It bought a second payload shape and a drift duty for no observable change.
+*   **C2 — a string-preserving money formatter in `formatters.ts`,** used by the statement and
+    eventually by everything. This is the only variant that would actually work. **Rejected
+    because exactness is the wrong property for this artifact:** a page read by a person should
+    not print `1234.56500000000000000000`, and the CSV already exists to be the exact
+    artifact. It also means hand-writing a decimal rounder (scale, sign, `-0`, exponent input)
+    that the repo does not have today, and if it lands inside `formatCurrency` it changes what
+    every existing screen prints for >2-dp values — the one thing this slice promised not to
+    do.
+*   **If exactness is ever required**, C2 is the shape to take, as its own change with its own
+    figure note. Recorded here so the next person does not re-derive C1.
 
 ## Verification
 
@@ -326,5 +375,6 @@ reasons are recorded because each one trades something away.
     dark text on white, and that the two headline figures match the dashboard to the cent.
     Added to the manual browser walkthrough in `docs/auth-testing.md` §5.
 *   Cross-check with the tax report once it exists: same portfolio, same moment, statement's
-    cumulative realized equals the CSV's cumulative realized column. Until the tax report
-    ships, the equality is asserted against the payload in the component test.
+    cumulative realized equals the CSV's cumulative realized column **rounded to the cent**,
+    and the page carries the line saying it was rounded. Until the tax report ships, that
+    equality is asserted against the payload in the component test.
