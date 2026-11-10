@@ -1,7 +1,13 @@
 # Portfolio Statement (Printable)
 
 *   **Author:** javierarrieta, with EGM review support
-*   **Status:** Proposed
+*   **Status:** Proposed — reviewed, **not implementation-ready**. Five stages of EGM review are
+    complete; Stages 5–8 findings are applied and Stage 9 findings are not. Five blockers and
+    sixteen majors remain open, all of them interface definitions rather than design objections: the
+    component's prop signature, hooks for the headline figures and holdings table, the nav item's
+    visible label, a self-contradictory rounding rule, and an unspecified null-payload state. Do not
+    write an implementation plan from this document without closing them first. See
+    `docs/superpowers/reviews/2026-11-09-statement-print/consolidated_review_report.md`.
 *   **Date:** 2026-11-09
 *   **Inherits from:** `2026-11-09-pricing-layer-truthfulness.md` — the statement renders the same
     FX conversion that document describes as broken for foreign-currency assets. It **inherits that

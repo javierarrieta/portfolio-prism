@@ -1,6 +1,6 @@
 # Statement design — decision records moved out of the spec
 
-Stage 8 (intermediate zoom out) found that roughly 180 of the statement spec's 718 lines were
+Stage 8 (intermediate zoom out) found that roughly 180 of the statement spec's then-718 lines were
 decision records rather than requirements: numeric-precision forensics, harness forensics, and
 correction history. The zoom-out standard puts those in the review record, which is already this
 repo's convention for exactly this (`2026-11-05-sell-pnl-breakdown.md`).
