@@ -1,0 +1,59 @@
+/*
+ * Print palette and hide rules for the printable statement. Imported after index.css
+ * in main.tsx so it wins the cascade at equal specificity.
+ *
+ * The hide rules are scoped with :has() on purpose. Unscoped, `.main-content > *:not(...)`
+ * hides every direct child of the content column on the dashboard, analytics and ledger
+ * tabs, because nothing there carries the attribute — three of four tabs would print blank.
+ * :has() is baseline (Chrome 105 / Safari 15.4 / Firefox 121); the repo sets no
+ * browserslist override.
+ */
+
+/* @page cannot take a selector, so this applies to a print started from any tab. */
+@page { size: A4; margin: 14mm; }
+
+@media print {
+  /* 1. Hide the shell, not a list of things inside it. An enumerated hide list drifts
+        every time someone adds chrome; the inclusive form cannot miss a direct child.
+        Rule one removes the sidebar and the auth-failed banner (a position:fixed
+        full-width banner an enumerated list would print on every page). Rule two leaves
+        only the statement in the content column, which is also what hides the Print
+        control — it is a sibling of the statement root, not inside it.
+        Both use `>`, so the statement root must be a DIRECT child of .main-content.
+        Wrap it in a layout div and this prints a blank page from a tab that looks
+        correct on screen. */
+  .app-container:has([data-print="statement"]) > *:not(.main-content) { display: none; }
+  .main-content:has([data-print="statement"]) > *:not([data-print="statement"]) { display: none; }
+
+  /* 2. Collapse the 260px 1fr grid, or the page prints with a 260px gutter of nothing. */
+  .app-container:has([data-print="statement"]) { grid-template-columns: 1fr; }
+
+  /* 3. Invert the palette. Legibility comes entirely from the TEXT overrides: text is
+        always painted and does not depend on the "background graphics" setting. The
+        background and border overrides are redundant in that sense and load-bearing in
+        the other one — a reader who HAS enabled background graphics otherwise gets dark
+        text on the dark app background. The two groups are not interchangeable. */
+  :root {
+    --bg-dark: #ffffff;
+    --bg-card: #ffffff;
+    --border-color: #333333;
+    --text-primary: #111111;
+    --text-secondary: #333333;
+    --text-muted: #555555;
+  }
+
+  .glass-card {
+    backdrop-filter: none;
+    box-shadow: none;
+    background: #ffffff;
+  }
+
+  /* .data-table td's own border is a literal rgba(255,255,255,0.03) (index.css:247),
+        not a variable, so --border-color never reaches it. Without this the header rule
+        inverts and every body rule stays invisible: a half-inverted table. */
+  .statement-table td { border-bottom: 1px solid #333333; }
+
+  /* 4. Break rules. */
+  tr { break-inside: avoid; }
+  .statement-headline { break-inside: avoid; }
+}
