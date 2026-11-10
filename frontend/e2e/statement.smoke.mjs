@@ -117,15 +117,23 @@ try {
   // body{overflow-x:hidden}, which propagates to the viewport, so a document-level
   // check can never fail -- it clips silently.
   //
-  // Viewport set to the printed page box first. emulateMedia({media:'print'}) changes
-  // the media type but NOT the layout viewport, so at 1400px this check could only
-  // fail at a width nobody prints at: the PDF lays out at A4 minus print.css:13's
-  // 14mm margins = 182mm, about 688px at 96dpi. 794px is A4 wide at 96dpi, and the
-  // statement's own box is ~714px of it (.main-content keeps 40px of padding under
-  // border-box), so the measure is within ~26px of what ships instead of nearly twice
-  // it. Nine columns of 16px cell padding is ~288px of padding alone, so this is the
-  // difference between an assertion that can fail and one that cannot.
-  await page.setViewportSize({ width: 794, height: 1123 })
+  // Viewport set to the printed page box first, because emulateMedia({media:'print'})
+  // changes the media type but NOT the layout viewport: at 1400px this could only fail
+  // at a width nobody prints at. The shipped PDF lays out at the @page CONTENT box -- A4
+  // at 210mm minus print.css:13's 14mm margins = 182mm = 688px at 96dpi. (794px is the
+  // whole sheet; the browser lays no content into the margins.) print.css overrides no
+  // padding anywhere, so .main-content keeps the 40px each side index.css:161 gives it
+  // and the statement's box is 688 - 80 = 608px. A 688px viewport reproduces that 608px
+  // exactly, so the residual against what ships is zero. Nine columns of 16px cell
+  // padding is ~288px of padding alone, which is why the ~106px between 608 and 714 was
+  // the whole point of the check. (.main-content is overflow-y:auto, so a page tall
+  // enough to scroll would shave ~15px off clientWidth -- stricter than the printed
+  // page, never more permissive.)
+  //
+  // If this fails on a real run it is a finding about the shipped PDF -- the printed
+  // table really is too wide for the page -- not a broken assertion. Do not "fix" it by
+  // moving the viewport back toward the desktop width.
+  await page.setViewportSize({ width: 688, height: 1123 })
   const [sw, cw] = await statement.evaluate((el) => [el.scrollWidth, el.clientWidth])
   if (sw > cw) fail(`horizontal overflow at the printed page box: scrollWidth ${sw} > clientWidth ${cw}`)
 

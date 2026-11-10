@@ -48,7 +48,7 @@ nix-shell -p chromium -p liberation_ttf --run 'cd frontend && ./e2e/run.sh'
 | --- | --- |
 | `CHROMIUM` | browser binary to launch |
 | `FONT_DIR` | extra font directory for the generated `fontconfig` file |
-| `SMOKE_SHOT=/tmp/x.png` | on a failed run, write a full-page screenshot to this path (sell-pnl also writes one of the open modal on success) |
+| `SMOKE_SHOT=/tmp/x.png` | write a full-page screenshot to this path. `e2e:statement`: on any failure, whether it threw or was only asserted. `e2e:sell-pnl`: once the modal has been read (before its assertions run) and again if the run throws — an assertion failure that does not throw writes nothing, even though `run.sh` still names the path |
 | `BASE_URL` / `API_URL` | override where the app and API live |
 
 ## What it asserts
