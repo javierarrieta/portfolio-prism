@@ -52,15 +52,37 @@ instead of pretending to be the exact file next door.
     A page that prints `1,234.57` next to a CSV cell reading `1234.56500000000000000000`
     and claims to be the same number is the defect. The fix is to say the rounding out loud
     on the page, not to pretend the page is exact.
-*   **There is no router.** `App.tsx:36` is `useState(DEFAULT_TAB)` and the nav is four
-    `<li className="nav-item">` elements (`App.tsx:385-396`). There is no URL to open a
-    statement at, so there is no link to re-open a printed page later and no way to bookmark
-    it. Adding a router for one page is not worth it and is a non-goal.
-*   **Nothing can prove it prints.** `.github/workflows/ci.yml` has no browser job. Issue
-    #45 (*Run the sell P&L Playwright smoke in CI*) is open. This slice therefore **ships
-    unverified by design** — see Risks. That was an explicit owner decision, not an
-    oversight, and it is the reason this document names its selectors and its smoke
-    assertions here rather than leaving them to implementation time.
+*   **There is no router, and therefore no linkable statement.** `App.tsx:36` is
+    `useState(DEFAULT_TAB)` and the nav is four `<li className="nav-item">` elements
+    (`App.tsx:385-396`). Adding a router for one page is not worth it and is a non-goal.
+    The honest consequence is that **a printed page cannot be re-opened by URL and the
+    statement is not bookmarkable**, and this document stops pretending that is a problem it
+    intends to solve. A query parameter was considered and rejected: `App.tsx:58` already
+    reads `new URLSearchParams(window.location.search)` and `App.tsx:347-353` rewrites it, so
+    `?view=statement` would follow an existing convention with no dependency — but
+    `selectedId` is component state and is not in the URL either, so a bookmarked
+    `?view=statement` reopens the wrong portfolio. It buys half a deep link, adds a second
+    navigation mechanism next to the one that works, and the smoke can drive the real
+    mechanism directly. If linkability is ever wanted, it is wanted for portfolio selection
+    first, and that is a router conversation this slice declines.
+*   **Nothing can prove it prints, and the reason is a workstation fact, not a CI law.**
+    `.github/workflows/ci.yml` has no browser job. Issue #45
+    (*Run the sell P&L Playwright smoke in CI*) is open. This slice therefore **ships
+    unverified by design** — see Risks and Verification layer 2. That phrase was inherited from
+    the parent design and it needs the correction recorded there: CI could run this smoke
+    today with a one-line chromium install; the reasons it does not are the cargo build the
+    harness drags in and the emptiness of a job allowed to fail. The document names its
+    selectors and its smoke assertions here rather than leaving them to implementation time,
+    so the check is specific the moment #45 lands.
+
+*   **The person the statement is for cannot log in.** Every `/api` route goes through
+    `AuthedUser` plus a `require*` call, and `apiFetch.ts:22-26` sends an unauthenticated
+    caller to `/auth/login`. An adviser has no account and will never get one from this
+    slice. So the artifact necessarily leaves the app, and "print it from the browser" is not
+    a complete story: the owner prints, then forwards. That is fine, but it means the page
+    must stand on its own once detached — which is what Goal 4's provenance block and Goal 3's
+    declared rounding are for. The cheaper exit (a copy-to-clipboard text block pasted into an
+    email body) is considered and rejected under Alternative F.
 
 ## Goals
 
@@ -95,9 +117,18 @@ instead of pretending to be the exact file next door.
     echoes **none** of the three fields, so the run-context line is omitted there rather than
     rendered from `str()`/`num()` defaults — a line reading "realized · (threshold 0d)" would
     be a fabricated run context on the one branch already cited for the currency problem.
-*   **Goal 5 — no backend change.** No new route, no new field, no new figure on any
-    existing endpoint, no OpenAPI regeneration. If this slice needs the backend, it has
-    drifted out of scope and should stop.
+*   **Goal 5 — no backend change in this slice.** No new route, no new field, no new figure on
+    any existing endpoint, no OpenAPI regeneration. This is a **sequencing** boundary, not a
+    standing principle: the parent design already rewrites this same handler's response, which
+    is why the committed OpenAPI body is empty, and will add `from`/`to` to it. If this slice
+    needed the backend it would mean the statement had drifted out of scope, and it should
+    stop. The cost of the boundary is stated: the run context the page prints is a subset of
+    what the parent design will eventually carry anyway, so echoing `strategy`,
+    `threshold_days` and `currency` is plumbing the sibling change does regardless. The
+    counter-argument for keeping the boundary is that any response-shape change lands in
+    `docs/openapi/openapi.json`, which CI diffs byte-for-byte, so it is not a quiet two-field
+    change — and the statement is the one slice of this programme not blocked on the pricing
+    layer.
 *   **Goal 6 — the palette inversion does not depend on a browser setting.** It must not
     rely on "background graphics" being ticked. Text becomes dark because the stylesheet
     says so, not because the browser kept a background.
@@ -175,17 +206,43 @@ variables — including inline styles such as
 this cheap: `print.css` overrides the variables on `:root` inside `@media print` and most
 of the app flips at once, inline styles included.
 
-`frontend/src/styles/print.css` (new, imported from `main.tsx` after `index.css`) does five
-things, in this order:
+`frontend/src/print.css` (new, flat beside `index.css` — the repo has no `src/styles/`
+directory and inventing a one-file directory is not worth it) is imported from `main.tsx`
+after `index.css`. It is imported second so it wins the cascade at equal specificity; that is
+source order doing the work, not the file boundary — a `@media print` block appended to
+`index.css` would win just as reliably. The separate file is for organisation, and the print
+palette sits beside nothing rather than beside the palette it inverts, which is the one thing
+the split costs.
+
+It does five things, in this order:
 
 1.  `@page { size: A4; margin: 14mm }`. Letter users change it in the print dialog; the
-    choice is stated rather than hidden.
-2.  Hide chrome: `.sidebar`, `.header-row`, `[data-no-print]`. **The selectors are named
-    here on purpose.** The parent design's file list cited `header.app-header` at
-    `App.tsx:385-396`; that element does not exist — the header is
-    `<div className="header-row">` at `App.tsx:458`, and the nav is `.nav-menu`/`.nav-item`
-    inside `<aside className="sidebar">` at `App.tsx:379`. A gate that greps for a selector
-    nobody wrote is worse than no gate.
+    choice is stated rather than hidden. `@page` has no scope, so it applies to a print
+    started from any tab — see the scoping note below.
+2.  **Hide the shell, not a list of things inside it.** Two rules, in this order:
+
+    ```css
+    .app-container > *:not(.main-content) { display: none }
+    .main-content > *:not([data-print="statement"]) { display: none }
+    ```
+
+    The first rule removes the sidebar (`<aside className="sidebar">`, `App.tsx:379`) and
+    anything else that is a direct child of `.app-container` — which includes the
+    auth-failed alert at `App.tsx:359-376`, a `position: fixed` full-width red banner that an
+    enumerated hide list would print on every page. The second leaves only the statement
+    inside the content column, so the header row (`<div className="header-row">`,
+    `App.tsx:458`) and any future chrome added to that column disappear without anyone
+    remembering to add them to a list.
+
+    An earlier draft enumerated `.sidebar`, `.header-row`, `[data-no-print]`. That list was
+    already wrong when written — it missed the auth alert — and an allowlist of what to hide
+    drifts every time someone adds chrome, in the same direction, silently. The inclusive
+    form cannot miss. `[data-no-print]` is still honoured, for the Print control and anything
+    else that opts out from inside the printed subtree.
+
+    **The selectors are named here on purpose.** The parent design's file list cited
+    `header.app-header` at `App.tsx:385-396`; that element does not exist. A gate that greps
+    for a selector nobody wrote is worse than no gate.
 3.  Collapse the layout: `.app-container` is a `260px 1fr` grid (`index.css:93-98`); in
     print it becomes one column, or the page prints with a 260 px gutter of nothing.
 4.  Invert: `--bg-dark`, `--bg-card`, `--border-color`, `--text-primary`,
@@ -195,9 +252,16 @@ things, in this order:
     so a greyscale printer loses nothing.
 5.  Break rules: `tr { break-inside: avoid }`, and the headline block never splits.
 
-The statement component itself uses **no hardcoded colors**. Inline `#121929`-style
-backgrounds (`SellPnlModal.tsx:132`) are exactly what a variable override cannot reach, and
-the statement must not repeat that mistake.
+**Scoping the inversion.** The rules above live under `@media print` and are not scoped to the
+statement tab, so Ctrl-P from the dashboard after this ships produces a light-on-dark page
+with the sidebar hidden and the dashboard printed — better than today's white-on-white, but not
+a designed output. Some backgrounds are not variables and will not flip: `.sidebar` is
+`rgba(10, 15, 28, 0.95)` (`index.css:101`), `.badge-crypto` (`:334`),
+`.data-table tr:hover td` (`:252`). The decision recorded here is that **printing from another
+tab is out of scope and stays that way**: the statement is the tab you print from, and the
+statement tab is the only one the smoke exercises. If that ever becomes wrong, the fix is a
+body attribute set by the statement tab and every print rule scoped under it — one attribute,
+not a rewrite.
 
 ### Verification, and what it cannot cover
 
@@ -222,15 +286,33 @@ Three layers, weakest first, with the gap named at each:
     in this file may compare two normalizers** — an earlier draft asked for that and it cannot
     fail, since both read the same object and both end up doubles at render.
 2.  **Playwright smoke** (`frontend/e2e/statement.smoke.mjs`, following
-    `sell-pnl.smoke.mjs`). `page.emulateMedia({ media: 'print' })`, then assert computed
-    `display: none` on the named chrome selectors, assert the statement's computed text
-    color is dark against a light background — that is the assertion that actually catches
-    the dark-theme failure, and it is a computed-style check, not a screenshot — assert no
-    horizontal overflow, and assert `page.pdf()` is non-empty and one page for the two-row
-    fixture — **for the fixture only**, with no claim about larger portfolios (Decided
-    item 2). **Local step, not a gate**: `e2e/run.sh` hardcodes
+    `sell-pnl.smoke.mjs`). `page.emulateMedia({ media: 'print' })`, then assert the statement
+    is **visible** (non-zero box, dark computed text color on a light background) and that the
+    shell is gone — `.sidebar` and the auth alert compute `display: none`. Asserting the
+    statement is visible is the primary check; asserting an enumerated list of hidden selectors
+    is not, because the hide rule is now inclusive and a list would only re-state a rule that
+    already cannot miss. The text-color assertion is what actually catches the dark-theme
+    failure, and it is a computed-style check, not a screenshot. Also assert no horizontal
+    overflow, and assert `page.pdf()` is non-empty and one page for the two-row fixture —
+    **for the fixture only**, with no claim about larger portfolios (Decided item 2). **Local step, not a gate**: `e2e/run.sh` hardcodes
     `node e2e/sell-pnl.smoke.mjs` and must be parameterised first, and `ci.yml` has no
     browser job. Both are issue #45.
+
+    **Why this stays local, and what that claim is actually resting on.** "Ships unverified by
+    design" was inherited from the parent design, and it is weaker than it looks: CI runs
+    `ubuntu-latest`, where `npx playwright install chromium` is the ordinary one-liner and
+    `emulateMedia`/`page.pdf()` need no display server. The remedy this document first named —
+    `nix-shell -p chromium -p liberation_ttf` — is the author's workstation, not CI, and
+    saying "no browser in CI" without checking which CI was meant is exactly the kind of
+    inherited constraint this review exists to catch. It stays local anyway, for two reasons
+    that survive the correction: `e2e/run.sh:3-16` is not browser-only — it compiles and
+    starts the Rust API against a throwaway SQLite file and starts Vite — so the job costs a
+    full cargo build and needs seeded data; and a job marked `continue-on-error` is
+    decoration unless someone reads it, which converts "unverified" into "verified and
+    therefore fine" by another door. The honest options are **local step** (chosen) or **a
+    real blocking browser job that also runs the existing sell-P&L smoke** — which is issue
+    #45's scope, not this slice's. The named assertions above are handed to #45 so they land
+    with the job that can execute them.
 3.  **A human with a print preview.** `docs/auth-testing.md` §5 is already the manual
     browser walkthrough for what CI cannot check; the statement's print preview joins that
     list.
@@ -258,7 +340,7 @@ style.
     `input` or hardcoded color inside the printed subtree; the Print control sits outside it
     with `data-no-print`.
 
-#### 2. `frontend/src/styles/print.css` (Create) and `frontend/src/main.tsx` (Modify)
+#### 2. `frontend/src/print.css` (Create) and `frontend/src/main.tsx` (Modify)
 
 *   **Type / Scope:** the print stylesheet, imported after `index.css` so it wins the
     cascade at equal specificity.
@@ -313,9 +395,10 @@ that can pass while the feature is broken is a gate that teaches people to ignor
 
 | Risk | Evidence | Mitigation |
 | :-- | :-- | :-- |
-| **The print path ships unverified.** No CI browser job; the smoke is a local step needing a chromium binary. | `ci.yml` has no browser job; issue #45 open | Selectors and smoke assertions are named in this document, so the check exists and is specific the moment #45 lands. The manual print preview is listed in `docs/auth-testing.md`. |
+| **The print path ships unverified.** No CI browser job; the smoke is a local step needing a chromium binary. The reason is a workstation fact, not a CI law — see Verification layer 2. | `ci.yml` has no browser job; issue #45 open | Selectors and smoke assertions are named in this document and handed to #45, so the check exists and is specific the moment that job lands. The manual print preview is listed in `docs/auth-testing.md` §5. |
 | **Palette override misses a hardcoded color.** | `SellPnlModal.tsx:132` uses inline `background: '#121929'` | The statement uses no hardcoded colors; the smoke asserts computed text color, which catches the failure regardless of cause. |
 | **A printed figure differs from the CSV's.** | The CSV is full-precision (`reviews/2026-11-05-…:18`) and `formatCurrency` quantises to 2 dp (`formatters.ts:4`) | Goal 3: the page declares its rounding, so the difference is stated rather than discovered by an adviser |
+| **A third renderer of one payload, with nothing comparing it to the second.** | `PortfolioDetail.tsx:238-292` renders the same `taxSummary.assets`; `Dashboard.tsx:40-45` renders the same headline figures | Accepted knowingly (Alternative D). The statement is a leaf with no interactivity and takes currency from the payload, not from `portfolio?.currency \|\| 'USD'` as `PortfolioDetail.tsx:261` does. If the two tables ever need to agree, the check is a comparison test between them, and it is not written here. |
 | **A4 on Letter hardware.** | `@page { size: A4 }` | Stated in the dialog, not hidden; the owner's portfolios are EUR-denominated. |
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
 | **Empty or failing portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Header currency from the portfolio object; the empty case prints an explicit "no holdings" line rather than three zeros. |
@@ -371,6 +454,14 @@ reasons are recorded because each one trades something away.
     an honest local step, because it converts "unverified" into "verified and therefore
     fine". The Playwright smoke is the gate; it is waiting on issue #45, which is the same
     blocker as the existing sell-P&L smoke.
+*   **Scope note, because this rejection is easy to over-apply.** What is rejected here is a
+    grep over a *stylesheet*. A different check was considered and is not rejected by the
+    argument above: a grep over `PortfolioStatement.tsx` for a hardcoded color literal,
+    which fails precisely when the "no hardcoded colors" convention breaks, and which the
+    repo already runs in this shape with its silent-no-match failure mode solved
+    (`backend_rust/scripts/check_access_gate.sh`). It is out of this slice only because the
+    convention it protects is one file wide and the smoke would catch the same breakage. If a
+    print gate is ever added, that is the check worth adding, not this one.
 
 ### Alternative C: make the printed page exact
 
@@ -392,6 +483,57 @@ declaring a rounding.
     do.
 *   **If exactness is ever required**, C2 is the shape to take, as its own change with its own
     figure note. Recorded here so the next person does not re-derive C1.
+
+### Alternative D: a print mode over the view that already renders this payload
+
+*   **Pros**: no third renderer. `PortfolioDetail.tsx:238-292` already renders a holdings
+    table from `taxSummary.assets` — symbol, type, shares, average cost, price, market value,
+    realized P&L, unrealized P&L, ROI — which is Decided item 1's row set plus an Actions
+    column, and `Dashboard.tsx:40-45` already renders the headline figures from the same
+    payload. The document's own description of the statement ("a dashboard with a different
+    heading") is an admission that this option was available.
+*   **Cons**: the existing table is exactly what Goal 2 forbids. It has buttons, expanders, an
+    Actions column, and inline `var(--color-success)` colors on the P&L cells
+    (`PortfolioDetail.tsx:286-292`); it takes its currency from `portfolio?.currency || 'USD'`
+    (`:261`) rather than from the payload. Making it print well means suppressing most of it
+    and re-deriving what the leaf component gets for free.
+*   **Reason for rejection**: a dedicated leaf is the cheaper honest artifact. But the choice is
+    recorded as what it is — **this slice adds a third renderer of one payload** — and the
+    drift risk it creates is in the Risks table, not hidden here. The two tables will disagree
+    about columns, about currency source, and about sign and rounding conventions unless
+    something keeps them honest; the smoke and the golden are the only things currently named
+    to do that, and neither compares the two tables.
+
+### Alternative E: the same route serves server-rendered HTML
+
+*   **Pros**: the parent design already commits to `?format=csv` on `tax-summary`, "served
+    where the exact decimals live", on the grounds that a total which must equal `tax-summary`
+    to the decimal should not be re-passed through a double on its way to a file. That
+    argument applies verbatim here. A `?format=print` variant with a small inline light
+    stylesheet dissolves the palette inversion, the rounding declaration, the adviser-access
+    problem and the whole print-stylesheet section at once, and produces a URL the owner can
+    bookmark and mail.
+*   **Cons**: a templating dependency or hand-built HTML in Rust; a second rendering technology
+    in a repo that has none today; it is the backend change Goal 5 refuses; it is blocked on
+    the parent design's route work and therefore on the pricing layer, which destroys the one
+    property that makes this slice worth doing first; and it cannot reuse `formatters.ts`, so
+    currency grouping drifts from the rest of the app.
+*   **Reason for rejection**: all four costs, especially the dependency on the pricing layer.
+    Recorded because Alternative A rejects only the PDF variant, and a reader would otherwise
+    conclude server rendering had been considered when it had not.
+
+### Alternative F: a copy-to-clipboard text block instead of a printed page
+
+*   **Pros**: the adviser cannot log in (see Problem), so the artifact leaves the app either
+    way. A plain-text block — run context, the headline figures, the holdings rows — pasted
+    into an email body needs no print stylesheet, no palette inversion, no `@page`, no
+    A4/Letter question, no page-count question, and no CI gap, and it is the only variant that
+    survives an adviser replying inline. The app already ships text artifacts
+    (`utils/download.ts`, `utils/sellPnlCsv.ts`).
+*   **Cons**: it cannot carry a 40-row table legibly, and it is not something an adviser files.
+*   **Reason for rejection**: Decided item 1 is an explicit owner decision that the artifact is
+    a document. A text block is a different product with a different audience, and shipping
+    both would mean two formats to keep in agreement for a use case that has one artifact today.
 
 ## Verification
 
