@@ -10,11 +10,13 @@ import {
   FolderOpen,
   Sparkles,
   LogOut,
+  Printer,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
+import PortfolioStatement from './components/PortfolioStatement';
 import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
 import { apiFetch, API_BASE } from './utils/apiFetch';
@@ -27,7 +29,7 @@ import {
   TransactionType
 } from './types';
 
-// dashboard, portfolios, analytics, ledger
+// dashboard, portfolios, analytics, ledger, statement
 const DEFAULT_TAB = 'dashboard';
 
 export default function App() {
@@ -42,6 +44,15 @@ export default function App() {
   // Loaded analytics
   const [performance, setPerformance] = useState<PortfolioPerformance | null>(null);
   const [taxSummary, setTaxSummary] = useState<TaxSummary | null>(null);
+  // setTaxSummary runs once and is never cleared, so a portfolio switch leaves the
+  // previous portfolio's summary in state until the new fetch resolves. A page with B's
+  // numbers under A's heading is the one failure this artifact cannot absorb quietly --
+  // unlike the zeros case, it looks right. The payload carries no portfolio id, so
+  // record the id beside it and guard the statement branch on the match. Same shape as
+  // sellPnl below, and for the reason that comment gives: five places change
+  // selectedId, and a reset that has to be remembered in each one is a reset that gets
+  // forgotten. Derived, not cleared from an effect.
+  const [taxMeta, setTaxMeta] = useState<{ portfolioId: number; fetchedAt: Date } | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
 
   // UI state
@@ -111,7 +122,11 @@ export default function App() {
       const taxRes = await apiFetch(`${API_BASE}/portfolios/${id}/tax-summary?strategy=${strategy}&threshold_days=${thresholdDays}`);
       if (!taxRes.ok) throw new Error('Failed to load tax lot summary');
       const taxData = await taxRes.json();
-      setTaxSummary(normalizeTaxSummary(taxData));
+      const normalizedTax = normalizeTaxSummary(taxData);
+      setTaxSummary(normalizedTax);
+      // The data-at line needs a source, and the statement renders cached state, so the
+      // fetch time is captured here rather than at render time.
+      setTaxMeta({ portfolioId: id, fetchedAt: new Date() });
 
       // 3. Fetch transactions list
       const txRes = await apiFetch(`${API_BASE}/portfolios/${id}/transactions/`);
@@ -395,6 +410,9 @@ export default function App() {
           <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => selectTab('ledger')}>
             <History size={18} /> Transaction Ledger
           </li>
+          <li className={`nav-item ${activeTab === 'statement' ? 'active' : ''}`} onClick={() => selectTab('statement')}>
+            <Printer size={18} /> Printable Statement
+          </li>
         </ul>
 
         {/* Portfolio Switcher */}
@@ -513,6 +531,28 @@ export default function App() {
                 onDeleteTransaction={handleDeleteTransaction}
                 onSelectSell={(txId) => setSellPnl({ txId, portfolioId: currentPortfolio.id })}
               />
+            )}
+
+            {/* The fragment creates no DOM node, which is what keeps both children direct
+                children of .main-content -- the position print.css needs to hide the Print
+                control and leave only the statement. A layout <div> here would be hidden
+                with the control, and the tab would print a blank page while looking correct
+                on screen. */}
+            {activeTab === 'statement' && taxSummary && taxMeta?.portfolioId === selectedId && (
+              <>
+                <button
+                  className="btn btn-primary"
+                  data-testid="print-button"
+                  onClick={() => window.print()}
+                >
+                  Print
+                </button>
+                <PortfolioStatement
+                  taxSummary={taxSummary}
+                  portfolio={currentPortfolio}
+                  fetchedAt={taxMeta.fetchedAt}
+                />
+              </>
             )}
 
             {sellPnl !== null && sellPnl.portfolioId === selectedId && (
