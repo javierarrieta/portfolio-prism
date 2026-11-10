@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Headless browser smoke for the sell P&L breakdown.
+# Headless browser smoke harness.
 #
-#   ./e2e/run.sh            # from frontend/  (or: npm run e2e:sell-pnl)
+#   ./e2e/run.sh [target]   # default sell-pnl.smoke.mjs; npm run e2e:{sell-pnl,statement}
 #
 # Starts the Rust API against a throwaway SQLite file, starts Vite, drives a real
-# Chromium through the ledger -> breakdown flow, then tears everything down. The
+# Chromium through whichever flow the target drives, then tears everything down. The
 # throwaway DATABASE_URL means this never reads or writes your real portfolio.db.
 #
 # Needs: a chromium-compatible browser, node with playwright-core installed
@@ -15,6 +15,9 @@
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+# ${1:-sell-pnl.smoke.mjs}, not $1: line 16 is `set -uo pipefail`, so a bare $1 aborts the script
+# when it is called with no argument -- which is how npm run e2e:sell-pnl calls it.
+TARGET="${1:-sell-pnl.smoke.mjs}"
 REPO_ROOT="$(cd .. && pwd)"
 WORK="$(mktemp -d)"
 BACKEND_PID=""
@@ -72,6 +75,11 @@ fi
 command -v curl >/dev/null || die "curl is required"
 DB="$WORK/e2e.db"
 export DATABASE_URL="sqlite:$DB?mode=rwc"
+# Without this the server defaults to OIDC, refuses to launch, and `wait_for backend`
+# burns its whole 420-second budget -- which is why this harness stopped starting. Safe
+# only because run.sh builds debug: `disabled` is compiled out of release builds
+# (backend_rust/src/auth/mod.rs:96-101). start.sh:21 does exactly the same.
+export AUTH_MODE=disabled
 export BASE_URL="${BASE_URL:-http://localhost:5173}"
 export API_URL="${API_URL:-http://127.0.0.1:8000/api}"
 
@@ -109,7 +117,7 @@ FRONTEND_PID=$FRONTEND_PGID
 wait_for "$BASE_URL/" frontend 60 || { tail -20 "$WORK/vite.log"; die "vite did not come up"; }
 
 # --- run ---------------------------------------------------------------------
-node e2e/sell-pnl.smoke.mjs
+node "e2e/${TARGET}"
 STATUS=$?
 
 [ "$STATUS" -ne 0 ] && [ -n "${SMOKE_SHOT:-}" ] && echo "screenshot: $SMOKE_SHOT" >&2

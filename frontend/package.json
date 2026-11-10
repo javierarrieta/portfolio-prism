@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "generate-types": "openapi-typescript ../docs/openapi/openapi.json --output src/types/api.d.ts",
-    "e2e:sell-pnl": "bash e2e/run.sh"
+    "e2e:sell-pnl": "bash e2e/run.sh",
+    "e2e:statement": "bash e2e/run.sh statement.smoke.mjs"
   },
   "dependencies": {
     "@types/papaparse": "^5.5.2",
