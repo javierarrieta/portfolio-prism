@@ -51,9 +51,11 @@ variable overrides and the `.glass-card` override (`print.css:36-49`) sit inside
 with no selector of their own, and `print.css` is imported globally (`main.tsx:4`), so on those
 tabs the page goes dark-on-white too. What does **not** change there is the layout — sidebar,
 nav and charts still print, because the hide rules are `:has()`-scoped and do not match. One
-residual to know about: `.sidebar` keeps a hardcoded dark background (`index.css:101`) while its
-nav text becomes `#333333`, so a reader who has enabled background graphics gets a dark-on-dark
-sidebar on those tabs. The statement tab is unaffected, because rule 1 hides the sidebar there.
+color those variable overrides cannot reach is `.sidebar`'s, which is a hardcoded dark literal
+(`index.css:101`), so `print.css` sets it to white explicitly: without that rule a reader who has
+enabled background graphics gets a dark-on-dark sidebar on those tabs. With it the print is legible
+either way, because the rule paints nothing when background graphics are off. The statement tab is
+unaffected regardless, because rule 1 hides the sidebar there.
 
 ## Behaviour changes worth knowing about
 
@@ -92,16 +94,18 @@ sidebar on those tabs. The statement tab is unaffected, because rule 1 hides the
 
 ## What is verified, and what is not
 
-**Covered by `npm test` (20 files, 173 tests, green as of this note):**
+**Covered by `npm test` (20 files, 176 tests, green as of this note):**
 
-- `PortfolioStatement.test.tsx` — the structural hooks, the literal copy, the nine table
-  columns, the empty branch's negative list, and one rounding golden (`1234.565` at EUR
-  renders `€1,234.57`). jsdom does not apply `@media print`, so this proves structure and
-  formatting and nothing about the printed page.
+- `PortfolioStatement.test.tsx` — the structural hooks, the literal copy on **both** P&L labels,
+  the nine table columns, the empty branch's negative list, the HYBRID-only threshold including
+  `HYBRID` with no `threshold_days`, and one rounding golden (`1234.565` at EUR renders
+  `€1,234.57`). jsdom does not apply `@media print`, so this proves structure and formatting and
+  nothing about the printed page.
 - `PrintCss.test.ts` — `print.css` read **as text**: both hide rules scoped with `:has()`,
-  the inverted palette values, the `.statement-table td` border override, the break rules,
-  and `@page` A4/14 mm. Text, not rendering — it cannot tell you the rules apply to the
-  elements they name.
+  the inverted palette values, the `.statement-table td` border override, the `.statement-table`
+  cell-padding rule that makes nine columns fit the page, the white `.sidebar` background, the
+  break rules, and exactly one `@page` block declaring A4/14 mm. Text, not rendering — it cannot
+  tell you the rules apply to the elements they name.
 - `AppStatement.test.tsx` — the tab is reachable by the label a person can actually see; the
   statement root and the Print button are direct children of `.main-content`, which is the
   position the hide rules need (a wrapper there prints a blank page from a tab that looks
@@ -117,7 +121,12 @@ workspace that produced this change has no chromium and none was installed. It i
 syntax-checked and reviewed, which is not the same as executed, and the first real run should
 be read as a first run rather than a regression. When it does run it asserts **no figure** on
 purpose: prices come from a live provider, and a smoke that asserted figures would print
-zeros and still pass.
+zeros and still pass. The assertion most likely to fail on that first run is the
+horizontal-overflow check — nine columns inside a 608px box is a tight fit — and `print.css` now
+shrinks the statement table's cells to `6px 8px` at `0.75rem` specifically to fit them, so the
+expected outcome is a pass. If it fails anyway, the finding is about the shipped PDF (the printed
+table really is too wide for the page and the three rightmost P&L columns are being clipped), and
+the response is to shrink the table further, not to widen the smoke's viewport.
 
 **There is no CI browser job.** Issue #45 is open. One is possible — CI could install chromium,
 and `emulateMedia` and `page.pdf()` need no display server — but the job is not browser-only:

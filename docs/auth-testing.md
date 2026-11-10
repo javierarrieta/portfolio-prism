@@ -323,9 +323,19 @@ Either answer is useful. Neither can be found from here.
   dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
   is falsy, so a coincidental fallback can satisfy an eyeball comparison.
 - an empty portfolio prints a short note and no figures
+- all nine columns are on the page. The rightmost three — Realized, Unrealized, Unrealized ROI —
+  are what a too-wide table loses first, and `body` sets `overflow-x: hidden` (`index.css:47`), so
+  an over-wide table is clipped with no scrollbar and no warning. `print.css` shrinks the
+  statement table's cells to `6px 8px` at `0.75rem` to fit them.
 
 Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
-scoped, so printing from any other tab now also gets A4 with 14mm margins.
+scoped, so printing from any other tab now also gets A4 with 14mm margins. The print palette
+cannot be scoped either: the other four tabs now print dark-on-white as well, which is an
+improvement on the near-invisible white-on-white they used to print. Their layout is unchanged —
+the hide rules are `:has()`-scoped, so their sidebar, nav and charts still print. One of those
+backgrounds is a hardcoded dark literal the palette overrides cannot reach, so `print.css` forces
+the sidebar white for print; if you enable background graphics and still get a dark-on-dark
+sidebar on another tab, that rule is what went missing.
 
 ---
 

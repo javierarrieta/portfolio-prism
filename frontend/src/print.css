@@ -3,8 +3,8 @@
  * in main.tsx so it wins the cascade at equal specificity.
  *
  * The hide rules are scoped with :has() on purpose. Unscoped, `.main-content > *:not(...)`
- * hides every direct child of the content column on the dashboard, analytics and ledger
- * tabs, because nothing there carries the attribute — three of four tabs would print blank.
+ * hides every direct child of the content column on every tab that does not carry the
+ * attribute — four of five tabs would print blank.
  * :has() is baseline (Chrome 105 / Safari 15.4 / Firefox 121); the repo sets no
  * browserslist override.
  */
@@ -48,12 +48,45 @@
     background: #ffffff;
   }
 
+  /* The sidebar's own background is a literal rgba(10, 15, 28, 0.95) (index.css:101),
+        not a variable, so the :root overrides above cannot reach it. On the statement tab
+        that is moot, because rule 1 hides the sidebar. On the other tabs the hide rules do
+        not match, the sidebar prints, and its nav text has just become --text-secondary
+        #333333 — with background graphics enabled that is dark-on-dark. This rule is a
+        no-op when they are off (nothing is painted) and removes the case when they are on.
+        It is unscoped like the palette above it, because scoping it to the statement tab
+        would leave the defect exactly where it occurs. */
+  .sidebar { background: #ffffff; }
+
   /* .data-table td's own border is a literal rgba(255,255,255,0.03) (index.css:247),
         not a variable, so --border-color never reaches it. Without this the header rule
         inverts and every body rule stays invisible: a half-inverted table. */
   .statement-table td { border-bottom: 1px solid #333333; }
 
-  /* 4. Break rules. */
+  /* 4. Fit the nine columns on the page, or the three rightmost ones never reach the
+        paper. The box: A4 is 210mm wide and `@page` above takes 14mm of it on each side,
+        so the content box is 182mm = 688px at 96dpi; .main-content keeps the 40px side
+        padding index.css:162 gives it, so the statement is laid out in 608px. A table
+        cannot shrink below min-content and body sets overflow-x:hidden (index.css:47), so
+        an over-wide table is clipped silently — losing Realized, Unrealized and
+        Unrealized ROI, which are the point of the artifact. At .data-table's 16px cell
+        padding (index.css:246) the horizontal padding alone costs 32px x 9 columns =
+        288px, 47% of the 608px box before a single glyph, and td inherits the 16px body
+        font (only th drops to 0.875rem, index.css:242), which puts min-content past what
+        remains. At 6px 8px the padding is 16px x 9 = 144px, leaving ~464px for content
+        instead of ~320px, and 0.75rem shrinks the widest unbreakable word in each column
+        ("Unrealized", "$1,200.00") by the same ratio. Specificity ties .data-table th/td
+        at (0,1,1), so source order decides: print.css is imported after index.css
+        (main.tsx:4). .main-content's own 40px is deliberately left alone — the smoke
+        measures the shipped 608px box, and collapsing it would widen the very thing that
+        assertion checks. */
+  .statement-table th,
+  .statement-table td {
+    padding: 6px 8px;
+    font-size: 0.75rem;
+  }
+
+  /* 5. Break rules. */
   tr { break-inside: avoid; }
   .statement-headline { break-inside: avoid; }
 }

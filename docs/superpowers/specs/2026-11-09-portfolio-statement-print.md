@@ -10,11 +10,16 @@
     blocked implementation are closed, the rest are citation drift and restatement cleanup.
 *   **Date:** 2026-11-09
 *   **Inherits from:** `2026-11-09-pricing-layer-truthfulness.md` — the statement renders the same
-    FX conversion that document describes as broken for foreign-currency assets. It **inherits that
-    pre-existing defect**; it is not blocked on the fix, because same-currency assets involve no FX at
-    all, and a foreign-currency portfolio already fails the `tax-summary` request outright today
-    (`currency_service.rs:234` → `analytics.rs:86` returns 500) — so nothing this slice prints can be
-    worse than the dashboard's current behaviour. See *When there is no payload at all*.
+    FX conversion that document was written to fix. It **inherits that layer's behaviour and no
+    failure mode of its own**; it was never blocked on it, because same-currency assets involve no FX
+    at all. The stronger claim made here at drafting — that a foreign-currency portfolio already fails
+    the `tax-summary` request outright with a 500 — was closed when that document shipped:
+    `fx_symbol` now builds `EURUSD=X` (`currency_service.rs:36`),
+    `get_rate` short-circuits a same-currency pair (`currency_service.rs:401`), and
+    `get_portfolio_tax_summary` passes both the asset and the base currency to the engine
+    (`analytics.rs:87-98`). Nothing this slice prints can be worse than the dashboard's current
+    behaviour. A pair the provider cannot answer still fails, and that is the live route into *When
+    there is no payload at all*.
     **Related:** `2026-11-09-tax-report-and-statement-design.md` (the tax report; this document was
     split out of it).
 *   **Origin:** split out of the tax-report design during its review; the scope judgement that
@@ -291,10 +296,14 @@ nonsense. The existing holdings table already makes the same branch for the same
 ### When there is no payload at all — an accepted gap
 
 There is a third state besides populated and `assets: []`: `taxSummary === null`. It is reached
-whenever the `tax-summary` request fails, and for a foreign-currency portfolio it fails today —
-`currency_service.rs:234` builds the malformed pair `EUR=USD`, `get_rate` returns `Err`, `replay`
-propagates it (`tax_engine.rs:403`), and `analytics.rs:86` turns it into a 500. `App.tsx:112` throws,
-`setTaxSummary` never runs, and the guard the mandated pattern produces renders nothing.
+whenever the `tax-summary` request fails. The example recorded here at drafting — a foreign-currency
+portfolio, `currency_service.rs:234` building the malformed pair `EUR=USD` — no longer reaches it:
+the pair symbology is fixed (`fx_symbol` yields `EURUSD=X`, `currency_service.rs:36`) and a
+same-currency pair short-circuits at `currency_service.rs:401`. The state is still reachable, because
+a cross pair still needs a rate. When the provider is down, or the currency is one it has never heard
+of, and neither the cache nor a stored row answers inside the lookback, `get_rate` returns `Err`,
+`replay` propagates it (`tax_engine.rs:416`), and `analytics.rs:98` turns it into a 500. `App.tsx:123`
+throws, `setTaxSummary` never runs, and the guard the mandated pattern produces renders nothing.
 
 **The decision is to accept this and say so, not to design around it.** In that state the statement
 tab renders nothing, so the `:has([data-print="statement"])` hide rules and the grid collapse
@@ -466,16 +475,18 @@ is out of scope — the statement is the tab you print from, and the only one th
 What changes for those tabs is **not** only `@page`, which no selector can scope: they now get A4
 with 14 mm margins, and the palette overrides at `print.css:36-49` sit inside `@media print` with
 no selector of their own, so their text and card backgrounds invert too. What does not invert on
-those tabs is anything with a hardcoded color, and the sidebar is the obvious case — `.sidebar`
+those tabs is anything with a hardcoded color. The one that matters is the sidebar: `.sidebar`
 keeps `rgba(10, 15, 28, 0.95)` (`index.css:101`) while its nav text becomes `--text-secondary`
-`#333333`, so with background graphics enabled that sidebar prints dark-on-dark. The statement
-tab is unaffected, because rule 1 hides the sidebar there.
+`#333333`, which with background graphics enabled would print dark-on-dark — so `print.css` carries
+an explicit `.sidebar { background: #ffffff }` for it. That rule is unscoped for the same reason as
+the palette above it: rule 1 hides the sidebar on the statement tab, so scoping the override to that
+tab would leave the defect exactly where it occurs. It is a no-op when background graphics are off,
+and the statement tab is unaffected either way.
 
 Two backgrounds are not variables and do not invert: `.badge-crypto`'s background
 (`index.css:334`; its **color** is a variable and does invert) and `.data-table tr:hover td`
-(`:252`, a hover state that cannot occur on paper). `.sidebar` is hardcoded at `:101` as well —
-rule 1 hides it on the statement tab, so it is not a residual *there*, and it is one on the other
-four tabs, as just said.
+(`:252`, a hover state that cannot occur on paper). `.sidebar` is hardcoded at `:101` as well, and is
+the only one of the three that got an explicit override, for the reason just given.
 
 ### Verification layers, and what each cannot cover
 
@@ -527,8 +538,9 @@ four tabs, as just said.
         `expect(await el.scrollWidth()) <= (await el.clientWidth())` for `[data-print="statement"]`.
         A document-level check is meaningless here — `index.css:47` sets `body { overflow-x: hidden }`,
         which propagates to the viewport, so the document never reports overflow; it clips silently.
-        Note `emulateMedia` does not resize the viewport (the harness runs 1400×1000), so this checks
-        the print stylesheet's typography at desktop width; the A4 case is the manual check's.
+        The viewport is resized to the `@page` content box (688px) before the check, because
+        `emulateMedia` changes the media type but not the layout viewport, and at the harness's
+        1400×1000 this could only fail at a width nobody prints at.
     *   `page.pdf({ format: 'A4', preferCSSPageSize: true, printBackground: false })` is non-empty.
         The options are stated because Playwright's defaults are Letter with
         `preferCSSPageSize: false`, which would measure a page size this slice does not ship. **No
@@ -537,8 +549,10 @@ four tabs, as just said.
     *   **no figure is asserted.** Figures come from a live price provider; when it is unreachable the
         fallback returns zero, and a smoke that asserted figures would then print zeros and still
         pass. The smoke pins structure and visibility, which are unaffected by price. The seeded
-        holdings are denominated in the portfolio's base currency — a foreign-currency fixture would
-        500 the request before any print assertion ran (see *When there is no payload at all*).
+        holdings are denominated in the portfolio's base currency so that no rate lookup is needed at
+        all: a cross pair goes to the live provider, which can fail outright on a rate nobody can
+        supply or answer with an older close than the date asked for, and a smoke that asserts no
+        figure must not depend on one (see *When there is no payload at all*).
 
     **Local step, not a gate.** `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` and gains a
     target argument here; `ci.yml` has no browser job, which is issue #45. The full reasoning —
@@ -648,7 +662,7 @@ the page still prints badly. The Playwright smoke is the check; see Alternative 
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
 | **Empty portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Goal 7 and *Empty portfolio*: heading, printed date and the empty note only. The negative list is asserted. |
 | **A stale payload prints under the wrong portfolio name.** | `setTaxSummary` is called once (`App.tsx:114`) and never cleared | Target Files 4 gives the form: record the id beside the summary, guard the statement branch, following `App.tsx:68`. |
-| **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs keep their layout | Out of scope and stated under *Other tabs*. Those tabs get two changes they did not ask for: `@page` (A4 with 14 mm margins), which no selector can scope, and the unscoped palette overrides (`print.css:36-49`), which invert their text and cards. The sidebar's hardcoded background does not invert along with them. |
+| **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs keep their layout | Out of scope and stated under *Other tabs*. Those tabs get two changes they did not ask for: `@page` (A4 with 14 mm margins), which no selector can scope, and the unscoped palette overrides (`print.css:36-49`), which invert their text and cards. The sidebar's background is a hardcoded literal those overrides cannot reach, so `print.css` sets it to white explicitly rather than leave it dark-on-dark. |
 | **Foreign-currency figures are wrong, inherited.** | The pricing-layer spec records that foreign-currency assets cannot be priced correctly today | Not this slice's fix and not this slice's regression. The statement inherits the dashboard's existing behaviour; the pricing-layer change corrects both at once. |
 | **A failed tax-summary request prints the app shell, not a statement.** | `taxSummary` stays `null` → the guard renders nothing → the `:has()`-scoped hide rules do not match. The FX cause recorded at drafting (`currency_service.rs:234` → 500) was closed by the pricing-layer change | **Accepted gap**, specified in *When there is no payload at all*. The print gets the shell — sidebar, header, error banner — around an empty content column, in the inverted palette, because the palette overrides carry no selector. Not the dashboard, and not illegible. |
 

@@ -57,6 +57,9 @@ describe('PortfolioStatement, populated', () => {
     renderIt();
     expect(screen.getByTestId('label-realized').textContent)
       .toBe('Realized P&L — cumulative since inception');
+    // The unrealized label has no test id of its own; the spec requires this copy
+    // literally, so it is pinned by text.
+    expect(screen.getByText('Unrealized P&L — as of today')).toBeDefined();
     expect(screen.getByTestId('generated-at').textContent).toBe('Printed Nov 9, 2026');
     expect(screen.getByTestId('data-at').textContent).toBe('Data fetched Nov 9, 2026, 10:30 AM');
     expect(screen.getByTestId('rounding-note').textContent)
@@ -80,6 +83,17 @@ describe('PortfolioStatement, populated', () => {
       />
     );
     expect(screen.getByTestId('run-context').textContent).toBe('Long-Term · EUR · FIFO');
+  });
+
+  it('omits the threshold text for HYBRID when the payload carries no threshold_days', () => {
+    render(
+      <PortfolioStatement
+        taxSummary={summary({ strategy: 'HYBRID', threshold_days: undefined })}
+        portfolio={portfolio} fetchedAt={fetchedAt}
+      />
+    );
+    // Without the `!== undefined` guard the page would print "(threshold undefinedd)".
+    expect(screen.getByTestId('run-context').textContent).toBe('Long-Term · EUR · HYBRID');
   });
 
   it('renders nine columns and one row per holding', () => {

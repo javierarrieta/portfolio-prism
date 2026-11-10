@@ -32,9 +32,13 @@ async function seed() {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: `Statement Smoke ${stamp}`, description: 'headless smoke', currency: 'USD' }),
   })
-  // Two USD holdings in a USD portfolio. Same-currency is a hard requirement: a
-  // foreign-currency asset makes tax-summary 500, the guard renders nothing, and
-  // the smoke would print the dashboard and still pass.
+  // Two USD holdings in a USD portfolio. Same-currency is still a hard requirement, but
+  // not for the reason first written here: since the pricing layer landed a
+  // foreign-currency asset no longer 500s tax-summary outright (fx_symbol now yields
+  // EURUSD=X, and get_rate short-circuits a same-currency pair). Rate lookups go to the
+  // live provider, so a fixture that needs FX can fail outright on a rate nobody can
+  // answer, or be priced at whatever older close the lookback substituted -- and this
+  // smoke asserts no figure, so it must not depend on one.
   for (const [symbol, name] of [['AAPL', 'Apple Inc.'], ['MSFT', 'Microsoft']]) {
     const asset = await api(`/portfolios/${portfolio.id}/assets`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -121,14 +125,14 @@ try {
   // changes the media type but NOT the layout viewport: at 1400px this could only fail
   // at a width nobody prints at. The shipped PDF lays out at the @page CONTENT box -- A4
   // at 210mm minus print.css:13's 14mm margins = 182mm = 688px at 96dpi. (794px is the
-  // whole sheet; the browser lays no content into the margins.) print.css overrides no
-  // padding anywhere, so .main-content keeps the 40px each side index.css:161 gives it
-  // and the statement's box is 688 - 80 = 608px. A 688px viewport reproduces that 608px
-  // exactly, so the residual against what ships is zero. Nine columns of 16px cell
-  // padding is ~288px of padding alone, which is why the ~106px between 608 and 714 was
-  // the whole point of the check. (.main-content is overflow-y:auto, so a page tall
-  // enough to scroll would shave ~15px off clientWidth -- stricter than the printed
-  // page, never more permissive.)
+  // whole sheet; the browser lays no content into the margins.) print.css shrinks the
+  // statement table's cells but overrides no container padding, so .main-content keeps the
+  // 40px each side index.css:162 gives it and the statement's box is 688 - 80 = 608px. A
+  // 688px viewport reproduces that 608px exactly, so the residual against what ships is
+  // zero. Nine columns at the on-screen 16px cell padding need 288px of padding alone, which
+  // is what print.css's .statement-table rule buys back -- see the arithmetic in the comment
+  // there. (.main-content is overflow-y:auto, so a page tall enough to scroll would shave
+  // ~15px off clientWidth -- stricter than the printed page, never more permissive.)
   //
   // If this fails on a real run it is a finding about the shipped PDF -- the printed
   // table really is too wide for the page -- not a broken assertion. Do not "fix" it by
