@@ -128,7 +128,7 @@ P2 (dedupe with stated tie-break → unique index → migration test) → P1 (da
 
 1.  `tests/access_gate_test.rs` and `tests/access_test.rs` never read; either may hold hard counts or tax-summary assertions that move.
 2.  Rocket local-client panic behaviour (underpins the guard's panic-release test being unwritable).
-3.  Whether `e2e/run.sh` supplies `AUTH_MODE=disabled`.
+3.  ~~Whether `e2e/run.sh` supplies `AUTH_MODE=disabled`.~~ **Answered during the statement review:** it does not, and the harness therefore does not start. `run.sh:74-76` exports only `DATABASE_URL`, `BASE_URL`, `API_URL`; the server defaults to OIDC and bails. Tracked on issue #45.
 4.  `frontend/src/test/mocks/handlers.test.ts` may assert the exact handler list and break when the tax-summary mock is branched.
 5.  Whether `cargo test` passes offline here.
 6.  utoipa / Rocket content negotiation for `?format=csv`.
@@ -136,3 +136,23 @@ P2 (dedupe with stated tie-break → unique index → migration test) → P1 (da
 ## 8. Process note
 
 Two stage-9 reviewers hit the 30-minute timeout at 71 turns / ~116 tool calls and were recovered by resuming with forked context and instructing a write-up of verified material only. For a 25-file audit against a repository, scope the reviewer tighter or set an explicit `maxRuntimeMs` — the default is too long to be a useful budget and too short for the task as posed.
+
+## 9. Values left open at the end of drafting — all four settled
+
+Recorded here because each was a fork, not an oversight. Full rationale in the spec's *Open questions*.
+
+| Value | Decision | Why |
+| :-- | :-- | :-- |
+| Single-parameter dates | **Either alone is legal.** `to` alone = cumulative from first transaction; `from` alone = through today. | Both-or-neither forces an invented start date, and an invented start silently changes the number. The dominant quarterly query is `to` alone. The effective range is echoed in the response and CSV, so an open end is visible rather than inferred. |
+| Missing-item cap | **20 symbols, 10 rate pairs**, with `missing_prices_total` / `missing_rates_total`. | The list is for a human; 200 unpriced symbols need the count, not the list. Truncation is never silent. |
+| Elapsed deadline | **20 s, checked between outbound calls.** | The spec said "between assets", and that is a hole: one asset can make two unreachable calls (price + FX pair), so 66 s can follow a clean check and the ingress 60 s default returns a 504 instead of the typed 503 — losing the body, `retryable`, and the point of failing closed. Between calls bounds it at 53 s. Testable without waiting: the deadline is a parameter alongside the start `Instant`. |
+| CSV summable-column convention | **Row 1 is always headers; caveats ride as columns.** | Evidence, not taste: `detectColumns` (`csvParser.ts:25`) normalizes row 1 against `FIELD_ALIASES`, so a leading `#` row maps every column to `null` and the import silently yields nothing. `lot_pnl` is the column that totals, separated by `row_type`; the disclosure goes in the release note. |
+
+Also closed as a side effect: the lookback and cache-bound constants were already owned and merged by
+the pricing-layer work (`FX_LOOKBACK_DAYS = 30`, `FX_SERIES_WINDOW_DAYS = 365`,
+`MAX_FX_SERIES_CACHED = 64`), the per-report outbound budget died with the cost guard (D2), and the
+print page count became a manual check in the statement document.
+
+One consequence worth carrying into the release note: a cold large portfolio can legitimately exceed
+20 s and 503 once, then succeed on retry because the first attempt warmed the per-pair series cache.
+Without that sentence a first request after a deploy reads as a bug.

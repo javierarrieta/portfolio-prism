@@ -1,7 +1,11 @@
 # Portfolio Tax Report and Portfolio Statement
 
 *   **Author:** javierarrieta, with EGM brainstorm and draft support
-*   **Status:** Proposed
+*   **Status:** Proposed — reviewed, and **the open values are settled**. Five stages of EGM review
+    are complete and applied; the six owner decisions (D1–D6) are applied; and the four values left
+    open at the end of drafting — single-parameter dates, the missing-item cap, the elapsed-deadline
+    constant, and the CSV summable-column convention — are decided in *Open questions* with their
+    rationale. Nothing in this document is left for an implementer to invent.
 *   **Date:** 2026-11-09
 *   **Predecessor:** `2026-11-09-tax-report-and-statement-concepts.md`
 *   **Sibling:** `2026-11-09-portfolio-statement-print.md` — the printable statement, split
@@ -9,8 +13,9 @@
     statement lives there; this document keeps only where the statement touches the tax
     report.
 *   **Blocked on:** `2026-11-09-pricing-layer-truthfulness.md` — dated FX,
-    `historical_prices` uniqueness and the pricing result types. This document does not
-    edit `currency_service.rs` or `lib.rs`.
+    `historical_prices` uniqueness and the pricing result types. That work is **implemented and
+    pushed** as `fix/pricing-layer-truthfulness` but not yet merged to `main`, so this document stays
+    blocked until that branch lands. This document does not edit `currency_service.rs` or `lib.rs`.
 
 ## Overview
 
@@ -133,7 +138,7 @@ signal.
 | :-- | :-- | :-- |
 | Existing figures move | The pricing-layer document's four changes each move numbers on endpoints the owner already trusts | Goal 7 and the Dependency section: those changes ship alone, with their own notes |
 | Late-recorded splits | A split entered after a period is filed changes in-window cost basis on regeneration, and concurrent first-sync requests can double a split | Out of scope, issue #50. The run context states splits are as recorded; the dated path does not sync |
-| Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing-layer work-set shrink; the route's elapsed deadline, which fails closed |
+| Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) — and one asset can make two such calls, a price and an FX pair | Pricing-layer work-set shrink; the route's 20 s elapsed deadline, checked **between outbound calls** so the worst case is 53 s and not 66 s past a clean check, which would surface as an ingress 504 instead of the typed 503 |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
 | Print fidelity | Owned by the statement document, which ships that slice unverified by design (no CI browser job; issue #45) | `2026-11-09-portfolio-statement-print.md`, Risks |
 | Single-replica assumptions | SQLite write behaviour assumes one pod; a rolling update with default maxSurge runs two for a window | State the dependency in the deployment manifest review |
@@ -367,14 +372,28 @@ raises against an `Editor` rule — the budget duplicates a bound the pricing-la
 cache already enforces structurally (about 22 outbound calls for the flagship portfolio),
 and neither could reach the code that would decrement it.
 
-What remains is a wall-clock bound, because the real hazard is elapsed time. The ingress
-carries no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly
-33 s worst case per unreachable host. The route records its start and stops attempting
-further assets once elapsed time passes a stated constant near 20 s, then **fails closed**:
-the existing 503 with `retryable: true` and no partial payload. A partial tax report is the
-outcome Goal 5 exists to prevent, so "return what was collected" is not an option. The
-deadline cannot preempt an in-flight outbound call, and it is only checkable between assets,
-which bounds anything only once the pricing-layer cache is genuinely per-pair.
+What remains is a wall-clock bound, because the real hazard is elapsed time. **The constant is
+20 s**, defined as `const REPORT_DEADLINE: Duration = Duration::from_secs(20)` beside the route.
+
+It is checked **between outbound calls, not between assets**, and the difference is what the number
+is for. Worst case for one unreachable host is 33 s — three attempts at the 10 s reqwest timeout
+(`currency_service.rs:290`, `MAX_RETRIES = 3` at `:15`) plus the 1 s and 2 s backoff. One asset can
+make two unreachable calls, a price and an FX pair, so a deadline checked only between assets can be
+followed by 66 s of work. The ingress carries no `proxy-read-timeout`, so the ingress-nginx 60 s
+default applies, and 66 s past a clean check produces a 504 from the ingress instead of the designed
+503 — the user loses the typed body, `retryable`, and the whole point of failing closed. Checking
+between calls bounds the worst case at 20 s + 33 s = 53 s, with 7 s of margin.
+
+The route records its start and stops attempting further work once elapsed time passes the deadline,
+then **fails closed**: the existing 503 with `retryable: true` and no partial payload. A partial tax
+report is the outcome Goal 5 exists to prevent, so "return what was collected" is not an option. The
+deadline cannot preempt an in-flight outbound call; it can only refuse the next one.
+
+A cold large portfolio can legitimately exceed 20 s and 503 once, then succeed on retry, because the
+first attempt warmed the per-pair series cache. That is the design working rather than failing, and it
+belongs in the release note: without it a first request after a deploy reads as a bug. The test does
+not wait 20 s — the deadline is a parameter of the report function alongside the start `Instant`, so a
+test passes `Duration::ZERO` with two assets and the check trips after the first.
 
 **Error contract.** Two failure classes, one typed body, produced by a custom Rocket
 `Responder` in the style of the auth `Unavailable` responder
@@ -386,8 +405,11 @@ unrecognized strategy, a negative `threshold_days` — also return 422, with
 `ErrorBody.error` naming the offending parameter and `missing_prices` and `missing_rates`
 empty; no-data failures return 422 with those lists populated. On any error the route
 returns only the error body, and the frontend does not call `downloadCsv` when the request
-fails, so no partial file reaches the owner. The missing-item list is capped, with a count
-of what was omitted.
+fails, so no partial file reaches the owner. **The missing-item lists are capped** — 20 entries in
+`missing_prices`, 10 in `missing_rates` — because the list is for a human to read and a portfolio with
+200 unpriced symbols needs the count, not the list. Truncation is never silent: the body carries
+`missing_prices_total` and `missing_rates_total`, and the test seeds cap+1 and asserts the list length
+equals the cap while the total equals cap+1.
 
 This choice depends on the pricing-layer document's P4. The pricing layer cannot currently
 distinguish "no data" from "could not ask": `get_price` returns `Decimal::ZERO` on every
@@ -404,8 +426,14 @@ UTC. `Transaction.date` is a `DateTime<Utc>` (`models.rs:35`), not a date, so "a
 time on `to` is inside the window" requires an explicit conversion — `date.date_naive() <=
 to` — and `replay_at`'s `end` parameter is a `NaiveDate`. Absent parameters reproduce
 current behaviour: all transactions, priced at the latest available close. `from > to`, a
-`from` or `to` in the future, and an unparseable date are all HTTP 422. Whether `to` alone
-or `from` alone is legal is an open question, not a settled rule; see Open Questions.
+`from` or `to` in the future, and an unparseable date are all HTTP 422. **Either parameter alone is
+legal.** `to` alone means cumulative from the portfolio's first transaction through `to`; `from` alone
+means `from` through today. Both-or-neither was rejected: it forces every caller to invent a start
+date, and an invented start silently changes the number, which is worse than an explicit open end. The
+dominant quarterly query — "gains through 30 June" — is `to` alone. The cost of an open end is that the
+answer moves with the clock, and the mitigation is already required for other reasons: the response and
+the CSV echo the *effective* range, so an open end is visible in the artifact rather than inferred by
+the reader.
 `strategy` is validated strictly on the dated path: absent means FIFO,
 present-but-unrecognized is a 422 naming the accepted values, rather than the silent
 fallback to FIFO that both `tax-summary` (`analytics.rs:217-221`) and the single-sell P&L
@@ -432,7 +460,7 @@ The owner accepted six decisions the RFC did not raise: the pricing result types
 pricing-layer document's responsibility); the `TaxLot` fix; strict strategy and threshold
 validation; bounding and versioning the FX cache (also the pricing-layer document's);
 HTTP 429 in the error contract; and the `SOLD_LOT` row-kind name. The 429 decision is now
-reversed — see Elapsed deadline above — leaving five standing. Two of those
+reversed — see Elapsed deadline above — leaving four standing. Two of those
 change existing endpoint behaviour — the result types and strict strategy validation — and were decided
 individually rather than folded in. `TaxLot` is corrected in place rather than worked
 around, because the Holdings table renders "Remaining Qty" and "Original Qty" as two
@@ -448,30 +476,38 @@ The payload and Alternative C; the error contract shape by Error contract; the a
 by Access level; date parameter semantics by Date parameter semantics; and the trading
 calendar question by Pricing resolution's bounded lookback.
 
-Open from this draft, each needing a decision before the slice that depends on it:
+Open from this draft, each needing a decision before the slice that depends on it. **All of these are
+now settled**, and are kept here because each was a real fork rather than an oversight.
 
-1.  **Single-parameter dates.** Is `to` alone legal, meaning cumulative from the
-    portfolio's first transaction, and is `from` alone legal with an open end? Or is it
-    both-or-neither with a 422 otherwise? The statement's cumulative figure and the CSV's
-    `realized_cumulative` column both depend on this.
-2.  **Numeric constants.** The bounded lookback length, the per-report outbound budget, the
-    missing-item cap, the FX cache bound, and the print page count are named nowhere. Each
-    needs a value and a place it is asserted by a test.
+1.  **~~Single-parameter dates~~** — **settled: either parameter alone is legal.** `to` alone is
+    cumulative from the portfolio's first transaction; `from` alone runs through today. Both-or-neither
+    would force an invented start date, and an invented start silently changes the number. The
+    effective range is echoed in the response and the CSV so an open end is visible, not inferred.
+    Rule and rationale in *Date parameter semantics*.
+2.  **~~Numeric constants~~** — **settled.** The bounded lookback and the cache bound are owned by the
+    pricing-layer document and already merged as `FX_LOOKBACK_DAYS = 30`, `FX_SERIES_WINDOW_DAYS = 365`
+    and `MAX_FX_SERIES_CACHED = 64` (`currency_service.rs:20`, `:26`, `:241`). The per-report outbound
+    budget died with the cost guard (D2). The print page count moved to
+    `2026-11-09-portfolio-statement-print.md`, which makes it a manual check. The missing-item cap is
+    20 symbols and 10 rate pairs, with `missing_prices_total` / `missing_rates_total` so truncation is
+    never silent; the elapsed deadline is 20 s, checked between outbound calls. Both in *Error
+    contract* and *Elapsed deadline*.
 3.  **~~P3's destination~~** — moved to issue #50. The interim rule is stated under
     Known limitation above.
-4.  **Strict validation on the undated path.** Adopting it reverses the standing rejection of
-    an input-validation matrix in
-    `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` and contradicts "absent
-    parameters reproduce current behaviour". Keep it dated-path-only, or cite the record and
-    amend Goal 7.
-5.  **The elapsed-deadline constant.** Near 20 s is the reviewer's suggestion, not a
-    measured value. It needs a number, a place it is defined, and a test that trips it
-    without waiting 20 s.
-6.  **CSV summable-column disclosure.** `sellPnlCsv.ts:13-16` deliberately puts caveats in
-    columns because a leading `#` row breaks naive parsers, including this app's own
-    `detectColumns`. The report CSV is now server-generated, which removes the BOM and
-    float questions but not this one: which convention, and does the file stay parseable by
-    the app's own importer?
+4.  **~~Strict validation on the undated path~~** — **settled: dated-path only** (D6). The undated path
+    keeps its silent fallback to FIFO, so "absent parameters reproduce current behaviour" still holds
+    and the standing rejection in `docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md` stands
+    unamended.
+5.  **~~The elapsed-deadline constant~~** — **settled: 20 s**, `REPORT_DEADLINE`, checked between
+    outbound calls rather than between assets, because one asset can cost two unreachable calls and
+    66 s past a clean check becomes an ingress 504 rather than a typed 503. Testable without waiting:
+    the deadline is a parameter alongside the start `Instant`. See *Elapsed deadline*.
+6.  **~~CSV summable-column disclosure~~** — **settled: caveats ride as columns; row 1 is always
+    headers.** A leading `#` row is ruled out by evidence, not taste: `detectColumns`
+    (`frontend/src/utils/csvParser.ts:25`) normalizes each cell of row 1 against `FIELD_ALIASES`, so a
+    `#` row maps every column to `null` and the import silently yields nothing. The summable column is
+    `lot_pnl`, separated by `row_type` — the predecessor's convention, already documented at
+    `sellPnlCsv.ts:13-16`. The disclosure lives in the release note, not the file.
 
 7.  **~~The print slice's verification gap~~** — moved to
     `2026-11-09-portfolio-statement-print.md`, which owns that slice and states the gap in
@@ -651,7 +687,7 @@ ReportResponse  context, asset_totals: [AssetTotals],
                          market_value, cost_basis},
                 rows: [ReportRow]
 ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
-                retryable, omitted_count
+                missing_prices_total, missing_rates_total, retryable
 ```
 
     `row_type` is an exhaustive enum both renderers must switch on. Nulls are nulls, not
@@ -672,8 +708,8 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     strategy strictly; filter transactions to `date <= to`; call `replay_at`; build
     `AssetTotals` and rows server-side so no renderer sums anything; resolve prices with the
     collected-failure rule and return the typed error body with 422 or 503. Stop attempting
-    further assets once elapsed time passes the stated deadline and return the 503 with no
-    partial payload. Replace the
+    further outbound calls once elapsed time passes `REPORT_DEADLINE` (20 s; checked between calls,
+    not between assets — see Elapsed deadline) and return the 503 with no partial payload. Replace the
     `.map_err(|_| Status::InternalServerError)` erasure on this handler.
 *   **Also in scope, and needed before the dated path**: normalize `strategy` on the **undated**
     path too, not only when `from`/`to` are present. Today the handler defaults but does not
@@ -778,7 +814,14 @@ expectation there assumes FX conversion at the latest rate.
     `fx_rate_date_used` per asset, `price_source`) as columns, and money written
     verbatim from the `Decimal` values so no float is ever involved. **The column list,
     order and the summable-column disclosure are specified here** — this is the
-    deliverable and the owner archives it. Formula-lead escaping on free-text cells and
+    deliverable and the owner archives it. **Row 1 is always the header row; a leading `#`
+    comment row is ruled out by evidence, not taste** — `detectColumns`
+    (`frontend/src/utils/csvParser.ts:25`) normalizes each cell of row 1 against
+    `FIELD_ALIASES`, so a `#` row maps every column to `null` and the import silently yields
+    nothing. Caveats therefore ride as columns, as the predecessor already does. The column that
+    totals is `lot_pnl`, separated by `row_type`; sell-level columns repeat per lot row and must
+    not be summed, which is stated in the release note rather than in the file, because anything
+    in the file's first row breaks the parser it is meant to warn. Formula-lead escaping on free-text cells and
     exponent-free numeric output, both re-implemented over `Decimal` rather than shared
     with `frontend/src/utils/sellPnlCsv.ts`, whose equivalents are module-private at
     `:55`, `:56` and `:62`. The BOM question disappears: the server emits no BOM and the
@@ -792,7 +835,10 @@ expectation there assumes FX conversion at the latest rate.
     compared as decimal strings; formula characters escaped; exponent notation never
     emitted; nulls rendered as empty cells; every row kind present; and two dispatches
     over unchanged data produce byte-identical output, which is Goal 4 actually being
-    testable. This replaces the frontend builder test and its `toBeCloseTo(…, 9)`
+    testable. Plus the two constants: a seeded portfolio with cap+1 missing symbols asserts the list
+    length equals the cap while `missing_prices_total` equals cap+1, and a report call given
+    `Duration::ZERO` as its deadline trips after the first asset without waiting 20 s. This replaces
+    the frontend builder test and its `toBeCloseTo(…, 9)`
     float-summing pattern in `sellPnlCsv.test.ts:184-194`.
 
 #### 16. Deleted — no frontend numeric work for reports
