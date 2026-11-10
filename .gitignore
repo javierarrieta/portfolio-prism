@@ -37,3 +37,6 @@ backend_rust/target/
 *.njsproj
 *.sln
 *.sw?
+
+# SDD scratch (ledger, task briefs, reports)
+.superpowers/

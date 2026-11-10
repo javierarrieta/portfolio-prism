@@ -56,7 +56,9 @@ describe('SellPnlModal', () => {
     })))
     renderModal()
     await waitFor(() => expect(screen.getByTestId('fx-note')).toBeInTheDocument())
-    expect(screen.getByTestId('fx-note')).toHaveTextContent('converted to EUR')
+    expect(screen.getByTestId('fx-note').textContent).toMatch(
+      /Cost basis was converted at the USD→EUR rate recorded on or before each buy date; proceeds at the rate recorded on or before the sell date/,
+    )
   })
 
   it('names the unmatched quantity instead of hiding it', async () => {
