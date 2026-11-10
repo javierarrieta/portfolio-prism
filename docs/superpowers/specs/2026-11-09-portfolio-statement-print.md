@@ -70,8 +70,9 @@ the cent.
     and the tax report's cumulative realized column are the same decimal, and that equality
     is a test.
 *   **Goal 4 — the page states its own provenance.** Portfolio name, base currency, the
-    strategy and `threshold_days` in effect when it was generated, the generation date, and
-    the standing caveat that splits are as recorded at that moment.
+    strategy and `threshold_days` the request was made with — labelled as the strategy in
+    use, because the payload does not confirm them (Decided item 3) — the generation date,
+    and the standing caveat that splits are as recorded at that moment.
 *   **Goal 5 — no backend change.** No new route, no new field, no new figure on any
     existing endpoint, no OpenAPI regeneration. If this slice needs the backend, it has
     drifted out of scope and should stop.
@@ -173,7 +174,8 @@ Three layers, weakest first, with the gap named at each:
     color is dark against a light background — that is the assertion that actually catches
     the dark-theme failure, and it is a computed-style check, not a screenshot — assert no
     horizontal overflow, and assert `page.pdf()` is non-empty and one page for the two-row
-    fixture. **Local step, not a gate**: `e2e/run.sh` hardcodes
+    fixture — **for the fixture only**, with no claim about larger portfolios (Decided
+    item 2). **Local step, not a gate**: `e2e/run.sh` hardcodes
     `node e2e/sell-pnl.smoke.mjs` and must be parameterised first, and `ci.yml` has no
     browser job. Both are issue #45.
 3.  **A human with a print preview.** `docs/auth-testing.md` §5 is already the manual
@@ -197,10 +199,10 @@ style.
 *   **Type / Scope:** the printable view.
 *   **Proposed Changes:** renders the string-typed summary: headline block (cumulative
     realized since inception, unrealized as of today, portfolio value) and one row per
-    holding. No asset-subset filter — the only arithmetic that would make a filtered
-    headline honest is the arithmetic renderers are forbidden from doing. Takes no date
-    parameter. Derives no totals. No `button`, `input` or hardcoded color inside the printed
-    subtree; the Print control sits outside it with `data-no-print`.
+    holding (Decided item 1). No asset-subset filter — the only arithmetic that would make a
+    filtered headline honest is the arithmetic renderers are forbidden from doing. Takes no
+    date parameter. Derives no totals. No `button`, `input` or hardcoded color inside the
+    printed subtree; the Print control sits outside it with `data-no-print`.
 
 #### 2. `frontend/src/styles/print.css` (Create) and `frontend/src/main.tsx` (Modify)
 
@@ -255,21 +257,34 @@ that can pass while the feature is broken is a gate that teaches people to ignor
 | **Two normalizers drift.** | `decimal.ts` is hand-written per field | The agree-to-the-cent test on one fixture. |
 | **A4 on Letter hardware.** | `@page { size: A4 }` | Stated in the dialog, not hidden; the owner's portfolios are EUR-denominated. |
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
+| **The strategy line asserts more than the payload confirms.** | The undated payload echoes neither `strategy` nor `threshold_days` | Labelled "strategy in use", never "confirmed"; Decided item 3 states the condition that would retire it |
 | **Empty or failing portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Header currency from the portfolio object; the empty case prints an explicit "no holdings" line rather than three zeros. |
 
-## Open Questions
+## Decided during drafting
 
-1.  **Does the statement list holdings at all?** The two headline figures are the point; a
-    40-row table is a second page and a second set of numbers to reconcile against the CSV.
-    Recommendation: list them, because a statement without holdings is a receipt, and the
-    owner's use case is handing something to someone.
-2.  **What exactly is the smoke's page-count bound?** One page for a two-row fixture is
-    checkable; a bound that holds for 50 holdings is a layout claim nobody has measured.
-    Recommendation: assert one page for the fixture and say nothing about larger portfolios.
-3.  **Does the strategy line print the value the frontend sent or the value the server used?**
-    The undated payload does not echo `strategy` or `threshold_days`, so only the sent value
-    is available without a backend change. Recommendation: print it and label it as the
-    strategy in use, and revisit if the tax report's payload ends up echoing both.
+Three items were open when this document was first written. They are settled here, and the
+reasons are recorded because each one trades something away.
+
+1.  **The statement lists holdings.** The two headline figures are the point, and a 40-row
+    table is a second page and a second set of numbers to reconcile against the CSV. It
+    lists them anyway: a statement without holdings is a receipt, and the owner's use case
+    is handing something to a person who will ask "which positions?". The reconciliation
+    cost is real and is paid by Goal 3 — every printed row is a payload value, so the rows
+    cannot drift from the CSV; what they can do is run to a second page, which is a layout
+    fact, not a correctness one.
+2.  **The smoke asserts one page for its own fixture and says nothing about larger
+    portfolios.** One page for a two-row fixture is checkable. A bound that holds for 50
+    holdings is a layout claim nobody has measured, and an assertion that fails on the
+    owner's real portfolio but passes in CI is an assertion that teaches people to ignore
+    the smoke. The page-break rules still ship (`tr { break-inside: avoid }`); they are
+    simply not claimed to produce a page count.
+3.  **The strategy line prints the value the frontend sent, labelled as the strategy in
+    use.** The undated payload echoes neither `strategy` nor `threshold_days`, so the
+    server's value is unavailable without a backend change this document refuses to make.
+    The sent value is honest as long as it is labelled as what it is; it stops being honest
+    the moment it is presented as confirmed by the server. If the tax report's payload ends
+    up echoing both, the statement should read them from the payload and this decision
+    should be revisited rather than left to rot.
 
 ## Alternatives Considered
 
