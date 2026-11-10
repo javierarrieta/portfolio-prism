@@ -35,54 +35,31 @@ instead of pretending to be the exact file next door.
     turns on background graphics, so a naive print is near-white text on white paper —
     invisible, not merely ugly. The print stylesheet's real job is **palette inversion**,
     not hiding the nav. Hiding the nav is the easy third.
-*   **The printed page must say what it rounded.** The backend sends money as decimal
-    strings (`backend_rust/src/db_types.rs:31`, `serializer.serialize_str(&d.to_string())`)
-    at full precision, and the tax report CSV is specified to be written at that same full
-    precision by standing repo decision
-    (`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md:18`,
-    "full precision, no quantisation"; per-field rounding is called "actively harmful" at
-    `:50`). The engine multiplies by the FX rate with no `set_scale` anywhere
-    (`tax_engine.rs:418`, `:422`, `:433`), so a realized figure genuinely carries more
-    decimals than a page should show. `normalizeTaxSummary` in
-    `frontend/src/utils/decimal.ts` runs every money field through `num()`, which is
-    `Number(v)`, and `formatCurrency` runs it through `toNumber` again
-    (`formatters.ts:4`) before quantising to 2 dp via `Intl`. So a printed figure and the
-    CSV's figure for the same holding are **already guaranteed to differ** — not by a
-    floating-point accident but by design, because one is quantised and the other is not.
-    A page that prints `1,234.57` next to a CSV cell reading `1234.56500000000000000000`
-    and claims to be the same number is the defect. The fix is to say the rounding out loud
-    on the page, not to pretend the page is exact.
-*   **There is no router, and therefore no linkable statement.** `App.tsx:36` is
-    `useState(DEFAULT_TAB)` and the nav is four `<li className="nav-item">` elements
-    (`App.tsx:385-396`). Adding a router for one page is not worth it and is a non-goal.
-    The honest consequence is that **a printed page cannot be re-opened by URL and the
-    statement is not bookmarkable**, and this document stops pretending that is a problem it
-    intends to solve. A query parameter was considered and rejected: `App.tsx:58` already
-    reads `new URLSearchParams(window.location.search)` and `App.tsx:347-353` rewrites it, so
-    `?view=statement` would follow an existing convention with no dependency — but
-    `selectedId` is component state and is not in the URL either, so a bookmarked
-    `?view=statement` reopens the wrong portfolio. It buys half a deep link, adds a second
-    navigation mechanism next to the one that works, and the smoke can drive the real
-    mechanism directly. If linkability is ever wanted, it is wanted for portfolio selection
-    first, and that is a router conversation this slice declines.
-*   **Nothing can prove it prints, and the reason is a workstation fact, not a CI law.**
-    `.github/workflows/ci.yml` has no browser job. Issue #45
-    (*Run the sell P&L Playwright smoke in CI*) is open. This slice therefore **ships
-    unverified by design** — see Risks and Verification layer 2. That phrase was inherited from
-    the parent design and it needs the correction recorded there: CI could run this smoke
-    today with a one-line chromium install; the reasons it does not are the cargo build the
-    harness drags in and the emptiness of a job allowed to fail. The document names its
-    selectors and its smoke assertions here rather than leaving them to implementation time,
-    so the check is specific the moment #45 lands.
-
-*   **The person the statement is for cannot log in.** Every `/api` route goes through
-    `AuthedUser` plus a `require*` call, and `apiFetch.ts:22-26` sends an unauthenticated
-    caller to `/auth/login`. An adviser has no account and will never get one from this
-    slice. So the artifact necessarily leaves the app, and "print it from the browser" is not
-    a complete story: the owner prints, then forwards. That is fine, but it means the page
-    must stand on its own once detached — which is what Goal 4's provenance block and Goal 3's
-    declared rounding are for. The cheaper exit (a copy-to-clipboard text block pasted into an
-    email body) is considered and rejected under Alternative F.
+*   **The printed page must say what it rounded.** The backend sends money as full-precision
+    decimal strings (`db_types.rs:31`) and the engine multiplies by the FX rate with no
+    `set_scale` anywhere (`tax_engine.rs:418`, `:422`, `:433`), so a realized figure carries
+    more decimals than a page should show. The frontend quantises at display: `Intl` renders
+    2 dp for fiat, up to 8 for `BTC`/`ETH` (`formatters.ts:10-11`). A printed figure and the
+    tax report CSV's figure for the same holding are therefore **guaranteed to differ** — not
+    by a floating-point accident but by design, one being quantised and the other not. A page
+    printing `1,234.57` beside a CSV cell reading `1234.56500000000000000000`, while claiming
+    to be the same number, is the defect. The fix is to say the rounding out loud on the page.
+*   **There is no router, so the statement is not linkable.** `App.tsx:36` is
+    `useState(DEFAULT_TAB)`; the nav is four `<li className="nav-item">` elements
+    (`App.tsx:385-396`). A printed page cannot be re-opened by URL or bookmarked, and this
+    document does not intend to solve that. A query parameter is rejected under Alternative G.
+*   **Nothing can prove it prints.** `.github/workflows/ci.yml` has no browser job and issue
+    #45 (*Run the sell P&L Playwright smoke in CI*) is open, so this slice **ships unverified
+    by design**. The reasons it stays that way are in Verification layer 2, along with the
+    correction that CI *could* run it — this is a choice, not an impossibility. Selectors and
+    smoke assertions are named here rather than left to implementation time, so the check is
+    specific the moment #45 lands.
+*   **The person the statement is for cannot log in.** Every `/api` route takes `AuthedUser`
+    plus a `require*` call, and `apiFetch.ts:22-26` sends an unauthenticated caller to
+    `/auth/login`. An adviser has no account. The artifact necessarily leaves the app: the
+    owner prints, then forwards. So the page must stand on its own once detached, which is what
+    Goal 4's provenance block and Goal 3's declared rounding are for. A copy-to-clipboard text
+    block is considered and rejected under Alternative F.
 
 ## Goals
 
@@ -94,20 +71,17 @@ instead of pretending to be the exact file next door.
 *   **Goal 2 — the printed page is a document.** No sidebar, no navigation, no buttons, no
     inputs, no charts, no error banner. One column. `@page { size: A4; margin: 14mm }`.
 *   **Goal 3 — the printed numbers are the payload's numbers, quantised once and declared.**
-    The statement is a **display artifact**. Every money value is a payload value, rendered
-    through `frontend/src/utils/formatters.ts`, quantised at display and nowhere else — to
-    the cent for a fiat base currency, to `formatters.ts`'s crypto precision for a `BTC` or
-    `ETH` base currency, which is the same rule every other screen already follows and is
-    stated here because "rounded to the cent" would be a lie on a BTC-denominated page.
-    The statement performs no arithmetic: it sums nothing, differences nothing, and never
-    re-derives a total. The payload itself carries full precision (`db_types.rs:31`), so the
-    page carries a visible line saying its figures are rounded from the payload's own
-    precision — the difference is declared rather than left for the adviser to discover.
-    When the tax report ships, its CSV is expected to hold the payload's full precision, and
-    the statement's cumulative realized figure should then equal that column **rounded the
-    same way `formatters.ts` rounds it**. That cross-check is conditional on the tax report
-    existing; the test that ships with this slice is the golden described under Verification,
-    which needs no second rounder to evaluate.
+    The statement is a **display artifact**. Every money value is a payload value rendered
+    through `frontend/src/utils/formatters.ts` and quantised at display, nowhere else: to the
+    cent for a fiat base currency, to `formatters.ts`'s crypto precision for `BTC`/`ETH` —
+    the rule every other screen already follows, stated because "rounded to the cent" would be
+    false on a BTC page. The statement performs no arithmetic: it sums nothing, differences
+    nothing, never re-derives a total. The payload carries full precision (`db_types.rs:31`),
+    so the page prints a visible line saying its figures are rounded from that precision.
+    When the tax report ships, its cumulative realized column should equal the statement's
+    figure rounded the same way `formatters.ts` rounds it; that cross-check is conditional on
+    the tax report existing, and the test that ships with this slice is the golden under
+    Verification, which needs no second rounder to evaluate.
 *   **Goal 4 — the page states its own provenance.** Portfolio name, base currency, the
     strategy and `threshold_days` **as the server echoed them** (`analytics.rs:98-100`), the
     generation date, and the standing caveat that splits are as recorded at that moment.
@@ -119,16 +93,13 @@ instead of pretending to be the exact file next door.
     be a fabricated run context on the one branch already cited for the currency problem.
 *   **Goal 5 — no backend change in this slice.** No new route, no new field, no new figure on
     any existing endpoint, no OpenAPI regeneration. This is a **sequencing** boundary, not a
-    standing principle: the parent design already rewrites this same handler's response, which
-    is why the committed OpenAPI body is empty, and will add `from`/`to` to it. If this slice
-    needed the backend it would mean the statement had drifted out of scope, and it should
-    stop. The cost of the boundary is stated: the run context the page prints is a subset of
-    what the parent design will eventually carry anyway, so echoing `strategy`,
-    `threshold_days` and `currency` is plumbing the sibling change does regardless. The
-    counter-argument for keeping the boundary is that any response-shape change lands in
-    `docs/openapi/openapi.json`, which CI diffs byte-for-byte, so it is not a quiet two-field
-    change — and the statement is the one slice of this programme not blocked on the pricing
-    layer.
+    standing principle: the parent design already rewrites this handler's response — which is
+    why the committed OpenAPI body is empty — and will add `from`/`to` to it. If this slice
+    needs the backend, it has drifted out of scope and should stop. The boundary's cost is
+    stated: the run context printed here is a subset of what the parent design will carry
+    anyway. It is kept because any response-shape change lands in `docs/openapi/openapi.json`,
+    which CI diffs byte-for-byte, so it is not a quiet two-field change — and because the
+    statement is the one slice of this programme not blocked on the pricing layer.
 *   **Goal 6 — the palette inversion does not depend on a browser setting.** It must not
     rely on "background graphics" being ticked. Text becomes dark because the stylesheet
     says so, not because the browser kept a background.
@@ -165,38 +136,28 @@ to 2 dp for a fiat base currency, and to between 2 and 8 dp for a crypto base cu
 (`formatters.ts:10-11` gives `BTC`/`ETH` `maximumFractionDigits: 8`). It does not attempt to
 be exact, and it says so on the page.
 
-*   **Why not preserve the decimal strings?** Because the render path throws them away one
-    layer below where they would be preserved. `formatCurrency` is
-    `const v = toNumber(value)` (`formatters.ts:4`) and `toNumber` is `Number(v)`
-    (`decimal.ts:20-23`), so `formatCurrency("1234.565")` and `formatCurrency(1234.565)`
-    are byte-identical. A string-preserving normalizer would change nothing observable on
-    the printed page while adding a second shape for one payload and a drift duty to go with
-    it. That was this document's first design, and a review found it: the mechanism protected
-    a boundary the renderer had already crossed.
-*   **Why not make the page exact?** Because exactness is the filed artifact's job and the
-    page would then print `1234.56500000000000000000` to a person. The two artifacts have
-    different jobs: one is filed, one is read. Making the page exact also means a
-    decimal rounder that is right about scale, sign, `-0` and exponent input. The repo has
-    one partial precedent — `sellPnlCsv.ts:61-65`, which handles the exponent case and
-    documents the `1e21` `toFixed` hazard — but it is a string-shaper for values already
-    through `Number()`, not a decimal rounder, so the cost is real rather than unlimited.
-*   **The double is a smaller hazard than the first draft claimed, and the correction is
-    recorded with its limit.** The first draft said a printed figure could differ from the
-    CSV "by a cent" because of `Number()`. At the magnitudes these portfolios reach, that
-    needs the input to carry more significant digits than a double holds (~15-17), and the
-    engine's products do carry them: `tax_engine.rs:414` is
-    `(tx_qty * tx_price + tx_fee) / tx_qty` and the FX multiplications at `:418`, `:422` and
-    `:433` have no scale control, so a value like `1234.56499999999999999999` is possible and
-    rounds to `1,234.57` through a double where exact decimal half-up gives `1,234.56`. The
-    probability in practice is negligible and the divergence nobody has measured is
-    quantisation, which is why Goal 3 declares that instead of denying it. This claim is
-    scoped to inputs of 15 significant digits or fewer; beyond that the residual is the
-    truncation above, and it is not claimed to be zero.
-*   **What is still required of the payload:** the statement reads `strategy`,
-    `threshold_days` and `currency` from the payload rather than from client state, since
-    the server echoes all three (`analytics.rs:98-100`) and `normalizeTaxSummary`
-    (`decimal.ts:63`) currently keeps only `currency`. That is two added fields on the
-    hand-written type and two lines in the normalizer — additive, and it moves no figure.
+*   **Why not preserve the decimal strings?** The render path throws them away one layer below
+    where they would be preserved. `formatCurrency` is `const v = toNumber(value)`
+    (`formatters.ts:4`) and `toNumber` is `Number(v)` (`decimal.ts:20-23`), so
+    `formatCurrency("1234.565")` and `formatCurrency(1234.565)` are byte-identical. A
+    string-preserving normalizer changes nothing observable while adding a second shape for one
+    payload and a drift duty to go with it. See Alternative C1.
+*   **Why not make the page exact?** Exactness is the filed artifact's job; a page would then
+    print `1234.56500000000000000000` to a person. See Alternative C2, which also covers the
+    cost of a decimal rounder and the `sellPnlCsv.ts:61-65` precedent.
+*   **The double, with its limit.** A double only diverges from exact decimal rounding once the
+    input carries more significant digits than a double holds (~15-17), and the engine's
+    products do: `tax_engine.rs:414` is `(tx_qty * tx_price + tx_fee) / tx_qty` and the FX
+    multiplications at `:418`, `:422`, `:433` have no scale control, so `1234.56499999999999999999`
+    is a reachable value and rounds to `1,234.57` through a double where exact half-up gives
+    `1,234.56`. The probability in practice is negligible; quantisation is the divergence that
+    actually happens, which is why Goal 3 declares that. Everything in this document's money
+    claims is scoped to inputs of 15 significant digits or fewer; beyond that the residual is
+    the truncation above and it is not claimed to be zero.
+*   **What the payload must supply:** the statement reads `strategy`, `threshold_days` and
+    `currency` from the payload, since the server echoes all three (`analytics.rs:98-100`) and
+    `normalizeTaxSummary` (`decimal.ts:63`) keeps only `currency`. Two added fields on the
+    hand-written type, two lines in the normalizer — additive, moves no figure.
 
 ### Palette inversion
 
@@ -227,18 +188,14 @@ It does five things, in this order:
     ```
 
     The first rule removes the sidebar (`<aside className="sidebar">`, `App.tsx:379`) and
-    anything else that is a direct child of `.app-container` — which includes the
-    auth-failed alert at `App.tsx:359-376`, a `position: fixed` full-width red banner that an
-    enumerated hide list would print on every page. The second leaves only the statement
-    inside the content column, so the header row (`<div className="header-row">`,
-    `App.tsx:458`) and any future chrome added to that column disappear without anyone
-    remembering to add them to a list.
-
-    An earlier draft enumerated `.sidebar`, `.header-row`, `[data-no-print]`. That list was
-    already wrong when written — it missed the auth alert — and an allowlist of what to hide
-    drifts every time someone adds chrome, in the same direction, silently. The inclusive
-    form cannot miss. `[data-no-print]` is still honoured, for the Print control and anything
-    else that opts out from inside the printed subtree.
+    every other direct child of `.app-container` — which includes the auth-failed alert at
+    `App.tsx:359-376`, a `position: fixed` full-width red banner that an enumerated hide list
+    would print on every page. The second leaves only the statement in the content column, so
+    the header row (`<div className="header-row">`, `App.tsx:458`) and any chrome added there
+    later disappear without anyone remembering a list. An allowlist of what to hide drifts
+    every time someone adds chrome, in the same direction, silently; the inclusive form cannot
+    miss. `[data-no-print]` is still honoured, for the Print control and anything else that
+    opts out from inside the printed subtree.
 
     **The selectors are named here on purpose.** The parent design's file list cited
     `header.app-header` at `App.tsx:385-396`; that element does not exist. A gate that greps
@@ -268,51 +225,45 @@ not a rewrite.
 Three layers, weakest first, with the gap named at each:
 
 1.  **Vitest component test** (`frontend/src/test/components/PortfolioStatement.test.tsx`).
-    jsdom does not apply print CSS, so this proves structure and formatting only. The
-    formatting assertion is a **golden**, not a comparison: a fixture payload carrying a
-    half-cent value (`1234.565`) and an expected literal rendered string in the test. An
-    assertion of the form "the printed figure equals the payload value rendered through
-    `formatters.ts`" cannot fail for any component that calls `formatCurrency`, and rounding
-    the payload with a double to build the expected value would re-run the renderer's own
-    path — the same unfailable-test failure this document uses to reject the grep gate. The
-    structural assertions: the statement root carries `data-print="statement"`; the printed
-    subtree contains no `button`, `input`, `select` or `svg`; all three printed headline
-    figures (cumulative realized, unrealized, portfolio value) appear; the rounding line is
-    present; and the run-context line carries the payload's echoed `strategy` and
-    `threshold_days` rather than a client-side copy, with `threshold_days` absent for a
-    non-HYBRID fixture. The mock at `handlers.ts:121` is branched, not duplicated, and its
-    money fields are changed to decimal strings to match what the server actually sends; the
-    existing handler ordering comment at `handlers.ts:130-131` still applies. **No assertion
-    in this file may compare two normalizers** — an earlier draft asked for that and it cannot
-    fail, since both read the same object and both end up doubles at render.
-2.  **Playwright smoke** (`frontend/e2e/statement.smoke.mjs`, following
-    `sell-pnl.smoke.mjs`). `page.emulateMedia({ media: 'print' })`, then assert the statement
-    is **visible** (non-zero box, dark computed text color on a light background) and that the
-    shell is gone — `.sidebar` and the auth alert compute `display: none`. Asserting the
-    statement is visible is the primary check; asserting an enumerated list of hidden selectors
-    is not, because the hide rule is now inclusive and a list would only re-state a rule that
-    already cannot miss. The text-color assertion is what actually catches the dark-theme
-    failure, and it is a computed-style check, not a screenshot. Also assert no horizontal
-    overflow, and assert `page.pdf()` is non-empty and one page for the two-row fixture —
-    **for the fixture only**, with no claim about larger portfolios (Decided item 2). **Local step, not a gate**: `e2e/run.sh` hardcodes
-    `node e2e/sell-pnl.smoke.mjs` and must be parameterised first, and `ci.yml` has no
-    browser job. Both are issue #45.
+    jsdom does not apply print CSS, so this proves structure and formatting only.
 
-    **Why this stays local, and what that claim is actually resting on.** "Ships unverified by
-    design" was inherited from the parent design, and it is weaker than it looks: CI runs
-    `ubuntu-latest`, where `npx playwright install chromium` is the ordinary one-liner and
-    `emulateMedia`/`page.pdf()` need no display server. The remedy this document first named —
-    `nix-shell -p chromium -p liberation_ttf` — is the author's workstation, not CI, and
-    saying "no browser in CI" without checking which CI was meant is exactly the kind of
-    inherited constraint this review exists to catch. It stays local anyway, for two reasons
-    that survive the correction: `e2e/run.sh:3-16` is not browser-only — it compiles and
-    starts the Rust API against a throwaway SQLite file and starts Vite — so the job costs a
-    full cargo build and needs seeded data; and a job marked `continue-on-error` is
-    decoration unless someone reads it, which converts "unverified" into "verified and
-    therefore fine" by another door. The honest options are **local step** (chosen) or **a
-    real blocking browser job that also runs the existing sell-P&L smoke** — which is issue
-    #45's scope, not this slice's. The named assertions above are handed to #45 so they land
-    with the job that can execute them.
+    *Formatting* is asserted by a **golden**: a fixture carrying a half-cent value
+    (`1234.565`) and an expected literal rendered string in the test. Anything of the form
+    "the printed figure equals the payload value rendered through `formatters.ts`" cannot fail
+    for a component that calls `formatCurrency`, and deriving the expected value by rounding
+    the payload with a double re-runs the renderer's own path — the same unfailable-test
+    failure this document uses to reject the grep gate (Alternative B). No assertion here may
+    compare two normalizers, for the same reason.
+
+    *Structure*: the statement root carries `data-print="statement"`; the printed subtree
+    contains no `button`, `input`, `select` or `svg`; all three headline figures appear; the
+    rounding line is present; the run-context line carries the payload's echoed `strategy`
+    and `threshold_days`, with `threshold_days` absent for a non-HYBRID fixture. The mock at
+    `handlers.ts:121` is branched, not duplicated, and its money fields become decimal strings
+    to match what the server actually sends; the handler-ordering comment at
+    `handlers.ts:130-131` still applies.
+2.  **Playwright smoke** (`frontend/e2e/statement.smoke.mjs`, following
+    `sell-pnl.smoke.mjs`). `page.emulateMedia({ media: 'print' })`, then assert the
+    statement is **visible** — non-zero box, dark computed text color on a light background,
+    which is the check that actually catches the dark-theme failure, as a computed-style check
+    rather than a screenshot — and that the shell is gone (`.sidebar` and the auth alert
+    compute `display: none`). Asserting visibility is the primary check; asserting an
+    enumerated list of hidden selectors would only re-state a rule that already cannot miss.
+    Also assert no horizontal overflow, and that `page.pdf()` is non-empty and one page for
+    the two-row fixture — **for the fixture only**, with no claim about larger portfolios
+    (Decided item 2).
+
+    **Local step, not a gate.** `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` and must
+    be parameterised first; `ci.yml` has no browser job; both are issue #45. The reason is a
+    choice, not an impossibility: CI runs `ubuntu-latest`, where `npx playwright install
+    chromium` is one line and `emulateMedia`/`page.pdf()` need no display server. It stays
+    local because `e2e/run.sh:3-16` is not browser-only — it compiles and starts the Rust API
+    against a throwaway SQLite file and starts Vite — so the job costs a full cargo build and
+    needs seeded data, and because a `continue-on-error` job nobody reads converts
+    "unverified" into "verified and therefore fine" by another door. The real alternative is a
+    blocking browser job that also runs the existing sell-P&L smoke, which is #45's scope.
+    The assertions above are handed to #45 so they land with a job that can execute them.
+
 3.  **A human with a print preview.** `docs/auth-testing.md` §5 is already the manual
     browser walkthrough for what CI cannot check; the statement's print preview joins that
     list.
@@ -353,8 +304,7 @@ style.
 *   **Proposed Changes:** `normalizeTaxSummary` keeps `strategy` and `threshold_days`
     (`decimal.ts:63` currently keeps `currency` only) and `TaxSummary` in `types.ts` gains
     both. Additive; no existing figure moves. There is **no** second normalizer and no
-    string-typed mirror type — see Money: a display artifact, declared, for why the first
-    draft of this document was wrong to add them.
+    string-typed mirror type — see Alternative C1 for why.
 
 #### 4. `frontend/src/App.tsx` (Modify)
 
@@ -382,8 +332,8 @@ style.
 *   **Type / Scope:** the browser smoke, and the parameterisation it needs.
 *   **Proposed Changes:** as in Verification layer 2. `run.sh` currently hardcodes
     `node e2e/sell-pnl.smoke.mjs`; it gains a target argument defaulting to the existing
-    smoke, and `package.json` gains `e2e:statement`. **Not wired into CI** — see Alternative
-    B.
+    smoke, and `package.json` gains `e2e:statement`. **Not wired into CI** — see Verification
+    layer 2 and issue #45.
 
 #### 7. Deleted — no print-CSS grep gate
 
@@ -474,13 +424,15 @@ declaring a rounding.
     boundary it was preserved to protect, and the printed output is byte-identical either way.
     It bought a second payload shape and a drift duty for no observable change.
 *   **C2 — a string-preserving money formatter in `formatters.ts`,** used by the statement and
-    eventually by everything. This is the only variant that would actually work. **Rejected
-    because exactness is the wrong property for this artifact:** a page read by a person should
-    not print `1234.56500000000000000000`, and the filed artifact — the tax report CSV, once
-    it ships — is the one meant to be exact. It also means hand-writing a decimal rounder (scale, sign, `-0`, exponent input)
-    that the repo does not have today, and if it lands inside `formatCurrency` it changes what
-    every existing screen prints for >2-dp values — the one thing this slice promised not to
-    do.
+    eventually by everything. The only variant that would actually work. **Rejected because
+    exactness is the wrong property for this artifact:** a page read by a person should not
+    print `1234.56500000000000000000`, and the filed artifact — the tax report CSV, once it
+    ships — is the one meant to be exact. It also means a decimal rounder right about scale,
+    sign, `-0` and exponent input. `sellPnlCsv.ts:61-65` is a partial precedent: it handles the
+    exponent case and documents the `1e21` `toFixed` hazard, but it shapes values already
+    through `Number()`, so it is a starting point rather than the utility. And if the formatter
+    lands inside `formatCurrency` it changes what every existing screen prints for >2-dp
+    values, which this slice promised not to do.
 *   **If exactness is ever required**, C2 is the shape to take, as its own change with its own
     figure note. Recorded here so the next person does not re-derive C1.
 
@@ -534,6 +486,19 @@ declaring a rounding.
 *   **Reason for rejection**: Decided item 1 is an explicit owner decision that the artifact is
     a document. A text block is a different product with a different audience, and shipping
     both would mean two formats to keep in agreement for a use case that has one artifact today.
+
+### Alternative G: `?view=statement` as a poor man's deep link
+
+*   **Pros**: `App.tsx:58` already reads `new URLSearchParams(window.location.search)` and
+    `App.tsx:347-353` rewrites the query string, so a query parameter follows an existing
+    convention in the exact file cited as lacking routing — no router, no dependency, and the
+    smoke could drive it with `page.goto('/?view=statement')` instead of a click path.
+*   **Cons**: `selectedId` is component state and is not in the URL either, so a bookmarked
+    `?view=statement` reopens the default portfolio. It buys half a deep link and adds a second
+    navigation mechanism alongside the one that works.
+*   **Reason for rejection**: half a deep link is not worth a second navigation mechanism. If
+    linkability is ever wanted it is wanted for portfolio selection first, and that is a router
+    conversation this slice declines.
 
 ## Verification
 
