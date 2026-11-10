@@ -1,19 +1,20 @@
 # Portfolio Statement (Printable)
 
 *   **Author:** javierarrieta, with EGM review support
-*   **Status:** Proposed — reviewed, **not implementation-ready**. Five stages of EGM review are
-    complete; Stages 5–8 findings are applied and Stage 9 findings are mostly not. Four blockers
-    remain open, all interface definitions rather than design objections: the component's prop
-    signature, hooks for the headline figures and holdings table, the nav item's visible label, and a
-    self-contradictory rounding rule. A fifth (the null-payload state) is closed as an **accepted
-    gap** — see *When there is no payload at all*. Do not write an implementation plan from this
-    document without closing the four. See
-    `docs/superpowers/reviews/2026-11-09-statement-print/consolidated_review_report.md`.
+*   **Status:** Proposed — reviewed and **implementation-ready**. Five stages of EGM review are
+    complete. Stages 5–8 findings are applied; of Stage 9's five blockers, four are closed (prop
+    signature, structural hooks, nav item, rounding-rule contradiction) and the fifth — the
+    null-payload state — is closed as an **accepted gap**; see *When there is no payload at all*.
+    Sixteen Stage 9 majors remain recorded in
+    `docs/superpowers/reviews/2026-11-09-statement-print/consolidated_review_report.md`; the ones that
+    blocked implementation are closed, the rest are citation drift and restatement cleanup.
 *   **Date:** 2026-11-09
 *   **Inherits from:** `2026-11-09-pricing-layer-truthfulness.md` — the statement renders the same
     FX conversion that document describes as broken for foreign-currency assets. It **inherits that
-    pre-existing defect**; it is not blocked on the fix, because same-currency assets involve no FX
-    at all and foreign-currency assets are already mispriced on the dashboard today.
+    pre-existing defect**; it is not blocked on the fix, because same-currency assets involve no FX at
+    all, and a foreign-currency portfolio already fails the `tax-summary` request outright today
+    (`currency_service.rs:234` → `analytics.rs:86` returns 500) — so nothing this slice prints can be
+    worse than the dashboard's current behaviour. See *When there is no payload at all*.
     **Related:** `2026-11-09-tax-report-and-statement-design.md` (the tax report; this document was
     split out of it).
 *   **Origin:** split out of the tax-report design during its review; the scope judgement that
@@ -94,10 +95,10 @@ file next door.
     saying its figures are rounded from that precision. When the tax report ships, its cumulative
     realized column should equal the statement's figure rounded the same way `formatters.ts` rounds
     it; that cross-check is conditional on the tax report existing.
-*   **Goal 4 — the page states its own provenance.** Portfolio name, base currency, the strategy and
-    `threshold_days` as the server echoed them (`analytics.rs`, the tail of the tax-summary
-    response), the printed date, the data timestamp, and the splits caveat — each with its hook and
-    literal copy in *On-page copy*. `threshold_days` prints only for `HYBRID`, because it is unused
+*   **Goal 4 — the page states its own provenance.** Portfolio name and base currency from the
+    portfolio object; strategy and `threshold_days` as the server echoed them (`analytics.rs`, the tail
+    of the tax-summary response); the printed date, the data timestamp, and the splits caveat — each
+    with its hook and literal copy in *On-page copy*. See *Money* for the currency rule. `threshold_days` prints only for `HYBRID`, because it is unused
     by `FIFO` and `LIFO` (`tax_engine.rs:645-649`). The empty-portfolio branch (`analytics.rs:45-51`)
     echoes none of the three fields, so the run-context line is omitted there rather than rendered
     from defaults; a line reading "realized · (threshold 0d)" would be a fabricated run context. See
@@ -140,41 +141,128 @@ file next door.
 
 ### Surface: a fifth tab, not a route
 
-`statement` joins `dashboard`, `portfolios`, `analytics` and `ledger` in the existing nav
-(`App.tsx:386-398`). It renders from the `taxSummary` state that `fetchPortfolioData` already
-populates (`App.tsx:111`), so opening the statement costs no request and cannot fail in a way the
-dashboard does not already fail.
+`statement` joins `dashboard`, `portfolios`, `analytics` and `ledger` in the existing nav. It renders
+from the `taxSummary` state that `fetchPortfolioData` already populates (`App.tsx:114`), so opening
+the statement issues no request of its own.
+
+The fifth nav item is specified completely, because it is the smoke's only entry point and there is
+no tab union to extend — `DEFAULT_TAB` is a bare `const` (`App.tsx:31`) and `useState(DEFAULT_TAB)`
+infers `string` (`:36`), so the nav-side work is one `<li>` and one branch:
+
+```jsx
+<li className={`nav-item ${activeTab === 'statement' ? 'active' : ''}`} onClick={() => selectTab('statement')}>
+  <Printer size={18} /> Printable Statement
+</li>
+```
+
+`Printer` is a new import from `lucide-react`, joining the twelve already imported at `App.tsx:2-13`.
+The label follows the existing pattern of a multi-word visible name unrelated to the tab id
+(`Holdings & Tax lots`, `Risk & Correlation`). The smoke navigates with
+`page.getByText('Printable Statement').click()`, which is the working idiom
+(`sell-pnl.smoke.mjs:107`); "accessible name" would be wrong, since these are `<li onClick>` with no
+role.
 
 The Print control is a button **outside** the printed subtree, calling `window.print()`, positioned
 as a sibling of the statement root so the hide rules remove it — see *Palette inversion*, rule 2.
+Its copy is `Print` and it carries `data-testid="print-button"`; it is not printed, so it needs no
+copy-table row.
+
+### The component's interface
+
+Target Files 1 says "takes the summary as a prop"; that is not enough, because the required copy needs
+three inputs and the payload carries only one of them cleanly. Stated verbatim:
+
+```ts
+interface PortfolioStatementProps {
+  taxSummary: TaxSummary;   // the figures and the money currency
+  portfolio: Portfolio;     // name and base currency for the header and run-context
+  fetchedAt: Date;          // the data-at line; see the two-clock rule below
+}
+```
+
+`portfolio` is the whole object rather than two strings, matching how the sibling tab is rendered
+(`App.tsx:485` passes `portfolio={...}` to `PortfolioDetail`). `Portfolio` already has `name` and
+`currency` (`types.ts`), so `run-context`'s portfolio name and the header's base currency both come
+from it — the payload carries no portfolio name, which is why the two new optional `TaxSummary`
+fields alone are not sufficient.
+
+"Takes no date parameter" means no **user-selected** date; `fetchedAt` is a captured timestamp, not an
+input the user chooses.
+
+App-side state, all three set at the one place `setTaxSummary` is called (`App.tsx:114`):
+
+```ts
+const [taxSummary, setTaxSummary] = useState<TaxSummary | null>(null);   // unchanged; three tabs read it
+const [taxMeta, setTaxMeta] = useState<{ portfolioId: number; fetchedAt: Date } | null>(null);
+```
+
+`taxMeta` is the parallel id from *Target Files 4*, kept separate so `Dashboard` and `PortfolioDetail`
+keep reading `taxSummary` untouched. The branch renders only when
+`taxSummary && taxMeta?.portfolioId === selectedId`.
+
+### Structural hooks and the holdings table
+
+The copy table fixes strings; these fix the elements the assertions and the CSS name. Without them,
+four specified assertions cannot be written and print rule 5 has no selector.
+
+| Hook / class | Element | Used by |
+| :-- | :-- | :-- |
+| `data-print="statement"` | the statement root `<section>` | print rules 1–2; layer 1 asserts its presence |
+| `className="statement-headline"` | the three-figure block | print rule 5 ("never splits") |
+| `data-testid="figure-value"` | portfolio value | layer 1 presence; layer 2 colour |
+| `data-testid="figure-realized"` | cumulative realized P&L | layer 1 presence; layer 2 colour |
+| `data-testid="figure-unrealized"` | unrealized P&L | layer 1 presence |
+| `data-testid="holdings"` | the holdings `<table>` | layer 1 column and row assertions |
+
+The table is `<table className="data-table statement-table">` — `.data-table` for the existing
+typography, `.statement-table` as the print hook. Nine columns, in this order, with the renderer
+named per column so no one has to guess which of the repo's three number formatters applies:
+
+| `<th>` | Renderer |
+| :-- | :-- |
+| `Symbol` | plain text |
+| `Type` | plain text — **not** the `.badge` markup `PortfolioDetail.tsx:272-276` uses, whose background is not a variable and would not invert |
+| `Quantity` | `toLocaleString(undefined, { maximumFractionDigits: 6 })`, as `PortfolioDetail.tsx:277` does |
+| `Avg cost`, `Price`, `Market value`, `Realized`, `Unrealized` | `formatCurrency(v, taxSummary.currency)` |
+| `Unrealized ROI` | `formatPercent(v)`, as `PortfolioDetail.tsx:292-294` does |
+
+No success/danger colour on the P&L cells — sign is in the number, per *Palette inversion* step 4.
+Layer 1 asserts the nine header strings and one row per asset; the golden below pins the formatting.
 
 ### On-page copy, written out
 
-Six strings are requirements rather than implementation detail — Goals 1, 3, 4 and 7 each assert one
-— so each is written here with a stable hook. An assertion that "the rounding line is present" is
+Seven strings are requirements rather than implementation detail. Goals 1, 3, 4 and 7 assert six of
+them; `data-at` exists because of the two-clock problem described below, not because a Goal names it.
+Each is written here with a stable hook, because an assertion that "the rounding line is present" is
 not an assertion until the string or the hook is fixed. Copy is English, matching the rest of the
 app's UI, and assertions match `textContent`, so these are literal text and not markup: write `P&L`,
 not `P&amp;L`.
 
 Hooks use the repo's existing `data-testid` convention (`SellPnlModal.tsx:209`,
 `sell-pnl.smoke.mjs` `getByTestId('strategy-note')`). The one exception is `data-print="statement"`,
-which is load-bearing in CSS rather than in tests.
+which is load-bearing in CSS and asserted once in the component test.
 
 | Hook | Copy | Printed on the empty branch? |
 | :-- | :-- | :-- |
 | `data-testid="label-realized"` | `Realized P&L — cumulative since inception` | no |
-| `data-testid="generated-at"` | `Printed {printDate}` — client render date, formatted with the app's existing date idiom (`Dashboard.tsx:114`) | yes |
-| `data-testid="data-at"` | `Data fetched {fetchTime}` — client timestamp captured in `fetchPortfolioData`, same idiom to the minute | no |
+| `data-testid="generated-at"` | `Printed Nov 9, 2026` — `printDate` is `new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })`, the idiom already at `Dashboard.tsx:114` | yes |
+| `data-testid="data-at"` | `Data fetched Nov 9, 2026, 10:30 AM` — `fetchedAt.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })`, the date idiom above extended to the minute; no such idiom exists in the repo yet, so this slice establishes it | no |
 | `data-testid="rounding-note"` | `Figures are rounded for display from full-precision calculations.` | no |
 | `data-testid="splits-note"` | `Split-adjusted history is as recorded when this page was loaded; late-recorded splits can change past figures.` | no |
-| `data-testid="empty-note"` | `No holdings in this portfolio on {printDate}.` | yes, alone |
+| `data-testid="empty-note"` | `No holdings in this portfolio on Nov 9, 2026.` | yes, alone |
 | `data-testid="run-context"` | `{portfolio name} · {base currency} · {strategy}`, and when strategy is `HYBRID` a trailing ` (threshold {threshold_days}d)` — the leading space is part of the appended segment, not of the base string | no |
+
+Layer 1 freezes the clock — `vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-09T10:30:00'))` —
+so the three templated rows are assertable as literals. `test/setup.ts:3` pins `process.env.TZ =
+'UTC'`, which is what makes a frozen clock deterministic rather than merely reproducible.
 
 Three rules that fall out of the table:
 
-*   **The rounding note is unconditional.** It prints even for a currency whose `Intl` rendering is
-    already exact for the values in hand, because the engine's precision is not the currency's
-    precision. Computing when it would be redundant is not worth the branch.
+*   **The rounding note is not conditional on the currency.** On any branch that prints figures, it
+    prints for every currency, including one whose `Intl` rendering is already exact for the values
+    in hand, because the engine's precision is not the currency's precision. Computing when it would
+    be redundant is not worth the branch. It is **not** printed on the empty branch — see *Empty
+    portfolio*.
 *   **Two dates, two clocks, and the page says which is which.** The statement renders cached state
     and issues no request on open, so a page printed the morning after a session opened yesterday
     carries today's date over yesterday's prices. `generated-at` is the client render date; `data-at`
@@ -233,7 +321,7 @@ The statement renders payload numbers through `formatters.ts`, which rounds at d
 It does not attempt to be exact, and it says so on the page.
 
 *   **Precision is lost before the component runs, not in the formatter.** `normalizeTaxSummary`
-    (`decimal.ts:65-67`) runs every money field through `num()`, which is `Number(v)`, and
+    (`decimal.ts:64-66` and `:71-77`) runs every money field through `num()`, which is `Number(v)`, and
     `TaxSummary` types them as `number` (`types.ts:89-95`). The full-precision string never reaches
     any statement code. The consequence for this spec: Goal 3's "the payload carries full precision"
     describes the wire, and the page's declaration is a statement about the engine's output, not
@@ -261,8 +349,7 @@ It does not attempt to be exact, and it says so on the page.
     competing sources: the populated branch returns `currency` **as** `portfolio.base_currency`, so
     they are the same string whenever there are holdings to format. They can differ only on the empty
     branch, which returns no `currency` key at all and would otherwise default to `USD` on a EUR
-    portfolio — and that branch prints no money (Goal 7). Stated once here; Goal 4, Goal 7 and
-    Target Files 4 point at this paragraph rather than re-deriving it.
+    portfolio — and that branch prints no money (Goal 7).
 
 ### What "splits" and the strategy line mean
 
@@ -342,9 +429,18 @@ It does five things, in this order:
     visibility assertion is what catches this, and only when someone runs it.
 3.  Collapse the layout: `.app-container` is a `260px 1fr` grid (`index.css:93-98`); in print it
     becomes one column, or the page prints with a 260 px gutter of nothing.
-4.  Invert `--bg-dark`, `--bg-card`, `--border-color`, `--text-primary`, `--text-secondary`,
-    `--text-muted` to print values; `.glass-card` loses `backdrop-filter`, `box-shadow` and its
-    translucent background. **Which of these carries Goal 6:** legibility comes entirely from the
+4.  Invert the palette. The six values are fixed here rather than left to implementation, because
+    layer 2's colour assertion compares against them literally:
+
+    ```css
+    --bg-dark: #ffffff;   --bg-card: #ffffff;   --border-color: #333333;
+    --text-primary: #111111; --text-secondary: #333333; --text-muted: #555555;
+    ```
+
+    plus `.statement-table td { border-bottom: 1px solid #333333 }`, because `.data-table td`'s own
+    border is a literal `rgba(255,255,255,0.03)` (`index.css:247`) and not a variable — without the
+    override the header rule inverts and the body rules do not, giving a half-inverted table.
+    `.glass-card` loses `backdrop-filter`, `box-shadow` and its translucent background. **Which of these carries Goal 6:** legibility comes entirely from the
     **text** overrides, because text is always painted and does not depend on the background-graphics
     setting. The background and border overrides are redundant in the Goal 6 sense and load-bearing
     in the other one: a reader who *has* enabled background graphics gets dark text on the dark app
@@ -376,45 +472,63 @@ at `:101` but rule 1 hides it, so it is not a residual.
 1.  **Vitest component test** (`frontend/src/test/components/PortfolioStatement.test.tsx`). jsdom
     does not apply print CSS, so this proves structure and formatting only.
 
-    The component takes the summary as a **prop** and the test uses a **prop fixture**, which is how
-    both existing tax-summary consumers are already tested (`PortfolioDetail.test.tsx:25-63`,
-    `Dashboard.test.tsx:38-42`). The shared MSW handler at `test/mocks/handlers.ts:121` is
-    therefore **not** touched; if an App-level test is ever wanted, the repo's convention for
-    per-test payload variation is a runtime override (`AppLedger.test.tsx:18-20`,
-    `SellPnlModal.test.tsx:116`), not branching the shared handler.
+    The component takes `taxSummary`, `portfolio` and `fetchedAt` as **props** (see *The component's
+    interface*) and the test uses a **prop fixture**, which is how both existing tax-summary consumers
+    are already tested (`PortfolioDetail.test.tsx:27-55`, `Dashboard.test.tsx:22-42`). The shared MSW
+    handler at `test/mocks/handlers.ts:121` is therefore **not** touched; if an App-level test is ever
+    wanted, the repo's convention for per-test payload variation is a runtime override
+    (`AppLedger.test.tsx:18-20`, `SellPnlModal.test.tsx:116`), not branching the shared handler.
 
-    *Formatting* is asserted by a **golden**: a fixture carrying a value with a third decimal place
-    (`1234.565`) and the expected rendered string written as a literal in the test. Anything of the
-    form "the printed figure equals the payload value rendered through `formatters.ts`" cannot fail
-    for a component that calls `formatCurrency`, and deriving the expected value by rounding the
-    payload with a double re-runs the renderer's own path. No assertion here may compare two
-    normalizers.
+    *Formatting* is asserted by a **golden**, with the clock frozen as specified in *On-page copy*. The
+    fixture is `currency: 'EUR'`, `total_realized_pnl: 1234.565`, and the test asserts
+    `getByTestId('figure-realized').textContent === '€1,234.57'` as a literal — verified against
+    `formatters.ts`, which routes EUR through `Intl` at 2 dp and the nearest double to `1234.565`
+    sits above the midpoint. Anything of the form "the printed figure equals the payload value rendered
+    through `formatters.ts`" cannot fail for a component that calls `formatCurrency`, and deriving the
+    expected value by rounding the payload with a double re-runs the renderer's own path. No assertion
+    here may compare two normalizers.
 
     *Structure, populated fixture*: the statement root carries `data-print="statement"`; the printed
-    subtree contains no `button`, `input`, `select` or `svg`; all three headline figures appear;
-    every hook in *On-page copy* except `empty-note` is present with its specified text; the
-    run-context line carries the payload's echoed `strategy` and `threshold_days`, with
-    `threshold_days` absent for a non-HYBRID fixture.
+    subtree contains no `button`, `input`, `select` or `svg`; `figure-value`, `figure-realized` and
+    `figure-unrealized` are each present and non-empty; every hook in *On-page copy* except
+    `empty-note` is present with its specified text; `holdings` has the nine `<th>` strings from
+    *Structural hooks and the holdings table* and one `<tr>` per asset; the run-context line carries
+    the payload's echoed `strategy` and `threshold_days`, with `threshold_days` absent for a
+    non-HYBRID fixture.
 
-    *Structure, empty fixture* (`assets: []`): `empty-note` and `generated-at` present, and
-    **absent** — `data-at`, `rounding-note`, `splits-note`, `run-context`, and all three headline
-    figures.
+    *Structure, empty fixture* (`assets: []`): `empty-note` and `generated-at` present, and **absent**
+    — `data-at`, `rounding-note`, `splits-note`, `run-context`, and all three figure hooks.
 2.  **Playwright smoke** (`frontend/e2e/statement.smoke.mjs`, following `sell-pnl.smoke.mjs`).
-    Navigate to the statement tab by clicking the nav item whose accessible name is the statement
-    label (Alternative G was rejected, so there is no URL to go to). Then
-    `page.emulateMedia({ media: 'print' })` and assert:
+    Navigate with `page.getByText('Printable Statement').click()` (Alternative G was rejected, so there
+    is no URL to go to). Then `page.emulateMedia({ media: 'print' })` and assert:
 
-    *   the statement is **visible** — non-zero box, and computed `color` on the statement root and
-        on one headline figure is dark. **Text color only.** Do not assert a light background: Goal
-        6's premise is that background graphics are off, `emulateMedia` does not enable background
+    *   the statement is **visible** — non-zero box, and computed `color` on `[data-print="statement"]`
+        and on `[data-testid="figure-realized"]` is `rgb(17, 17, 17)`, the `--text-primary` value from
+        *Palette inversion* step 4. **Text color only.** Do not assert a light background: Goal 6's
+        premise is that background graphics are off, `emulateMedia` does not enable background
         painting, and `page.pdf()` defaults `printBackground: false`.
+    *   nothing printable is inside the printed subtree:
+        `expect(await page.locator('[data-print="statement"] button, [data-print="statement"] input, [data-print="statement"] select, [data-print="statement"] svg').count()).toBe(0)`.
+        This is the automated form of "no Print control", and layer 1 cannot cover it because it
+        renders the component in isolation and never sees the control.
     *   `.sidebar` computes `display: none`. The auth alert is **not** asserted: it renders only from
         the `auth_error=auth_failed` query param and is not in the DOM under this harness.
-    *   no horizontal overflow, and `page.pdf()` is non-empty and one page for the two-row fixture —
-        **for the fixture only**, with no claim about larger portfolios (Decided item 2).
+    *   no horizontal overflow, measured **on the statement**, not the document:
+        `expect(await el.scrollWidth()) <= (await el.clientWidth())` for `[data-print="statement"]`.
+        A document-level check is meaningless here — `index.css:47` sets `body { overflow-x: hidden }`,
+        which propagates to the viewport, so the document never reports overflow; it clips silently.
+        Note `emulateMedia` does not resize the viewport (the harness runs 1400×1000), so this checks
+        the print stylesheet's typography at desktop width; the A4 case is the manual check's.
+    *   `page.pdf({ format: 'A4', preferCSSPageSize: true, printBackground: false })` is non-empty.
+        The options are stated because Playwright's defaults are Letter with
+        `preferCSSPageSize: false`, which would measure a page size this slice does not ship. **No
+        page-count assertion**: proving "one page" needs a PDF parser, and no such dependency exists in
+        `frontend/package.json`. Decided item 2's one-page claim moves to the manual check.
     *   **no figure is asserted.** Figures come from a live price provider; when it is unreachable the
         fallback returns zero, and a smoke that asserted figures would then print zeros and still
-        pass. The smoke pins structure, visibility and page count, which are unaffected by price.
+        pass. The smoke pins structure and visibility, which are unaffected by price. The seeded
+        holdings are denominated in the portfolio's base currency — a foreign-currency fixture would
+        500 the request before any print assertion ran (see *When there is no payload at all*).
 
     **Local step, not a gate.** `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` and gains a
     target argument here; `ci.yml` has no browser job, which is issue #45. The full reasoning —
@@ -448,14 +562,13 @@ moves no existing figure. The programme-level slice table is owned by the parent
 ### 1. `frontend/src/components/PortfolioStatement.tsx` (Create)
 
 *   **Type / Scope:** the printable view.
-*   **Proposed Changes:** renders the summary: headline block (cumulative realized since inception,
-    unrealized as of today, portfolio value), the provenance block, and one row per holding (Decided
-    item 1). No asset-subset filter — the only arithmetic that would make a filtered headline honest
-    is the arithmetic renderers are forbidden from doing. Takes the summary as a prop, takes no date
-    parameter, derives no totals. No `button`, `input`, `select` or hardcoded color inside the
-    printed subtree. The root element carries `data-print="statement"` and must not be wrapped; the
-    Print control is a sibling of the root, both direct children of `.main-content`, which is what
-    hides it.
+*   **Type / Scope:** the printable view.
+*   **Proposed Changes:** renders the headline block, the provenance block, and one row per holding
+    (Decided item 1). Props, hooks, table columns and per-column renderers are all specified in *The
+    component's interface* and *Structural hooks and the holdings table*; this file list does not
+    restate them. No asset-subset filter — the only arithmetic that would make a filtered headline
+    honest is the arithmetic renderers are forbidden from doing. Derives no totals. No `button`,
+    `input`, `select` or hardcoded color inside the printed subtree.
 
 ### 2. `frontend/src/print.css` (Create) and `frontend/src/main.tsx` (Modify)
 
@@ -468,7 +581,7 @@ moves no existing figure. The programme-level slice table is owned by the parent
 
 *   **Type / Scope:** surface the two run-context fields the payload already sends.
 *   **Proposed Changes:** `normalizeTaxSummary` keeps `strategy` and `threshold_days`
-    (`decimal.ts:65-67` keeps `currency` only today) and `TaxSummary` gains both as **optional**
+    (`decimal.ts:63` keeps `currency` only today) and `TaxSummary` gains both as **optional**
     fields, so the existing literals in `PortfolioDetail.test.tsx` and `Dashboard.test.tsx` still
     compile under `npm run typecheck`. Additive; no existing figure moves. There is no second
     normalizer and no string-typed mirror type — Alternative C1.
@@ -483,14 +596,14 @@ moves no existing figure. The programme-level slice table is owned by the parent
     switch leaves the previous portfolio's summary in state until the new fetch resolves — and a page
     with B's numbers under A's heading is the one failure this artifact cannot absorb quietly, because
     unlike the zeros case it looks right. The payload carries no portfolio id, so record the id beside
-    the summary and guard only the statement branch. The repo has the pattern and its rationale:
-    `App.tsx:68` stores `{ txId, portfolioId }` with the guard at `:518`, and the comment at `:66-67`
-    explains why it is derived rather than cleared from an effect — *"five places change
+    the summary and guard only the statement branch. The shape is `taxMeta: { portfolioId, fetchedAt }`
+    set beside `setTaxSummary`, specified in *The component's interface*. The repo has the pattern and
+    its rationale: `App.tsx:68` stores `{ txId, portfolioId }` with the guard at `:518`, and the comment
+    at `:66-67` explains why it is derived rather than cleared from an effect — *"five places change
     `selectedId`, and a reset that has to be remembered in each one is a reset that gets forgotten."*
-    A parallel id, then, not a reshape of state three tabs consume; and no clear-on-switch variant,
+    A parallel record, then, not a reshape of state three tabs consume; and no clear-on-switch variant,
     which that comment already rejects.
-*   **Currency:** the header's base currency comes from the portfolio object, not the payload, and
-    only because of the empty branch. *Money* states the rule once.
+*   **Currency:** see *Money*, "Which currency formats the money, and which prints in the header".
 *   **Fetch timestamp:** `fetchPortfolioData` records the time beside `setTaxSummary` so the `data-at`
     line has a source.
 
@@ -518,8 +631,8 @@ the page still prints badly. The Playwright smoke is the check; see Alternative 
 | :-- | :-- | :-- |
 | **The print path ships unverified.** No CI browser job; the smoke is a local step. | `ci.yml` has no browser job; issue #45 open | Selectors and smoke assertions are named here and handed to #45. The manual print preview is listed in `docs/auth-testing.md` §5. |
 | **The e2e harness does not currently start**, so the smoke's acceptance step cannot run. | `run.sh` sets no `AUTH_MODE`; the server refuses to start without OIDC config | This slice adds `export AUTH_MODE=disabled` to `run.sh` (Target Files 6), following `start.sh:21`. |
-| **Palette override misses a hardcoded color inside the statement.** | `SellPnlModal.tsx:132` uses inline `background: '#121929'`; `PortfolioDetail.tsx:286-292` uses `var(--color-success)`, which inverts but is not one of the six variables step 4 lists | The statement uses no hardcoded colors and no success/danger coloring — sign is in the number. The smoke's text-color check catches a hardcoded **text** color and **cannot** see a hardcoded background; that residual is accepted rather than gated, for the reason in `decision_records.md` §5. |
-| **A printed figure differs from the CSV's.** | The CSV will be full-precision (`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md:18`); `normalizeTaxSummary` converts money to `number` before any statement code runs (`decimal.ts:65-67`) | Goal 3 declares the rounding on the page, so the difference is stated rather than discovered by an adviser. Verification layer 1 pins the reachable third-decimal case. |
+| **Palette override misses a hardcoded color inside the statement.** | `SellPnlModal.tsx:131` uses inline `background: '#121929'`; `PortfolioDetail.tsx:286-292` colours P&L with `var(--color-success)`, which step 4 does **not** override; `.data-table td`'s border is a literal `rgba(255,255,255,0.03)` (`index.css:247`) | The statement avoids all three: no hardcoded colors, no success/danger colouring (sign is in the number), asset type as plain text rather than `.badge`, and an explicit print override for `.statement-table td`'s border. The smoke's text-color check catches a hardcoded **text** color and **cannot** see a hardcoded background; that residual is accepted rather than gated, for the reason in `decision_records.md` §5. |
+| **A printed figure differs from the CSV's.** | The CSV will be full-precision (`docs/superpowers/reviews/2026-11-05-sell-pnl-breakdown.md:18`); `normalizeTaxSummary` converts money to `number` before any statement code runs (`decimal.ts:64-66`) | Goal 3 declares the rounding on the page, so the difference is stated rather than discovered by an adviser. Verification layer 1 pins the reachable third-decimal case. |
 | **A third renderer of one payload, with nothing comparing it to the second.** | `PortfolioDetail.tsx:238-292` renders the same `taxSummary.assets`; `Dashboard.tsx:40-45` renders the same headline figures | Accepted knowingly (Alternative D). The statement is a leaf with no interactivity. If the two tables ever need to agree, the check is a comparison test between them, and it is not written here. |
 | **A4 on Letter hardware.** | `@page { size: A4 }`, and `@page` cannot be scoped, so other tabs' paper size changes too | Stated in the dialog, not hidden. The owner's portfolios are EUR-denominated, which is a hint about likely paper preference and nothing more. |
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
@@ -541,11 +654,13 @@ echoed strategy — is recorded in `decision_records.md` §4.
     printed row is a payload value rounded once at display, so a row cannot disagree with the CSV
     except by the rounding the page declares. What the rows can do is run to a second page, which is
     a layout fact, not a correctness one.
-2.  **The smoke asserts one page for its own fixture and says nothing about larger portfolios.** One
-    page for a two-row fixture is checkable. A bound that holds for 50 holdings is a layout claim
-    nobody has measured, and an assertion that fails on the owner's real portfolio but passes in CI
-    is an assertion that teaches people to ignore the smoke. The page-break rules still ship
-    (`tr { break-inside: avoid }`); they are simply not claimed to produce a page count.
+2.  **Page count is a manual check, not an assertion.** The original form of this decision was "the
+    smoke asserts one page for its own fixture and says nothing about larger portfolios" — but Stage 9
+    found that counting pages needs a PDF parser, and no such dependency exists in
+    `frontend/package.json`. A bound that holds for 50 holdings is a layout claim nobody has measured
+    anyway, and an assertion that fails on the owner's real portfolio but passes locally is an
+    assertion that teaches people to ignore the smoke. The page-break rules still ship
+    (`tr { break-inside: avoid }`); the page count is confirmed by eye in the print preview.
 
 ## Alternatives Considered
 
@@ -567,7 +682,8 @@ echoed strategy — is recorded in `decision_records.md` §4.
 *   **Cons**: it asserts that a stylesheet mentions selectors, not that the page prints. It passes on
     a page that prints white-on-white.
 *   **Reason for rejection**: a gate that can pass while the feature is broken converts "unverified"
-    into "verified and therefore fine". The Playwright smoke is the gate; it is waiting on issue #45,
+    into "verified and therefore fine". The Playwright smoke is the check; it is a local step until
+    issue #45 lands,
     the same blocker as the existing sell-P&L smoke.
 *   **Scope note**: what is rejected is a grep over a *stylesheet*. A grep over
     `PortfolioStatement.tsx` for a hardcoded color literal is a different check and is not rejected
