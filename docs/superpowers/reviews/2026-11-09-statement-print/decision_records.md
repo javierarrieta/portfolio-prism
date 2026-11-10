@@ -61,9 +61,9 @@ note to revisit, and the bound is worth restating.
 
 ## 3. Why the print smoke is a local step — the CI forensics
 
-Moved from spec *Verification layers* layer 2. **This text is destined for GitHub issue #45** and
-for `frontend/e2e/README.md`, which already has a "Why it is not in CI" section at `:73-77` that
-will otherwise drift from the spec.
+Moved from spec *Verification layers* layer 2. **Done:** posted to GitHub issue #45 and folded into
+`frontend/e2e/README.md`, section "Why it is not in CI" — cited by section name rather than line
+number, because that file's line numbers move whenever the harness changes.
 
 - CI runs `ubuntu-latest`, where `npx playwright install chromium` is one line and
   `emulateMedia`/`page.pdf()` need no display server. So a browser job is possible; keeping the
@@ -87,8 +87,7 @@ will otherwise drift from the spec.
   smoke; Stage 8 removed it. `grep -rn historical_prices backend_rust/src/api_routes/` returns
   nothing — the only writers are internal cache writes after a successful provider fetch
   (`backend_rust/src/services/currency_service.rs:397`, `:490`), so pinning would require writing
-  SQLite out-of-band, against the harness's own rule (`frontend/e2e/README.md:10-11`, "seeds its
-  own fixture through the REST API"). It also couples this slice's smoke to the schema the
+  SQLite out-of-band, against the harness's own rule of seeding its fixture through the REST API. It also couples this slice's smoke to the schema the
   pricing-layer change is actively revising (its P2 is the `historical_prices` dedupe + unique
   index + real upsert, `2026-11-09-pricing-layer-truthfulness.md:184`). And it buys nothing: the
   smoke asserts no figure, so a zero-price run cannot fail it. If deterministic prices are ever
