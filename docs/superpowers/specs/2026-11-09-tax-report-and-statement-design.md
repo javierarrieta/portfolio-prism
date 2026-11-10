@@ -86,8 +86,10 @@ signal.
     inputs*, the same numbers come out on regeneration. The CSV records the strategy, the
     threshold, the portfolio base currency, the requested date range, the
     `price_date_used` and `fx_rate_date_used` per asset, and a `price_source` flag saying
-    where each value came from; the statement prints the same run context in its header
-    block. The pricing-layer fixes are what make this hold; a split recorded after the fact
+    where each value came from. The printable statement prints a **subset** — portfolio, base
+    currency, strategy, threshold, and its own dates — and no per-asset pricing provenance,
+    because it renders the undated response, which carries none. See
+    `2026-11-09-portfolio-statement-print.md`, *Non-Goals*. The pricing-layer fixes are what make this hold; a split recorded after the fact
     legitimately
     changes a regenerated file, and the run context is where that is visible.
 *   **Goal 5 — no silent wrong numbers.** A price or FX rate that cannot be obtained fails
@@ -673,6 +675,15 @@ ErrorBody       error, missing_prices: [symbol], missing_rates: [{from,to}],
     further assets once elapsed time passes the stated deadline and return the 503 with no
     partial payload. Replace the
     `.map_err(|_| Status::InternalServerError)` erasure on this handler.
+*   **Also in scope, and needed before the dated path**: normalize `strategy` on the **undated**
+    path too, not only when `from`/`to` are present. Today the handler defaults but does not
+    normalize (`analytics.rs:59`, `strategy.unwrap_or_else(|| "FIFO".to_string())`), and the
+    engine's match falls through to FIFO ordering for any unrecognized string, so
+    `?strategy=average_cost` reports `average_cost` while the engine silently used FIFO. The
+    sibling sell-P&L route already fixed exactly this (`analytics.rs:216-222`, whose comment reads
+    *"so the modal can never name a matching method the engine did not use"*). This is what the
+    printable statement's run-context line depends on being able to claim: until it lands, the
+    statement can only say "the strategy the app sent", not "the strategy the engine used".
 
 #### 7. `backend_rust/src/openapi.rs` (Modify) — slice 4
 
