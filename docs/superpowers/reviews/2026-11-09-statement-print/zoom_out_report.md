@@ -276,3 +276,60 @@ or an exact one.
 *   **Rejecting server-generated PDF** (Alternative A) — sound as far as it goes; see M5 for the
     variant it does not cover.
 *   **Not adding a router** — one page does not justify it.
+
+---
+
+## Re-audit (single permitted re-run, after commit `a43418c`)
+
+**B1 — ADDRESSED.** Grepped for the deleted concepts rather than trusting the diff: the only
+surviving mentions of the second normalizer and the agree-to-the-cent test are the sentences
+that forbid them (`:246-247`, `:193-194`), and the risk row, sequencing row, Overview and
+Alternative C all moved with them.
+
+**B2 — ADDRESSED** at all three sites (Goal 4, the risk row, Decided item 3), with one hole the
+fix itself left: the empty-portfolio branch echoes **none** of the three fields
+(`analytics.rs:45-51`), so Goal 4's "the payload already carries all three" was not universally
+true and the normalizer's `str()`/`num()` defaults would have printed
+"realized · (threshold 0d)" — a fabricated run context on the branch already cited for the
+currency problem.
+
+**Nine new findings in the rewrite, all confirmed against the tree and all fixed in the
+follow-up commit:**
+
+1. **Major** — "quantised to the cent" is false for two currencies `formatters.ts` supports:
+   `formatters.ts:10-11` gives `BTC`/`ETH` `maximumFractionDigits: 8`, and
+   `PortfolioDetail.tsx:442-443` offers both as a base currency. A BTC page would print 8 dp
+   under a line claiming cent-rounding.
+2. **Major** — Goal 3 called its equality "a test" while leaving the rounding side undefined,
+   and the shipped assertion ("the printed figures equal the payload rendered through
+   `formatters.ts`") cannot fail for any component that calls `formatCurrency` — the same
+   unfailable-test sin this document uses to reject the grep gate. Replaced with a golden:
+   fixture carrying `1234.565`, expected literal string in the test, no second rounder needed.
+3. **Major** — the double-safety evidence was scoped to inputs the payload never produces.
+   2-dp and 3-dp samples cannot exhibit the failure they were cited to rule out: the engine's
+   products carry up to 28 fractional digits (`tax_engine.rs:414` divides; `:418`, `:422`,
+   `:433` have no scale control), and the failure is significant-digit truncation at ~15-17,
+   not magnitude near 2^53. Claim rescopeed to ≤15 significant digits with the residual named
+   rather than denied.
+4. **Major** — the rewrite asserted in the present tense that the tax report CSV exists. It
+   does not: `grep -i csv backend_rust/src` returns nothing. It is slice 3 of a sibling
+   *Proposed* spec that is itself blocked on the pricing layer, whose date semantics are still
+   open. Anchored the declared-rounding line to the payload (which is full-precision today) and
+   marked the CSV cross-check conditional.
+5. **Nit** — three off-by-one citations, all inherited from this review's own drift:
+   `analytics.rs:97-99` → `98-100`; `decimal.ts:64-68` → `:63`; `App.tsx:474` → `:483`.
+6. **Nit** — `threshold_days` printed unconditionally, while the cited precedent
+   (`SellPnlModal.tsx:210`) gates it on HYBRID. Next to FIFO it presents an unused parameter
+   as part of the method.
+7. **Nit** — "two headline figures" in Goal 1 and the layer-1 assertion versus three in target
+   file 1; portfolio value had no assertion.
+8. **Nit** — "260 mm gutter" should be px (`index.css:95`).
+9. **Nit** — the C2 liability argument claimed the repo has no decimal-shaping utility;
+   `sellPnlCsv.ts:61-65` ships one and documents the `1e21` `toFixed` hazard being cited.
+
+The re-audit also confirmed every other citation in the rewrite: `analytics.rs:45-51`,
+`analytics.rs:95-97`, `db_types.rs:31`, `tax_engine.rs:418/422/433`, `formatters.ts:4`,
+`decimal.ts:20-23`, `index.css:3-31`/`93-98`, `SellPnlModal.tsx:132/206/210`,
+`App.tsx:36/111/379/385-396/458`, `handlers.ts:121/122/130-131`, `run.sh:112`,
+`reviews/2026-11-05-…:18` and `:50`, `auth-testing.md` §5, `main.tsx:3`, no `@media print`,
+no CI browser job.
