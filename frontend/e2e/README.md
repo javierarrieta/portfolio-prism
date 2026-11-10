@@ -48,7 +48,7 @@ nix-shell -p chromium -p liberation_ttf --run 'cd frontend && ./e2e/run.sh'
 | --- | --- |
 | `CHROMIUM` | browser binary to launch |
 | `FONT_DIR` | extra font directory for the generated `fontconfig` file |
-| `SMOKE_SHOT=/tmp/x.png` | write a full-page screenshot of the open modal |
+| `SMOKE_SHOT=/tmp/x.png` | on a failed run, write a full-page screenshot to this path (sell-pnl also writes one of the open modal on success) |
 | `BASE_URL` / `API_URL` | override where the app and API live |
 
 ## What it asserts

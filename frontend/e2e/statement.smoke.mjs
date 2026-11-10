@@ -10,6 +10,7 @@
 // Required env: CHROMIUM   path to a chromium-compatible browser binary
 // Optional env: BASE_URL   default http://localhost:5173
 //               API_URL    default http://127.0.0.1:8000/api
+//               SMOKE_SHOT set to a path to write a full-page screenshot when the run fails
 
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:5173'
 const API_URL = process.env.API_URL ?? 'http://127.0.0.1:8000/api'
@@ -115,8 +116,18 @@ try {
   // Measured ON THE STATEMENT, not the document. index.css:47 sets
   // body{overflow-x:hidden}, which propagates to the viewport, so a document-level
   // check can never fail -- it clips silently.
+  //
+  // Viewport set to the printed page box first. emulateMedia({media:'print'}) changes
+  // the media type but NOT the layout viewport, so at 1400px this check could only
+  // fail at a width nobody prints at: the PDF lays out at A4 minus print.css:13's
+  // 14mm margins = 182mm, about 688px at 96dpi. 794px is A4 wide at 96dpi, and the
+  // statement's own box is ~714px of it (.main-content keeps 40px of padding under
+  // border-box), so the measure is within ~26px of what ships instead of nearly twice
+  // it. Nine columns of 16px cell padding is ~288px of padding alone, so this is the
+  // difference between an assertion that can fail and one that cannot.
+  await page.setViewportSize({ width: 794, height: 1123 })
   const [sw, cw] = await statement.evaluate((el) => [el.scrollWidth, el.clientWidth])
-  if (sw > cw) fail(`horizontal overflow: scrollWidth ${sw} > clientWidth ${cw}`)
+  if (sw > cw) fail(`horizontal overflow at the printed page box: scrollWidth ${sw} > clientWidth ${cw}`)
 
   // A non-empty PDF. No page-count assertion: that needs a PDF parser and
   // frontend/package.json has none. preferCSSPageSize:true so the A4 @page rule is
@@ -126,7 +137,20 @@ try {
   ok(`pdf rendered (${pdf.length} bytes)`)
 } catch (err) {
   fail(err.message)
+  // A first-ever run failing on a locator timeout or a refused fetch tells you nothing
+  // from the message alone. The stack names the frame that threw; printed separately so
+  // the failure tally stays one line per failure.
+  if (err.stack) console.error(err.stack)
 } finally {
+  // run.sh echoes `screenshot: $SMOKE_SHOT` on a non-zero exit, so this smoke has to
+  // actually write that file or the message points at a path that does not exist.
+  // In finally, not in the catch: a failing assertion calls fail() without throwing, so
+  // the catch only sees the throwing half of the failures. Guarded by .catch so a
+  // screenshot error cannot mask the real failure or move the exit code.
+  if (failures.length && process.env.SMOKE_SHOT) {
+    await page.screenshot({ path: process.env.SMOKE_SHOT, fullPage: true })
+      .catch((e) => console.error(`screenshot not written: ${e.message}`))
+  }
   await browser.close()
 }
 
