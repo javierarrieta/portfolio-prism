@@ -4,6 +4,10 @@
 *   **Status:** Proposed
 *   **Date:** 2026-11-09
 *   **Predecessor:** `2026-11-09-tax-report-and-statement-concepts.md`
+*   **Sibling:** `2026-11-09-portfolio-statement-print.md` — the printable statement, split
+    out of this document at the same time the pricing layer was. Everything about the
+    statement lives there; this document keeps only where the statement touches the tax
+    report.
 *   **Blocked on:** `2026-11-09-pricing-layer-truthfulness.md` — dated FX,
     `historical_prices` uniqueness and the pricing result types. This document does not
     edit `currency_service.rs` or `lib.rs`.
@@ -18,14 +22,14 @@ every sell dated inside a chosen `[start, end]` window at lot granularity, with 
 lots each sell consumed, plus every lot still open at `end` with its unrealized gain or
 loss at that date.
 
-The **portfolio statement** is a page the owner reads or hands to someone. It shows
-realized P&L cumulative from inception and unrealized P&L as of today, for one portfolio in
-full. The browser prints it to PDF; the server never produces a PDF. It takes no date: the
-tax report is the dated artifact, and a printable page about a past quarter is not on the
-roadmap this document covers.
+The **portfolio statement** is a page the owner reads or hands to someone: realized P&L
+cumulative from inception and unrealized P&L as of today, printed by the browser. It takes
+no date and needs no backend change, which is why it is specified separately in
+`2026-11-09-portfolio-statement-print.md`. This document mentions it only where the two
+share ground: the same run context, and the same rule that renderers do no arithmetic.
 
-They are not two features. They are one dated-calculation change plus two renderers, and the
-statement renderer needs no backend change at all.
+They are not two features with equal weight. The tax report is a dated-calculation change
+plus a renderer; the statement is a renderer alone.
 
 ## The Problem
 
@@ -91,10 +95,10 @@ signal.
     to a stated cap, with a count of what was omitted. Where a date falls on a non-trading
     day, the file states the date actually used. No column is silently substituted, and the
     file states which columns are legal to sum.
-*   **Goal 6 — a printable statement.** The printed page contains no navigation, no
-    buttons, no inputs and no interactive controls, and its two headline figures —
-    cumulative realized P&L and unrealized P&L — are the payload totals rendered through
-    `frontend/src/utils/formatters.ts`, not arithmetic invented by the print view.
+*   **Goal 6 — a printable statement.** Specified in
+    `2026-11-09-portfolio-statement-print.md`, which owns the printed page, its print
+    stylesheet and its verification. What this document owes that one is a payload whose
+    totals are complete and server-owned, so the statement never has to add anything up.
 *   **Goal 7 — existing figures move only where declared.** Every change to numbers on
     existing endpoints is named and ships with its own note. Within this document the only
     such change is the `TaxLot` fix, which corrects two Holdings columns currently fed from
@@ -129,7 +133,7 @@ signal.
 | Late-recorded splits | A split entered after a period is filed changes in-window cost basis on regeneration, and concurrent first-sync requests can double a split | Out of scope, issue #50. The run context states splits are as recorded; the dated path does not sync |
 | Outbound cost and elapsed time | `replay` converts per transaction (`tax_engine.rs:403`); the process throttle is roughly five requests per second (`currency_service.rs:14`); `k8s/ingress.yaml` sets no `proxy-read-timeout`, so the ingress-nginx 60 s default applies, against roughly 33 s worst case per unreachable host (10 s reqwest timeout, `MAX_RETRIES = 3`, 1 s/2 s backoff) | Pricing-layer work-set shrink; the route's elapsed deadline, which fails closed |
 | Access posture | A parameter-dependent access rule on an existing route is invisible to the grep-based gate | Access level: one rule for both paths, proven by `isolation_test.rs` |
-| Print fidelity | No `@media print` CSS exists and CI has no browser job, so nothing can prove the page prints. **This slice ships unverified by design** — see issue #45, *Run the sell P&L Playwright smoke in CI* | The Playwright smoke is the only honest check and it is a local step until #45 lands; the print hook and chrome selectors are named in file 21 so a future gate has something to assert on |
+| Print fidelity | Owned by the statement document, which ships that slice unverified by design (no CI browser job; issue #45) | `2026-11-09-portfolio-statement-print.md`, Risks |
 | Single-replica assumptions | SQLite write behaviour assumes one pod; a rolling update with default maxSurge runs two for a window | State the dependency in the deployment manifest review |
 
 ## Technical Plan (Architecture)
@@ -312,10 +316,10 @@ The JSON variant stays a documented public surface, not an internal intermediate
 OpenAPI schema, the regenerated spec and the generated types are all kept, so the payload is
 usable outside this frontend.
 
-The statement is a React view with a print stylesheet. There is no `@media print` rule
-anywhere in the frontend (verified: no `@media print` in `frontend/src/`), so this
-stylesheet does not exist yet. It renders the payload's totals through
-`frontend/src/utils/formatters.ts`, and its printed subtree contains no buttons or inputs.
+The statement is a React view with a print stylesheet, specified in
+`2026-11-09-portfolio-statement-print.md`. It renders the payload's totals through
+`frontend/src/utils/formatters.ts` and derives nothing of its own, which is the only
+requirement this document places on it.
 
 ### Sequencing
 
@@ -325,13 +329,15 @@ touches no network.
 | Slice | Ships | Reaches network in tests? | Blast radius on existing figures | New-code risk |
 | :-- | :-- | :-- | :-- | :-- |
 | Out | The pricing-layer changes: dated FX, `historical_prices` uniqueness, pricing result types | no | figures move for every foreign-currency asset | moderate |
-| 1 | Statement at today's date, pure frontend over the existing tax-summary payload | no | none | low |
+| 1 | Statement at today's date — **owned by the statement document**, pure frontend over the existing tax-summary payload | no | none | low |
 | 2 | `replay_at` in the engine, unit tests only | no | none | contained |
 | 3 | Tax report CSV, sold-lot rows only — the quarterly realized figure, served by the route | no | none | moderate |
 | 4 | Open-lot rows, the pricing rule, and the failure contract | **yes** | none new here — the pricing-layer document's result types stop failed lookups returning zero | **the risky piece** |
 
 There is no slice 5. An earlier revision had the statement switch to the dated payload; the
-statement now renders today's figures only, so the dated work never reaches it.
+statement now renders today's figures only, so the dated work never reaches it. Slice 1 is
+listed here to keep the ordering honest — it is sequenced first, but it is specified and
+delivered by the statement document, and nothing in this document depends on it.
 
 ### Decided during drafting
 
@@ -465,26 +471,17 @@ Open from this draft, each needing a decision before the slice that depends on i
     float questions but not this one: which convention, and does the file stay parseable by
     the app's own importer?
 
-7.  **The print slice's verification gap.** It ships with no automated check. Issue #45
-    (*Run the sell P&L Playwright smoke in CI*) is the prerequisite for making it a gate;
-    until then `npm run e2e:statement` is a manual step needing a chromium binary, and
-    `check_print_styles.sh` was dropped as a gate that can pass while printing is broken.
+7.  **~~The print slice's verification gap~~** — moved to
+    `2026-11-09-portfolio-statement-print.md`, which owns that slice and states the gap in
+    its own Risks section.
 
 ## Alternatives Considered
 
 ### Alternative A: server-generated PDF for the statement
 
-*   **Pros**: a byte-reproducible artifact; fetchable by script or `curl`; identical output
-    regardless of the reader's browser and fonts; archivable.
-*   **Cons**: no PDF engine exists in the project. The realistic Rust options are `typst`
-    (pure Rust, large dependency tree, needs a font file), `genpdf` or `print` (system
-    libraries in the image), or HTML through headless Chromium (a second runtime in a
-    container that currently has none). Font embedding for non-ASCII symbols and currency
-    names, page breaks, and a layout that cannot be unit-tested the way the CSV builder is.
-*   **Reason for rejection**: the statement is read or emailed by the owner, not filed or
-    signed. Browser print-to-PDF reuses the existing formatters so the numbers look like
-    the rest of the app, and costs no dependency. The cost of the alternative is permanent
-    maintenance in a 256Mi single-replica container for a property nobody asked for.
+Moved to `2026-11-09-portfolio-statement-print.md`, which is where the statement's format
+is decided. The rejection stands: browser print-to-PDF, no PDF dependency, no second
+runtime in a 256Mi container.
 
 ### Alternative B: a new `/tax-report` endpoint
 
@@ -816,59 +813,16 @@ existing screen.
     current selection. If the route fails with the elapsed-deadline 503 the UI says the
     report took too long and offers a retry.
 
-#### 19. `frontend/src/components/PortfolioStatement.tsx` (Create) — slices 1, 5
+#### 19-23. Moved to the statement document
 
-*   **Type / Scope**: printable statement view.
-*   **Proposed Changes**: renders portfolio totals and per-asset figures through
-    `frontend/src/utils/formatters.ts`, for the portfolio in full — there is no asset-subset
-    filter, because the only arithmetic that would make a filtered headline honest is the
-    arithmetic renderers are forbidden from doing. It renders the existing `taxSummary`
-    payload at today's date and takes no date parameter; the dated artifact is the CSV. It
-    derives no totals of its own and contains no buttons or inputs inside the printed
-    subtree.
-
-#### 20. `frontend/src/styles/print.css` (Create) and its import (Modify) — slice 1
-
-*   **Type / Scope**: print stylesheet. There is no `@media print` rule in the project
-    today.
-*   **Proposed Changes**: hide app chrome, set page margins and break rules, and force
-    background-safe number rendering. Imported from the app entry so it ships in the main
-    bundle.
-
-#### 21. `frontend/src/test/components/PortfolioStatement.test.tsx` (Create) and `frontend/src/test/mocks/handlers.ts` (Modify) — slice 1
-
-*   **Type / Scope**: component tests and API mocks.
-*   **Proposed Changes**: assert the statement root carries the hook the print stylesheet
-    targets, that the printed subtree contains no `button` or `input`, and that the two
-    headline figures equal the payload totals rendered through
-    `frontend/src/utils/formatters.ts`. **Name the selectors here rather than at
-    implementation time**, or a CI grep can pass while hiding nothing: statement hook
-    `data-print="statement"`; chrome selectors `.nav-menu`, `.nav-item` and
-    `header.app-header` (`App.tsx:385-396`). `handlers.ts` already registers
-    `/api/portfolios/:id/tax-summary` and MSW matches on path, so the change is branching
-    that handler on `from`/`to`, not adding a route; respect the existing ordering comment at
-    `handlers.ts:130-131`.
-
-#### 22. Deleted — no print-CSS grep gate
-
-The original plan added `frontend/scripts/check_print_styles.sh` wired into CI. It is
-removed: a grep asserting that a stylesheet mentions some selectors goes green while the
-page still prints badly, which is the failure mode the analogous `check_access_gate.sh`
-exists to prevent. The Playwright smoke in file 23 is the honest check.
-
-#### 23. `frontend/e2e/statement.smoke.mjs` (Create) and `frontend/e2e/run.sh` (Modify) — slice 1
-
-*   **Type / Scope**: browser smoke, following the existing sell-pnl e2e pattern.
-*   **Proposed Changes**: load the statement, emulate print media, assert chrome is
-    `display: none`, that there is no horizontal overflow, and that `page.pdf()` returns a
-    non-empty buffer within a stated page count (**state the count**). This is the only
-    honest check that printing works; there is no server artifact to assert on. The
-    prerequisites: `frontend/package.json` is not in this list and must gain an
-    `e2e:statement` script — `e2e/run.sh` hardcodes `node e2e/sell-pnl.smoke.mjs` — and
-    `.github/workflows/ci.yml` has **no browser job at all**, so this smoke test is a local
-    step requiring a chromium binary, not a gate. Making it a gate is issue #45, *Run the
-    sell P&L Playwright smoke in CI*; this file is written so it drops straight into whatever
-    job #45 adds.
+Files 19 through 23 of the original list — `PortfolioStatement.tsx`, `print.css` and its
+import, `PortfolioStatement.test.tsx` with the `handlers.ts` branch, the deleted
+print-CSS grep gate, and `statement.smoke.mjs` with the `run.sh` parameterisation — are
+specified in **`2026-11-09-portfolio-statement-print.md`**. Nothing in this document edits
+those files. Two things this document owed them are settled there: the chrome selectors are
+the real ones (`.sidebar`, `.header-row`, `.nav-menu`, `.nav-item` — the
+`header.app-header` named in the original file 21 does not exist), and the page-count bound
+is one page for the smoke's fixture rather than an unmeasured claim about large portfolios.
 
 #### 24. Moved to the pricing-layer document
 
@@ -919,8 +873,8 @@ its own decisions land is mis-cut.
     with no tolerance, under FIFO, LIFO and HYBRID.
 *   **Byte reproducibility**: two `format=csv` dispatches over unchanged data produce
     identical bytes. This is Goal 4, and it is only testable because the file is server-side.
-*   **Print**: `npm run e2e:statement` from `frontend/`. It is a local step, not a gate — CI
-    has no browser job and no CSS check today (issue #45).
+*   **Print**: owned by `2026-11-09-portfolio-statement-print.md`. Its smoke is a local
+    step, not a gate — CI has no browser job and no CSS check today (issue #45).
 *   **Manual, cannot be automated**: a real OIDC login and a real browser print preview. The
     login is the item `docs/auth-testing.md` lists as unverifiable in CI; the print preview is
     new to this document and is not listed there.
