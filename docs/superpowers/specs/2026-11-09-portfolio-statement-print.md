@@ -297,19 +297,23 @@ propagates it (`tax_engine.rs:403`), and `analytics.rs:86` turns it into a 500. 
 `setTaxSummary` never runs, and the guard the mandated pattern produces renders nothing.
 
 **The decision is to accept this and say so, not to design around it.** In that state the statement
-tab renders nothing, so `:has([data-print="statement"])` does not match and Ctrl-P prints the
-dashboard — which is exactly the behaviour *Other tabs* already declares out of scope. The gap is
-therefore not a new failure mode but the absence of a designed one, and it is bounded: the same
-portfolio is equally unpriceable on the dashboard, and the pricing-layer change removes the cause for
+tab renders nothing, so the `:has([data-print="statement"])` hide rules and the grid collapse
+(`print.css:25-29`) do not match, and Ctrl-P prints the app shell — sidebar, header, error banner
+— around an empty content column. It is **not** the dashboard: every tab branch in `App.tsx` is
+gated on the active tab, so the content column holds only its header row. It is not illegible
+either: the palette overrides (`print.css:36-49`) carry no selector, so that shell prints
+dark-on-white. The gap is therefore not a new failure mode but the absence of a designed one, and
+it is bounded: the same failed request leaves the dashboard on its "No Active Assets Found" card
+(`Dashboard.tsx:26`), and the pricing-layer change removes the cause for
 every foreign-currency holding. What this slice will not do is invent a fourth state, a copy string
 for it, and a test for it, to paper over a defect another document already owns.
 
 Two consequences are stated rather than left to be discovered:
 
-*   **The banner that would explain the blank tab is hidden in print.** It lives inside `.header-row`
-    (`App.tsx:458`), which print rule 2 hides. A user who prints from the statement tab after a
-    failed fetch gets the dashboard, not a blank page and not an explanation. On screen the banner is
-    visible, so the failure is not silent where the user is looking at it.
+*   **The banner that would explain the blank tab is printed, not hidden.** It lives inside
+    `.header-row` (`App.tsx:458`), which print rule 2 hides — but rule 2 is `:has()`-scoped and
+    does not match in this state, so the banner is on the printed page. On screen it is visible
+    too, so the failure is not silent either way.
 *   **The smoke's fixture must be same-currency.** Seeded holdings are denominated in the portfolio's
     base currency, or the harness 500s before any print assertion runs. That is a constraint on the
     fixture, not a thing under test.
@@ -456,16 +460,22 @@ Add the rule in the change that first needs it.
 
 #### Other tabs, and what will not invert
 
-With the rules scoped as above, printing from the dashboard, analytics or ledger tab behaves exactly
-as it does today: sidebar, navigation, charts and all. That is not designed, it is unchanged, and it
-is out of scope — the statement is the tab you print from, and the only one the smoke exercises. What
-changes for those tabs is `@page` alone, which no selector can scope: they now get A4 with 14 mm
-margins instead of the browser default.
+With the hide rules scoped as above, printing from the dashboard, analytics or ledger tab keeps
+its layout: sidebar, navigation, charts and all. That is not designed, it is unchanged, and it
+is out of scope — the statement is the tab you print from, and the only one the smoke exercises.
+What changes for those tabs is **not** only `@page`, which no selector can scope: they now get A4
+with 14 mm margins, and the palette overrides at `print.css:36-49` sit inside `@media print` with
+no selector of their own, so their text and card backgrounds invert too. What does not invert on
+those tabs is anything with a hardcoded color, and the sidebar is the obvious case — `.sidebar`
+keeps `rgba(10, 15, 28, 0.95)` (`index.css:101`) while its nav text becomes `--text-secondary`
+`#333333`, so with background graphics enabled that sidebar prints dark-on-dark. The statement
+tab is unaffected, because rule 1 hides the sidebar there.
 
-Two backgrounds are not variables and would not invert if that scope were ever widened:
-`.badge-crypto`'s background (`index.css:334`; its **color** is a variable and does invert) and
-`.data-table tr:hover td` (`:252`, a hover state that cannot occur on paper). `.sidebar` is hardcoded
-at `:101` but rule 1 hides it, so it is not a residual.
+Two backgrounds are not variables and do not invert: `.badge-crypto`'s background
+(`index.css:334`; its **color** is a variable and does invert) and `.data-table tr:hover td`
+(`:252`, a hover state that cannot occur on paper). `.sidebar` is hardcoded at `:101` as well —
+rule 1 hides it on the statement tab, so it is not a residual *there*, and it is one on the other
+four tabs, as just said.
 
 ### Verification layers, and what each cannot cover
 
@@ -638,9 +648,9 @@ the page still prints badly. The Playwright smoke is the check; see Alternative 
 | **Statement read as a quarterly figure.** | The undated endpoint has no window | Goal 1's label requirement: "cumulative since inception" is on the page, not implied. |
 | **Empty portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Goal 7 and *Empty portfolio*: heading, printed date and the empty note only. The negative list is asserted. |
 | **A stale payload prints under the wrong portfolio name.** | `setTaxSummary` is called once (`App.tsx:114`) and never cleared | Target Files 4 gives the form: record the id beside the summary, guard the statement branch, following `App.tsx:68`. |
-| **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs print as today | Out of scope and stated under *Other tabs*. The one change for those tabs is `@page`, which no selector can scope. |
+| **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs keep their layout | Out of scope and stated under *Other tabs*. Those tabs get two changes they did not ask for: `@page` (A4 with 14 mm margins), which no selector can scope, and the unscoped palette overrides (`print.css:36-49`), which invert their text and cards. The sidebar's hardcoded background does not invert along with them. |
 | **Foreign-currency figures are wrong, inherited.** | The pricing-layer spec records that foreign-currency assets cannot be priced correctly today | Not this slice's fix and not this slice's regression. The statement inherits the dashboard's existing behaviour; the pricing-layer change corrects both at once. |
-| **A foreign-currency portfolio prints the dashboard, not a statement.** | `currency_service.rs:234` → `get_rate` `Err` → `analytics.rs:86` returns 500 → `taxSummary` stays `null` → the guard renders nothing → `:has()` does not match | **Accepted gap**, specified in *When there is no payload at all*. Behaviour in that state is the same as the other three tabs, already out of scope. The on-screen banner explains it; the print path hides that banner. Closed by the pricing-layer change. |
+| **A failed tax-summary request prints the app shell, not a statement.** | `taxSummary` stays `null` → the guard renders nothing → the `:has()`-scoped hide rules do not match. The FX cause recorded at drafting (`currency_service.rs:234` → 500) was closed by the pricing-layer change | **Accepted gap**, specified in *When there is no payload at all*. The print gets the shell — sidebar, header, error banner — around an empty content column, in the inverted palette, because the palette overrides carry no selector. Not the dashboard, and not illegible. |
 
 ## Decided during drafting
 

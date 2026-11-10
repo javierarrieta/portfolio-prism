@@ -4,8 +4,8 @@ Who this is for: whoever has to convince themselves this is safe to deploy. The
 implementation record says what was built; this says how to check it, in increasing
 order of effort, and is explicit about which checks are automated and which are not.
 
-Two things in here are **not verified by anything in CI**, and they are the reason this
-document exists:
+Two things about the authentication work in here are **not verified by anything in CI**, and
+they are the reason this document exists:
 
 1. Nothing in this repository has ever completed a login against a real identity
    provider. Every OIDC test exercises the failure path.
@@ -25,7 +25,7 @@ Run from the repository root. All of these are expected to pass on
 `feat/oidc-identity-isolation`.
 
 ```fish
-# Backend: 244 tests
+# Backend: 272 tests
 cd backend_rust; and cargo test
 
 # Static access gate: prints "handlers inspected: 15, cleared: 15"
@@ -49,7 +49,7 @@ diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi
 ```
 
 ```fish
-# Frontend: 152 tests, types, lint
+# Frontend: 173 tests, types, lint
 cd ../frontend
 npm test
 npx tsc --noEmit
@@ -211,6 +211,10 @@ that accepted either would pass on a build that got the branch backwards.
 
 ## 5. The browser walkthrough — this is the part that closes the two open items
 
+Everything in this section is about authentication except the last subsection, *Printing the
+statement*, which is the report-export feature's manual check and is listed here because this
+is where the document keeps the checks CI cannot run.
+
 Either bring up the compose harness or run locally.
 
 ### Option A — compose (closest to production shape)
@@ -318,7 +322,7 @@ Either answer is useful. Neither can be found from here.
 - the three headline figures equal the payload shown in devtools -- **not** "match the
   dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
   is falsy, so a coincidental fallback can satisfy an eyeball comparison.
-- an empty portfolio prints two lines and no figures
+- an empty portfolio prints a short note and no figures
 
 Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
 scoped, so printing from any other tab now also gets A4 with 14mm margins.

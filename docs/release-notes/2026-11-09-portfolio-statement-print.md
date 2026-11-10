@@ -18,10 +18,15 @@ quarterly tax form is how a wrong filing starts.
 
 **The page states that it rounded.** `Figures are rounded for display from full-precision
 calculations.` The engine emits full-precision decimals and the page prints whatever
-`formatters.ts` renders for the currency — 2 dp for USD and EUR, **0 dp for a zero-decimal
-currency** (`1234.565` prints `¥1,235` for JPY), up to 8 dp for BTC/ETH, and exactly 2 dp
-for any other code — an unrecognised one falls back to the same 2 dp rendering rather than
-an error. The reconciliation this disclosure exists for: the only CSV export in the app
+`formatters.ts` renders for the currency — which is CLDR's digit count for that code, not a
+fixed two decimals: 2 dp for USD and EUR, **0 dp for a zero-decimal currency** (`1234.565`
+prints `¥1,235` for JPY and `₩1,235` for KRW), 3 dp for KWD and BHD, 4 dp for CLF, and up to
+8 dp for BTC/ETH, which `formatters.ts` special-cases before `Intl` is consulted. The
+non-2-dp codes are reachable, not exotic: `taxSummary.currency` is the portfolio's base
+currency and the backend stores whatever the request body carries, with no validation
+(`portfolios.rs:26-32`, `:216-218`); the UI dropdown merely happens to offer ten codes — nine
+at 2 dp plus JPY (`App.tsx:615-624`). The reconciliation this disclosure exists for: the only
+CSV export in the app
 today, the sell P&L breakdown (`sellPnlCsv.ts`), is full-precision by standing decision, so
 a reader who reconciles a printed realized figure against that export is comparing the same
 underlying numbers at two different precisions and the last digits will not match. One
@@ -39,10 +44,16 @@ splits caveat under "no holdings" is nonsense.
 and LIFO. The claim it can make is "the strategy the app sent and the server echoed", not
 "the strategy the engine used" — this route defaults the strategy but does not normalize it.
 
-**Printing from the other four tabs is unchanged — except the paper.** `@page` takes no
-selector, so a print started from the dashboard, analytics or ledger now gets A4 with 14 mm
-margins instead of the browser default. Everything else about those prints — sidebar, nav,
-charts — is exactly as it was.
+**Printing from the other four tabs changes in two ways, not one.** `@page` takes no selector,
+so a print started from the dashboard, analytics or ledger now gets A4 with 14 mm margins
+instead of the browser default. And the palette inversion is not scoped either: the `:root`
+variable overrides and the `.glass-card` override (`print.css:36-49`) sit inside `@media print`
+with no selector of their own, and `print.css` is imported globally (`main.tsx:4`), so on those
+tabs the page goes dark-on-white too. What does **not** change there is the layout — sidebar,
+nav and charts still print, because the hide rules are `:has()`-scoped and do not match. One
+residual to know about: `.sidebar` keeps a hardcoded dark background (`index.css:101`) while its
+nav text becomes `#333333`, so a reader who has enabled background graphics gets a dark-on-dark
+sidebar on those tabs. The statement tab is unaffected, because rule 1 hides the sidebar there.
 
 ## Behaviour changes worth knowing about
 
@@ -60,15 +71,15 @@ charts — is exactly as it was.
   `Split-adjusted history is as recorded when this page was loaded; late-recorded splits
   can change past figures.` The sync-in-a-read-path shape itself is issue #50.
 - **If the tax-summary request failed, the tab renders nothing.** The statement renders only
-  when there is a summary for the portfolio currently selected. With none, nothing in the
-  print stylesheet engages — every hide rule and the palette inversion are scoped with
-  `:has([data-print="statement"])` — so a print started in that state gets the app shell as
-  it looks on screen (sidebar, header, the error banner) with an empty content column, in the
-  dark palette, which is to say illegible. That is the absence of a designed state rather than
-  a new failure mode, and it is bounded: the same failed request leaves the dashboard on its
-  "No Active Assets Found" card (`Dashboard.tsx:26`), so nothing here is worse than the state
-  the app already has. On screen the error banner is visible, so the failure is not silent
-  where you are looking at it.
+  when there is a summary for the portfolio currently selected. With none, the `:has()`-scoped
+  rules — both hide rules and the grid collapse (`print.css:25-29`) — never engage, so a print
+  started in that state gets the app shell (sidebar, header, the error banner) around an empty
+  content column. It is **not** the dashboard: every tab branch in `App.tsx` is gated on the
+  active tab, so the content column holds only its header row. It is also not illegible — the
+  palette overrides carry no selector, so that shell prints dark-on-white. That is the absence
+  of a designed state rather than a new failure mode, and it is bounded: the same failed request
+  leaves the dashboard on its "No Active Assets Found" card (`Dashboard.tsx:26`). On screen the
+  error banner is visible, so the failure is not silent where you are looking at it.
 - **Switching portfolios cannot print the wrong portfolio's numbers.** The summary is
   guarded against the selected portfolio id (`taxMeta` in `App.tsx`). Between switching and
   the new response landing, the statement renders nothing rather than portfolio B's figures
@@ -125,8 +136,9 @@ this slice deliberately ships the print path unverified by CI.
 
 - No backend change of any kind: no new route, no new field, no new figure, no OpenAPI
   regeneration.
-- No print stylesheet for the dashboard, analytics or ledger tabs. Printing from them still
-  prints the sidebar, the nav and a Recharts SVG — now on A4.
+- No print stylesheet for the dashboard, analytics or ledger tabs — no hide rules for them and
+  no layout work. Printing from them still prints the sidebar, the nav and a Recharts SVG, now
+  on A4 and now in the inverted palette.
 - No date parameter and no past-period statement. Today-only by decision; the dated artifact
   is the tax report, which is specified and not built.
 - No server-side PDF and no PDF dependency. The browser prints.
