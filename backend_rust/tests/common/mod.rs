@@ -136,6 +136,32 @@ pub async fn seed_asset(pool: &SqlitePool, portfolio_id: i32, symbol: &str, name
     res.0
 }
 
+/// `seed_asset` hardcodes `'USD'`, which is why no fixture in the suite could tell a
+/// correct dated-FX implementation from the broken one: the asset currency and the
+/// portfolio base currency were always the same string, so every conversion was a
+/// no-op. Multi-currency tests use this instead.
+#[allow(dead_code)]
+pub async fn seed_asset_currency(
+    pool: &SqlitePool,
+    portfolio_id: i32,
+    symbol: &str,
+    name: &str,
+    currency: &str,
+) -> i32 {
+    let res = sqlx::query_as::<_, (i32,)>(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES (?, ?, ?, ?, ?) RETURNING id"
+    )
+    .bind(portfolio_id)
+    .bind(symbol)
+    .bind(name)
+    .bind("STOCK")
+    .bind(currency)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    res.0
+}
+
 #[allow(dead_code)]
 pub async fn seed_transaction(
     pool: &SqlitePool,

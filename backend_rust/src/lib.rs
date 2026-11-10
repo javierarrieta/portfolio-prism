@@ -173,16 +173,16 @@ pub async fn init_db(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<(
         close_price TEXT NOT NULL
     )").execute(pool).await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_historical_prices_symbol_date ON historical_prices(symbol, date)")
-        .execute(pool)
-        .await?;
-
     sqlx::query("CREATE TABLE IF NOT EXISTS split_sync (
         symbol TEXT PRIMARY KEY,
         last_synced_at DATE NOT NULL
     )").execute(pool).await?;
 
     migrate_decimal_columns(pool).await?;
+
+    // After the decimal migration: it renames close_price on this same table, and a
+    // dedupe that runs before it operates on a schema about to change.
+    enforce_price_uniqueness(pool).await?;
 
     // --- identity -------------------------------------------------------------
     sqlx::query(
@@ -394,6 +394,45 @@ async fn migrate_one_column(
             Ok(())
         }
     }
+}
+
+/// Collapse duplicate `historical_prices` rows and make `(symbol, date)` unique.
+///
+/// The table was created with no primary key and only a non-unique index (the
+/// `CREATE TABLE IF NOT EXISTS historical_prices` in `init_db`), so `INSERT OR
+/// REPLACE` always inserted and every fetch
+/// appended. Reads have no `ORDER BY`, which made "the close on date X" an
+/// arbitrary row among N.
+///
+/// The tie-break is `MAX(rowid)`: the table has no write timestamp, so the most
+/// recently written row is the only deterministic survivor available. That is a
+/// deliberate choice about Yahoo's revisions around corporate actions, and it is
+/// what makes an as-of price reproducible from here on.
+///
+/// Must run AFTER `migrate_decimal_columns`, which renames this table's
+/// `close_price` column on a dedicated connection.
+pub async fn enforce_price_uniqueness(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM historical_prices WHERE rowid NOT IN (
+             SELECT MAX(rowid) FROM historical_prices GROUP BY symbol, date
+         )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Superseded by the unique index below; leaving it costs a write for no read.
+    sqlx::query("DROP INDEX IF EXISTS idx_historical_prices_symbol_date")
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_historical_prices_symbol_date
+             ON historical_prices(symbol, date)",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn migrate_decimal_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {

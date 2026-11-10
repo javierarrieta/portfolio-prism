@@ -14,6 +14,80 @@ use rust_decimal::prelude::FromPrimitive;
 const RATE_LIMIT_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRIES: usize = 3;
 
+/// How far back a first fetch for a pair reaches. One wide window per pair, so a
+/// year of dated lookups costs a single outbound call instead of one per distinct
+/// transaction date.
+pub(crate) const FX_SERIES_WINDOW_DAYS: i64 = 365;
+
+/// How stale a close may be and still answer for a date. Thirty days is generous
+/// for a currency pair, which trades nearly every day, and tight enough that a
+/// delisted or mis-symbolled pair produces an error instead of a years-old rate
+/// silently used as a tax figure.
+pub(crate) const FX_LOOKBACK_DAYS: i64 = 30;
+
+/// How stale a stored series may be and still answer for a window ending at
+/// `end_date`. Four days covers a long market weekend; beyond that the window is
+/// treated as incomplete and the provider is asked for the tail.
+pub(crate) const PRICE_WINDOW_FRESH_DAYS: i64 = 4;
+
+/// Yahoo's FX pair symbology. `EUR=USD` returns "No data found"; `EURUSD=X`
+/// returns data. `get_rate` built the first form, which is why every asset whose
+/// currency differed from the portfolio's base currency failed to price at all.
+pub(crate) fn fx_symbol(from: &str, to: &str) -> String {
+    format!("{}{}=X", from.to_uppercase(), to.to_uppercase())
+}
+
+/// The last close on or before `date`, within `lookback_days`. Returns the date
+/// actually used alongside the value: a caller that reports a figure "as of" a
+/// date must be able to say which date priced it, and silent substitution is the
+/// failure this whole change exists to remove.
+///
+/// Pure and order-independent on purpose, so the rule is testable without a pool
+/// or a network.
+pub(crate) fn select_rate(
+    series: &[(NaiveDate, Decimal)],
+    date: NaiveDate,
+    lookback_days: i64,
+) -> Option<(NaiveDate, Decimal)> {
+    let earliest = date.checked_sub_signed(chrono::Duration::days(lookback_days))?;
+    series
+        .iter()
+        .filter(|(d, _)| *d <= date && *d >= earliest)
+        .max_by_key(|(d, _)| *d)
+        .cloned()
+}
+
+/// Does a stored window answer for `end_date`? Only if its newest row is within
+/// `PRICE_WINDOW_FRESH_DAYS` of it; an empty window is never fresh.
+///
+/// Pure for the same reason as [`select_rate`]: the rule is what needs testing, and
+/// a test of it must not need a pool, a provider, or a network.
+fn stored_window_is_fresh(newest: Option<NaiveDate>, end_date: NaiveDate) -> bool {
+    matches!(newest, Some(d) if (end_date - d).num_days() <= PRICE_WINDOW_FRESH_DAYS)
+}
+
+/// Combine what the provider returned for the tail of a window with the rows
+/// already stored for its head. Provider rows win on a shared date; the result is
+/// ascending by date.
+///
+/// Pure so the merge is testable too: it only runs in production when a real
+/// provider answers, and this crate has no dev-dependencies to mock one with.
+fn merge_series(
+    fetched: Vec<(NaiveDate, Decimal)>,
+    stored: Vec<(NaiveDate, Decimal)>,
+) -> Vec<(NaiveDate, Decimal)> {
+    let fetched_dates: std::collections::HashSet<NaiveDate> =
+        fetched.iter().map(|(date, _)| *date).collect();
+    let mut merged = fetched;
+    for (date, price) in stored {
+        if !fetched_dates.contains(&date) {
+            merged.push((date, price));
+        }
+    }
+    merged.sort_by_key(|(date, _)| *date);
+    merged
+}
+
 fn f64_to_decimal(v: f64) -> Decimal {
     Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
 }
@@ -122,9 +196,91 @@ struct EodhdSearchResult {
 pub struct CurrencyService {
     client: Client,
     timeout: Duration,
-    cache: Arc<RwLock<HashMap<(String, String, NaiveDate), Decimal>>>,
+    cache: Arc<RwLock<HashMap<(String, String), FxSeries>>>,
     last_request: Mutex<Option<Instant>>,
     eodhd_api_key: Option<String>,
+}
+
+/// One fetched window of a pair's dated closes. Keyed by pair, not by pair-and-date:
+/// the old key (`(from, to, date)`) meant every distinct transaction date was its own
+/// outbound call, and the value was never the date it claimed.
+///
+/// The cache is process-local and dies with the process, so it needs no key version:
+/// entries written by the old buggy code cannot outlive a deploy. The persistent store
+/// is `historical_prices`, and it is versioned by symbology — `EURUSD=X` rows cannot
+/// have been written by the `EUR=USD` code path.
+struct FxSeries {
+    /// First date of the fetched window. A request earlier than this needs a new
+    /// fetch rather than a wrong answer from a window that never covered it.
+    window_start: NaiveDate,
+    /// Last date the fetch covered — the `date` whose request produced this series.
+    /// A cached series never holds closes after it, so it may not answer for a later
+    /// date either. See [`FxSeries::rate_at`].
+    window_end: NaiveDate,
+    series: Vec<(NaiveDate, Decimal)>,
+}
+
+impl FxSeries {
+    /// The close this window is allowed to answer for `date`, or `None` when the
+    /// date falls outside the range the fetch actually covered. Both bounds are
+    /// load-bearing: a date before `window_start` was never in the window, and a
+    /// date after `window_end` would be priced by the window's last close, which
+    /// stopped days short of it — inside the lookback, so nothing downstream would
+    /// notice the substitution.
+    fn rate_at(&self, date: NaiveDate, lookback_days: i64) -> Option<(NaiveDate, Decimal)> {
+        if date < self.window_start || date > self.window_end {
+            return None;
+        }
+        select_rate(&self.series, date, lookback_days)
+    }
+}
+
+/// Bound on cached pairs. Unbounded is not an option in a 256Mi pod once past dates
+/// became reachable; 64 pairs is far beyond any portfolio in this app, and the
+/// eviction is a full clear rather than an LRU because a miss is one cheap call.
+const MAX_FX_SERIES_CACHED: usize = 64;
+
+/// A rate and the date that produced it. The date is not decoration: a report that
+/// says "as of 2024-03-31" has to be able to state that a Friday close priced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateAt {
+    pub rate: Decimal,
+    pub date_used: NaiveDate,
+}
+
+/// "There is no close for this symbol" and "we could not ask" are different failures
+/// with different user actions. `get_price` returned `Decimal::ZERO` for both, and
+/// zero is a plausible price.
+///
+/// `std::error::Error` is what lets callers use `?` over it (notably `get_rate`, which
+/// keeps its `anyhow::Result` return type).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PricingError {
+    NoData,
+    ProviderUnavailable(String),
+}
+
+impl std::fmt::Display for PricingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PricingError::NoData => write!(f, "no price data available"),
+            PricingError::ProviderUnavailable(reason) => write!(f, "price provider unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PricingError {}
+
+/// The error for "this pair has no close near that date", built separately from the
+/// `ok_or_else` in `get_rate` so the message is testable without a provider. Public so
+/// the integration test can assert on it; `select_rate` stays `pub(crate)`.
+pub fn no_rate_error(symbol: &str, date: NaiveDate, lookback_days: i64) -> anyhow::Error {
+    anyhow!(
+        "No {} close on or before {} within {} days",
+        symbol,
+        date,
+        lookback_days
+    )
 }
 
 impl CurrencyService {
@@ -217,54 +373,147 @@ impl CurrencyService {
         Err(anyhow!("Max retries exceeded for {}", Self::redact_url(url)))
     }
 
-    pub async fn get_rate(&self, from_curr: &str, to_curr: &str, date: DateTime<Utc>) -> Result<Decimal> {
+    /// The FX rate to convert `from_curr` into `to_curr` for `date`: the last close
+    /// on or before that date *within a window that actually reaches `date`*, within
+    /// `FX_LOOKBACK_DAYS`, together with the date actually used.
+    ///
+    /// "A window that actually reaches `date`" is a real limit, not a figure of
+    /// speech, and the two read paths enforce it differently. The cache records the
+    /// window its fetch covered, so [`FxSeries::rate_at`](FxSeries::rate_at) rejects a
+    /// date outside those bounds exactly. `historical_prices` records no coverage, so
+    /// the database path uses a proxy: the newest stored row must be within
+    /// `PRICE_WINDOW_FRESH_DAYS` of `date`, or the window is treated as incomplete and
+    /// the provider is asked for the tail. A per-symbol coverage record is the
+    /// follow-up that would replace the proxy.
+    ///
+    /// Read order is database first, provider second — the same order
+    /// [`get_historical_prices`](Self::get_historical_prices) now uses, and for the same
+    /// reason: it is what makes a past-dated conversion testable without a network.
+    pub async fn get_rate(
+        &self,
+        from_curr: &str,
+        to_curr: &str,
+        date: DateTime<Utc>,
+        pool: &SqlitePool,
+    ) -> Result<RateAt> {
         let date_naive = date.date_naive();
-        let cache_key = (from_curr.to_string(), to_curr.to_string(), date_naive);
+
+        if from_curr.to_uppercase() == to_curr.to_uppercase() {
+            return Ok(RateAt { rate: Decimal::ONE, date_used: date_naive });
+        }
+
+        let key = (from_curr.to_uppercase(), to_curr.to_uppercase());
 
         {
             let cache = self.cache.read().await;
-            if let Some(rate) = cache.get(&cache_key) {
-                return Ok(*rate);
+            if let Some((date_used, rate)) = cache
+                .get(&key)
+                .and_then(|fx| fx.rate_at(date_naive, FX_LOOKBACK_DAYS))
+            {
+                return Ok(RateAt { rate, date_used });
             }
         }
 
-        if from_curr == to_curr {
-            return Ok(Decimal::ONE);
+        let symbol = fx_symbol(from_curr, to_curr);
+        let window_start = date_naive - chrono::Duration::days(FX_SERIES_WINDOW_DAYS);
+
+        // Database first: a seeded or previously fetched window answers with no
+        // outbound call at all.
+        if let Some(hit) = self.rate_from_db(&symbol, window_start, date_naive, pool).await? {
+            return Ok(hit);
         }
 
-        let symbol = format!("{}={}", from_curr, to_curr);
-        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
+        // get_historical_prices already builds the range URL, parses the chart
+        // response, persists the series through the upsert, and merges what it
+        // fetched over stored rows it found too stale to answer with. Reaching this
+        // line means `rate_from_db` found nothing it was allowed to answer with — no
+        // row inside `FX_LOOKBACK_DAYS`, or a newest row past
+        // `PRICE_WINDOW_FRESH_DAYS` — so any stored row in the window is merged under
+        // whatever the provider returns. Reusing it is why this change is small.
+        let series = self
+            .get_historical_prices(&symbol, window_start, date_naive, pool)
+            .await?;
 
-        let response = self.fetch_with_retry(&url).await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Yahoo Finance returned status {} for symbol {}",
-                response.status(),
-                symbol
-            ));
+        // An empty result is not a window. Caching one would spend a slot on a pair
+        // that produced nothing, and then answer nothing from it.
+        if !series.is_empty() {
+            let mut cache = self.cache.write().await;
+            if cache.len() >= MAX_FX_SERIES_CACHED && !cache.contains_key(&key) {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                FxSeries {
+                    window_start: series.first().map(|(d, _)| *d).unwrap_or(window_start),
+                    window_end: date_naive,
+                    series: series.clone(),
+                },
+            );
         }
 
-        let yahoo_resp: YahooChartResponse = response.json().await?;
-
-        let result = yahoo_resp.chart.result.first()
-            .ok_or_else(|| anyhow!("No result found for symbol {}", symbol))?;
-
-        let close_prices = &result.indicators.quote.first()
-            .ok_or_else(|| anyhow!("No quote data found for symbol {}", symbol))?
-            .close;
-
-        let rate = close_prices.iter().rev()
-            .find_map(|x| x.map(f64_to_decimal))
-            .ok_or_else(|| anyhow!("No close price found for symbol {}", symbol))?;
-
-        let mut cache = self.cache.write().await;
-        cache.insert(cache_key, rate);
-
-        Ok(rate)
+        select_rate(&series, date_naive, FX_LOOKBACK_DAYS)
+            .map(|(date_used, rate)| RateAt { rate, date_used })
+            .ok_or_else(|| no_rate_error(&symbol, date_naive, FX_LOOKBACK_DAYS))
     }
 
-    pub async fn get_price(&self, symbol: &str, isin: Option<&str>, pool: &SqlitePool) -> Decimal {
+    /// The pair's dated closes as already stored, narrowed to the same rules
+    /// `select_rate` and `stored_window_is_fresh` apply. `None` means "the database
+    /// cannot answer", which is not the same as "no rate exists" — only the provider
+    /// can say that.
+    async fn rate_from_db(
+        &self,
+        symbol: &str,
+        window_start: NaiveDate,
+        date: NaiveDate,
+        pool: &SqlitePool,
+    ) -> Result<Option<RateAt>> {
+        let rows: Vec<(NaiveDate, String)> = sqlx::query_as(
+            "SELECT date, close_price FROM historical_prices
+                 WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date",
+        )
+        .bind(symbol)
+        .bind(window_start)
+        .bind(date)
+        .fetch_all(pool)
+        .await?;
+
+        let series: Vec<(NaiveDate, Decimal)> = rows
+            .into_iter()
+            .map(|(d, p)| (d, crate::db_types::str_to_decimal(&p)))
+            .collect();
+
+        // The same coverage rule `get_historical_prices` applies to its stored
+        // window, and for the same reason: rows that stop short of `date` are an
+        // incomplete window, not an answer. Without this gate the two DB-first read
+        // paths disagree about the same database — `get_historical_prices` asks the
+        // provider for the tail while this one serves a close from inside the
+        // lookback — and `replay` walks transactions ascending, so the first FX call
+        // pins the earliest transaction's rate over every later date within the
+        // lookback that has no stored close of its own.
+        let newest = series.iter().map(|(d, _)| *d).max();
+        if !stored_window_is_fresh(newest, date) {
+            return Ok(None);
+        }
+
+        Ok(
+            select_rate(&series, date, FX_LOOKBACK_DAYS)
+                .map(|(date_used, rate)| RateAt { rate, date_used }),
+        )
+    }
+
+    /// The close for `symbol` as of today, or why there is none.
+    ///
+    /// Read order, stated rather than inherited: **the database answers when it holds
+    /// today's row**; the provider is asked only on a miss.
+    ///
+    /// `Err(ProviderUnavailable)` means we could not ask. `Err(NoData)` means we asked
+    /// and there is no close for this symbol.
+    pub async fn get_price(
+        &self,
+        symbol: &str,
+        isin: Option<&str>,
+        pool: &SqlitePool,
+    ) -> Result<Decimal, PricingError> {
         let today = chrono::Utc::now().date_naive();
         let existing = sqlx::query_as::<_, HistoricalPrice>(
             "SELECT * FROM historical_prices WHERE symbol = ? AND date = ?"
@@ -272,16 +521,25 @@ impl CurrencyService {
         .bind(symbol)
         .bind(today)
         .fetch_optional(pool)
-        .await;
+        .await
+        .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
 
-        if let Ok(Some(hp)) = existing {
-            return crate::db_types::str_to_decimal(&hp.close_price);
+        if let Some(hp) = existing {
+            return Ok(crate::db_types::str_to_decimal(&hp.close_price));
         }
 
-        let price = self.fetch_yahoo_price(symbol).await;
-        if price > Decimal::ZERO {
-            self.cache_price(symbol, today, price, pool).await;
-            return price;
+        // A provider outage is remembered rather than swallowed: the EODHD fallback
+        // below still gets its turn, exactly as it did when every failure was zero,
+        // but if neither source answers the caller is told we could not ask rather
+        // than that no such price exists.
+        let mut outage = None;
+        match self.fetch_yahoo_price(symbol).await {
+            Ok(price) => {
+                self.cache_price(symbol, today, price, pool).await;
+                return Ok(price);
+            }
+            Err(e @ PricingError::ProviderUnavailable(_)) => outage = Some(e),
+            Err(PricingError::NoData) => {}
         }
 
         if let Some(isin) = isin {
@@ -290,22 +548,25 @@ impl CurrencyService {
                     let price = self.fetch_eodhd_price(isin, eodhd_key).await;
                     if price > Decimal::ZERO {
                         self.cache_price(symbol, today, price, pool).await;
-                        return price;
+                        return Ok(price);
                     }
                 }
             }
         }
 
-        Decimal::ZERO
+        Err(outage.unwrap_or(PricingError::NoData))
     }
 
-    async fn fetch_yahoo_price(&self, symbol: &str) -> Decimal {
+    /// Yahoo's latest close for `symbol`. A request failure and an unknown symbol are
+    /// reported apart from each other, because `get_price` decides what to tell the
+    /// user from that difference.
+    async fn fetch_yahoo_price(&self, symbol: &str) -> Result<Decimal, PricingError> {
         let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
         let response = match self.fetch_with_retry(&url).await {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!("WARN: Failed to fetch Yahoo price for {}: {}", symbol, e);
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -317,14 +578,14 @@ impl CurrencyService {
                 status, symbol,
                 &body_preview[..body_preview.len().min(500)]
             );
-            return Decimal::ZERO;
+            return Err(PricingError::ProviderUnavailable(format!("status {status}")));
         }
 
         let body_bytes = match response.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("WARN: Failed to read Yahoo response for {}: {}", symbol, e);
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -337,7 +598,7 @@ impl CurrencyService {
                     symbol, e,
                     &body_preview[..body_preview.len().min(500)]
                 );
-                return Decimal::ZERO;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -347,16 +608,23 @@ impl CurrencyService {
                 Some(q) => q.close.clone(),
                 None => {
                     eprintln!("WARN: No quote data for symbol: {}", symbol);
-                    return Decimal::ZERO;
+                    return Err(PricingError::NoData);
                 }
             },
             None => {
                 eprintln!("WARN: No price data for symbol: {}", symbol);
-                return Decimal::ZERO;
+                return Err(PricingError::NoData);
             }
         };
 
-        close_prices.iter().rev().find_map(|x| x.map(f64_to_decimal)).unwrap_or(Decimal::ZERO)
+        // A close of zero is not a price, it is a hole in the series: the same answer
+        // the old `price > Decimal::ZERO` test in `get_price` gave, now named.
+        close_prices
+            .iter()
+            .rev()
+            .find_map(|x| x.map(f64_to_decimal))
+            .filter(|price| *price > Decimal::ZERO)
+            .ok_or(PricingError::NoData)
     }
 
     async fn fetch_eodhd_price(&self, isin: &str, api_key: &str) -> Decimal {
@@ -394,7 +662,8 @@ impl CurrencyService {
 
     async fn cache_price(&self, symbol: &str, date: NaiveDate, price: Decimal, pool: &SqlitePool) {
         let _ = sqlx::query(
-            "INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                 ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
         )
         .bind(symbol)
         .bind(date)
@@ -403,13 +672,53 @@ impl CurrencyService {
         .await;
     }
 
+    /// Daily closes for `symbol` in `[start_date, end_date]`.
+    ///
+    /// Read order, stated rather than inherited: **the database answers when its
+    /// newest row in the window is within `PRICE_WINDOW_FRESH_DAYS` of
+    /// `end_date`**; otherwise the provider is asked for the tail and what it returns
+    /// is merged over the stored rows. "Any row in the window" is not enough, because
+    /// a window whose stored rows stop short of `end_date` is incomplete, not an
+    /// answer: [`calculate_portfolio_performance`](crate::engines::stats_engine::StatsEngine::calculate_portfolio_performance)
+    /// asks for a window that ends today and prices a date with no close as zero, so
+    /// answering from a series that stopped days ago reports today's value as zero —
+    /// the headline figure freezes the day after any fetch. Four days is a rule, not a
+    /// parameter: it has to cover a market holiday weekend and nothing longer, because
+    /// a longer gap means the series really was not updated.
+    ///
+    /// The previous order was provider-first with a database fallback on every
+    /// failure, which is the only reason the hermetic pricing tests worked. With the
+    /// fallback gone, a seeded window has to answer on its own — which it does, as
+    /// long as it runs up to `end_date`.
+    ///
+    /// `Err(ProviderUnavailable)` means we could not ask. `Err(NoData)` means we asked
+    /// and there is nothing. Neither is papered over with the stale rows: an
+    /// incomplete window the provider could not top up stays an error rather than
+    /// being promoted to a success.
+    ///
+    /// Either way the returned series is in ascending date order, which `get_rate`
+    /// depends on when it records the window a fetch covered.
     pub async fn get_historical_prices(
         &self,
         symbol: &str,
         start_date: NaiveDate,
         end_date: NaiveDate,
         pool: &SqlitePool,
-    ) -> Result<Vec<(NaiveDate, Decimal)>> {
+    ) -> Result<Vec<(NaiveDate, Decimal)>, PricingError> {
+        let mut db_prices = self
+            .get_historical_prices_from_db(symbol, start_date, end_date, pool)
+            .await
+            .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
+
+        // The freshness rule. It lives in `stored_window_is_fresh` so the predicate
+        // under test is the predicate that runs; no stored row at all is the most
+        // incomplete window there is, so it falls through too.
+        let newest = db_prices.iter().map(|(date, _)| *date).max();
+        if stored_window_is_fresh(newest, end_date) {
+            db_prices.sort_by_key(|(date, _)| *date);
+            return Ok(db_prices);
+        }
+
         let start_ts = start_date
             .and_hms_opt(0, 0, 0)
             .unwrap()
@@ -426,7 +735,7 @@ impl CurrencyService {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!("WARN: Failed to fetch historical prices for {}: {}", symbol, e);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -439,14 +748,14 @@ impl CurrencyService {
                 symbol,
                 &body_preview[..body_preview.len().min(500)]
             );
-            return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+            return Err(PricingError::ProviderUnavailable(format!("status {status}")));
         }
 
         let yahoo_resp: YahooChartResponse = match response.json().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("WARN: Failed to parse historical Yahoo response for {}: {}", symbol, e);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::ProviderUnavailable(e.to_string()));
             }
         };
 
@@ -464,7 +773,7 @@ impl CurrencyService {
             }
             None => {
                 eprintln!("WARN: No chart result for symbol: {}", symbol);
-                return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+                return Err(PricingError::NoData);
             }
         };
 
@@ -484,10 +793,14 @@ impl CurrencyService {
         }
 
         if !daily_prices.is_empty() {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
             for (date, price) in &daily_prices {
                 let _ = sqlx::query(
-                    "INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+                    "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                         ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
                 )
                 .bind(symbol)
                 .bind(*date)
@@ -499,24 +812,24 @@ impl CurrencyService {
         }
 
         if daily_prices.is_empty() {
-            return self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await;
+            return Err(PricingError::NoData);
         }
 
-        let db_prices = self.get_historical_prices_from_db(symbol, start_date, end_date, pool).await?;
-        let yahoo_dates: std::collections::HashSet<NaiveDate> = daily_prices.iter().map(|(d, _)| *d).collect();
-
-        let mut merged: Vec<(NaiveDate, Decimal)> = daily_prices;
-        for (date, price) in db_prices {
-            if !yahoo_dates.contains(&date) {
-                merged.push((date, price));
-            }
-        }
-        merged.sort_by_key(|(date, _)| *date);
-
-        Ok(merged)
+        // The provider was asked because the stored window stopped short of
+        // `end_date`, so what came back is the tail, not the whole series. Merge it
+        // over the rows read above — the fetched rows win on a shared date, since the
+        // provider just wrote them through the upsert — so a partial stored window is
+        // kept rather than discarded. Re-reading the window here would return these
+        // same rows plus the ones just persisted, which are already in
+        // `daily_prices`.
+        Ok(merge_series(daily_prices, db_prices))
     }
 
-    async fn get_historical_prices_from_db(
+    /// The rows already stored for `symbol` in `[start_date, end_date]`, with no
+    /// freshness rule and no provider. `pub(crate)` so
+    /// [`calculate_portfolio_performance`](crate::engines::stats_engine::StatsEngine::calculate_portfolio_performance)
+    /// can serve them when the provider is down.
+    pub(crate) async fn get_historical_prices_from_db(
         &self,
         symbol: &str,
         start_date: NaiveDate,
@@ -696,13 +1009,27 @@ mod tests {
         assert_eq!(CurrencyService::redact_url(url), url);
     }
 
+    /// Same-currency requests short-circuit in `get_rate` before any query, so an
+    /// empty in-memory pool is the whole fixture — there are no seeded prices here.
+    async fn empty_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     #[tokio::test]
     async fn test_same_currency_returns_one() {
         let svc = CurrencyService::new();
         let date = DateTime::from_timestamp(1705312200, 0).unwrap();
-        let result = svc.get_rate("USD", "USD", date).await;
+        let pool = empty_pool().await;
+        let result = svc.get_rate("USD", "USD", date, &pool).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Decimal::ONE);
+        assert_eq!(result.unwrap().rate, Decimal::ONE);
     }
 
     #[tokio::test]
@@ -710,19 +1037,173 @@ mod tests {
         let svc = CurrencyService::new();
         let date1 = DateTime::from_timestamp(1700000001, 0).unwrap();
         let date2 = DateTime::from_timestamp(1700000001, 0).unwrap();
+        let pool = empty_pool().await;
 
-        let r1 = svc.get_rate("GBP", "GBP", date1).await.unwrap();
-        let r2 = svc.get_rate("GBP", "GBP", date2).await.unwrap();
+        let r1 = svc.get_rate("GBP", "GBP", date1, &pool).await.unwrap().rate;
+        let r2 = svc.get_rate("GBP", "GBP", date2, &pool).await.unwrap().rate;
         assert_eq!(r1, r2);
+    }
+
+    fn date_of(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn ts_utc(s: &str) -> DateTime<Utc> {
+        date_of(s).and_hms_opt(0, 0, 0).unwrap().and_utc()
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    async fn seed_prices(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+        for (d, price) in rows {
+            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+                .bind(symbol)
+                .bind(date_of(d))
+                .bind(*price)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn fx_series_answers_only_dates_its_window_covered() {
+        // The shape a request for Saturday 2024-03-09 leaves behind: the window ends
+        // on the requested date, the last close inside it is Friday's.
+        let window = FxSeries {
+            window_start: date_of("2023-03-09"),
+            window_end: date_of("2024-03-09"),
+            series: vec![(date_of("2024-03-07"), dec("0.9100")), (date_of("2024-03-08"), dec("0.9125"))],
+        };
+
+        // Inside the window: the last close on or before the date, with its own date.
+        assert_eq!(window.rate_at(date_of("2024-03-08"), 30), Some((date_of("2024-03-08"), dec("0.9125"))));
+        assert_eq!(window.rate_at(date_of("2024-03-09"), 30), Some((date_of("2024-03-08"), dec("0.9125"))));
+
+        // Past the end: this window never fetched 2024-03-25, so its 2024-03-08 close
+        // — 17 days back, comfortably inside the lookback — must not price it.
+        assert_eq!(window.rate_at(date_of("2024-03-25"), 30), None);
+
+        // Before the start: the same rule on the other side, and it has to hold even
+        // though the series here holds a close the lookback would happily accept.
+        let late_window = FxSeries {
+            window_start: date_of("2024-03-01"),
+            window_end: date_of("2024-03-08"),
+            series: vec![(date_of("2024-02-20"), dec("0.8700"))],
+        };
+        assert_eq!(late_window.rate_at(date_of("2024-02-26"), 30), None);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_stored_window_answers_without_the_provider() {
+        // The hermetic half of the read order, at the level it is decided. The symbol
+        // cannot resolve, so the provider could not have produced this answer: the
+        // newest row sits exactly on the freshness bound, which means the database
+        // returned and no outbound call was made. The stale side of the rule is a
+        // pure predicate now (`stored_window_is_fresh_up_to_the_bound_and_stale_past_it`)
+        // rather than a test that has to reach the network to fail.
+        let pool = empty_pool().await;
+        let end = date_of("2024-06-14");
+        let window_start = end - chrono::Duration::days(30);
+        let svc = CurrencyService::new();
+
+        let fresh_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
+        let fresh_newest_str = fresh_newest.format("%Y-%m-%d").to_string();
+        seed_prices(&pool, "FRESHWINDOW", &[(&fresh_newest_str, "1.0500")]).await;
+        let fresh = svc
+            .get_historical_prices("FRESHWINDOW", window_start, end, &pool)
+            .await
+            .expect("a window whose newest row is PRICE_WINDOW_FRESH_DAYS old answers from the database");
+        assert_eq!(fresh, vec![(fresh_newest, dec("1.0500"))]);
+    }
+
+    #[tokio::test]
+    async fn get_rate_refuses_a_cached_window_that_stops_short_of_the_date() {
+        // The reachable version of the bug above: `replay` walks a foreign-currency
+        // asset's transactions in ascending date order, so a later transaction
+        // routinely asks a later date than the one that populated the cache, and
+        // `CurrencyService` is Rocket managed state — the cache is shared across
+        // requests for the whole process.
+        let pool = empty_pool().await;
+        seed_prices(&pool, "EURUSD=X", &[("2024-03-08", "0.9125"), ("2024-03-22", "1.0500")]).await;
+
+        let svc = CurrencyService::new();
+        // Exactly what a request for 2024-03-08 leaves behind.
+        svc.cache.write().await.insert(
+            ("EUR".to_string(), "USD".to_string()),
+            FxSeries {
+                window_start: date_of("2023-03-09"),
+                window_end: date_of("2024-03-08"),
+                series: vec![(date_of("2024-03-08"), dec("0.9125"))],
+            },
+        );
+
+        // An unbounded cache would answer 0.9125 here. The database has the real
+        // 2024-03-22 close, and refusing the stale window is what lets it answer.
+        let got = svc.get_rate("EUR", "USD", ts_utc("2024-03-25"), &pool).await.unwrap();
+        assert_eq!(got.rate, dec("1.0500"), "a cached window must not price a date past its end");
+        assert_eq!(got.date_used, date_of("2024-03-22"));
+    }
+
+    /// C1: `rate_from_db` is the other DB-first read path `get_rate` takes, and it
+    /// must apply the same coverage rule `get_historical_prices` applies. The stale
+    /// row here sits 10 days before the requested date — inside `FX_LOOKBACK_DAYS`,
+    /// so `select_rate` alone serves it and the provider is never asked.
+    #[tokio::test]
+    async fn rate_from_db_refuses_a_stored_window_that_stops_short_of_the_date() {
+        let svc = CurrencyService::new();
+        let requested = date_of("2024-03-25");
+        let window_start = requested - chrono::Duration::days(FX_SERIES_WINDOW_DAYS);
+
+        // Incomplete coverage: the newest stored close is 10 days short of the date.
+        let stale_pool = empty_pool().await;
+        let stale = requested - chrono::Duration::days(10);
+        let stale_str = stale.format("%Y-%m-%d").to_string();
+        seed_prices(&stale_pool, "EURUSD=X", &[(&stale_str, "0.9125")]).await;
+        let incomplete = svc
+            .rate_from_db("EURUSD=X", window_start, requested, &stale_pool)
+            .await
+            .unwrap();
+        assert!(
+            incomplete.is_none(),
+            "a window whose newest close is 10 days short of the requested date is \
+             incomplete coverage, not an answer; got {incomplete:?}"
+        );
+
+        // Honest coverage, same distance from the lookback bound: a newest close
+        // within `PRICE_WINDOW_FRESH_DAYS` still answers, with its own date.
+        let fresh_pool = empty_pool().await;
+        let fresh = requested - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
+        let fresh_str = fresh.format("%Y-%m-%d").to_string();
+        seed_prices(&fresh_pool, "EURUSD=X", &[(&fresh_str, "1.0500")]).await;
+        let complete = svc
+            .rate_from_db("EURUSD=X", window_start, requested, &fresh_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete,
+            Some(RateAt { rate: dec("1.0500"), date_used: fresh }),
+            "a window that runs up to the freshness bound must still answer from the database"
+        );
     }
 
     #[tokio::test]
     async fn test_get_price_uses_today_cached_price() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let today = chrono::Utc::now().date_naive();
         let _ = sqlx::query(
@@ -735,17 +1216,25 @@ mod tests {
         .await;
 
         let svc = CurrencyService::new();
-        let price = svc.get_price("TEST", None, &pool).await;
+        let price = svc.get_price("TEST", None, &pool).await.unwrap();
         assert_eq!(price, Decimal::from_str("42.0").unwrap());
     }
 
     #[tokio::test]
     async fn test_get_price_ignores_stale_cache() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let stale_date = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let _ = sqlx::query(
@@ -758,8 +1247,11 @@ mod tests {
         .await;
 
         let svc = CurrencyService::new();
+        // The stale row must not answer for today. Whether the provider then has a
+        // price for `TEST` is not this test's business; what it pins is that the
+        // 2020 close is not the answer, whichever branch the provider takes.
         let price = svc.get_price("TEST", None, &pool).await;
-        assert_ne!(price, Decimal::from_str("99.0").unwrap());
+        assert_ne!(price.ok(), Some(Decimal::from_str("99.0").unwrap()));
     }
 
     async fn make_split_tx_table(pool: &SqlitePool) {
@@ -973,5 +1465,128 @@ mod tests {
     fn test_detect_currency_case_insensitive() {
         assert_eq!(CurrencyService::detect_currency("sap.de"), "EUR");
         assert_eq!(CurrencyService::detect_currency("shel.l"), "GBP");
+    }
+
+    fn series(pairs: &[(&str, &str)]) -> Vec<(NaiveDate, Decimal)> {
+        pairs
+            .iter()
+            .map(|(d, p)| {
+                (
+                    NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap(),
+                    Decimal::from_str(p).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn select_rate_uses_the_exact_date_when_present() {
+        let s = series(&[("2024-03-01", "0.9000"), ("2024-03-04", "0.9050")]);
+        let (used, rate) = select_rate(&s, day("2024-03-04"), FX_LOOKBACK_DAYS).unwrap();
+        assert_eq!(used, day("2024-03-04"));
+        assert_eq!(rate, Decimal::from_str("0.9050").unwrap());
+    }
+
+    #[test]
+    fn select_rate_falls_back_to_the_prior_trading_day() {
+        // Review Focus 2: 2024-03-09 is a Saturday; the Friday close is the answer,
+        // and the caller learns which date was used instead of assuming its own.
+        let s = series(&[("2024-03-07", "0.9100"), ("2024-03-08", "0.9125")]);
+        let (used, rate) = select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS).unwrap();
+        assert_eq!(used, day("2024-03-08"));
+        assert_eq!(rate, Decimal::from_str("0.9125").unwrap());
+    }
+
+    #[test]
+    fn select_rate_rejects_a_date_before_every_close() {
+        let s = series(&[("2024-03-07", "0.9100")]);
+        assert_eq!(select_rate(&s, day("2024-03-01"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn select_rate_rejects_a_gap_wider_than_the_lookback() {
+        // Review Focus 1: a delisted pair whose last close is three years old must
+        // produce no rate at all rather than a stale one.
+        let s = series(&[("2021-01-04", "0.8800")]);
+        assert_eq!(select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn select_rate_accepts_a_gap_exactly_at_the_lookback_edge() {
+        let date = day("2024-03-09");
+        let edge = date - chrono::Duration::days(FX_LOOKBACK_DAYS);
+        let s = series(&[("2024-02-08", "0.8900")]);
+        assert_eq!(edge, day("2024-02-08"), "fixture must sit on the boundary");
+        assert_eq!(select_rate(&s, date, FX_LOOKBACK_DAYS).map(|(d, _)| d), Some(edge));
+    }
+
+    #[test]
+    fn select_rate_handles_an_unsorted_series_and_an_empty_one() {
+        let s = series(&[("2024-03-08", "0.9125"), ("2024-03-06", "0.9075"), ("2024-03-07", "0.9100")]);
+        assert_eq!(select_rate(&s, day("2024-03-09"), FX_LOOKBACK_DAYS).map(|(d, _)| d), Some(day("2024-03-08")));
+        assert_eq!(select_rate(&[], day("2024-03-09"), FX_LOOKBACK_DAYS), None);
+    }
+
+    #[test]
+    fn stored_window_is_fresh_up_to_the_bound_and_stale_past_it() {
+        // The rule that decides whether a stored window answers, tested on its own so
+        // that pinning it costs no pool, no provider and no outbound call.
+        let end = day("2024-06-14");
+        assert!(
+            stored_window_is_fresh(Some(end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS)), end),
+            "a newest row exactly on the bound still answers"
+        );
+        assert!(
+            !stored_window_is_fresh(Some(end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS + 1)), end),
+            "one day past the bound the window is incomplete and the provider is asked"
+        );
+        assert!(stored_window_is_fresh(Some(end), end), "a window that ends on the date is fresh");
+        assert!(
+            !stored_window_is_fresh(None, end),
+            "no stored row at all is the most incomplete window there is"
+        );
+        // A newest row *after* `end_date` is not reachable at the only call site:
+        // `get_historical_prices_from_db` reads `date >= start_date AND date <=
+        // end_date`, so the newest row it can hand back never passes `end_date`. Said
+        // rather than tested, because inventing the case would test a shape that
+        // cannot occur.
+    }
+
+    #[test]
+    fn merge_series_keeps_both_sides_of_the_window_and_sorts_them() {
+        // The provider answers the tail; the stored rows are the head. Both survive,
+        // the fetched row wins where they overlap (the upsert just rewrote it), and
+        // the result is ascending even though both inputs came in unordered — the
+        // ordering `get_rate` depends on when it records a window.
+        let merged = merge_series(
+            series(&[("2024-06-13", "1.0700"), ("2024-06-10", "1.0600")]),
+            series(&[("2024-06-10", "0.9000"), ("2024-06-07", "0.9100")]),
+        );
+        assert_eq!(
+            merged,
+            series(&[
+                ("2024-06-07", "0.9100"),
+                ("2024-06-10", "1.0600"),
+                ("2024-06-13", "1.0700"),
+            ])
+        );
+
+        // The first-fetch case: nothing stored, so the merge is the fetched rows.
+        assert_eq!(
+            merge_series(series(&[("2024-06-10", "1.0600")]), vec![]),
+            series(&[("2024-06-10", "1.0600")])
+        );
+    }
+
+    #[test]
+    fn fx_symbol_uses_yahoo_pair_symbology() {
+        // Review Focus 5: the live endpoint returns "No data found" for GBP=JPY and
+        // data for GBPJPY=X. The old form is why no foreign-currency asset priced.
+        assert_eq!(fx_symbol("EUR", "USD"), "EURUSD=X");
+        assert_eq!(fx_symbol("GBP", "JPY"), "GBPJPY=X");
     }
 }

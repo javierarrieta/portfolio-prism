@@ -280,7 +280,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
               {data.fx_applied && (
                 <span data-testid="fx-note" style={{ display: 'flex', gap: '6px' }}>
                   <Info size={13} style={{ flexShrink: 0, marginTop: '2px' }} />
-                  Cost basis and proceeds were converted to {data.currency} at the latest available {data.asset_currency}→{data.currency} rate.
+                  Cost basis was converted at the {data.asset_currency}→{data.currency} rate recorded on or before each buy date; proceeds at the rate recorded on or before the sell date.
                 </span>
               )}
             </div>
