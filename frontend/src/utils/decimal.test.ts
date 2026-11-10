@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeSellPnl } from './decimal'
+import { normalizeSellPnl, normalizeTaxSummary } from './decimal'
 
 const raw = {
   transaction_id: 42, asset_id: 7, symbol: 'AAPL', asset_type: 'STOCK',
@@ -68,4 +68,24 @@ describe('normalizeSellPnl', () => {
     // needs the same runtime coercion as the top-level ones.
     expect(d.matches[0].buy_transaction_id).toBe(11)
   })
+})
+
+describe('normalizeTaxSummary run-context fields', () => {
+  it('keeps strategy and threshold_days when the payload echoes them', () => {
+    const s = normalizeTaxSummary({
+      currency: 'EUR', strategy: 'HYBRID', threshold_days: 45,
+      total_portfolio_value: '10.00', total_realized_pnl: '1234.565',
+      total_unrealized_pnl: '0.00', assets: [],
+    });
+    expect(s.strategy).toBe('HYBRID');
+    expect(s.threshold_days).toBe(45);
+  });
+
+  it('leaves both undefined when the payload omits them (the empty-portfolio branch)', () => {
+    const s = normalizeTaxSummary({
+      total_portfolio_value: 0, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [],
+    });
+    expect(s.strategy).toBeUndefined();
+    expect(s.threshold_days).toBeUndefined();
+  });
 })

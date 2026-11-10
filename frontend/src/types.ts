@@ -89,6 +89,8 @@ export interface PortfolioPerformance {
 export interface TaxSummary {
   assets: AssetTaxSummary[];
   currency: string;
+  strategy?: string;
+  threshold_days?: number;
   total_portfolio_value: number;
   total_realized_pnl: number;
   total_unrealized_pnl: number;
