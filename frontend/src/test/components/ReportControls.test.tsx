@@ -168,9 +168,23 @@ describe('the client clock must agree with the server\'s', () => {
   // are identical, so this cannot fail on the suite's own clock. It pins the definition -- the
   // value must equal the UTC date -- and would catch a revert to local parts on any host that is
   // not UTC. The fix itself is verified by the server reading UTC, not by this test.
-  it('derives the date from UTC parts, matching the route', () => {
-    for (const iso of ['2026-02-14T23:30:00Z', '2026-02-15T00:30:00Z', '2026-12-31T23:59:59Z']) {
-      expect(isoDate(new Date(iso))).toBe(iso.slice(0, 10))
+  it('derives the date from UTC parts, not the local calendar', () => {
+    // The route rejects a `to` after `Utc::now().date_naive()` (analytics.rs:71, :669). Built
+    // from local parts, the default window was a future date for every user east of UTC during
+    // the first hours of their day, so the tab 422'd on open and no preset could rescue it.
+    //
+    // `test/setup.ts` pins TZ=UTC, where local and UTC parts are identical, so the suite's own
+    // clock cannot see the difference. Overriding TZ for this one test makes them differ: at
+    // UTC+14, noon UTC is already the next local day. Verified to fail when isoDate is reverted
+    // to local parts.
+    const previous = process.env.TZ
+    process.env.TZ = 'Pacific/Kiritimati'
+    try {
+      const d = new Date('2026-02-14T12:00:00Z')
+      expect(d.getDate()).toBe(15)          // the local calendar, which the route would refuse
+      expect(isoDate(d)).toBe('2026-02-14') // what the server calls today
+    } finally {
+      process.env.TZ = previous
     }
   })
 })
