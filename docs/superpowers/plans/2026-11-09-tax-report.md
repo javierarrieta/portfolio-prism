@@ -2972,8 +2972,8 @@ fn render_row(
         text_cell(&row.symbol),
         text_cell(&row.asset_type),
         text_cell(&row.asset_currency),
-        row.fx_applied().to_string(),
-        row.split_applied().to_string(),
+        totals.map(|t| t.fx_applied).unwrap_or(false).to_string(),
+        totals.map(|t| t.split_applied).unwrap_or(false).to_string(),
         row.price_source.map(|s| s.as_str().to_string()).unwrap_or_default(),
         row.price_date_used.map(|d| d.to_string()).unwrap_or_default(),
         row.fx_rate_date_used.map(|d| d.to_string()).unwrap_or_default(),
@@ -3012,18 +3012,7 @@ fn render_row(
 }
 ```
 
-`fx_applied` and `split_applied` are **per asset**, not per row, so `ReportRow` does not carry them. Read them off the asset's totals with two one-line private helpers in this module rather than adding fields:
-
-```rust
-impl ReportRow {
-    /// `fx_applied` lives on the asset's totals, not on the row: it is a fact about the
-    /// asset, and repeating it per row in the payload would be 40 bytes of noise per row.
-    fn fx_applied(&self) -> bool { self.fx_applied }
-    fn split_applied(&self) -> bool { self.split_applied }
-}
-```
-
-— which means `ReportRow` **does** carry both flags per row after all, since the CSV is a projection of the rows. Add them to the struct in `schemas.rs` (`pub fx_applied: bool`, `pub split_applied: bool`) and to `ReportRow::of`, and drop the two helpers above. That is a twelve-line change to Task 3's struct, and it is the resolution the file needs: a flat projection cannot read a fact it does not carry. **Regenerate `docs/openapi/openapi.json` after this change** (`cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json`) and commit it with this task.
+`fx_applied` and `split_applied` are per asset, not per row, so they are read off the asset's totals — the row `render_row` already has in hand for the five total columns. No field is added to `ReportRow`, and the CSV is still a projection of the payload: the totals vector is part of it.
 
 Then add to `backend_rust/src/lib.rs`, after `pub mod access;`:
 
@@ -3135,4 +3124,4 @@ git add backend_rust/src/report_csv.rs backend_rust/src/lib.rs backend_rust/src/
 git commit -m "feat(api): serve the dated tax report as CSV from the same route"
 ```
 
-(`types/api.d.ts` is regenerated because the two new `ReportRow` fields appear there too. `npm run generate-types` — the file has no importers, so it cannot break a renderer.)
+(`frontend/src/types/api.d.ts` is regenerated from the committed contract with `npm run generate-types`, so the generated file and the committed one cannot disagree. It has no importers, so it cannot break a renderer.)
