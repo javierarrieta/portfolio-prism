@@ -851,8 +851,8 @@ async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
 // What cannot be tested here, and why (Task 4, Step 9)
 // --------------------------------------------------------------------------------------
 //
-// Two cases the spec asks for have no hermetic test, and this file does not pretend
-// otherwise. Both are the same missing seam; the compensating tests are above.
+// Three cases the spec asks for have no hermetic test, and this file does not pretend
+// otherwise. All three are the same missing seam; the compensating tests are above.
 //
 // 1. "A missing price returns 422 naming every missing symbol." A seeded database cannot
 //    produce `Err(NoData)`: `get_historical_prices` answers from `historical_prices` when
@@ -864,11 +864,33 @@ async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
 //    (`missing_prices`, `missing_rates`, both totals, `retryable: false`) through the
 //    validation failures, which share the body; the caps and the pair-not-symbol rule
 //    through `MissingItems`; and `pricing_failure_status` for the mapping itself.
-// 2. "An unreachable provider returns 503 with `retryable: true`." Same seam, and the
+// 2. "A missing rate is collected as a PAIR into `missing_rates`." The `fx_applied`
+//    branch calls `add_rate` only when the pair prefetch returns `Err(NoData)`, or when
+//    `replay_at` errors with something that is neither `sqlx::Error` nor
+//    `ProviderUnavailable` (the `no_rate_error` fallback). Neither is reachable from the
+//    database, and the reason is mechanical rather than a matter of effort. `get_rate`
+//    answers from `historical_prices` only while `stored_window_is_fresh` holds
+//    (`currency_service.rs:434-441`): a fresh window has its newest row within
+//    `PRICE_WINDOW_FRESH_DAYS` of the date asked for, which is well inside
+//    `FX_LOOKBACK_DAYS`, so `select_rate` always returns that row and never `None` — the
+//    only way to build `no_rate_error`. A non-fresh window is not answered from the
+//    database at all; it falls through to the provider. And every construction site of
+//    `PricingError::NoData` is inside provider-response parsing (`currency_service.rs:616`,
+//    `:621`, `:632`, `:781`, `:820`), so without a provider there is no missing rate to
+//    collect. This is a property of the design, not merely a test gap: without asking the
+//    provider, a rate that genuinely does not exist is indistinguishable from a provider
+//    outage, so the route cannot choose 422 over 503 for a delisted pair until a call has
+//    been made. Task 7's docs should say that plainly rather than implying the 422 is
+//    fully exercised. Pinned instead: the pair-not-a-symbol shape through
+//    `a_missing_rate_is_named_as_a_pair_not_a_symbol`, the caps through
+//    `the_missing_item_lists_are_capped_and_the_totals_say_so`, and the 422/503 mapping
+//    through `pricing_failure_status`; only the route's *decision* to take the branch is
+//    unproven.
+// 3. "An unreachable provider returns 503 with `retryable: true`." Same seam, and the
 //    deadline test is the hermetic path to that body:
 //    `the_deadline_fails_closed_instead_of_returning_a_partial_report` asserts the
 //    status, `retryable`, and that no partial payload comes back.
 //
-// If a future change adds a provider seam, both become writable and should be added;
+// If a future change adds a provider seam, all three become writable and should be added;
 // until then a test asserting them would either hit the network or pass for the wrong
 // reason.
