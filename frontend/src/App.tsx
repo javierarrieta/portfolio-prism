@@ -11,12 +11,16 @@ import {
   Sparkles,
   LogOut,
   Printer,
+  Receipt,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
+import ReportControls, { TaxReportTable } from './components/ReportControls';
+import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
+import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
 import { apiFetch, API_BASE } from './utils/apiFetch';
@@ -26,11 +30,24 @@ import {
   TaxSummary, 
   Transaction, 
   Asset,
-  TransactionType
+  TransactionType,
+  ReportErrorBody,
+  TaxReport,
 } from './types';
 
-// dashboard, portfolios, analytics, ledger, statement
+// dashboard, portfolios, analytics, ledger, statement, report
 const DEFAULT_TAB = 'dashboard';
+
+/**
+ * The identity of a report request: the portfolio it is about and the window, strategy and
+ * threshold it was asked with, and nothing else. A payload or an error is rendered only
+ * while the selection still carries its own key, which is what stops the previous window's
+ * numbers surviving a portfolio switch, a strategy change or an in-flight fetch. Derived
+ * here rather than cleared from an effect, for the reason `taxMeta` gives below.
+ */
+const reportRequestKey = (
+  portfolioId: number, window: ReportWindow, strategy: string, thresholdDays: number,
+) => `${portfolioId}|${window.from}|${window.to}|${strategy}|${thresholdDays}`;
 
 export default function App() {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
@@ -54,6 +71,22 @@ export default function App() {
   // forgotten. Derived, not cleared from an effect.
   const [taxMeta, setTaxMeta] = useState<{ portfolioId: number; fetchedAt: Date } | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+
+  // The dated report: its own state, its own request, its own payload. The normalized
+  // `taxSummary` above is never the source for anything on that tab -- the two answer
+  // different questions and the report's money stays in the exact decimal strings the
+  // server sent, so nothing here round-trips it through `number`.
+  const [reportWindow, setReportWindow] = useState<ReportWindow>(() => currentYearToDate());
+  // Both the payload and the error are keyed by the request they describe, and rendered only
+  // while the current selection still carries that key. Same guard, and the same reason, as
+  // `taxMeta` above: a switch, a strategy change or an in-flight fetch must not leave the
+  // previous window's numbers on screen under a new page's heading.
+  const [report, setReport] = useState<{ key: string; payload: TaxReport } | null>(null);
+  const [reportError, setReportError] = useState<{ key: string; body: ReportErrorBody } | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  // Bumped by "Try again". The other dependencies do not move when a 503 is retried with the
+  // same window, so without this the retry button would be inert.
+  const [reportAttempt, setReportAttempt] = useState(0);
 
   // UI state
   const [loading, setLoading] = useState(false);
@@ -164,6 +197,52 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, [selectedId, fetchPortfolioData]);
+
+  // The report tab's own fetch, next to the tax state rather than inside `fetchPortfolioData`:
+  // the Holdings and Dashboard tabs never pay for a dated report, and this request is
+  // answered by a different branch of the same route.
+  useEffect(() => {
+    // Only on the report tab, and only with a window: without one the route answers with the
+    // legacy summary, which is a different question from the one this tab asks.
+    if (activeTab !== 'report' || selectedId === null) return;
+    if (!reportWindow.from && !reportWindow.to) return;
+    const key = reportRequestKey(selectedId, reportWindow, strategy, thresholdDays);
+    const query = buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
+    let cancelled = false;
+    const load = async () => {
+      setReportLoading(true);
+      setReportError(null);
+      try {
+        const res = await apiFetch(`${API_BASE}${query}`);
+        const body = await res.json();
+        // A cancelled run is one whose selection has already moved on; its body must not be
+        // stamped with the key the current selection is rendering under.
+        if (cancelled) return;
+        if (res.ok) {
+          setReport({ key, payload: body as TaxReport });
+        } else {
+          setReportError({ key, body: body as ReportErrorBody });
+        }
+      } catch (err) {
+        // A response that is not the typed error at all -- a 500 with an HTML body, a dropped
+        // connection: the same keyed shape, so the guard below still decides whether it may
+        // render, and `retryable` stays false because nothing here knows what happened.
+        if (!cancelled) {
+          setReportError({
+            key,
+            body: {
+              error: String(err), missing_prices: [], missing_rates: [],
+              missing_prices_total: 0, missing_rates_total: 0, retryable: false,
+            },
+          });
+        }
+      } finally {
+        if (!cancelled) setReportLoading(false);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [activeTab, selectedId, reportWindow, strategy, thresholdDays, reportAttempt]);
 
   const handleCreatePortfolio = async (e: FormEvent) => {
     e.preventDefault();
@@ -358,6 +437,22 @@ export default function App() {
 
   const currentPortfolio = portfolios.find(p => p.id === selectedId);
 
+  // The request the current selection asks for, derived once for both the effect that fetches
+  // it and the guard that decides what may render. Built from `reportRequestKey` so the two
+  // cannot drift into two different identities.
+  const reportKey = selectedId === null
+    ? null
+    : reportRequestKey(selectedId, reportWindow, strategy, thresholdDays);
+  const reportQuery = selectedId === null
+    ? ''
+    : buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
+  // `?format=csv` is only valid with `from` or `to`: without one the route answers 422 naming
+  // `format`. With no window the anchor is absent rather than broken, and the link it does
+  // carry is prefixed with `API_BASE` because `buildReportQuery` returns a server path.
+  const reportCsvHref = reportQuery !== '' && (reportWindow.from !== '' || reportWindow.to !== '')
+    ? `${API_BASE}${reportQuery}&format=csv`
+    : '';
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('auth_error') === 'auth_failed') {
@@ -412,6 +507,9 @@ export default function App() {
           </li>
           <li className={`nav-item ${activeTab === 'statement' ? 'active' : ''}`} onClick={() => selectTab('statement')}>
             <Printer size={18} /> Printable Statement
+          </li>
+          <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
+            <Receipt size={18} /> Tax Report
           </li>
         </ul>
 
@@ -552,6 +650,26 @@ export default function App() {
                   portfolio={currentPortfolio}
                   fetchedAt={taxMeta.fetchedAt}
                 />
+              </>
+            )}
+
+            {/* A fragment, no layout wrapper, for the reason the statement branch's comment
+                gives: the controls and the table stay direct children of .main-content. The
+                table renders only while the loaded payload belongs to the current selection;
+                `TaxReportTable` is rendered from the same guarded payload the controls are
+                handed, so neither can show another portfolio's window. */}
+            {activeTab === 'report' && (
+              <>
+                <ReportControls
+                  window={reportWindow}
+                  onWindowChange={setReportWindow}
+                  csvHref={reportCsvHref}
+                  onRetry={() => setReportAttempt((n) => n + 1)}
+                  report={report && report.key === reportKey ? report.payload : null}
+                  error={reportError && reportError.key === reportKey ? reportError.body : null}
+                  loading={reportLoading}
+                />
+                {report !== null && report.key === reportKey && <TaxReportTable report={report.payload} />}
               </>
             )}
 

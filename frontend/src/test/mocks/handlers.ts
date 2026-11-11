@@ -1,6 +1,7 @@
 import { http, HttpResponse } from 'msw'
 import type { Portfolio, Asset } from '../../types'
 import type { AssetType } from '../../types'
+import { REPORT_FIXTURE } from './reportFixture'
 
 export const handlers = [
   http.get('/api/portfolios', () => {
@@ -118,7 +119,15 @@ export const handlers = [
    http.get('/api/portfolios/:id/performance', () => {
      return HttpResponse.json({ metrics: { portfolio_value: 5000 } })
    }),
-   http.get('/api/portfolios/:id/tax-summary', () => {
+   http.get('/api/portfolios/:id/tax-summary', ({ request }) => {
+     const url = new URL(request.url)
+     // The dated report and the legacy summary are the same route, so this is a branch rather
+     // than a second handler (MSW matches by path and takes the first). Without it the report
+     // tab would receive the summary body and its renderer would show nothing, which is the
+     // failure the dated tests exist to catch.
+     if (url.searchParams.has('from') || url.searchParams.has('to')) {
+       return HttpResponse.json(REPORT_FIXTURE)
+     }
      return HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })
    }),
    http.get('/api/portfolios/:id/transactions', () => {
