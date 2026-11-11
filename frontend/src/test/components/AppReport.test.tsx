@@ -119,21 +119,57 @@ describe('a failed refetch retires the payload it replaced', () => {
     expect(screen.queryByTestId('download-csv')).toBeNull()
   })
 
-  it('does not show an error that belongs to another portfolio', async () => {
-    // The mirror of the payload guard, which the controller had already mutation-proved. Without
-    // the keyed check on `reportError`, portfolio 1's failure follows the user to portfolio 2.
+  it('retires the error when the selection can no longer have produced it', async () => {
+    // The mirror of the payload guard, which the controller had already mutation-proved.
+    //
+    // *** Why this clears the dates rather than switching portfolios. *** Switching portfolios
+    // starts a new request, and a new request clears `reportError` at its start, so the keyed
+    // guard is never consulted and the test passes with the guard deleted (measured). The guard
+    // only decides when NO new request starts: a windowless selection early-returns from the
+    // effect, leaving the old keyed body in state.
     server.use(
-      http.get('/api/portfolios/1/tax-summary', ({ request }) =>
+      http.get('/api/portfolios/:id/tax-summary', ({ request }) =>
         new URL(request.url).searchParams.has('from')
           ? HttpResponse.json({ error: 'no data', missing_prices: ['ZZZZ'], missing_rates: [], missing_prices_total: 1, missing_rates_total: 0, retryable: false }, { status: 422 })
           : HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })),
-      http.get('/api/portfolios/2/tax-summary', () => new Promise(() => {})),
     )
     render(<App />)
     await userEvent.click(await screen.findByText('Tax Report'))
     await waitFor(() => expect(screen.getByTestId('report-error')).toBeInTheDocument())
 
-    await userEvent.selectOptions(screen.getByRole('combobox'), 'Retirement Fund')
+    await userEvent.clear(screen.getByLabelText('To'))
+    await userEvent.clear(screen.getByLabelText('From'))
     await waitFor(() => expect(screen.queryByTestId('report-error')).toBeNull())
+  })
+
+  it('stops showing the spinner when no request is in flight for the selection', async () => {
+    // A boolean `reportLoading` stuck at true here: clearing `To` cancels run 1 and starts run
+    // 2; clearing `From` then makes the effect early-return, so run 2's `finally` is skipped by
+    // the cancelled guard and nothing ever resets the flag. Loading is derived from the
+    // in-flight key instead, so a key that no longer matches simply is not loading.
+    server.use(http.get('/api/portfolios/:id/tax-summary', () => new Promise(() => {})))
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByText('Loading the report…')).toBeInTheDocument())
+
+    await userEvent.clear(screen.getByLabelText('To'))
+    await userEvent.clear(screen.getByLabelText('From'))
+    await waitFor(() => expect(screen.queryByText('Loading the report…')).toBeNull())
+  })
+
+  it('renders a panel, not a blank page, when the error body is not the typed shape', async () => {
+    // `body as ReportErrorBody` is compile-time only. A proxy `{}`, Rocket's own envelope, or a
+    // truncated body used to reach `error.missing_prices.length` and throw during render, and
+    // `main.tsx` has no error boundary -- so the whole app went white.
+    server.use(
+      http.get('/api/portfolios/:id/tax-summary', ({ request }) =>
+        new URL(request.url).searchParams.has('from')
+          ? HttpResponse.json({}, { status: 422 })
+          : HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })),
+    )
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('report-error')).toBeInTheDocument())
+    expect(screen.queryByTestId('total-realized-in-window')).toBeNull()
   })
 })
