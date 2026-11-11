@@ -420,6 +420,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replay_at_includes_transactions_dated_exactly_the_end_date() {
+        // `end` is INCLUSIVE, and for a quarterly capital-gains report that boundary is the
+        // quarter end: a sale on the last day of the period belongs to the period. An
+        // off-by-one using `<` instead of `<=` would silently drop every transaction dated
+        // on the closing day and understate realized P&L with no other symptom.
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SELL", "40.0", "120.0", "0.0", "2024-06-30T00:00:00Z"),
+        ];
+        let svc = CurrencyService::new();
+        let pool = empty_pool().await;
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-06-30"), day("2024-06-30"),
+            Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.sell_breakdowns.len(),
+            1,
+            "a sell dated exactly `end` is inside the window, not outside it"
+        );
+        assert_eq!(out.open_lots[0].remaining_qty, Decimal::from_str("60.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_replay_at_an_empty_window_reports_nothing_and_costs_no_rate() {
+        // Everything is dated after `end`, so there are no lots and no market value to
+        // convert. The early return is what keeps a position bought after the window from
+        // costing an outbound FX call and from appearing in the report at all.
+        let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-07-01T00:00:00Z")];
+        let svc = CurrencyService::new();
+        let pool = empty_pool().await;
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-06-30"), day("2024-06-30"),
+            Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.open_lots.is_empty(), "nothing was bought on or before `end`");
+        assert!(out.sell_breakdowns.is_empty());
+        assert_eq!(out.current_price_base, Decimal::ZERO);
+        assert_eq!(out.fx_rate_date_used, None, "no conversion happened, so no rate date to report");
+    }
+
+    #[tokio::test]
     async fn test_replay_at_a_split_after_end_does_not_move_the_window() {
         // The split branch rescales every lot in scope, so the filter has to run before
         // sorting and matching rather than after. Without the filter this fixture
