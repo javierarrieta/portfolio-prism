@@ -1216,14 +1216,15 @@ In `backend_rust/src/api_routes/analytics.rs`, replace the `tax-summary` `#[utoi
 ///
 /// `format=csv` returns the same report as `text/csv`, byte-identical between calls over
 /// unchanged data. JSON stays the documented public surface.
+///
+/// No `params(...)` block, deliberately: utoipa derives the query parameters from the route
+/// attribute, which is why `strategy` and `threshold_days` are already in the committed
+/// document without one. `from`, `to` and `format` therefore arrive in the contract when the
+/// route attribute gains them — in Task 4 and Task 5 — and the contract never advertises a
+/// parameter the route ignores.
 #[utoipa::path(
     get,
     path = "/api/portfolios/<id>/tax-summary",
-    params(
-        ("from" = Option<String>, Query, description = "Window start, YYYY-MM-DD, inclusive, UTC. Absent means from the portfolio's first transaction."),
-        ("to" = Option<String>, Query, description = "Window end, YYYY-MM-DD, inclusive, UTC. Absent means today."),
-        ("format" = Option<String>, Query, description = "`csv` returns the report as text/csv. Any other value is a 422.")
-    ),
     responses(
         (status = 200, description = "Dated tax report when a window is given; the legacy summary object otherwise", body = ReportResponse),
         (status = 404, description = "Portfolio not found", body = ErrorBody),
@@ -2412,7 +2413,7 @@ impl ReportTotals {
 
 - [ ] **Step 7: Rewire the handler**
 
-Replace the body of `get_portfolio_tax_summary` in `backend_rust/src/api_routes/analytics.rs`. The signature gains two parameters and its return type changes; the `#[utoipa::path]` block is already the one Task 3 wrote.
+Replace the body of `get_portfolio_tax_summary` in `backend_rust/src/api_routes/analytics.rs`. The signature gains two parameters and its return type changes; the `#[utoipa::path]` block is the one Task 3 wrote, and `from`/`to` enter the document through the route attribute below, which is how `strategy` and `threshold_days` got there.
 
 ```rust
 #[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>")]
