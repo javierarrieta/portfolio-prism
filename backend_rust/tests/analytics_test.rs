@@ -288,3 +288,35 @@ async fn a_lot_reports_the_quantity_that_was_bought_and_the_buy_it_came_from() {
     assert_eq!(lot["original_qty"], "60.0", "60 were bought");
     assert_eq!(lot["remaining_qty"], "40.0", "20 were sold");
 }
+
+#[tokio::test]
+async fn a_split_scales_the_original_quantity_alongside_the_remaining_one() {
+    // `original_qty` exists to be reconciled against a ledger a person is reading, and a
+    // split is the case that would silently break that: scaling only `qty` would leave
+    // `original_qty` reporting 60 pre-split shares next to 80 post-split ones, so the two
+    // columns would be in different units and the ratio between them would be wrong by
+    // the split factor. Both must move together (tax_engine.rs, SPLIT branch).
+    //
+    // Split ratio is quantity : price (shares after : shares before), so 2.0 / 1.0 is 2:1.
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Lot split", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "LOTSPLIT", "Lot split").await;
+    seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "SELL", 20.0, 130.0, 0.0, "2024-06-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, "2024-09-01T00:00:00Z").await;
+    seed_price(&pool, "LOTSPLIT", Utc::now().date_naive(), "110.0").await;
+    seed_split_sync(&pool, "LOTSPLIT").await;
+
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    let lot = &body["assets"][0]["tax_lots"][0];
+
+    // 60 bought and 20 sold pre-split, then everything doubles: 120 opened, 80 left.
+    assert_eq!(lot["original_qty"], "120.0", "60 bought, doubled by a 2:1 split");
+    assert_eq!(lot["remaining_qty"], "80.0", "40 left after the sell, doubled by the split");
+}
