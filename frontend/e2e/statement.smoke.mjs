@@ -207,7 +207,8 @@ try {
   //
   // What this CAN see: a table whose min-content exceeds the box -- a shape whose unbreakable
   // content is genuinely wider than the page, which is the silent clip described above. What it
-  // could not see on its own, and still cannot: a table that is merely squeezed. print.css used to
+  // cannot see on its own is a table that is merely squeezed -- forced below max-content while its
+  // min-content still fits. print.css used to carry
   // carry `overflow-wrap: anywhere` on the Type column, which let MUTUAL_FUND shatter into a
   // fragment small enough to hold min-content under the box -- measured at 608px scrollWidth with
   // a 37px Type cell, while the same fixture at 688px measured 694px of max-content and a 96px
