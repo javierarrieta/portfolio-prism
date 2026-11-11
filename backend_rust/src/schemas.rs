@@ -187,7 +187,12 @@ pub struct SellBreakdown {
 pub struct DatedLot {
     pub buy_transaction_id: i32,
     pub buy_date: DateTime<Utc>,
-    /// Split-adjusted purchase price per unit, in the asset's own currency.
+    /// Split-adjusted purchase price per unit, **in the portfolio's base currency** —
+    /// converted at the buy's own date, not the asset's own currency. The value is
+    /// `tx_price * get_rate(asset, base, buy_date)`, which is what the undated `TaxLot`
+    /// and `LotMatch.buy_price` also carry, so the three agree by construction.
+    /// Anything rendering this must label it base currency; a CSV column that says
+    /// "in asset currency" while printing this value would mix two currencies on one row.
     pub buy_price: Decimal,
     /// The quantity originally bought, split-adjusted: a 100-share lot after a 2:1 split
     /// is 200 whether or not any of it has been sold.
@@ -209,8 +214,11 @@ pub struct DatedReplay {
     /// The base-currency price the open lots were valued at. The report sums lot values
     /// and never multiplies this by a quantity of its own.
     pub current_price_base: Decimal,
-    /// The date whose close priced the market value, or `None` when the asset and the
-    /// base currency are the same and no conversion happened.
+    /// The date whose close priced the market value, or `None` when no conversion
+    /// happened. Compared case-insensitively, matching `get_rate`'s own identity rule —
+    /// an asset stored as `"usd"` in a `"USD"` portfolio needs no conversion and must not
+    /// report one. Reports the date of the row that actually produced the rate, which
+    /// `select_rate` may answer with an earlier date than the one requested.
     pub fx_rate_date_used: Option<NaiveDate>,
 }
 

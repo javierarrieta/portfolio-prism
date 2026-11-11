@@ -337,7 +337,7 @@ Three separate changes are required and doing the obvious thing — adding a sin
   pub struct DatedLot {
       pub buy_transaction_id: i32,
       pub buy_date: DateTime<Utc>,
-      pub buy_price: Decimal,      // asset currency, split-adjusted
+      pub buy_price: Decimal,      // BASE currency (converted at the buy's date), split-adjusted
       pub original_qty: Decimal,   // split-adjusted
       pub remaining_qty: Decimal,
       pub unit_cost: Decimal,      // base currency, fee-amortised
@@ -1038,7 +1038,11 @@ pub struct ReportRow {
     // Buy-lot cells: present on SOLD_LOT and OPEN_LOT.
     pub buy_transaction_id: Option<i32>,
     pub buy_date: Option<DateTime<Utc>>,
-    /// Split-adjusted, in `asset_currency`.
+    /// Split-adjusted, in the portfolio's **base** currency — converted at the buy's own
+    /// date. NOT `asset_currency`: `DatedLot.buy_price` and `LotMatch.buy_price` are both
+    /// `tx_price * get_rate(asset, base, buy_date)`, and the frontend already renders
+    /// `LotMatch.buy_price` with the base currency (`SellPnlModal.tsx:255`). The sell-side
+    /// price on the same row IS asset currency, so the two columns must not share a label.
     #[serde(with = "decimal_opt_json")]
     pub buy_price: Option<Decimal>,
     #[serde(with = "decimal_opt_json")]
@@ -2929,7 +2933,7 @@ pub const CSV_COLUMNS: [&str; 49] = [
     "sell_fee_in_asset_currency", "proceeds", "cost_basis", "realized_pnl", "matched_qty",
     "unmatched_qty",
     // the buy lot a sell consumed
-    "buy_transaction_id", "buy_date", "buy_price_in_asset_currency", "unit_cost",
+    "buy_transaction_id", "buy_date", "buy_price_in_base_currency", "unit_cost",
     "lot_matched_qty", "lot_qty_before_match", "lot_cost_basis", "lot_proceeds", "lot_pnl",
     "holding_days", "term",
     // the lot still open at the window end
@@ -3767,7 +3771,7 @@ Each of these is a place where the spec's text and the code as it now stands do 
 
 1. **The undated path keeps its legacy response shape.** The typed `ReportResponse` is returned only when `from` or `to` is present. The spec's file 7 says to replace `body = serde_json::Value` with the typed response; doing that for *both* paths breaks two shipped screens, because the statement and `PortfolioDetail` read `assets[].tax_lots`, `current_shares` and `total_portfolio_value`, none of which the report payload carries — and the spec's own *Route* decision says "absent `from` and `to`, the endpoint behaves exactly as it does today". The committed contract therefore documents the dated shape for 200, and the operation's description states the undated form.
 2. **`backend_rust/src/lib.rs` gains one line.** The spec says nothing in this document edits `lib.rs`, and that is about the pricing-layer work that used to live in the file. `report_csv.rs` must not live under `src/api_routes/` (the access gate's Rule A), and a module has to be declared in its parent, so `pub mod report_csv;` lands there.
-3. **`AssetTotals` carries `asset_type` and `asset_currency`,** which the spec's shape block omits. The CSV writes `sell_price_in_asset_currency` and `buy_price_in_asset_currency` beside base-currency money; without the asset's currency named on the row, those columns are unlabelled. A tax file that mixes currencies without saying so fails Goal 5's "no column is silently substituted".
+3. **`AssetTotals` carries `asset_type` and `asset_currency`,** which the spec's shape block omits. The CSV writes `sell_price_in_asset_currency` (genuinely asset currency — the raw as-entered sell price) beside base-currency money; without the asset's currency named on the row, those columns are unlabelled. **Correction found in review:** `buy_price` is NOT asset currency — it is converted at the buy's date into the base currency, like `LotMatch.buy_price` — so its header is `buy_price_in_base_currency`. Labelling it asset currency would print base-currency money under an asset-currency header on the same row as a genuinely asset-currency sell price, which is exactly the silent substitution Goal 5 forbids.
 4. **The per-asset totals ride in the CSV** as `asset_realized_in_window` and its four siblings. The spec's file 14 column description does not mention them, and its *The payload* section does: "The CSV writes the server-computed totals verbatim and states which columns are legal to sum". A reader cannot check the file against a total the file does not carry.
 5. **`unrealized_roi` is nullable.** The spec says "nulls are nulls" for the payload and does not give the open-lot ROI's zero-cost behaviour. This plan follows `SellPnlResponse.roi`, whose documented rule is null when the cost basis is zero — rather than `TaxLot.latent_roi`, which writes a zero and cannot be told from a genuine 0%.
 6. **Two spec test cases are recorded as unwritable, not faked.** "A missing price returns 422 naming every missing symbol" and "an unreachable provider returns 503" both need a provider seam that does not exist: a seeded database is either fresh — and answers — or stale, and stale routes to the hardcoded provider URL. Task 4 Step 9 names what is pinned instead (the body shape via validation, the caps and the pair rule on `MissingItems`, the mapping on `pricing_failure_status`, and the deadline's 503 with `retryable`). Writing them as integration tests would mean reaching the network.

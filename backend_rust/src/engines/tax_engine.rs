@@ -449,8 +449,12 @@ mod tests {
     #[tokio::test]
     async fn test_replay_at_an_empty_window_reports_nothing_and_costs_no_rate() {
         // Everything is dated after `end`, so there are no lots and no market value to
-        // convert. The early return is what keeps a position bought after the window from
-        // costing an outbound FX call and from appearing in the report at all.
+        // convert. This pins the SHAPE of the early return (no lots, no breakdowns, zero
+        // price, no rate date). The "costs no outbound call" property is true of the code
+        // but is proven by POSITION, not by this fixture: the return sits above the FX
+        // lookup, and this fixture is USD/USD, which would skip that lookup anyway. A
+        // foreign-currency fixture that proved it would reach the provider when the code
+        // was wrong, which the no-network rule forbids.
         let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-07-01T00:00:00Z")];
         let svc = CurrencyService::new();
         let pool = empty_pool().await;
@@ -501,11 +505,16 @@ mod tests {
         // no gain at all -- plausible enough to survive a reader who is not looking for
         // a date.
         let pool = priced_pool().await;
+        // Deliberately NO row on 2024-03-31. `select_rate` answers with the newest row
+        // dated at or before the request, so the rate comes from 2024-03-30 and
+        // `fx_rate_date_used` must say 03-30. Seeding a row exactly on the requested date
+        // would let an implementation that echoes `valuation_date` and ignores
+        // `at.date_used` pass every assertion here — which is the whole point of this
+        // field: it is provenance, and provenance that restates the question is worthless.
         seed_fx(&pool, "EURUSD=X", &[
             ("2024-01-01", "1.0000"),
             ("2024-03-29", "1.2500"),
             ("2024-03-30", "1.2500"),
-            ("2024-03-31", "1.2500"),
         ]).await;
         let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z")];
         let svc = CurrencyService::new();
@@ -517,12 +526,39 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out.fx_rate_date_used, Some(day("2024-03-31")));
+        assert_eq!(out.fx_rate_date_used, Some(day("2024-03-30")),
+            "the rate came from the 03-30 row, so that is the date this must report");
         assert_eq!(out.current_price_base, Decimal::from_str("125.0").unwrap());
         assert_eq!(out.open_lots[0].unit_cost, Decimal::from_str("100.0").unwrap(),
             "the realized leg converts the buy at the buy's own date");
         assert_eq!(out.open_lots[0].market_value, Decimal::from_str("12500.0").unwrap());
         assert_eq!(out.open_lots[0].unrealized_gain_loss, Decimal::from_str("2500.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_replay_at_a_split_inside_the_window_still_rescales_the_lots() {
+        // The mirror of the split-after-`end` test. The filter's whole purpose is to keep
+        // post-`end` splits OUT; that only means something if in-window splits are still
+        // applied. A filter written too aggressively would drop both and still satisfy the
+        // exclusion test. A 2:1 split on the closing day doubles quantity and halves unit
+        // cost, and both quantity fields move together.
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SPLIT", "2.0", "1.0", "0.0", "2024-06-30T00:00:00Z"),
+        ];
+        let svc = CurrencyService::new();
+        let pool = empty_pool().await;
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-06-30"), day("2024-06-30"),
+            Decimal::from_str("100.0").unwrap(), "USD", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.open_lots.len(), 1);
+        assert_eq!(out.open_lots[0].remaining_qty, Decimal::from_str("200.0").unwrap());
+        assert_eq!(out.open_lots[0].original_qty, Decimal::from_str("200.0").unwrap());
+        assert_eq!(out.open_lots[0].unit_cost, Decimal::from_str("50.0").unwrap());
     }
 
     #[tokio::test]
@@ -535,7 +571,7 @@ mod tests {
             make_tx(2, "BUY", "40.0", "120.0", "0.0", "2024-06-01T00:00:00Z"),
             make_tx(3, "SELL", "80.0", "130.0", "0.0", "2024-12-01T00:00:00Z"),
         ];
-        let today = ChronoUtc::now().date_naive();
+        let end = day("2030-01-01");
         let price = Decimal::from_str("110.0").unwrap();
 
         for strategy in ["FIFO", "LIFO", "HYBRID"] {
@@ -547,7 +583,7 @@ mod tests {
             .await
             .unwrap();
             let out = TaxLotEngine::replay_at(
-                &txs, today, today, price, "USD", "USD", &svc, strategy, 30, &pool,
+                &txs, end, end, price, "USD", "USD", &svc, strategy, 30, &pool,
             )
             .await
             .unwrap();
@@ -901,7 +937,16 @@ impl TaxLotEngine {
         }
 
         let mut fx_rate_date_used = None;
-        let current_price_base = if asset_currency != base_currency {
+        // Case-insensitive on purpose, to match `get_rate`'s own identity rule
+        // (`currency_service.rs:401-403`): an asset stored as "usd" in a "USD" portfolio
+        // needs no conversion, and `get_rate` short-circuits it to rate 1 with
+        // `date_used = valuation_date`. A plain `!=` here would take the branch and then
+        // report `fx_rate_date_used = Some(valuation_date)` — "a conversion happened on
+        // this date" when none did. Money is unaffected either way; only the provenance
+        // cell would lie. `replay` (:621) and `calculate_lots` (:778) still use a plain
+        // `!=`; neither exposes provenance, so the difference is invisible today and is
+        // tracked rather than changed here, since :778 is the live undated path.
+        let current_price_base = if !asset_currency.eq_ignore_ascii_case(base_currency) {
             // The market-value leg marks the position at the close the caller quoted for
             // `valuation_date`, so it is converted at that date's rate. The realized legs
             // in `replay` are each converted at their own transaction date, which is the
