@@ -513,6 +513,145 @@ async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
     assert_eq!(unmatched[0]["unmatched_qty"], "10.0");
 }
 
+// --------------------------------------------------------------------------------------
+// The FX branch of the dated route: no test above crosses a currency boundary.
+// --------------------------------------------------------------------------------------
+
+/// One USD-priced asset in a EUR portfolio, partly sold, with the `USDEUR=X` pair seeded
+/// so every rate lookup the dated route makes answers from the database.
+///
+/// The rate rows are the load-bearing detail. `get_rate` answers from
+/// `historical_prices` only when the newest stored row is within `PRICE_WINDOW_FRESH_DAYS`
+/// of the date asked for (`currency_service.rs:434-441`), so every date that needs a
+/// rate — the buy's, the sell's and the valuation date — must have a row within four
+/// days of it, or the call reaches Yahoo and the test stops being hermetic. The newest
+/// rate row is 2024-03-28, **strictly before the window end of 2024-03-31**, so
+/// `fx_rate_date_used` cannot be an echo of the request.
+///
+/// 10 bought @ 100 USD on 2024-01-02 and 6 sold @ 130 USD on 2024-03-08, so the sell is
+/// matched and 4 units stay open: one fixture covers both the realized leg and the
+/// market-value leg of the conversion.
+async fn fx_fixture(pool: &SqlitePool) -> (i32, i32) {
+    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "FX Dated", "EUR").await;
+    let asset = common::seed_asset_currency(pool, port_id, "AAPL", "Apple", "USD").await;
+    common::seed_transaction_at(pool, asset, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
+    common::seed_transaction_at(pool, asset, "SELL", 6.0, 130.0, 0.0, "2024-03-08T00:00:00Z").await;
+
+    // USD -> EUR closes: 0.8700 on the buy date, 0.9125 on the sell date, 0.9000 on the
+    // last row before `to`. All three are inside `FX_LOOKBACK_DAYS` of the end date, so
+    // the route's pair prefetch (`get_historical_prices` over the whole span) answers
+    // from the database too.
+    common::seed_price(pool, "USDEUR=X", day("2024-01-02"), "0.8700").await;
+    common::seed_price(pool, "USDEUR=X", day("2024-03-08"), "0.9125").await;
+    common::seed_price(pool, "USDEUR=X", day("2024-03-28"), "0.9000").await;
+
+    // The asset's own close, dated 2024-03-29 rather than 2024-03-28 on purpose: the
+    // price date and the rate date deliberately differ, so a cell wired from the other
+    // one fails. `resolve_close` only needs the newest row within 4 days of `to`.
+    common::seed_price(pool, "AAPL", day("2024-03-29"), "130.0").await;
+
+    (port_id, asset)
+}
+
+#[tokio::test]
+async fn a_dated_fx_report_converts_to_base_currency_and_reports_the_rate_date_it_used() {
+    // Review finding: the `fx_applied` branch of `build_tax_report` had no route-level
+    // test at all. This drives the real route across a currency boundary and pins three
+    // things at once.
+    //
+    // 1. `fx_rate_date_used` is the date of the row that produced the rate, NOT the
+    //    requested `to`. The newest `USDEUR=X` row is 2024-03-28 while `to` is
+    //    2024-03-31; an implementation that echoed the request returns "2024-03-31" and
+    //    fails. Copying `price_date_used` here fails too, because that date is
+    //    2024-03-29.
+    // 2. `fx_applied` is true and `fx_rate_date_used` is non-null on the same asset.
+    //    A provenance cell that says a conversion happened and then names no rate date
+    //    is the cell that lies.
+    // 3. Every converted money cell is in the PORTFOLIO base currency (EUR), not the
+    //    asset's (USD). `LotMatch.buy_price` / `DatedLot.buy_price` are
+    //    `tx_price * get_rate(asset, base, buy_date)` and `proceeds` is
+    //    `matched_qty * sell_unit_proceeds_base` (`tax_engine.rs:736`), so a report that
+    //    skipped the FX leg would print a 100.0 buy and a 130.0 sell.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _asset) = fx_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&to=2024-03-31"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(report["context"]["base_currency"], "EUR");
+    let totals = &report["asset_totals"][0];
+    assert_eq!(totals["symbol"], "AAPL");
+    assert_eq!(totals["asset_currency"], "USD");
+    // The response names one base currency; `AssetTotals` has no currency cell of its
+    // own (schemas.rs:335-357), and every money figure below is that currency.
+    assert_eq!(totals["fx_applied"], true);
+    assert_eq!(
+        totals["fx_rate_date_used"], "2024-03-28",
+        "the rate row's date, not an echo of `to` (2024-03-31) and not the price date (2024-03-29)"
+    );
+    assert_eq!(totals["price_date_used"], "2024-03-29", "the asset's close, a different date from the rate");
+
+    // Realized leg, each transaction converted at its own date: sell 6 @ 130 USD at the
+    // 2024-03-08 rate 0.9125 = 118.625 EUR a unit; cost 6 @ 100 USD at the 2024-01-02
+    // rate 0.8700 = 87.0 EUR a unit. P&L = 6 * (118.625 - 87.0) = 189.75 EUR.
+    assert_eq!(dec_at(totals, "/realized_in_window"), dec("189.75"));
+    // Market-value leg: the 4 units left are marked at the 2024-03-29 close (130.0 USD)
+    // converted at the 2024-03-28 rate 0.9000 = 117.0 EUR a unit; cost basis 4 * 87.0
+    // = 348.0 EUR.
+    assert_eq!(dec_at(totals, "/market_value"), dec("468.0"));
+    assert_eq!(dec_at(totals, "/cost_basis"), dec("348.0"));
+    assert_eq!(dec_at(totals, "/unrealized_at_end"), dec("120.0"));
+
+    let rows = report["rows"].as_array().unwrap();
+    let sold = rows.iter().find(|r| r["row_type"] == "SOLD_LOT")
+        .expect("the matched sell is a row");
+    assert_eq!(dec_at(sold, "/lot_proceeds"), dec("711.75"), "6 * 118.625 EUR, not 6 * 130 USD");
+    assert_eq!(dec_at(sold, "/lot_cost_basis"), dec("522.0"), "6 * 87.0 EUR, not 6 * 100 USD");
+    assert_eq!(dec_at(sold, "/lot_pnl"), dec("189.75"));
+    assert_eq!(dec_at(sold, "/buy_price"), dec("87.0"), "the lot's buy price is BASE currency, not USD 100");
+    assert_eq!(sold["fx_rate_date_used"], "2024-03-28", "the rate date repeats on each row of the asset");
+
+    let open = rows.iter().find(|r| r["row_type"] == "OPEN_LOT")
+        .expect("4 units remain open");
+    assert_eq!(dec_at(open, "/remaining_qty"), dec("4.0"));
+    assert_eq!(dec_at(open, "/buy_price"), dec("87.0"));
+    assert_eq!(dec_at(open, "/unit_cost"), dec("87.0"), "cost basis per unit in BASE currency");
+    assert_eq!(dec_at(open, "/market_value"), dec("468.0"), "4 * 117.0 EUR");
+    assert_eq!(dec_at(open, "/unrealized_gain_loss"), dec("120.0"));
+    assert_eq!(open["fx_rate_date_used"], "2024-03-28");
+}
+
+/// The mirror of the FX test, and the other half of "the two provenance cells must never
+/// disagree": `fx_applied: false` beside a non-null `fx_rate_date_used` would claim a
+/// conversion that did not happen. The portfolio and its assets are all USD, so no pair
+/// exists and none may be demanded.
+#[tokio::test]
+async fn a_same_currency_asset_never_reports_a_rate_date() {
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    for totals in report["asset_totals"].as_array().unwrap() {
+        assert_eq!(totals["fx_applied"], false, "{}", totals["symbol"]);
+        assert!(
+            totals["fx_rate_date_used"].is_null(),
+            "{}: no conversion happened, so there is no rate date to report",
+            totals["symbol"],
+        );
+    }
+}
+
 /// The validation failures, each of which names the parameter and carries two empty
 /// lists. They are all 422 with `retryable: false`: the client typed something the
 /// server cannot act on, and retrying changes nothing.
