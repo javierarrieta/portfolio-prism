@@ -5,6 +5,9 @@
  * response is normalized at the boundary in `src/utils/decimal.ts`, so components
  * and these types always operate on numbers. Sending a create/update payload may
  * use either string or number for decimal fields.
+ *
+ * The dated tax report (`TaxReport`) is the one exception and says so at its definition:
+ * its money stays in the exact decimal strings the server sent.
  */
 export type AssetType = 'STOCK' | 'CRYPTO' | 'ETF' | 'MUTUAL_FUND';
 export type TransactionType = 'BUY' | 'SELL' | 'SPLIT';
@@ -135,4 +138,106 @@ export interface SellPnlBreakdown {
   matched_qty: number;
   unmatched_qty: number;
   matches: LotMatch[];
+}
+
+/**
+ * The dated tax report. Deliberately NOT normalized through `number` the way every other
+ * payload in this file is (see the header): the report's figures are displayed from the
+ * exact decimal strings the server produced, and the same strings are what the CSV
+ * carries. Round-tripping them through a double here would make the screen and the file
+ * two renderings of different numbers, which is the one thing this feature exists to
+ * avoid. `formatCurrency` already accepts `string | number`.
+ */
+export type ReportRowKind = 'SOLD_LOT' | 'OPEN_LOT' | 'UNMATCHED';
+export type ReportPriceSource = 'database' | 'provider';
+
+export interface ReportContext {
+  portfolio_id: number;
+  portfolio_name: string;
+  base_currency: string;
+  strategy: string;
+  threshold_days: number;
+  /** The window actually applied; null when the portfolio has no transaction at all. */
+  requested_from: string | null;
+  requested_to: string;
+  splits_note: string;
+}
+
+export interface ReportAssetTotals {
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  asset_currency: string;
+  realized_in_window: string;
+  realized_cumulative: string;
+  unrealized_at_end: string;
+  market_value: string;
+  cost_basis: string;
+  price_date_used: string | null;
+  fx_rate_date_used: string | null;
+  price_source: ReportPriceSource | null;
+  fx_applied: boolean;
+  split_applied: boolean;
+}
+
+export interface ReportTotals {
+  realized_in_window: string;
+  realized_cumulative: string;
+  unrealized_at_end: string;
+  market_value: string;
+  cost_basis: string;
+}
+
+export interface ReportRow {
+  row_type: ReportRowKind;
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  asset_currency: string;
+  price_date_used: string | null;
+  fx_rate_date_used: string | null;
+  price_source: ReportPriceSource | null;
+  sell_transaction_id: number | null;
+  sell_date: string | null;
+  sold_qty: string | null;
+  sell_price: string | null;
+  sell_fee: string | null;
+  proceeds: string | null;
+  cost_basis: string | null;
+  realized_pnl: string | null;
+  matched_qty: string | null;
+  unmatched_qty: string | null;
+  buy_transaction_id: number | null;
+  buy_date: string | null;
+  buy_price: string | null;
+  unit_cost: string | null;
+  lot_matched_qty: string | null;
+  lot_qty_before_match: string | null;
+  lot_cost_basis: string | null;
+  lot_proceeds: string | null;
+  /** The only column whose sum over SOLD_LOT rows is an asset's realized_in_window. */
+  lot_pnl: string | null;
+  holding_days: number | null;
+  term: 'SHORT' | 'LONG' | null;
+  original_qty: string | null;
+  remaining_qty: string | null;
+  market_value: string | null;
+  unrealized_gain_loss: string | null;
+  unrealized_roi: string | null;
+}
+
+export interface TaxReport {
+  context: ReportContext;
+  asset_totals: ReportAssetTotals[];
+  totals: ReportTotals;
+  rows: ReportRow[];
+}
+
+export interface ReportErrorBody {
+  error: string;
+  missing_prices: string[];
+  missing_rates: { from: string; to: string }[];
+  missing_prices_total: number;
+  missing_rates_total: number;
+  retryable: boolean;
 }
