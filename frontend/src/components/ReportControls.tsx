@@ -62,13 +62,13 @@ export default function ReportControls(props: ReportControlsProps) {
             onChange={(e) => onWindowChange({ ...window, to: e.target.value })}
           />
         </div>
-        {quarterPresets(today).map(({ label, window: presetWindow, available }) => (
+        {quarterPresets(today).map(({ label, window: presetWindow, available, clamped }) => (
           <button
             key={label}
             type="button"
             className="btn btn-secondary"
             disabled={!available}
-            title={available ? undefined : `${label} has not started yet`}
+            title={available ? (clamped ? `${label} runs to ${presetWindow.to}, today: the rest of the quarter has not happened yet` : undefined) : `${label} has not started yet`}
             onClick={() => onWindowChange(presetWindow)}
           >
             {label}
@@ -102,7 +102,10 @@ export default function ReportControls(props: ReportControlsProps) {
           {error.retryable ? (
             <button className="btn btn-secondary" onClick={onRetry}>Try again</button>
           ) : (
-            <p>The range or the strategy has to change before this can be answered.</p>
+            <p>
+              The dates or the strategy have to change before this can be answered. The strategy and
+              its threshold are set on the Holdings &amp; Tax lots tab, not here.
+            </p>
           )}
         </div>
       )}
@@ -201,8 +204,9 @@ export function TaxReportTable({ report }: { report: TaxReport }) {
                   <td>{c.date ?? '—'}</td>
                   <td>{c.qty ?? '—'}</td>
                   {/* A null money cell is an em dash, never a formatted zero. */}
-                  <td>{c.value === null ? '—' : formatCurrency(c.value, currency)}</td>
-                  <td>{c.gain === null ? '—' : formatCurrency(c.gain, currency)}</td>
+                  {/* `== null`, not `=== null`: a key that is absent entirely must read as unknown, not as a formatted zero. */}
+                  <td>{c.value == null ? '—' : formatCurrency(c.value, currency)}</td>
+                  <td>{c.gain == null ? '—' : formatCurrency(c.gain, currency)}</td>
                   <td data-testid={`row-${i}-price-date`}>{row.price_date_used ?? '—'}</td>
                 </tr>
               );

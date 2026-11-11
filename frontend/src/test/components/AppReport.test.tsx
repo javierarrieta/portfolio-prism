@@ -157,6 +157,22 @@ describe('a failed refetch retires the payload it replaced', () => {
     await waitFor(() => expect(screen.queryByText('Loading the report…')).toBeNull())
   })
 
+  it('offers a retry when the request never got an answer', async () => {
+    // A dropped connection lands in the generic catch. It used to hardcode `retryable: false`,
+    // which told the user their dates were wrong and offered no way to try again -- for a
+    // failure with nothing wrong with their dates at all.
+    server.use(
+      http.get('/api/portfolios/:id/tax-summary', ({ request }) =>
+        new URL(request.url).searchParams.has('from')
+          ? HttpResponse.error()
+          : HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })),
+    )
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('report-error')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument()
+  })
+
   it('renders a panel, not a blank page, when the error body is not the typed shape', async () => {
     // `body as ReportErrorBody` is compile-time only. A proxy `{}`, Rocket's own envelope, or a
     // truncated body used to reach `error.missing_prices.length` and throw during render, and

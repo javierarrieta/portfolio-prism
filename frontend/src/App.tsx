@@ -264,7 +264,10 @@ export default function App() {
             key,
             body: {
               error: String(err), missing_prices: [], missing_rates: [],
-              missing_prices_total: 0, missing_rates_total: 0, retryable: false,
+              // Retryable: this branch is a dropped connection or an unreadable body, both of
+              // which are worth another click. Telling the user their dates are wrong is worse
+              // advice than offering a retry they did not need.
+              missing_prices_total: 0, missing_rates_total: 0, retryable: true,
             },
           });
         }

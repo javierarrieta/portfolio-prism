@@ -30,7 +30,7 @@ export const isoDate = (d: Date) =>
  * would be an error rather than a default.
  */
 export function currentYearToDate(today: Date = new Date()): ReportWindow {
-  return { from: `${today.getFullYear()}-01-01`, to: isoDate(today) };
+  return { from: `${today.getUTCFullYear()}-01-01`, to: isoDate(today) };
 }
 
 export interface ReportPreset {
@@ -38,6 +38,8 @@ export interface ReportPreset {
   window: ReportWindow;
   /** False for a quarter that has not begun: there is nothing in it to report. */
   available: boolean;
+  /** True when the quarter ran past today and `window.to` was pulled back to it. */
+  clamped: boolean;
 }
 
 /**
@@ -52,7 +54,7 @@ export interface ReportPreset {
  * `available: false`; it keeps its nominal range and is disabled, with a `title` saying so.
  */
 export function quarterPresets(today: Date): ReportPreset[] {
-  const year = today.getFullYear();
+  const year = today.getUTCFullYear();
   const todayIso = isoDate(today);
   const quarters: ReportWindow[] = [
     { from: `${year}-01-01`, to: `${year}-03-31` },
@@ -63,13 +65,15 @@ export function quarterPresets(today: Date): ReportPreset[] {
   return [
     ...quarters.map((window, i) => {
       const available = window.from <= todayIso;
+      const clamped = available && window.to > todayIso;
       return {
         label: `Q${i + 1}`,
-        window: available && window.to > todayIso ? { from: window.from, to: todayIso } : window,
+        window: clamped ? { from: window.from, to: todayIso } : window,
         available,
+        clamped,
       };
     }),
-    { label: 'This year to date', window: currentYearToDate(today), available: true },
+    { label: 'This year to date', window: currentYearToDate(today), available: true, clamped: false },
   ];
 }
 
