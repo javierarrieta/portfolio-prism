@@ -53,13 +53,13 @@ describe('print.css', () => {
     // The 80px this buys back is what the nine-column fit is measured against: the printed box
     // is the full 688px @page content box, not 608px. The :has() scope is load-bearing —
     // unscoped, every other tab loses its padding too — and specificity (0,2,0) beats
-    // .main-content's (0,1,0) in index.css without !important. This file only pins the rule as
-    // text; the smoke is what shows that deleting it costs anything. It used to be measurable as
-    // a Type column squeezed from 96px to 37px with MUTUAL_FUND broken across lines, but that
-    // measurement belonged to the raw enum and to the Type-column break rule this stylesheet no
-    // longer has. Which of the smoke's two width checks a deletion trips now is a browser
-    // measurement, not something this text assertion can claim.
-    expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
+    // .main-content's (0,1,0) in index.css without !important.
+    // This text assertion is the ONLY thing anywhere that sees the rule being deleted. That was
+    // measured, not assumed: with the rule removed (box back to 608px) the smoke stayed green on
+    // all nine assertions, so the behavioural cost at the shipped fixture is zero and the rule is
+    // margin, not necessity. It used to look measurable as a Type column squeezed to 37px
+    // with MUTUAL_FUND broken across lines, but that measurement belonged to the raw enum and to
+    // the Type-column break rule this stylesheet no longer has.
     expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
   });
 

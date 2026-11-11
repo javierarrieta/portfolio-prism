@@ -323,11 +323,14 @@ Either answer is useful. Neither can be found from here.
   dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
   is falsy, so a coincidental fallback can satisfy an eyeball comparison.
 - an empty portfolio prints a short note and no figures
-- all nine columns are on the page — **and run this check on a portfolio whose values reach six
-  digits or more**: a mutual-fund holding, or one carrying a realized P&L of six digits
-  (`-$123,456.00`) or more.
-  Six digits is the threshold because that is where the measurements say the room runs out. On a
-  small stock position the table fits with room to spare and the check proves nothing; that is
+- all nine columns are on the page — **and run this check on a wide portfolio, not the smallest one
+  you have**: something carrying a large realized or market value, e.g. `-$123,456.00` or bigger.
+  Shape, not digit count, decides the width. The recorded series measured a seven-digit-realized
+  shape at 635px and an eight-digit-realized one at 608px — the bigger number came out the narrower
+  table, because its other columns were smaller — and the smoke's own fixture carries an eight-figure
+  realized value and fits 608px as it ships. So there is no digit count you can test against; it is
+  the columns moving together that fills the page. On a small stock position the table fits with
+  room to spare and the check proves nothing; that is
   exactly the blind check the smoke used to perform, and why its fixture was widened. The rightmost
   three — Realized, Unrealized, Unrealized ROI — are what a too-wide table loses first, and the
   clip is silent: `.main-content` computes `overflow-x: auto` (because it declares
@@ -336,8 +339,12 @@ Either answer is useful. Neither can be found from here.
   statement table's cells shrink to `4px 6px` at `0.75rem`, the Type column prints a short display
   label (`Fund`, not the stored `MUTUAL_FUND`), and `.main-content`'s 40px side padding is
   collapsed **for the statement tab only**. Measured in a browser at the printed page box, that
-  collapse takes the box from 608px to 688px. So what to look for: all nine headers with their
-  figures under them, the rightmost figure sitting inside the paper with about the same gap as the
+  collapse takes the box from 608px to 688px — and it is worth saying plainly that the collapse is
+  **margin, not necessity**: with it deleted the smoke still passes all nine assertions on the
+  shipped fixture, because the shortened Type label already bought the room. Leave the rule alone;
+  just do not be afraid of it, and do not expect a failing check if something else takes that slack
+  away. So what to look for: all nine headers with their figures under them, the rightmost figure
+  sitting inside the paper with about the same gap as the
   leftmost one (the table now runs the full width of the text above it, because the side padding
   is gone), and nothing half-cut at either edge. A missing or clipped rightmost column means the
   table is over the page box — padding alone cannot fix that, so say so before you hand the page
@@ -346,8 +353,12 @@ Either answer is useful. Neither can be found from here.
   failure the bullet above cannot see, so check it separately. The Type column prints a
   human-readable label — `Stock`, `Crypto`, `ETF`, `Fund` — never the database enum, so no cell
   should read as half a word. Any value split over two lines, a label or a number, means the table
-  has been squeezed below what it needs: the columns are interdependent, so whichever column the
-  browser can shrink gives way first. Look at the money columns, then Type. The smoke asserts this
+  has been squeezed below what it needs — with one exception to rule out before you chase it: a value
+  that merely contains a break opportunity, a space or a hyphen, splits there with no squeeze at all.
+  An asset type the label map has never seen falls through to the raw string, and a hyphenated symbol
+  like `BRK-B` breaks on the hyphen; both are content, not layout. Absent that, the columns are
+  interdependent, so whichever column the browser can shrink gives way first. Look at the money
+  columns, then Type. The smoke asserts this
   directly, by counting the line boxes of every table **body** cell; a header that wraps onto two
   lines is not itself a defect, because the header row is where that excess width is meant to land.
   Nothing in `print.css` may break a token mid-word to make a squeezed table fit — that rule used

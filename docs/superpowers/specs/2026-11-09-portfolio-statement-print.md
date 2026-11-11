@@ -544,19 +544,29 @@ the only one of the three that got an explicit override, for the reason just giv
         `emulateMedia` changes the media type but not the layout viewport, and at the harness's
         1400×1000 this could only fail at a width nobody prints at. The statement's box is that
         full 688px: `print.css` collapses `.main-content`'s 40px side padding under
-        `:has([data-print="statement"])`, so a 688px viewport reproduces what ships exactly. (It
+        `:has([data-print="statement"])`, so a 688px viewport reproduces it to within the scrollbar
+        (`.main-content` is `overflow-y: auto`, so a page tall enough to scroll shaves ~15px off
+        `clientWidth` — the box measured here is up to 15px **narrower** than the printed one, an
+        error that runs one way: stricter than what ships, never more permissive). (It
         did before that rule too, when the box was 688 − 80 = 608px — the box moved, the viewport
         did not need to.) **What this check cannot see on its own is a table that is merely
         squeezed** — it fails when min-content exceeds the box, and on nothing else. Measured with
         the fixture as it stood when this was written, the table's max-content was 694px — wider
         than both boxes — and deleting the padding rule did not overflow the 608px box at all: the
-        Type column was squeezed from 96px to 37px and `MUTUAL_FUND` broke across lines instead.
+        Type column was squeezed to 37px and `MUTUAL_FUND` broke across lines instead (96px was the
+        max-content ideal for that column, not what rendered — at 688px the token was already on two
+        lines, which is the run that made the smoke red).
         (An earlier claim here, that the fixture measured 617px and so failed this check with the
         rule deleted, was measured false and does not survive.) That measurement belonged to the
         raw enum in the Type column, an eight-figure live market value, and an
         `overflow-wrap: anywhere` rule on the Type column; all three have since been removed on
-        purpose, so no max-content figure is claimed here for the current fixture and **which of
-        the two width checks a padding-rule deletion trips is an open browser question.**
+        purpose, so no max-content figure is claimed here for the current fixture. What the two
+        checks were left to answer is settled, not open: **neither width check sees a padding-rule
+        deletion.** With `.main-content:has([data-print="statement"]) { padding: 0 0 24px }` removed,
+        so the box is back to 608px, the smoke ran green on all nine assertions and the worst body
+        cell still rendered on one line. That rule is margin, not necessity — about 80px of slack
+        against the shipped fixture — and `PrintCss.test.ts`, which pins it as text, is the only gate
+        anywhere that notices its absence.
     *   no **body** cell renders across more than one line box: for each
         `[data-print="statement"] tbody td`, build a `Range` with `selectNodeContents` and count
         `getClientRects().length` — one client rectangle per line box the text actually occupies.
@@ -568,9 +578,11 @@ the only one of the three that got an explicit override, for the reason just giv
         $16,000) precisely so this check does not depend on what a provider quotes today. Expects
         one line per cell at the shipped width, and fails listing every offending cell's index,
         text and line count — every one, because the columns are interdependent and one wrapped
-        cell and five are different diagnoses. Together with the overflow check above this is what
-        detects the padding rule being deleted; the on-screen `paddingLeft` check below only
-        detects that rule escaping `@media print`.
+        cell and five are different diagnoses. This check does **not** detect the padding rule being
+        deleted, and neither does the overflow check above: measured with that rule removed (box back
+        to 608px) the smoke stayed green on all nine assertions. `PrintCss.test.ts`, which pins the
+        rule as text, is the only gate that sees its absence; the on-screen `paddingLeft` check below
+        detects only that rule escaping `@media print`.
     *   before `emulateMedia`, on screen, `.main-content`'s computed `paddingLeft` is `40px`. Same
         shape as the other pre-`emulateMedia` checks: `PrintCss.test.ts` pins the statement print
         padding collapse as text and cannot see `@media` membership, so if that rule escaped the

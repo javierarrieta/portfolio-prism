@@ -60,11 +60,12 @@ async function seed() {
   //
   // The Type column prints the display label `Fund` (PortfolioStatement.tsx), not the stored
   // MUTUAL_FUND, so the widest Type token this fixture prints is now `Stock`. Earlier versions of
-  // this comment
-  // recorded MUTUAL_FUND rendering whole in a 96px Type cell at 688px and shattered into 37px at
-  // 608px, and a table max-content of 694px against the 688px page box. All of those were
-  // measured with the raw enum, an eight-figure market value and the Type-column break rule, and
-  // all three are gone, so no max-content figure is restated here. What has not changed is what
+  // this comment recorded a 96px Type cell with MUTUAL_FUND whole, and a table max-content of 694px
+  // against the 688px page box. Those two numbers described the table's max-content LAYOUT, not what
+  // the browser rendered: at 688px it was already squeezing, and MUTUAL_FUND broke across two line
+  // boxes -- that is the run that retired them. All of it was measured with the raw enum, an
+  // eight-figure market value and the Type-column break rule, and all three are gone, so no
+  // max-content figure is restated here. What has not changed is what
   // the two checks at the bottom are for: at the shipped width every body cell must render on one
   // line, and a table squeezed below what it needs must show up as a failure rather than as
   // smaller, broken type. If the line-count check fails on a real run that IS the finding: do not
@@ -197,26 +198,31 @@ try {
   // at 210mm minus print.css:13's 14mm margins = 182mm = 688px at 96dpi. (794px is the
   // whole sheet; the browser lays no content into the margins.) print.css collapses
   // .main-content's 40px side padding when the statement is what is printing, so the
-  // statement's box IS that 688px content box and a 688px viewport reproduces it exactly --
-  // residual zero. (Before that rule the box was 688 - 80 = 608px and the same viewport
-  // reproduced it exactly: the box moved, the viewport did not need to.) Nine columns at the
+  // statement's box is that 688px content box, and a 688px viewport reproduces it to within the
+  // scrollbar. (Before that rule the box was 688 - 80 = 608px and the same viewport
+  // reproduced it just as closely: the box moved, the viewport did not need to.) Nine columns at the
   // on-screen 16px cell padding need 288px of padding alone, which is what print.css's
-  // .statement-table rule buys back -- see the arithmetic in the comment there. (.main-content
-  // is overflow-y:auto, so a page tall enough to scroll would shave ~15px off clientWidth --
-  // stricter than the printed page, never more permissive.)
+  // .statement-table rule buys back -- see the arithmetic in the comment there. The reproduction is
+  // approximate, not exact: .main-content is overflow-y:auto, so a page tall enough to scroll shaves
+  // ~15px off clientWidth, which makes the box measured here up to 15px NARROWER than the printed
+  // one. That error runs one way -- stricter than what ships, never more permissive -- so a pass here
+  // is still a pass on paper.
   //
   // What this CAN see: a table whose min-content exceeds the box -- a shape whose unbreakable
   // content is genuinely wider than the page, which is the silent clip described above. What it
   // cannot see on its own is a table that is merely squeezed -- forced below max-content while its
-  // min-content still fits. print.css used to carry
-  // carry `overflow-wrap: anywhere` on the Type column, which let MUTUAL_FUND shatter into a
-  // fragment small enough to hold min-content under the box -- measured at 608px scrollWidth with
-  // a 37px Type cell, while the same fixture at 688px measured 694px of max-content and a 96px
-  // Type cell with the token whole. That break rule is gone (see print.css) and the Type column
-  // prints a display label now, so a squeeze has nothing left to shatter. Whether it now surfaces
-  // here, in the line-count check below, or in both is a browser measurement to take again, not
-  // something to assert from here; no max-content figure is restated for the same reason. Both
-  // checks stay, because between them a squeezed or over-wide table cannot pass quietly.
+  // min-content still fits. print.css used to carry `overflow-wrap: anywhere` on the Type column,
+  // which let MUTUAL_FUND shatter into a fragment small enough to hold min-content under the box --
+  // measured at 608px scrollWidth with a 37px Type cell. The same fixture's max-content layout
+  // measured 694px, wider than both boxes, which is why the Type column was already giving way at
+  // 688px; 694px and the 96px Type cell describe that max-content layout, not what rendered. That
+  // break rule is gone (see print.css) and the Type column prints a display label now, so a squeeze
+  // has nothing left to shatter. What a squeeze does now was measured on the current fixture with
+  // print.css's .main-content padding collapse deleted (box back to 608px): nothing -- this check
+  // and the line-count check below both stayed green, because the table fits 608px as it ships. No
+  // max-content figure is restated here for the current fixture. Both checks stay anyway, because
+  // between them an over-wide table cannot pass quietly -- but neither one is the guard on that
+  // padding rule.
   //
   // If this fails on a real run it is a finding about the shipped PDF -- the printed
   // table really is too wide for the page -- not a broken assertion. Do not "fix" it by
@@ -225,13 +231,14 @@ try {
   const [sw, cw] = await statement.evaluate((el) => [el.scrollWidth, el.clientWidth])
   if (sw > cw) fail(`horizontal overflow at the printed page box: scrollWidth ${sw} > clientWidth ${cw}`)
 
-  // No body cell may wrap onto a second line. This check and the overflow check above are the only
-  // assertions anywhere that can see print.css's
-  // `.main-content:has([data-print="statement"]) { padding: 0 0 24px }` being DELETED (the
-  // on-screen check earlier only sees it escaping @media print). Which of the two a deletion trips
-  // now is an open browser question: the measurement that made THIS one the discriminator (Type
-  // column 96px -> 37px, MUTUAL_FUND broken across two lines) belonged to the raw enum and to the
-  // Type-column break rule, and both are gone.
+  // No body cell may wrap onto a second line. This check and the overflow check above are NOT guards
+  // on print.css's `.main-content:has([data-print="statement"]) { padding: 0 0 24px }`. That was
+  // measured with the rule DELETED (box back to 608px): the smoke stayed green on all nine
+  // assertions, so neither of the two width checks fires and the rule is margin, not necessity. The
+  // only assertion anywhere that sees the deletion is PrintCss.test.ts, which pins the rule as text;
+  // the on-screen check earlier sees only it escaping @media print. The measurement that once made
+  // THIS one the discriminator (Type column squeezed to 37px, MUTUAL_FUND broken across two lines)
+  // belonged to the raw enum and to the Type-column break rule, and both are gone.
   //
   // Element height cannot answer this. Cells in a row share the row's height, so in a wrapped
   // row every td in it measures the row's height and none of them discriminates. A Range over a

@@ -39,7 +39,14 @@
         argument, here the [data-print="statement"] attribute selector — against (0,1,0) for
         .main-content, so it wins with no !important (and print.css is imported after
         index.css regardless, main.tsx:3-4). 24px stays at the bottom so the last row is not
-        flush against the printed edge. */
+        flush against the printed edge.
+        THIS RULE IS MARGIN, NOT NECESSITY — measured, not assumed. With this line deleted, so the
+        box is back to 608px, the smoke ran green on all nine assertions at the shipped fixture:
+        neither width check fires and the worst body cell still rendered on one line. Roughly 80px
+        of slack, bought when the Type column stopped printing the raw enum. So deleting this costs
+        nothing today, and PrintCss.test.ts — which pins this line as text — is the only gate that
+        would notice. Read that as "do not fear deleting it", not as "it is safe to delete": the
+        slack belongs to today's fixture, and rule 4's ceiling argument is untouched by it. */
   .main-content:has([data-print="statement"]) { padding: 0 0 24px; }
 
   /* 3. Invert the palette. Legibility comes entirely from the TEXT overrides: text is
@@ -113,9 +120,12 @@
         instead. Two parts of that measurement have since been retired on purpose: the Type column
         prints a display label (PortfolioStatement.tsx), and the smoke keeps its live-priced
         columns narrow so its checks are not price-sensitive. So the current max-content is not
-        restated here, and neither is WHICH of the smoke's two width checks sees this rule
-        deleted — both checks are in the smoke, and only a browser run can say which one fires.
-        What has not changed is the risk: padding is finite, a holding's column content is not,
+        restated here. The question of WHICH of the smoke's two width checks sees this rule deleted
+        was since measured, and the answer is NEITHER: with rule 2's padding collapse removed the
+        smoke stayed green on all nine assertions, because the table now fits the 608px box too.
+        That is rule 2 being margin, not this rule being unnecessary — the fit arithmetic above is
+        written against the 688px box, and it is why there is slack to lose. What has not changed is
+        the risk: padding is finite, a holding's column content is not,
         and an over-wide table is still clipped silently. */
   .statement-table th,
   .statement-table td {

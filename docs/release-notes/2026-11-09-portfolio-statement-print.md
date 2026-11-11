@@ -129,9 +129,11 @@ anywhere that a print rule did not escape `@media print` into the running app, b
 **It has been run** — locally, under chromium 157, against the real Rocket API and Vite with the
 fixture seeded through the API. That is still not a gate. There is no
 browser job in CI (#45), so running it remains a step an operator has to take by hand, and a change
-to the print CSS can still merge with nobody having run it. The last run was **red**, and correctly
-so: the body-cell line-count assertion failed on `MUTUAL_FUND` in the Type column, which is what
-sent this round. What that round changed, and what still needs a browser to confirm, is below.
+to the print CSS can still merge with nobody having run it. The run that sent this round was **red**,
+and correctly so: the body-cell line-count assertion failed on `MUTUAL_FUND` in the Type column.
+**The smoke has since been re-run on the fixed slice and is green — all nine assertions**, with the
+worst body cell rendering on one line across all eighteen. What that round changed, and what the
+re-run then measured, is below.
 
 Its fixture is deliberately not the narrowest table the endpoint can produce, and it is now shaped
 by two rules at once. One column must stay wide so the width checks measure something real: the
@@ -153,10 +155,13 @@ previous round had bought width two other ways: the statement table's cells down
 Measuring the smoke's own
 fixture, rather than a narrower probe, then invalidated two claims made here: the table's
 max-content width was **694px**, wider than both boxes, so something always wrapped, and at 608px
-the fixture did **not** overflow — it dropped the Type column from 96px to 37px and broke
-`MUTUAL_FUND` across two lines instead. (What was written here before — that the fixture overflowed
+the fixture did **not** overflow — it squeezed the Type column to 37px and broke
+`MUTUAL_FUND` across two lines instead. (The 96px Type cell quoted in earlier notes was the
+max-content ideal, not what rendered: at 688px the browser was already squeezing and the token was
+already on two lines — that is the run that made the smoke red.) What was written here before — that
+the fixture overflowed
 the 608px box, and that at 617px it passed with the padding rule and failed without it — came from a
-narrower single-asset shape and did not survive measuring this fixture.)
+narrower single-asset shape and did not survive measuring this fixture.
 
 That red run invalidated a third claim, and this round is the fix for it. The break rule was not a
 lever, it was the thing hiding the failure: with the raw enum, an eight-figure live market value and
@@ -165,7 +170,15 @@ So the Type column now prints a **display label** — `Stock`, `Crypto`, `ETF`, 
 fall-through so an AssetType the map has never seen still prints rather than blanking the cell — and
 `print.css` no longer carries a token-break rule anywhere, because a rule that shatters a word is
 what let a squeezed table pass every check. No max-content figure is restated for the fixed table:
-it has not been re-measured, and the smoke is what will measure it. If it still fails, the finding
+the smoke measures whether the shipped box holds, it does not report a max-content number. The re-run
+came back green — every body cell on one line at the 688px box — and it settled the one question the
+previous round had left open, by deleting `print.css`'s
+`.main-content:has([data-print="statement"]) { padding: 0 0 24px }` and running the smoke again at
+the 608px box that then remains: **still green, all nine assertions.** So that padding rule is
+**margin, not necessity** — roughly 80px of slack against the shipped fixture, bought by the shorter
+Type label — and `PrintCss.test.ts`, which pins the rule as text, is the only gate that sees it go.
+Keep it; just do not mistake it for load-bearing, and do not expect a failure if something else takes
+the slack away. If a future run does fail, the finding
 has not changed — widening the smoke's viewport or narrowing the fixture is not the response.
 
 **Padding is not a solution to an unbounded width problem.** A portfolio whose columns are wide
