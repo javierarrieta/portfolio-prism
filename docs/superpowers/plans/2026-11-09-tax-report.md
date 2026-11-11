@@ -731,8 +731,8 @@ This task lands the contract one commit ahead of the behavior: the route's docum
 Create `backend_rust/tests/tax_report_test.rs` (it grows in Tasks 4 and 5):
 
 ```rust
-//! The dated tax report: the three reconciliation equalities, the typing of the payload
-//! and the failure contract.
+//! The dated tax report: the payload's typing, the three reconciliation equalities and
+//! the failure contract.
 //!
 //! Hermetic by construction, like `fx_pricing_test.rs`: every price and rate these tests
 //! need is seeded into `historical_prices`, and the pricing layer reads the database
@@ -740,24 +740,91 @@ Create `backend_rust/tests/tax_report_test.rs` (it grows in Tasks 4 and 5):
 
 mod common;
 
-use backend_rust::schemas::{ReportRow, RowKind};
-use chrono::NaiveDate;
+use backend_rust::models::{Asset, Transaction};
+use backend_rust::schemas::{LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
+use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
+use std::str::FromStr;
 
 fn day(s: &str) -> NaiveDate {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
 }
 
+fn ts(s: &str) -> DateTime<Utc> {
+    day(s).and_hms_opt(0, 0, 0).unwrap().and_utc()
+}
+
+fn dec(s: &str) -> Decimal {
+    Decimal::from_str(s).unwrap()
+}
+
+fn fixture_asset() -> Asset {
+    Asset {
+        id: 1,
+        portfolio_id: 1,
+        symbol: "AAPL".to_string(),
+        name: "Apple".to_string(),
+        asset_type: "STOCK".to_string(),
+        sector: None,
+        currency: "USD".to_string(),
+        isin: None,
+    }
+}
+
+fn fixture_sell(id: i32) -> Transaction {
+    Transaction {
+        id,
+        asset_id: 1,
+        r#type: "SELL".to_string(),
+        quantity: "80.0".to_string(),
+        price: "130.0".to_string(),
+        fee: "0.0".to_string(),
+        date: ts("2024-12-01"),
+    }
+}
+
+/// A sell of 80 units against one 60-unit lot, so 20 units are unmatched: the fixture
+/// that carries both shapes, and the same one the engine's own tests use.
+fn fixture_breakdown(sell_id: i32) -> SellBreakdown {
+    SellBreakdown {
+        sell_transaction_id: sell_id,
+        sell_date: ts("2024-12-01"),
+        sold_qty: dec("80.0"),
+        matched_qty: dec("60.0"),
+        unmatched_qty: dec("20.0"),
+        proceeds: dec("7800.0"),
+        cost_basis: dec("6000.0"),
+        realized_pnl: dec("1800.0"),
+        matches: vec![LotMatch {
+            buy_transaction_id: 1,
+            buy_date: ts("2024-01-01"),
+            buy_price: dec("100.0"),
+            unit_cost: dec("100.0"),
+            matched_qty: dec("60.0"),
+            lot_qty_before_match: dec("60.0"),
+            cost_basis: dec("6000.0"),
+            proceeds: dec("7800.0"),
+            pnl: dec("1800.0"),
+            holding_days: 335,
+            term: None,
+        }],
+    }
+}
+
 #[test]
 fn an_unmatched_row_serialises_its_money_cells_as_null_not_zero() {
     // The rule the whole payload obeys: a consumer has to be able to tell "not
-    // applicable" from "zero". `UNMATCHED` is the row kind where every money cell is
-    // inapplicable, so it is where the rule is easiest to break by defaulting.
-    let row = ReportRow::unmatched(1, "AAPL", "STOCK", "USD", Some("database"), 7, "80.0");
+    // applicable" from "zero". `UNMATCHED` is where every money cell is inapplicable,
+    // which makes it the row kind where a default would be easiest and least visible.
+    let asset = fixture_asset();
+    let sell = fixture_sell(7);
+    let breakdown = fixture_breakdown(7);
+    let row = ReportRow::unmatched(&asset, None, None, Some(PriceSource::Database), &sell, &breakdown);
     let v = serde_json::to_value(&row).unwrap();
 
-    assert_eq!(v["row_type"], "UNMATCHED");
+    assert_eq!(v["row_type"], RowKind::Unmatched.as_str());
     assert_eq!(v["sell_transaction_id"], 7);
-    assert_eq!(v["unmatched_qty"], "80.0");
+    assert_eq!(v["unmatched_qty"], "20.0");
     assert!(v["lot_pnl"].is_null(), "money that does not exist is null, not \"0\"");
     assert!(v["realized_pnl"].is_null());
     assert!(v["proceeds"].is_null());
@@ -767,24 +834,26 @@ fn an_unmatched_row_serialises_its_money_cells_as_null_not_zero() {
 
 #[test]
 fn a_sold_lot_row_carries_money_as_decimal_strings() {
+    let asset = fixture_asset();
+    let sell = fixture_sell(3);
+    let breakdown = fixture_breakdown(3);
+    let matched = &breakdown.matches[0];
     let row = ReportRow::sold_lot(
-        1, "AAPL", "STOCK", "USD", Some(day("2024-06-30")), None, Some("database"),
-        3, day("2024-12-01"), // sell id and date
-        "80.0", "130.0", "0.0",                 // sold_qty, sell_price, sell_fee
-        "10400.0", "8400.0", "2000.0", "80.0", "0.0",  // proceeds, cost_basis, realized_pnl, matched, unmatched
-        1, day("2024-01-01"), "100.0", "100.0", // buy id, date, price, unit_cost
-        "60.0", "60.0", "6000.0", "7800.0", "1800.0", 335, None, // lot cells, holding_days, term
+        &asset, Some(day("2024-06-30")), None, Some(PriceSource::Database),
+        &sell, &breakdown, matched,
     );
     let v = serde_json::to_value(&row).unwrap();
 
-    assert_eq!(v["row_type"], "SOLD_LOT");
-    assert_eq!(v["lot_pnl"], "1800.0");
-    assert_eq!(v["realized_pnl"], "2000.0");
+    assert_eq!(v["row_type"], RowKind::SoldLot.as_str());
+    assert_eq!(v["lot_pnl"], "1800.0", "LotMatch.pnl under the CSV's name for it");
+    assert_eq!(v["realized_pnl"], "1800.0");
+    assert_eq!(v["sell_price"], "130.0", "as entered, in the asset's currency");
+    assert_eq!(v["unmatched_qty"], "20.0", "the sell's context repeats on every lot row");
     assert!(v["market_value"].is_null(), "an open-lot cell on a sold-lot row");
     assert_eq!(v["price_date_used"], "2024-06-30");
-    assert_eq!(v["row_type"], RowKind::SoldLot.as_str());
 }
 ```
+
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -1118,8 +1187,6 @@ pub struct ErrorBody {
 }
 ```
 
-Note the test's constructor calls in Step 1 are written against a *different* signature than the final one for `sold_lot`/`unmatched`: the final constructors take `&Asset` and the engine's types, because that is what the route has in hand. **Fix the test in Step 1 to match the final signatures before running Step 6** — construct an `Asset` and a `SellBreakdown` in the test (the `Asset` struct is `models::Asset`, all public fields; `SellBreakdown`/`LotMatch` are `schemas` types with public fields). This is the one place in this plan where the test is written against the interface it *should* have: write it against the implemented signature as soon as Step 3 lands.
-
 - [ ] **Step 4: Register the types and retype the response**
 
 In `backend_rust/src/openapi.rs`, add to `components(schemas(...))` after `schemas::SellPnlResponse`:
@@ -1306,4 +1373,1261 @@ git add backend_rust/src/schemas.rs backend_rust/src/openapi.rs backend_rust/src
         backend_rust/tests/tax_report_test.rs docs/openapi/openapi.json \
         frontend/src/types.ts frontend/src/types/api.d.ts
 git commit -m "feat(api): type the dated tax report payload and document it"
+```
+
+---
+
+## Task 4: The dated `tax-summary` route
+
+The route stops being undated: `from` and `to` are optional, either alone is legal, and with a window the response is the typed report from Task 3. Access stays `Access::Viewer` for every call, dated or not, and **no route is added** — so `tests/route_coverage_test.rs`'s hard counts stay at 15/15/13 and `to_document_path` (`:86-92`) keeps truncating at `?`.
+
+Three rules this task is the home of, all settled and none of them re-opened here: the 422/503 contract with capped lists, the 20 s elapsed deadline checked between outbound calls, and the undated path keeping its legacy response shape (the shipped statement and `PortfolioDetail` read `assets[].tax_lots`, `current_shares` and `total_portfolio_value`, which the typed payload does not carry).
+
+`?format=csv` is **Task 5**, deliberately: this task adds no `format` parameter and no unreachable branch.
+
+**Files:**
+- Modify: `backend_rust/src/api_routes/analytics.rs` (the handler, and the report machinery below it)
+- Modify: `backend_rust/src/schemas.rs` (`AssetTotals::empty`, `ReportTotals::zero` — helpers only, no field change, so the committed contract does not move)
+- Modify: `backend_rust/tests/common/mod.rs` (add `seed_daily_prices`)
+- Modify: `backend_rust/tests/isolation_test.rs` (the dated variant)
+- Modify: `backend_rust/tests/auth_test.rs` (the dated sweep pass and its stale comment)
+- Test: `backend_rust/tests/tax_report_test.rs`
+
+**Interfaces:**
+- Consumes: `replay_at`/`DatedLot`/`DatedReplay` (Task 2), the payload types (Task 3), and from `currency_service.rs`: `get_historical_prices` (public), `get_historical_prices_from_db`, `stored_window_is_fresh`, `select_rate`, `fx_symbol`, `FX_LOOKBACK_DAYS`, `PricingError` — all `pub(crate)`, so the route can reuse the layer's own rule without editing that file.
+- Produces, for Task 5 and 6:
+  ```rust
+  pub const REPORT_DEADLINE: Duration = Duration::from_secs(20);
+  pub const SPLITS_NOTE: &str;
+  pub struct ReportWindow { pub from: Option<NaiveDate>, pub to: NaiveDate }
+  pub struct MissingItems { .. }           // pub: caps are testable without a provider
+  pub struct ReportError { pub status: Status, pub body: ErrorBody }   // impl Responder
+  pub enum TaxSummaryResponse { Legacy(Json<serde_json::Value>), Report(Json<ReportResponse>) }
+  pub async fn build_tax_report(.., window: &ReportWindow, deadline: Duration)
+      -> Result<ReportResponse, ReportError>
+  ```
+
+- [ ] **Step 1: Add the dense-price helper and write the route tests**
+
+Append to `backend_rust/tests/common/mod.rs`:
+
+```rust
+/// A close for `symbol` on every calendar day in `[start, end]`. Dense on purpose: the
+/// pricing layer answers from the database only when the newest stored row is within
+/// `PRICE_WINDOW_FRESH_DAYS` of the date asked for, so a sparse seed reaches the
+/// provider and the test is no longer hermetic. `analytics_test.rs`'s own fixture skips
+/// weekends for the opposite reason — to exercise the gap — and that is why this one is
+/// shared rather than copied.
+#[allow(dead_code)]
+pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end: &str, close: &str) {
+    let mut day = NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap();
+    let last = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
+    while day <= last {
+        seed_price(pool, symbol, day, close).await;
+        day = day.succ_opt().expect("a date has a successor");
+    }
+}
+```
+
+Append to `backend_rust/tests/tax_report_test.rs`:
+
+```rust
+use backend_rust::api_routes::analytics::{build_tax_report, MissingItems, ReportError, ReportWindow};
+use backend_rust::models::{Portfolio, Transaction};
+use backend_rust::services::currency_service::{CurrencyService, PricingError};
+use common::{build_rocket, disabled_config, seed_price, seed_split_sync, setup_db, DEFAULT_USER};
+use rocket::http::Status;
+use rocket::local::asynchronous::Client;
+use sqlx::sqlite::SqlitePool;
+use std::time::Duration;
+
+/// One portfolio, two assets and four transactions, with a close seeded for each asset
+/// up to `through`. The window end a test uses must be no later than `through`, or the
+/// pricing layer stops answering from the database.
+///
+/// SOLDIT: buys 60 @ 100 (Jan) and 40 @ 120 (Mar), sells 80 @ 130 (May) and 10 @ 140
+/// (late June) — so 10 units are unmatched, which is the row kind that carries nulls.
+/// HELDIT: one buy of 50 @ 200 (Feb).
+async fn fixture(pool: &SqlitePool, through: &str) -> (i32, i32, i32) {
+    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "Dated", "USD").await;
+    let sold = common::seed_asset(pool, port_id, "SOLDIT", "Sold it").await;
+    let held = common::seed_asset(pool, port_id, "HELDIT", "Held it").await;
+
+    common::seed_transaction_at(pool, sold, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "BUY", 40.0, 120.0, 0.0, "2024-03-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "SELL", 80.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "SELL", 10.0, 140.0, 0.0, "2024-06-25T00:00:00Z").await;
+    common::seed_transaction_at(pool, held, "BUY", 50.0, 200.0, 0.0, "2024-02-01T00:00:00Z").await;
+
+    common::seed_daily_prices(pool, "SOLDIT", "2024-01-01", through, "110.0").await;
+    common::seed_daily_prices(pool, "HELDIT", "2024-02-01", through, "220.0").await;
+    // No split is seeded, so this only has to keep `sync_splits_for_asset` on its cache
+    // path for the undated call.
+    seed_split_sync(pool, "SOLDIT").await;
+    seed_split_sync(pool, "HELDIT").await;
+
+    (port_id, sold, held)
+}
+
+fn dec_at(v: &serde_json::Value, path: &str) -> Decimal {
+    Decimal::from_str(v.pointer(path).and_then(|p| p.as_str()).unwrap_or_else(|| panic!("{path} missing"))).unwrap()
+}
+
+#[tokio::test]
+async fn a_dated_report_sums_its_own_rows_and_agrees_with_the_undated_summary() {
+    // Goal 1, all three equalities, under all three strategies:
+    // (a) the sold-lot rows' `lot_pnl` sum to the asset's `realized_in_window`;
+    // (b) with `from` at the portfolio's first transaction, that sum is also the asset's
+    //     `realized_pnl` on the undated endpoint, which is fully driven here because the
+    //     window is the whole history and both calls price from the same seeded rows;
+    // (c) the open-lot rows' `unrealized_gain_loss` sums to `unrealized_at_end`.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    for strategy in ["FIFO", "LIFO", "HYBRID"] {
+        let dated = client
+            .get(format!(
+                "/api/portfolios/{port_id}/tax-summary?strategy={strategy}&threshold_days=30&from=2024-01-01&to={through}"
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(dated.status(), Status::Ok, "{strategy}");
+        let report: serde_json::Value = serde_json::from_str(&dated.into_string().await.unwrap()).unwrap();
+
+        for totals in report["asset_totals"].as_array().unwrap() {
+            let symbol = totals["symbol"].as_str().unwrap();
+            let rows: Vec<&serde_json::Value> = report["rows"].as_array().unwrap().iter()
+                .filter(|r| r["symbol"] == symbol)
+                .collect();
+
+            let sold: Decimal = rows.iter()
+                .filter(|r| r["row_type"] == "SOLD_LOT")
+                .map(|r| dec_at(r, "/lot_pnl"))
+                .sum();
+            assert_eq!(sold, dec_at(totals, "/realized_in_window"), "{strategy}/{symbol}: rows must sum to the server total");
+
+            let open: Decimal = rows.iter()
+                .filter(|r| r["row_type"] == "OPEN_LOT")
+                .map(|r| dec_at(r, "/unrealized_gain_loss"))
+                .sum();
+            assert_eq!(open, dec_at(totals, "/unrealized_at_end"), "{strategy}/{symbol}");
+        }
+
+        // The rollup is the server's, and the rows must not be the only source of it.
+        let rollup: Decimal = report["asset_totals"].as_array().unwrap().iter()
+            .map(|t| dec_at(t, "/realized_in_window"))
+            .sum();
+        assert_eq!(rollup, dec_at(&report, "/totals/realized_in_window"), "{strategy}");
+
+        let undated = client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?strategy={strategy}&threshold_days=30"))
+            .dispatch()
+            .await;
+        let summary: serde_json::Value = serde_json::from_str(&undated.into_string().await.unwrap()).unwrap();
+        for asset in summary["assets"].as_array().unwrap() {
+            let symbol = asset["symbol"].as_str().unwrap();
+            let dated_asset = report["asset_totals"].as_array().unwrap().iter()
+                .find(|t| t["symbol"] == symbol)
+                .unwrap();
+            assert_eq!(
+                dec_at(dated_asset, "/realized_cumulative"),
+                dec_at(asset, "/realized_pnl"),
+                "{strategy}/{symbol}: cumulative realized must equal what the Holdings tab shows",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_undated_call_still_returns_the_shape_the_statement_reads() {
+    // Review Focus 5. The printable statement and `PortfolioDetail` read `assets[].tax_lots`,
+    // `current_shares` and `total_portfolio_value`, none of which the typed report carries.
+    // If this test fails because `context` appears and `assets` does not, the typed payload
+    // has replaced the legacy response and both shipped screens are broken.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert!(body["assets"].is_array());
+    assert!(body["assets"][0]["tax_lots"].is_array());
+    assert!(body["assets"][0]["current_shares"].is_string());
+    assert!(body["total_portfolio_value"].is_string());
+    assert_eq!(body["strategy"], "FIFO");
+    assert!(body.get("rows").is_none(), "the legacy shape has no rows");
+    assert!(body.get("context").is_none(), "and no run context");
+}
+
+#[tokio::test]
+async fn the_undated_path_still_names_the_strategy_the_engine_used() {
+    // The spec's file 6 fix: the handler defaults but does not normalise, so
+    // `?strategy=average_cost` reports `average_cost` while the engine ran FIFO. The
+    // printable statement's run-context line is what depends on this, and the numbers do
+    // not move -- the engine already fell through to FIFO.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=average_cost&threshold_days=30"))
+        .dispatch()
+        .await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "FIFO", "the response must not name a method the engine did not use");
+}
+
+#[tokio::test]
+async fn a_window_end_on_a_non_trading_day_reports_the_close_it_used() {
+    // 2024-06-30 is a Sunday and the fixture stops on the Friday before it (2 days, inside
+    // `PRICE_WINDOW_FRESH_DAYS = 4`), so the database answers and the file states which
+    // close priced the position. Silent substitution is the failure Goal 5 names.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&to=2024-06-30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(report["context"]["requested_to"], "2024-06-30");
+    assert_eq!(
+        report["context"]["requested_from"], "2024-01-01",
+        "`to` alone is cumulative from the portfolio's first transaction",
+    );
+    for totals in report["asset_totals"].as_array().unwrap() {
+        assert_eq!(totals["price_date_used"], "2024-06-28", "{}", totals["symbol"]);
+        assert_eq!(totals["price_source"], "database");
+    }
+    for row in report["rows"].as_array().unwrap() {
+        assert_eq!(row["price_date_used"], "2024-06-28", "one close per asset, repeated on its rows");
+    }
+}
+
+#[tokio::test]
+async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
+    // A sell dated before `from` is out of the window's rows and out of
+    // `realized_in_window`, and still part of `realized_cumulative` — and the buy lots it
+    // consumed still show up as open lots (or not) at `end`. Getting this wrong changes a
+    // filed quarter.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&from=2024-06-01&to=2024-06-30"))
+        .dispatch()
+        .await;
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert!(report["rows"].as_array().unwrap().iter().all(|r| r["sell_date"].is_null() || r["sell_date"].as_str().unwrap() >= "2024-06-01"));
+    let soldit = report["asset_totals"].as_array().unwrap().iter()
+        .find(|t| t["symbol"] == "SOLDIT").unwrap();
+    // Only the 10 June units are in the window, and 10 of them are unmatched: FIFO takes
+    // the oldest lot first, and the May sell already consumed all 60 units of it.
+    assert_eq!(dec_at(soldit, "/realized_in_window"), dec("0.0"), "an unmatched tail realizes nothing");
+    assert_eq!(dec_at(soldit, "/realized_cumulative"), dec("1800.0") + dec("-0.0") + dec("0.0"));
+    let unmatched = report["rows"].as_array().unwrap().iter()
+        .filter(|r| r["row_type"] == "UNMATCHED")
+        .collect::<Vec<_>>();
+    assert_eq!(unmatched.len(), 1, "the June sell's unmatched tail is a row of its own");
+    assert!(unmatched[0]["realized_pnl"].is_null());
+    assert_eq!(unmatched[0]["unmatched_qty"], "10.0");
+}
+```
+
+`dec` is the helper already defined in Step 1 of Task 3.
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test --test tax_report_test`
+Expected: FAIL to compile — `build_tax_report` does not exist, and `from`/`to` are not accepted parameters. (The handler needs the query parameters before anything can be dispatched.)
+
+- [ ] **Step 3: Write the validation and failure-contract tests**
+
+Add to `backend_rust/tests/tax_report_test.rs`:
+
+```rust
+/// The validation failures, each of which names the parameter and carries two empty
+/// lists. They are all 422 with `retryable: false`: the client typed something the
+/// server cannot act on, and retrying changes nothing.
+#[tokio::test]
+async fn invalid_windows_are_422s_that_name_the_parameter() {
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let today = Utc::now().date_naive();
+    let tomorrow = (today + chrono::Duration::days(1)).to_string();
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("from after to", format!("from=2024-06-30&to=2024-06-01"), "from"),
+        ("future to", format!("to={tomorrow}"), "to"),
+        ("future from", format!("from={tomorrow}"), "from"),
+        ("unparseable to", "to=31-06-2024".to_string(), "to"),
+        ("unparseable from", "from=not-a-date".to_string(), "from"),
+        ("unknown strategy", "to=2024-06-30&strategy=average_cost".to_string(), "strategy"),
+        ("negative threshold", "to=2024-06-30&threshold_days=-1".to_string(), "threshold_days"),
+    ];
+
+    for (label, query, param) in cases {
+        let resp = client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?{query}"))
+            .dispatch()
+            .await;
+        assert_eq!(resp.status(), Status::UnprocessableEntity, "{label}");
+        let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains(param),
+            "{label}: the body must name the offending parameter, got {}",
+            body["error"],
+        );
+        assert_eq!(body["missing_prices"], serde_json::json!([]), "{label}");
+        assert_eq!(body["missing_rates"], serde_json::json!([]), "{label}");
+        assert_eq!(body["retryable"], false, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_portfolio_is_404_and_an_unknown_strategy_on_the_undated_path_is_not_an_error() {
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let missing = client.get("/api/portfolios/9999/tax-summary?strategy=FIFO").dispatch().await;
+    assert_eq!(missing.status(), Status::NotFound);
+
+    // Dated-only strictness (decision D6): the same unknown value that is a 422 with a
+    // window is a 200 without one.
+    let undated = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=average_cost"))
+        .dispatch()
+        .await;
+    assert_eq!(undated.status(), Status::Ok);
+}
+
+#[test]
+fn the_missing_item_lists_are_capped_and_the_totals_say_so() {
+    // The cap is testable without a provider because it is applied when the collected
+    // failures render, not when they are found. See Step 9 for why the collection itself
+    // has no hermetic test.
+    let mut missing = MissingItems::new();
+    for i in 0..21 {
+        missing.add_price(&format!("SYM{i}"));
+    }
+    for i in 0..11 {
+        missing.add_rate(&format!("C{i}"), "USD");
+    }
+    // Duplicates are not items: the list names symbols and pairs, once each.
+    missing.add_price("SYM0");
+    missing.add_rate("C0", "USD");
+
+    let body = missing.into_error_body("no price or rate exists at or before the requested date");
+    assert_eq!(body.missing_prices.len(), 20);
+    assert_eq!(body.missing_prices_total, 21);
+    assert_eq!(body.missing_rates.len(), 10);
+    assert_eq!(body.missing_rates_total, 11);
+    assert!(!body.retryable);
+}
+
+#[test]
+fn a_missing_rate_is_named_as_a_pair_not_a_symbol() {
+    let mut missing = MissingItems::new();
+    missing.add_rate("EUR", "USD");
+    let body = missing.into_error_body("no price or rate exists at or before the requested date");
+    assert_eq!(body.missing_rates[0].from, "EUR");
+    assert_eq!(body.missing_rates[0].to, "USD");
+    assert!(body.missing_prices.is_empty());
+}
+
+#[test]
+fn the_two_failure_classes_carry_the_right_status_and_retryable_flag() {
+    // The contract, pinned on the constructors rather than through a provider.
+    let no_data = ReportError::no_data(MissingItems::new());
+    assert_eq!(no_data.status, Status::UnprocessableEntity);
+    assert!(!no_data.body.retryable);
+
+    let provider = ReportError::provider("timeout".to_string());
+    assert_eq!(provider.status, Status::ServiceUnavailable);
+    assert!(provider.body.retryable);
+
+    let deadline = ReportError::deadline();
+    assert_eq!(deadline.status, Status::ServiceUnavailable);
+    assert!(deadline.body.retryable);
+
+    // `PricingError`'s two variants mean different user actions, and the report's mapping
+    // is the place that difference becomes a status code.
+    assert_eq!(pricing_failure_status(&PricingError::NoData), Status::UnprocessableEntity);
+    assert_eq!(
+        pricing_failure_status(&PricingError::ProviderUnavailable("timeout".to_string())),
+        Status::ServiceUnavailable,
+    );
+}
+
+#[tokio::test]
+async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
+    // The one hermetic route to a 503: the check runs before the first pricing step, so
+    // `Duration::ZERO` trips it with no outbound call at all. A test that waited 20 s
+    // would not be worth having.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let portfolio = load_fixture_portfolio(&pool, port_id).await;
+    let assets = load_fixture_assets(&pool, port_id).await;
+    let svc = CurrencyService::new();
+
+    let err = build_tax_report(
+        &pool, &svc, &portfolio, &assets, "FIFO", 30,
+        &ReportWindow { from: None, to: day("2024-06-30") },
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("a zero deadline must not produce a report");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert!(err.body.retryable);
+    assert!(err.body.missing_prices.is_empty(), "no partial payload, and no missing items either");
+}
+```
+
+`load_fixture_portfolio` / `load_fixture_assets` are two three-line helpers in the test file that read the rows back through SQLx (`SELECT * FROM portfolios WHERE id = ?`, `SELECT * FROM assets WHERE portfolio_id = ?`), because `build_tax_report` takes the loaded rows rather than the ids.
+
+- [ ] **Step 4: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test --test tax_report_test`
+Expected: FAIL to compile (`MissingItems`, `ReportError`, `build_tax_report`, `pricing_failure_status`).
+
+- [ ] **Step 5: Implement the window, the caps, and the error type**
+
+Append to `backend_rust/src/api_routes/analytics.rs`. Extend the imports at the top of that file:
+
+```rust
+use std::io::Cursor;
+use std::time::{Duration, Instant};
+use chrono::{NaiveDate, Utc};
+use rocket::http::{ContentType, Status};
+use rocket::request::Request;
+use rocket::response::{Responder, Response};
+use rocket::serde::json::Json;
+use crate::schemas::{
+    AssetTotals, ErrorBody, MissingRate, ReportContext, ReportResponse, ReportRow, ReportTotals,
+};
+use crate::services::currency_service::{
+    fx_symbol, select_rate, stored_window_is_fresh, PricingError, FX_LOOKBACK_DAYS,
+};
+```
+
+```rust
+// ---------------------------------------------------------------------------
+// The dated tax report
+// ---------------------------------------------------------------------------
+
+/// Wall-clock bound on one report.
+///
+/// Checked between outbound calls, not between assets: one asset can cost two calls (a
+/// close and a currency pair), so a check placed between assets can be followed by 66 s
+/// of work — past the ingress' 60 s default, which turns the designed 503 into an HTML
+/// 504 with no typed body and no `retryable`. It cannot preempt a call already in flight;
+/// it refuses the next one. A cold portfolio can legitimately exceed this once and
+/// succeed on retry, because the first attempt warmed the per-pair series.
+pub const REPORT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The caps on the two missing-item lists (settled value: 20 symbols, 10 pairs). The list
+/// is for a human to read; a portfolio with 200 unpriced symbols needs the count, not the
+/// list, and `missing_*_total` is what keeps truncation from being silent.
+const MISSING_PRICES_CAP: usize = 20;
+const MISSING_RATES_CAP: usize = 10;
+
+/// The run context's splits statement. A constant in the payload rather than prose in each
+/// renderer, because the CSV carries it as a cell and the file's first row is the header
+/// row.
+pub const SPLITS_NOTE: &str =
+    "Split-adjusted history is as recorded when this report was generated; a split recorded later changes past figures.";
+
+/// The window a dated request asks about, after defaults are applied.
+pub struct ReportWindow {
+    /// `None` means inception — or "the portfolio has no transaction at all".
+    pub from: Option<NaiveDate>,
+    pub to: NaiveDate,
+}
+
+/// Pricing failures collected across every asset, so one response can name all of them
+/// instead of failing on the first (Goal 5).
+///
+/// `pub` so `tests/tax_report_test.rs` can pin the caps: the collection itself cannot be
+/// exercised hermetically (see Step 9), and the cap is the part of that contract that can.
+#[derive(Default)]
+pub struct MissingItems {
+    prices: Vec<String>,
+    rates: Vec<MissingRate>,
+}
+
+impl MissingItems {
+    pub fn new() -> Self { Self::default() }
+
+    /// Once per symbol, in the order first seen.
+    pub fn add_price(&mut self, symbol: &str) {
+        if !self.prices.iter().any(|s| s == symbol) {
+            self.prices.push(symbol.to_string());
+        }
+    }
+
+    /// Once per pair. A missing rate is a pair, not a symbol, and `missing_rates` says so.
+    pub fn add_rate(&mut self, from: &str, to: &str) {
+        if !self.rates.iter().any(|r| r.from == from && r.to == to) {
+            self.rates.push(MissingRate { from: from.to_string(), to: to.to_string() });
+        }
+    }
+
+    pub fn is_empty(&self) -> bool { self.prices.is_empty() && self.rates.is_empty() }
+
+    /// Totals are counted before truncation, so a client can tell a short list from a
+    /// complete one.
+    pub fn into_error_body(self, error: &str) -> ErrorBody {
+        let prices_total = self.prices.len();
+        let rates_total = self.rates.len();
+        ErrorBody {
+            error: error.to_string(),
+            missing_prices: self.prices.into_iter().take(MISSING_PRICES_CAP).collect(),
+            missing_rates: self.rates.into_iter().take(MISSING_RATES_CAP).collect(),
+            missing_prices_total: prices_total,
+            missing_rates_total: rates_total,
+            retryable: false,
+        }
+    }
+}
+
+/// The route's one error type, in the style of the auth `Unavailable` responder
+/// (`auth/routes.rs:33-52`): a responder, so `Result<..>` needs no conversion layer, and
+/// public with public fields so a test can assert a failure it produced directly.
+pub struct ReportError {
+    pub status: Status,
+    pub body: ErrorBody,
+}
+
+impl ReportError {
+    /// A parameter the client can fix. 422, never retryable.
+    pub fn validation(param: &str, detail: &str) -> Self {
+        Self::plain(Status::UnprocessableEntity, format!("{param}: {detail}"), false)
+    }
+
+    /// Prices or rates that do not exist at or before the requested date. 422: asking
+    /// again changes nothing.
+    pub fn no_data(missing: MissingItems) -> Self {
+        Self {
+            status: Status::UnprocessableEntity,
+            body: missing.into_error_body("no price or rate exists at or before the requested date"),
+        }
+    }
+
+    /// A provider we could not ask. 503: the same request may succeed later.
+    pub fn provider(detail: String) -> Self {
+        Self::plain(Status::ServiceUnavailable, format!("pricing provider unavailable: {detail}"), true)
+    }
+
+    /// The elapsed deadline. Same 503 as an outage, and fail-closed: no partial payload.
+    pub fn deadline() -> Self {
+        Self::plain(
+            Status::ServiceUnavailable,
+            format!("the report exceeded its {} second deadline", REPORT_DEADLINE.as_secs()),
+            true,
+        )
+    }
+
+    pub fn not_found() -> Self {
+        Self::plain(Status::NotFound, "portfolio not found".to_string(), false)
+    }
+
+    pub fn internal(detail: String) -> Self {
+        Self::plain(Status::InternalServerError, detail, false)
+    }
+
+    /// `require` answers `NotFound` for a portfolio the caller cannot see, and
+    /// `InternalServerError` when the access check itself failed (`access.rs:78-93`).
+    pub fn from_status(status: Status) -> Self {
+        match status {
+            Status::NotFound => Self::not_found(),
+            other => Self::internal(format!("access check failed: {}", other.reason().unwrap_or("unknown"))),
+        }
+    }
+
+    fn plain(status: Status, error: String, retryable: bool) -> Self {
+        Self {
+            status,
+            body: ErrorBody {
+                error,
+                missing_prices: Vec::new(),
+                missing_rates: Vec::new(),
+                missing_prices_total: 0,
+                missing_rates_total: 0,
+                retryable,
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for ReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReportError({}, {})", self.status, self.body.error)
+    }
+}
+
+impl<'r> Responder<'r, 'static> for ReportError {
+    fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
+        // Infallible in practice; the fallback is a valid body rather than a second
+        // failure mode.
+        let body = serde_json::to_string(&self.body)
+            .unwrap_or_else(|_| r#"{"error":"internal","retryable":false}"#.to_string());
+        Response::build()
+            .status(self.status)
+            .header(ContentType::JSON)
+            .sized_body(body.len(), Cursor::new(body))
+            .ok()
+    }
+}
+
+/// The status a pricing failure maps to. Pure so the mapping is testable without a
+/// provider: `PricingError::NoData` is a fact about the world (422), and
+/// `ProviderUnavailable` is a fact about this attempt (503).
+pub fn pricing_failure_status(error: &PricingError) -> Status {
+    match error {
+        PricingError::NoData => Status::UnprocessableEntity,
+        PricingError::ProviderUnavailable(_) => Status::ServiceUnavailable,
+    }
+}
+
+/// The route's two shapes. The enum is hand-written rather than Rocket's `Either`: that
+/// type is re-exported `#[doc(hidden)]` (`rocket-0.5.1/src/lib.rs:186`), and this match is
+/// where Task 5 adds the CSV arm.
+pub enum TaxSummaryResponse {
+    Legacy(Json<serde_json::Value>),
+    Report(Json<ReportResponse>),
+}
+
+impl<'r> Responder<'r, 'static> for TaxSummaryResponse {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        match self {
+            TaxSummaryResponse::Legacy(json) => json.respond_to(request),
+            TaxSummaryResponse::Report(json) => json.respond_to(request),
+        }
+    }
+}
+
+fn parse_window(
+    from: Option<&str>,
+    to: Option<&str>,
+    today: NaiveDate,
+) -> Result<Option<ReportWindow>, ReportError> {
+    let (Some(from), Some(to)) = (from, to) else {
+        let parsed_from = from.map(|raw| parse_date_param("from", raw)).transpose()?;
+        let parsed_to = to.map(|raw| parse_date_param("to", raw)).transpose()?.unwrap_or(today);
+        if let Some(from) = parsed_from {
+            if from > parsed_to {
+                return Err(ReportError::validation("from", "must not be after `to`"));
+            }
+            if from > today {
+                return Err(ReportError::validation("from", "is in the future"));
+            }
+        }
+        if parsed_to > today {
+            return Err(ReportError::validation("to", "is in the future"));
+        }
+        return Ok(Some(ReportWindow { from: parsed_from, to: parsed_to }));
+    };
+    // Both are present: one window, validated the same way. `from` alone means through
+    // today and `to` alone means from inception — both-or-neither was rejected because it
+    // forces every caller to invent a start date, and an invented start silently changes
+    // the number.
+    let parsed_from = parse_date_param("from", from)?;
+    let parsed_to = parse_date_param("to", to)?;
+    if parsed_from > parsed_to {
+        return Err(ReportError::validation("from", "must not be after `to`"));
+    }
+    if parsed_from > today {
+        return Err(ReportError::validation("from", "is in the future"));
+    }
+    if parsed_to > today {
+        return Err(ReportError::validation("to", "is in the future"));
+    }
+    Ok(Some(ReportWindow { from: Some(parsed_from), to: parsed_to }))
+}
+
+fn parse_date_param(param: &str, raw: &str) -> Result<NaiveDate, ReportError> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map_err(|_| ReportError::validation(param, "expected YYYY-MM-DD"))
+}
+
+/// Strict on the dated path: a present-but-unrecognized strategy is a 422 naming the
+/// accepted values, rather than the silent fallback to FIFO that both this endpoint and
+/// the single-sell route used to run. Dated-path only (decision D6).
+fn strict_strategy(strategy: Option<&str>) -> Result<String, ReportError> {
+    match strategy {
+        None => Ok("FIFO".to_string()),
+        Some(raw) => match raw.to_uppercase().as_str() {
+            "FIFO" => Ok("FIFO".to_string()),
+            "LIFO" => Ok("LIFO".to_string()),
+            "HYBRID" => Ok("HYBRID".to_string()),
+            other => Err(ReportError::validation(
+                "strategy",
+                &format!("`{other}` is not one of FIFO, LIFO, HYBRID"),
+            )),
+        },
+    }
+}
+
+/// The undated path's rule, which is the sell-P&L route's (`analytics.rs:216-222`):
+/// normalize once and use the normalized value for both the engine call and the response,
+/// so the response can never name a matching method the engine did not use. It still
+/// falls back to FIFO rather than rejecting: "absent parameters reproduce today's
+/// behaviour" holds for an unrecognized one too.
+fn normalize_strategy(strategy: Option<&str>) -> String {
+    match strategy.unwrap_or_default().to_uppercase().as_str() {
+        "LIFO" => "LIFO".to_string(),
+        "HYBRID" => "HYBRID".to_string(),
+        _ => "FIFO".to_string(),
+    }
+}
+```
+
+- [ ] **Step 6: Implement the close resolution and the report builder**
+
+Still in `backend_rust/src/api_routes/analytics.rs`:
+
+```rust
+/// Why one asset's close could not be resolved.
+enum CloseFailure {
+    /// No close exists at or before the date. A 422 item, not a provider outage.
+    NoData,
+    /// We could not ask. A 503.
+    Provider(String),
+    /// The database itself failed. A 500.
+    Database(String),
+}
+
+/// The close for `symbol` on or before `to`, with the date that actually priced it and
+/// which source answered.
+///
+/// The read order is the pricing layer's, reused rather than re-invented:
+/// `stored_window_is_fresh` is the *same* predicate `get_historical_prices` applies
+/// (`currency_service.rs:713-717`), so the route's rule and the layer's cannot drift, and
+/// the provider is asked only when the stored window stops short of the requested date.
+/// The one thing this adds over calling `get_historical_prices` alone is the source flag
+/// Goal 4 requires: the layer returns a series, not where it came from.
+async fn resolve_close(
+    currency_service: &CurrencyService,
+    pool: &SqlitePool,
+    symbol: &str,
+    to: NaiveDate,
+) -> Result<(Decimal, NaiveDate, PriceSource), CloseFailure> {
+    let window_start = to - chrono::Duration::days(FX_LOOKBACK_DAYS);
+
+    let stored = currency_service
+        .get_historical_prices_from_db(symbol, window_start, to, pool)
+        .await
+        .map_err(|e| CloseFailure::Database(e.to_string()))?;
+    let newest = stored.iter().map(|(date, _)| *date).max();
+    if stored_window_is_fresh(newest, to) {
+        if let Some((date_used, close)) = select_rate(&stored, to, FX_LOOKBACK_DAYS) {
+            return Ok((close, date_used, PriceSource::Database));
+        }
+    }
+
+    match currency_service.get_historical_prices(symbol, window_start, to, pool).await {
+        Ok(series) => match select_rate(&series, to, FX_LOOKBACK_DAYS) {
+            Some((date_used, close)) => Ok((close, date_used, PriceSource::Provider)),
+            None => Err(CloseFailure::NoData),
+        },
+        Err(PricingError::NoData) => Err(CloseFailure::NoData),
+        Err(PricingError::ProviderUnavailable(detail)) => Err(CloseFailure::Provider(detail)),
+    }
+}
+
+/// Build the dated report.
+///
+/// `deadline` is a parameter rather than the constant alone so a test can pass
+/// `Duration::ZERO` and prove the fail-closed path without waiting 20 s.
+///
+/// Everything that leaves the process happens in this function's own loop, in a fixed
+/// order per asset — one pair fetch, then one close — with the deadline checked before
+/// each. That is the point of resolving the pair here rather than letting `replay_at`
+/// discover transaction dates one at a time: a range fetched now covers every date the
+/// replay will ask about, so the engine's per-transaction `get_rate` calls read
+/// `historical_prices` and the deadline can actually sit between the calls.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_tax_report(
+    pool: &SqlitePool,
+    currency_service: &CurrencyService,
+    portfolio: &Portfolio,
+    assets: &[Asset],
+    strategy: &str,
+    threshold_days: i64,
+    window: &ReportWindow,
+    deadline: Duration,
+) -> Result<ReportResponse, ReportError> {
+    let start = Instant::now();
+    let expired = || start.elapsed() >= deadline;
+
+    // Every asset's transactions first: the effective window's start is the portfolio's
+    // earliest transaction, which is not knowable one asset at a time.
+    let mut loaded: Vec<(Asset, Vec<Transaction>)> = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let txs = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
+            .bind(asset.id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ReportError::internal(e.to_string()))?;
+        loaded.push((asset.clone(), txs));
+    }
+
+    let first_in_scope = loaded
+        .iter()
+        .flat_map(|(_, txs)| txs.iter())
+        .filter(|tx| tx.date.date_naive() <= window.to)
+        .map(|tx| tx.date.date_naive())
+        .min();
+    let requested_from = window.from.or(first_in_scope);
+
+    let mut missing = MissingItems::new();
+    let mut asset_totals = Vec::new();
+    let mut rows = Vec::new();
+    let mut totals = ReportTotals::zero();
+
+    for (asset, txs) in &loaded {
+        let fx_applied = asset.currency != portfolio.base_currency;
+        // A split dated after the window end changed nothing inside the window, and the
+        // replay's filter is what makes that true of the figures as well as the flag.
+        let split_applied = txs.iter().any(|tx| {
+            tx.r#type.to_uppercase() == "SPLIT" && tx.date.date_naive() <= window.to
+        });
+
+        let in_scope = txs.iter().any(|tx| tx.date.date_naive() <= window.to);
+        if !in_scope {
+            // Nothing dated at or before the window end: nothing realized, nothing open,
+            // and no close to obtain — so no outbound call and no failure either.
+            asset_totals.push(AssetTotals::empty(asset, fx_applied, split_applied));
+            continue;
+        }
+
+        if fx_applied {
+            if expired() {
+                return Err(ReportError::deadline());
+            }
+            let pair = fx_symbol(&asset.currency, &portfolio.base_currency);
+            let earliest = txs.iter()
+                .map(|tx| tx.date.date_naive())
+                .min()
+                .expect("the asset has at least one transaction");
+            let warm_start = earliest - chrono::Duration::days(FX_LOOKBACK_DAYS);
+            match currency_service.get_historical_prices(&pair, warm_start, window.to, pool).await {
+                Ok(_) => {}
+                Err(PricingError::NoData) => {
+                    missing.add_rate(&asset.currency, &portfolio.base_currency);
+                    continue;
+                }
+                Err(PricingError::ProviderUnavailable(detail)) => {
+                    return Err(ReportError::provider(detail));
+                }
+            }
+        }
+
+        if expired() {
+            return Err(ReportError::deadline());
+        }
+        let (close, price_date_used, price_source) =
+            match resolve_close(currency_service, pool, &asset.symbol, window.to).await {
+                Ok(found) => found,
+                Err(CloseFailure::NoData) => {
+                    missing.add_price(&asset.symbol);
+                    continue;
+                }
+                Err(CloseFailure::Provider(detail)) => return Err(ReportError::provider(detail)),
+                Err(CloseFailure::Database(detail)) => return Err(ReportError::internal(detail)),
+            };
+
+        let replay = match TaxLotEngine::replay_at(
+            txs, window.to, window.to, close, &asset.currency, &portfolio.base_currency,
+            currency_service, strategy, threshold_days, pool,
+        )
+        .await
+        {
+            Ok(replay) => replay,
+            Err(e) => {
+                // `replay_at` can fail three ways and they are enumerated rather than
+                // inferred: the pricing layer's typed errors, a `sqlx` error, and
+                // `no_rate_error` — a plain `anyhow!` from that layer with no type tag
+                // (`currency_service.rs:277`), which is "this pair has no close near that
+                // date". The last one is the only remaining case.
+                if let Some(sq) = e.downcast_ref::<sqlx::Error>() {
+                    return Err(ReportError::internal(sq.to_string()));
+                }
+                if let Some(PricingError::ProviderUnavailable(detail)) = e.downcast_ref::<PricingError>() {
+                    return Err(ReportError::provider(detail.clone()));
+                }
+                missing.add_rate(&asset.currency, &portfolio.base_currency);
+                continue;
+            }
+        };
+
+        let in_window = |date: NaiveDate| {
+            requested_from.map_or(true, |from| date >= from) && date <= window.to
+        };
+        let realized_in_window: Decimal = replay.sell_breakdowns.iter()
+            .filter(|b| in_window(b.sell_date.date_naive()))
+            .map(|b| b.realized_pnl)
+            .sum();
+        let realized_cumulative: Decimal = replay.sell_breakdowns.iter()
+            .map(|b| b.realized_pnl)
+            .sum();
+        let market_value: Decimal = replay.open_lots.iter().map(|lot| lot.market_value).sum();
+        let cost_basis: Decimal = replay.open_lots.iter()
+            .map(|lot| lot.remaining_qty * lot.unit_cost)
+            .sum();
+        // Derived from the two sums rather than by adding the per-lot gains, so Goal 2's
+        // equality is a comparison of two independently computed figures.
+        let unrealized_at_end = market_value - cost_basis;
+
+        for breakdown in &replay.sell_breakdowns {
+            if !in_window(breakdown.sell_date.date_naive()) {
+                continue;
+            }
+            let sell = txs.iter()
+                .find(|tx| tx.id == breakdown.sell_transaction_id)
+                .expect("every breakdown came from this transaction set");
+            for matched in &breakdown.matches {
+                rows.push(ReportRow::sold_lot(
+                    asset, Some(price_date_used), replay.fx_rate_date_used,
+                    Some(price_source), sell, breakdown, matched,
+                ));
+            }
+            if breakdown.unmatched_qty > Decimal::ZERO {
+                rows.push(ReportRow::unmatched(
+                    asset, Some(price_date_used), replay.fx_rate_date_used,
+                    Some(price_source), sell, breakdown,
+                ));
+            }
+        }
+        for lot in &replay.open_lots {
+            rows.push(ReportRow::open_lot(
+                asset, Some(price_date_used), replay.fx_rate_date_used,
+                Some(price_source), lot,
+            ));
+        }
+
+        totals.realized_in_window += realized_in_window;
+        totals.realized_cumulative += realized_cumulative;
+        totals.unrealized_at_end += unrealized_at_end;
+        totals.market_value += market_value;
+        totals.cost_basis += cost_basis;
+
+        asset_totals.push(AssetTotals {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
+            asset_type: asset.asset_type.clone(),
+            asset_currency: asset.currency.clone(),
+            realized_in_window,
+            realized_cumulative,
+            unrealized_at_end,
+            market_value,
+            cost_basis,
+            price_date_used: Some(price_date_used),
+            fx_rate_date_used: replay.fx_rate_date_used,
+            price_source: Some(price_source),
+            fx_applied,
+            split_applied,
+        });
+    }
+
+    if !missing.is_empty() {
+        // Fail closed. A partial tax report is the outcome Goal 5 exists to prevent, so
+        // "return what was collected" is not an option.
+        return Err(ReportError::no_data(missing));
+    }
+
+    Ok(ReportResponse {
+        context: ReportContext {
+            portfolio_id: portfolio.id,
+            portfolio_name: portfolio.name.clone(),
+            base_currency: portfolio.base_currency.clone(),
+            strategy: strategy.to_string(),
+            threshold_days,
+            requested_from,
+            requested_to: window.to,
+            splits_note: SPLITS_NOTE.to_string(),
+        },
+        asset_totals,
+        totals,
+        rows,
+    })
+}
+```
+
+Add the two helpers to `backend_rust/src/schemas.rs` (methods only — the generated contract does not move, and Step 10 re-runs the generator to prove it):
+
+```rust
+impl AssetTotals {
+    /// An asset with nothing dated at or before the window end: no realized figure, no
+    /// open lot, and no close to report.
+    pub fn empty(asset: &Asset, fx_applied: bool, split_applied: bool) -> Self {
+        AssetTotals {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
+            asset_type: asset.asset_type.clone(),
+            asset_currency: asset.currency.clone(),
+            realized_in_window: Decimal::ZERO,
+            realized_cumulative: Decimal::ZERO,
+            unrealized_at_end: Decimal::ZERO,
+            market_value: Decimal::ZERO,
+            cost_basis: Decimal::ZERO,
+            price_date_used: None,
+            fx_rate_date_used: None,
+            price_source: None,
+            fx_applied,
+            split_applied,
+        }
+    }
+}
+
+impl ReportTotals {
+    pub fn zero() -> Self {
+        ReportTotals {
+            realized_in_window: Decimal::ZERO,
+            realized_cumulative: Decimal::ZERO,
+            unrealized_at_end: Decimal::ZERO,
+            market_value: Decimal::ZERO,
+            cost_basis: Decimal::ZERO,
+        }
+    }
+}
+```
+
+- [ ] **Step 7: Rewire the handler**
+
+Replace the body of `get_portfolio_tax_summary` in `backend_rust/src/api_routes/analytics.rs`. The signature gains two parameters and its return type changes; the `#[utoipa::path]` block is already the one Task 3 wrote.
+
+```rust
+#[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>")]
+pub async fn get_portfolio_tax_summary(
+    user: AuthedUser,
+    id: i32,
+    pool: &State<SqlitePool>,
+    currency_service: &State<CurrencyService>,
+    strategy: Option<String>,
+    threshold_days: Option<i64>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<TaxSummaryResponse, ReportError> {
+    // First statement in the body on purpose: `check_access_gate.sh`'s Rule B ends a
+    // handler at the first column-0 `}` and requires a `require*` call before any
+    // `WHERE id` query anywhere in it.
+    require(pool.inner(), user.id, id, Access::Viewer)
+        .await
+        .map_err(ReportError::from_status)?;
+
+    let pool = pool.inner();
+    let today = Utc::now().date_naive();
+    let window = parse_window(from.as_deref(), to.as_deref(), today)?;
+
+    // Strict on the dated path, permissive on the undated one (decision D6).
+    let strategy_val = match &window {
+        Some(_) => strict_strategy(strategy.as_deref())?,
+        None => normalize_strategy(strategy.as_deref()),
+    };
+    let threshold_val = threshold_days.unwrap_or(30);
+    if window.is_some() && threshold_val < 0 {
+        return Err(ReportError::validation("threshold_days", "must not be negative"));
+    }
+
+    let portfolio = load_portfolio(pool, id).await?;
+    let assets = load_assets(pool, id).await?;
+
+    match window {
+        Some(window) => {
+            let report = build_tax_report(
+                pool, currency_service.inner(), &portfolio, &assets,
+                &strategy_val, threshold_val, &window, REPORT_DEADLINE,
+            )
+            .await?;
+            Ok(TaxSummaryResponse::Report(Json(report)))
+        }
+        None => {
+            let summary = undated_summary(pool, currency_service.inner(), &portfolio, &assets, &strategy_val, threshold_val).await?;
+            Ok(TaxSummaryResponse::Legacy(Json(summary)))
+        }
+    }
+}
+
+async fn load_portfolio(pool: &SqlitePool, id: i32) -> Result<Portfolio, ReportError> {
+    sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ReportError::internal(e.to_string()))?
+        .ok_or_else(ReportError::not_found)
+}
+
+async fn load_assets(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<Asset>, ReportError> {
+    sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = ?")
+        .bind(portfolio_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ReportError::internal(e.to_string()))
+}
+
+/// The undated response, moved verbatim out of the handler: same numbers, same shape,
+/// same keys, including the empty-portfolio early return and the splits sync this
+/// endpoint has always performed before reading. The dated path deliberately does not
+/// sync splits (issue #50).
+async fn undated_summary(
+    pool: &SqlitePool,
+    currency_service: &CurrencyService,
+    portfolio: &Portfolio,
+    assets: &[Asset],
+    strategy: &str,
+    threshold_days: i64,
+) -> Result<serde_json::Value, ReportError> {
+    if assets.is_empty() {
+        return Ok(serde_json::json!({
+            "assets": [],
+            "total_portfolio_value": "0",
+            "total_realized_pnl": "0",
+            "total_unrealized_pnl": "0"
+        }));
+    }
+
+    let mut asset_summaries = Vec::new();
+    let mut total_value = Decimal::ZERO;
+    let mut total_realized = Decimal::ZERO;
+    let mut total_unrealized = Decimal::ZERO;
+
+    for asset in assets {
+        // Auto-detect and persist any unrecorded stock splits for this asset before
+        // computing tax lots, so they feed into P&L and value.
+        let _ = currency_service.sync_splits_for_asset(asset, pool).await;
+
+        let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
+            .bind(asset.id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ReportError::internal(e.to_string()))?;
+
+        // A pricing failure is still exactly what it was on this path: a zero, and a 200
+        // response. This endpoint is undated, so the type change must not move a number
+        // here; a dated report is where an `Err` becomes an error instead.
+        let current_price = match currency_service
+            .get_price(&asset.symbol, asset.isin.as_deref(), pool)
+            .await
+        {
+            Ok(price) => price,
+            Err(e) => {
+                eprintln!("WARN: no price for {}: {}", asset.symbol, e);
+                Decimal::ZERO
+            }
+        };
+
+        let summary = TaxLotEngine::calculate_lots(
+            &asset.symbol, &asset.asset_type, &transactions, current_price,
+            &asset.currency, &portfolio.base_currency, currency_service,
+            strategy, threshold_days, pool,
+        )
+        .await
+        .map_err(|e| ReportError::internal(e.to_string()))?;
+
+        total_value += summary.market_value;
+        total_realized += summary.realized_pnl;
+        total_unrealized += summary.unrealized_pnl;
+        asset_summaries.push(summary);
+    }
+
+    Ok(serde_json::json!({
+        "assets": asset_summaries,
+        "total_portfolio_value": total_value.to_string(),
+        "total_realized_pnl": total_realized.to_string(),
+        "total_unrealized_pnl": total_unrealized.to_string(),
+        "strategy": strategy,
+        "threshold_days": threshold_days,
+        "currency": portfolio.base_currency,
+    }))
+}
+```
+
+- [ ] **Step 8: Add the dated variant to the access proofs**
+
+In `backend_rust/tests/isolation_test.rs`, extend `b_cannot_read_a_s_tax_summary_performance_or_sell_pnl` with the dated variant, in the same test so the denial and the success are adjacent:
+
+```rust
+    // The dated variant, which the grep-based access gate cannot see: it is a
+    // parameter-dependent path on an existing route, so this matrix is the real gate
+    // (Access level, spec). `require` runs before the window is even parsed, so B's
+    // dated request is a 404 and not a 422.
+    let dated_b = format!("/api/portfolios/{}/tax-summary?strategy=FIFO&threshold_days=365&from=2024-01-01&to=2024-12-31", u.a_portfolio);
+    assert_eq!(b.get(&dated_b).dispatch().await.status(), Status::NotFound);
+
+    // A's own dated request gets past the access check and stops at the window: the
+    // fixture has one transaction and no seeded close, so a window that could be answered
+    // would reach the provider. `from > to` proves the request arrived instead.
+    let invalid_a = format!("/api/portfolios/{}/tax-summary?from=2024-12-31&to=2024-01-01", u.a_portfolio);
+    assert_eq!(a.get(&invalid_a).dispatch().await.status(), Status::UnprocessableEntity);
+```
+
+The 200 path of the dated variant is covered in `tax_report_test.rs` with a seeded close, which this file does not seed.
+
+In `backend_rust/tests/auth_test.rs`, correct the stale comment and cover the dated variant. The `filter` closure currently appends strategy parameters to the two tax routes and its comment claims those routes *require* a strategy — `analytics.rs:59` defaults to FIFO, so that was never true:
+
+```rust
+            // The tax routes default `strategy` and `threshold_days`; the parameters are
+            // here so the sweep exercises the same shape the UI sends, not because the
+            // route requires them.
+            if path.ends_with("/tax-summary") || path.ends_with("/pnl") {
+                (r.method, format!("{path}?strategy=FIFO&threshold_days=365"))
+            } else if path.starts_with("/api/assets/lookup") {
+```
+
+and add a second, dated pass over the same path (no new entry, because no route is added):
+
+```rust
+#[tokio::test]
+async fn every_tax_route_denies_the_dated_variant_without_a_session() {
+    let client = oidc_client().await;
+    let dated = "/api/portfolios/1/tax-summary?strategy=FIFO&threshold_days=365&from=2024-01-01&to=2024-12-31";
+    assert_eq!(client.get(dated).dispatch().await.status(), Status::Unauthorized);
+    let csvish = "/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-12-31";
+    assert_eq!(client.get(csvish).dispatch().await.status(), Status::Unauthorized);
+}
+```
+
+- [ ] **Step 9: Record what cannot be tested here, and why**
+
+Two cases the spec asks for cannot be written as integration tests, and this plan does not pretend otherwise. Both are the same missing seam, and the compensating tests are in Step 3.
+
+1. **"A missing price returns 422 naming every missing symbol."** A seeded database cannot produce `Err(NoData)`: `get_historical_prices` answers from `historical_prices` when the window's newest row is within `PRICE_WINDOW_FRESH_DAYS` of the requested date, and otherwise asks the provider (`currency_service.rs:713-717`). There is no third path, so "no data" is only ever the provider's answer — and the provider is a hardcoded Yahoo URL (`CurrencyService::new()` takes no arguments, and the URL is built at `:756`), so a test that wants it reaches the network. What is pinned instead: the *shape* of the 422 (`missing_prices`, `missing_rates`, both totals, `retryable: false`) through the validation failures, which share the body; the caps and the pair-not-symbol rule through `MissingItems`; and `pricing_failure_status` for the mapping itself.
+2. **"An unreachable provider returns 503 with `retryable: true`."** Same seam, and the deadline test is the hermetic path to that body: `the_deadline_fails_closed_instead_of_returning_a_partial_report` asserts the status, `retryable`, and that no partial payload comes back.
+
+If a future change adds a provider seam, these two cases become writable and should be added; until then, a test asserting them would either hit the network or pass for the wrong reason.
+
+- [ ] **Step 10: Run every gate**
+
+```bash
+cd backend_rust && cargo test && bash scripts/check_access_gate.sh && cargo clippy --all-targets
+cargo run --bin backend_rust -- --print-openapi | diff - ../docs/openapi/openapi.json
+```
+
+Expected: all green, and the generator's output identical to the committed file — this task added methods to `schemas.rs`, not fields, so nothing in the contract moves. `check_access_gate.sh` must still report the same handler count it reported before: the handler still takes `AuthedUser` and calls `require` first.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add backend_rust/src/api_routes/analytics.rs backend_rust/src/schemas.rs \
+        backend_rust/tests/common/mod.rs backend_rust/tests/tax_report_test.rs \
+        backend_rust/tests/isolation_test.rs backend_rust/tests/auth_test.rs
+git commit -m "feat(api): serve a dated tax report from tax-summary"
 ```
