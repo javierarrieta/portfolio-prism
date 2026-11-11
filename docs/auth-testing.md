@@ -49,7 +49,7 @@ diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi
 ```
 
 ```fish
-# Frontend: 173 tests, types, lint
+# Frontend: 177 tests, types, lint
 cd ../frontend
 npm test
 npx tsc --noEmit
@@ -323,10 +323,17 @@ Either answer is useful. Neither can be found from here.
   dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
   is falsy, so a coincidental fallback can satisfy an eyeball comparison.
 - an empty portfolio prints a short note and no figures
-- all nine columns are on the page. The rightmost three — Realized, Unrealized, Unrealized ROI —
-  are what a too-wide table loses first, and `body` sets `overflow-x: hidden` (`index.css:47`), so
-  an over-wide table is clipped with no scrollbar and no warning. `print.css` shrinks the
-  statement table's cells to `6px 8px` at `0.75rem` to fit them.
+- all nine columns are on the page — **and run this check on a portfolio that can actually
+  overflow**: a mutual-fund holding, or one whose values reach 6-7 digits. On a small stock
+  position the table fits with room to spare and the check proves nothing; that is exactly the
+  blind check the smoke used to perform, and why its fixture was widened. The rightmost three —
+  Realized, Unrealized, Unrealized ROI — are what a too-wide table loses first, and the clip is
+  silent: `.main-content` computes `overflow-x: auto` (because it declares `overflow-y: auto`,
+  `index.css:163`), so an over-wide table is cut at that container and at the page box with no
+  scrollbar and no warning. `print.css` shrinks the statement table's cells to `4px 6px` at
+  `0.75rem` and lets the Type column break `MUTUAL_FUND`, which is enough for realistic but not
+  extreme data. A holding whose values reach 7 digits cannot fit nine columns on A4 portrait at
+  any legible size; if that is your portfolio, say so before you hand the page to an adviser.
 
 Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
 scoped, so printing from any other tab now also gets A4 with 14mm margins. The print palette

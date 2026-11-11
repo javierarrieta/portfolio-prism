@@ -30,11 +30,18 @@ describe('print.css', () => {
   });
 
   it('shrinks the nine-column table to fit the printed page box', () => {
-    // Without this the three rightmost columns are clipped silently by body's
-    // overflow-x:hidden. The rule must cover th as well as td: th is the wider of the two
-    // for min-content, and both tie .data-table's selector on specificity.
-    expect(css).toMatch(/\.statement-table\s+th\s*,\s*\.statement-table\s+td\s*\{[^}]*padding:\s*6px 8px/);
+    // Without this the three rightmost columns are clipped silently, at .main-content and
+    // at the page box. The rule must cover th as well as td: th is the wider of the two for
+    // min-content, and both tie .data-table's selector on specificity.
+    expect(css).toMatch(/\.statement-table\s+th\s*,\s*\.statement-table\s+td\s*\{[^}]*padding:\s*4px 6px/);
     expect(css).toMatch(/\.statement-table\s+th\s*,\s*\.statement-table\s+td\s*\{[^}]*font-size:\s*0\.75rem/);
+  });
+
+  it('lets the Type column break mid-token, and only the Type column', () => {
+    // td:nth-child(2) is Type, whose widest token MUTUAL_FUND cannot break on the underscore.
+    // Scoped on purpose: overflow-wrap anywhere on a numeric column would let a figure
+    // break mid-number, which is worse than the overflow it prevents.
+    expect(css).toMatch(/\.statement-table\s+td:nth-child\(2\)\s*\{[^}]*overflow-wrap:\s*anywhere/);
   });
 
   it('collapses the two-column grid and keeps the headline off a page break', () => {
@@ -43,7 +50,10 @@ describe('print.css', () => {
     expect(css).toMatch(/tr\s*\{[^}]*break-inside:\s*avoid/);
   });
 
-  it('declares A4 once, unscoped, because @page takes no selector', () => {
+  it('declares exactly one @page block, carrying A4 and 14mm', () => {
+    // Counts, so a second @page cannot be added unnoticed. It cannot see whether the block
+    // is nested inside @media print — nothing in this file can; the smoke's on-screen checks
+    // are what pin @media membership for the rules that would show on screen.
     const atPage = css.match(/@page\s*\{[^}]*\}/g) ?? [];
     expect(atPage).toHaveLength(1);
     expect(atPage[0]).toContain('size: A4');

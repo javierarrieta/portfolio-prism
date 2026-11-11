@@ -45,7 +45,7 @@ and LIFO. The claim it can make is "the strategy the app sent and the server ech
 "the strategy the engine used" — this route defaults the strategy but does not normalize it.
 
 **Printing from the other four tabs changes in two ways, not one.** `@page` takes no selector,
-so a print started from the dashboard, analytics or ledger now gets A4 with 14 mm margins
+so a print started from any of the other four tabs now gets A4 with 14 mm margins
 instead of the browser default. And the palette inversion is not scoped either: the `:root`
 variable overrides and the `.glass-card` override (`print.css:36-49`) sit inside `@media print`
 with no selector of their own, and `print.css` is imported globally (`main.tsx:4`), so on those
@@ -94,7 +94,7 @@ unaffected regardless, because rule 1 hides the sidebar there.
 
 ## What is verified, and what is not
 
-**Covered by `npm test` (20 files, 176 tests, green as of this note):**
+**Covered by `npm test` (20 files, 177 tests, green as of this note):**
 
 - `PortfolioStatement.test.tsx` — the structural hooks, the literal copy on **both** P&L labels,
   the nine table columns, the empty branch's negative list, the HYBRID-only threshold including
@@ -103,9 +103,10 @@ unaffected regardless, because rule 1 hides the sidebar there.
   nothing about the printed page.
 - `PrintCss.test.ts` — `print.css` read **as text**: both hide rules scoped with `:has()`,
   the inverted palette values, the `.statement-table td` border override, the `.statement-table`
-  cell-padding rule that makes nine columns fit the page, the white `.sidebar` background, the
-  break rules, and exactly one `@page` block declaring A4/14 mm. Text, not rendering — it cannot
-  tell you the rules apply to the elements they name.
+  cell-padding rule that makes nine columns fit the page, the Type-column token break, the white
+  `.sidebar` background, the break rules, and exactly one `@page` block declaring A4/14 mm. Text,
+  not rendering — it cannot tell you the rules apply to the elements they name, and it cannot see
+  `@media` membership at all; the smoke's on-screen checks are what close that.
 - `AppStatement.test.tsx` — the tab is reachable by the label a person can actually see; the
   statement root and the Print button are direct children of `.main-content`, which is the
   position the hide rules need (a wrapper there prints a blank page from a tab that looks
@@ -116,17 +117,29 @@ prerequisites in `frontend/e2e/README.md`) is the only test in the repository th
 print CSS: it emulates print media, checks the sidebar computes `display: none`, checks the
 text colour is `rgb(17, 17, 17)`, checks no control sits inside the printed subtree, checks
 for horizontal overflow at the A4 content box, and checks `page.pdf()` returns a non-empty
-buffer. **It has never been run.** The
+buffer. Before it emulates print media it also checks the sidebar is visible, still dark, and
+that a statement cell still carries its 16px padding — the only check anywhere that a print rule
+did not escape `@media print` into the running app, because `PrintCss.test.ts` reads the file as
+text and cannot see `@media` membership. **It has never been run.** The
 workspace that produced this change has no chromium and none was installed. It is
 syntax-checked and reviewed, which is not the same as executed, and the first real run should
-be read as a first run rather than a regression. When it does run it asserts **no figure** on
-purpose: prices come from a live provider, and a smoke that asserted figures would print
-zeros and still pass. The assertion most likely to fail on that first run is the
-horizontal-overflow check — nine columns inside a 608px box is a tight fit — and `print.css` now
-shrinks the statement table's cells to `6px 8px` at `0.75rem` specifically to fit them, so the
-expected outcome is a pass. If it fails anyway, the finding is about the shipped PDF (the printed
-table really is too wide for the page and the three rightmost P&L columns are being clipped), and
-the response is to shrink the table further, not to widen the smoke's viewport.
+be read as a first run rather than a regression. Its fixture is deliberately not the narrowest
+table the endpoint can produce: one plain `STOCK` position and one `MUTUAL_FUND` holding carrying
+a six-figure **recorded** realized loss, so the overflow check measures realistic column widths.
+Realized P&L is replayed from the seeded transactions rather than read from the live provider,
+so that loss is deterministic and the run still asserts **no figure** on purpose: prices come
+from a live provider, and a smoke that asserted figures would print zeros and still pass. The
+assertion most likely to fail on that first run is the horizontal-overflow check — nine columns
+inside a 608px box is a tight fit — and `print.css` now shrinks the statement table's cells to
+`4px 6px` at `0.75rem` and lets the Type column break `MUTUAL_FUND` specifically to fit them, so
+the expected outcome is a pass. If it fails anyway, the finding is about the shipped PDF: the
+printed table really is too wide for the page and the three rightmost P&L columns are being
+clipped. Widening the smoke's viewport is not the response, and neither is "make the CSS smaller" —
+for a table this content-bound the levers that move the ceiling are collapsing `.main-content`'s
+40px print padding (+80px), shortening the printed Type token, or moving the currency symbol into
+the column header (~+90px each). **A holding whose values reach 7 digits needs ~712px and cannot
+fit nine columns on A4 portrait at any legible size.** That is a decision about what the statement
+prints, not a CSS bug, and it is going to the owner.
 
 **There is no CI browser job.** Issue #45 is open. One is possible — CI could install chromium,
 and `emulateMedia` and `page.pdf()` need no display server — but the job is not browser-only:
@@ -145,8 +158,9 @@ this slice deliberately ships the print path unverified by CI.
 
 - No backend change of any kind: no new route, no new field, no new figure, no OpenAPI
   regeneration.
-- No print stylesheet for the dashboard, analytics or ledger tabs — no hide rules for them and
-  no layout work. Printing from them still prints the sidebar, the nav and a Recharts SVG, now
+- No print stylesheet for the other four tabs — no hide rules for them and
+  no layout work. Printing from them still prints the sidebar, the nav and the tab's own
+  content — including the Recharts SVGs on the analytics tab — now
   on A4 and now in the inverted palette.
 - No date parameter and no past-period statement. Today-only by decision; the dated artifact
   is the tax report, which is specified and not built.

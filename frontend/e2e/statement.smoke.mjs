@@ -39,15 +39,35 @@ async function seed() {
   // live provider, so a fixture that needs FX can fail outright on a rate nobody can
   // answer, or be priced at whatever older close the lookback substituted -- and this
   // smoke asserts no figure, so it must not depend on one.
-  for (const [symbol, name] of [['AAPL', 'Apple Inc.'], ['MSFT', 'Microsoft']]) {
-    const asset = await api(`/portfolios/${portfolio.id}/assets`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol, name, asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: '' }),
-    })
-    for (const [type, quantity, price, date] of [
+  //
+  // Width is the other half of the fixture. The first version seeded two STOCK assets at
+  // $100-130, which is the narrowest table this endpoint can produce -- widest unbreakable
+  // token "STOCK", ~40px -- so the overflow check at the bottom of this file passed for a
+  // reason unrelated to the risk it exists to catch. MUTUAL_FUND is the widest asset_type
+  // the app can store (types.ts:9) and the widest unbreakable token the table prints, and
+  // the recorded realized loss puts a leading-minus six-figure amount in the Realized
+  // column: 1200 x (5 - 120) = -$138,000.00. Both are deterministic -- realized P&L is
+  // replayed from these transactions, never read from the live provider -- so this still
+  // adds no figure assertion. At the first print padding this fixture measured ~632px
+  // against the 608px box and failed by ~24px; at 4px 6px it should land near 596px. If it
+  // fails on a real run that IS the finding: do not widen the viewport and do not narrow
+  // the fixture.
+  const holdings = [
+    { symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', txs: [
       ['BUY', '60', '100', '2024-01-01T00:00:00Z'],
       ['SELL', '20', '130', '2024-12-01T00:00:00Z'],
-    ]) {
+    ] },
+    { symbol: 'MSFT', name: 'Microsoft', asset_type: 'MUTUAL_FUND', txs: [
+      ['BUY', '1500', '120', '2024-01-01T00:00:00Z'],
+      ['SELL', '1200', '5', '2024-12-01T00:00:00Z'],
+    ] },
+  ]
+  for (const { symbol, name, asset_type, txs } of holdings) {
+    const asset = await api(`/portfolios/${portfolio.id}/assets`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, name, asset_type, sector: 'Technology', currency: 'USD', isin: '' }),
+    })
+    for (const [type, quantity, price, date] of txs) {
       await api(`/portfolios/${portfolio.id}/assets/${asset.id}/transactions`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type, quantity, price, fee: '0', date }),
@@ -77,15 +97,34 @@ try {
 
   // BEFORE emulateMedia, on screen: the sidebar must be visible. print.css keeps its
   // hide rules inside `@media print`, but PrintCss.test.ts reads the file as text and
-  // cannot see @media membership -- a hide rule duplicated outside the block passes it
-  // 5/5 while blanking the sidebar on screen. This is the assertion that catches that,
-  // and it is only meaningful while the media type is still screen.
+  // cannot see @media membership -- a hide rule duplicated outside the block passes every
+  // one of its tests while blanking the sidebar on screen. This is the assertion that
+  // catches that, and it is only meaningful while the media type is still screen.
   const onScreen = await page.locator('.sidebar').boundingBox()
   const onScreenDisplay = await page.locator('.sidebar').evaluate((el) => getComputedStyle(el).display)
   if (!onScreen || onScreen.width === 0 || onScreen.height === 0 || onScreenDisplay === 'none') {
     fail(`sidebar not visible on screen (box=${JSON.stringify(onScreen)} display=${onScreenDisplay}): a hide rule escaped @media print`)
   } else {
     ok('sidebar visible on screen, so the hide rules are inside @media print')
+  }
+
+  // Same argument, for the two rules that would be visible in the RUNNING APP if they
+  // escaped @media print: a white sidebar and a shrunken table. PrintCss.test.ts pins both
+  // as text and cannot see @media membership at all, so either escaping is green everywhere
+  // except here.
+  const sidebarBg = await page.locator('.sidebar').evaluate((el) => getComputedStyle(el).backgroundColor)
+  if (sidebarBg === 'rgb(255, 255, 255)') {
+    fail(`sidebar computes backgroundColor ${sidebarBg} on screen: the print background rule escaped @media print`)
+  } else {
+    ok(`sidebar keeps its dark background on screen (${sidebarBg})`)
+  }
+
+  const tdPadding = await page.locator('[data-print="statement"] td').first()
+    .evaluate((el) => getComputedStyle(el).padding)
+  if (tdPadding !== '16px') {
+    fail(`statement td computes padding ${tdPadding} on screen, expected 16px: the print typography rule escaped @media print`)
+  } else {
+    ok('statement table keeps its 16px on-screen padding')
   }
 
   await page.emulateMedia({ media: 'print' })
@@ -117,9 +156,10 @@ try {
   if (interactive !== 0) fail(`${interactive} interactive elements inside the printed subtree`)
   ok('printed subtree holds no controls')
 
-  // Measured ON THE STATEMENT, not the document. index.css:47 sets
-  // body{overflow-x:hidden}, which propagates to the viewport, so a document-level
-  // check can never fail -- it clips silently.
+  // Measured ON THE STATEMENT, not the document. .main-content declares overflow-y:auto
+  // (index.css:163), which makes its computed overflow-x auto too, so an over-wide table
+  // is clipped at that container and at the page box instead of being reported by the
+  // document -- a document-level check can never fail.
   //
   // Viewport set to the printed page box first, because emulateMedia({media:'print'})
   // changes the media type but NOT the layout viewport: at 1400px this could only fail

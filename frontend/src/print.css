@@ -67,24 +67,44 @@
         paper. The box: A4 is 210mm wide and `@page` above takes 14mm of it on each side,
         so the content box is 182mm = 688px at 96dpi; .main-content keeps the 40px side
         padding index.css:162 gives it, so the statement is laid out in 608px. A table
-        cannot shrink below min-content and body sets overflow-x:hidden (index.css:47), so
-        an over-wide table is clipped silently — losing Realized, Unrealized and
-        Unrealized ROI, which are the point of the artifact. At .data-table's 16px cell
-        padding (index.css:246) the horizontal padding alone costs 32px x 9 columns =
-        288px, 47% of the 608px box before a single glyph, and td inherits the 16px body
-        font (only th drops to 0.875rem, index.css:242), which puts min-content past what
-        remains. At 6px 8px the padding is 16px x 9 = 144px, leaving ~464px for content
-        instead of ~320px, and 0.75rem shrinks the widest unbreakable word in each column
-        ("Unrealized", "$1,200.00") by the same ratio. Specificity ties .data-table th/td
-        at (0,1,1), so source order decides: print.css is imported after index.css
-        (main.tsx:4). .main-content's own 40px is deliberately left alone — the smoke
-        measures the shipped 608px box, and collapsing it would widen the very thing that
-        assertion checks. */
+        cannot shrink below min-content, and an over-wide one is clipped silently: at
+        .main-content — whose computed overflow-x is auto, because index.css:163 sets
+        overflow-y:auto and a `visible` paired with a non-visible overflow computes to
+        auto — and again at the page box. Nothing scrolls and nothing warns you; Realized,
+        Unrealized and Unrealized ROI are just not on the sheet. At .data-table's 16px cell
+        padding (index.css:246) the horizontal padding alone costs 32px x 9 columns = 288px,
+        47% of the 608px box before a single glyph, and td inherits the 16px body font (only
+        th drops to 0.875rem, index.css:242), which puts min-content far past what remains.
+        4px 6px is where this lands: 12px x 9 = 108px of padding, leaving ~500px for
+        content — 36px more than 6px 8px left (2px x 2 sides x 9 cells), and 180px more
+        than the on-screen padding. The font stays at 0.75rem on purpose: 12px is ~9pt,
+        ordinary print body size, and going to 11px buys only ~48px while shrinking exactly
+        the digits an adviser reconciles against the full-precision CSV export. 4px vertical
+        keeps a ~24px row (~6.4mm) and every row already carries a 1px rule, so the table
+        does not collapse into a wall of text; 6px horizontal is a 1.6mm gutter, adequate
+        between numeric columns. Specificity ties .data-table th/td at (0,1,1), so source
+        order decides: print.css is imported after index.css (main.tsx:4).
+        This is a ceiling, not a solution: a holding whose values reach 7 digits needs
+        ~712px and cannot fit nine columns on A4 portrait at legible size. The levers that
+        move that ceiling are collapsing .main-content's 40px print padding (+80px),
+        shortening the printed Type token, or moving the currency symbol into the column
+        header (~+90px each) — a content decision, not a CSS one. .main-content's 40px is
+        left alone here because the smoke measures the shipped 608px box, and collapsing it
+        would widen the very thing that assertion checks. */
   .statement-table th,
   .statement-table td {
-    padding: 6px 8px;
+    padding: 4px 6px;
     font-size: 0.75rem;
   }
+
+  /* The Type column, and only it, may break mid-token. MUTUAL_FUND is a valid AssetType
+        (types.ts:9) and what the backend normalises "Mutual Fund" to (lookup.rs:116), and
+        it is the widest unbreakable token this table can print: `_` is not a line-break
+        opportunity under UAX #14, so all 11 characters claim their column at once — worth
+        ~46px at 0.75rem. Scoped to that column deliberately: overflow-wrap anywhere on a
+        numeric column would let "-$138,000.00" break mid-number, which is worse than the
+        overflow it prevents. */
+  .statement-table td:nth-child(2) { overflow-wrap: anywhere; }
 
   /* 5. Break rules. */
   tr { break-inside: avoid; }

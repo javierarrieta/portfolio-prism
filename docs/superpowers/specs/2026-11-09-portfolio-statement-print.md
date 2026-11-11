@@ -255,7 +255,7 @@ which is load-bearing in CSS and asserted once in the component test.
 | `data-testid="rounding-note"` | `Figures are rounded for display from full-precision calculations.` | no |
 | `data-testid="splits-note"` | `Split-adjusted history is as recorded when this page was loaded; late-recorded splits can change past figures.` | no |
 | `data-testid="empty-note"` | `No holdings in this portfolio on Nov 9, 2026.` | yes, alone |
-| `data-testid="run-context"` | `{portfolio name} · {base currency} · {strategy}`, and when strategy is `HYBRID` a trailing ` (threshold {threshold_days}d)` — the leading space is part of the appended segment, not of the base string | no |
+| `data-testid="run-context"` | `{portfolio name} · {base currency} · {strategy}`, and when strategy is `HYBRID` **and the payload also carries `threshold_days`** a trailing ` (threshold {threshold_days}d)` — the leading space is part of the appended segment, not of the base string. The backend always sends `threshold_val` (`analytics.rs:110-112`), so the guard is defensive rather than a fourth state | no |
 
 Layer 1 freezes the clock — `vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-09T10:30:00'))` —
 so the three templated rows are assertable as literals. `test/setup.ts:3` pins `process.env.TZ =
@@ -403,9 +403,8 @@ inverts.
 
 **The hide rules are scoped to the statement tab by `:has()`.** Unscoped rules are not acceptable:
 rule 2 as `.main-content > *:not([data-print="statement"])` hides every direct child of
-`.main-content` on the dashboard, analytics and ledger tabs, because nothing there carries that
-attribute — Ctrl-P on three of four tabs would print a blank A4 sheet, where today it prints the
-dashboard. `:has()` expresses the scoping with no JavaScript, so there is no lifecycle to get wrong
+`.main-content` on every tab that does not carry that attribute — Ctrl-P on four of the five tabs
+would print a blank A4 sheet, where today it prints the dashboard. `:has()` expresses the scoping with no JavaScript, so there is no lifecycle to get wrong
 and no attribute that can outlive the component; the repo touches `document.body` exactly once
 today, to append a download anchor (`utils/download.ts:33`), and this slice does not change that.
 `:has()` is baseline (Chrome 105, Safari 15.4, Firefox 121) and the repo sets no browserslist
@@ -469,8 +468,8 @@ Add the rule in the change that first needs it.
 
 #### Other tabs, and what will not invert
 
-With the hide rules scoped as above, printing from the dashboard, analytics or ledger tab keeps
-its layout: sidebar, navigation, charts and all. That is not designed, it is unchanged, and it
+With the hide rules scoped as above, printing from any of the other four tabs keeps
+its layout: sidebar, navigation and whatever the tab holds, charts included. That is not designed, it is unchanged, and it
 is out of scope — the statement is the tab you print from, and the only one the smoke exercises.
 What changes for those tabs is **not** only `@page`, which no selector can scope: they now get A4
 with 14 mm margins, and the palette overrides at `print.css:36-49` sit inside `@media print` with
@@ -515,7 +514,9 @@ the only one of the three that got an explicit override, for the reason just giv
     `empty-note` is present with its specified text; `holdings` has the nine `<th>` strings from
     *Structural hooks and the holdings table* and one `<tr>` per asset; the run-context line carries
     the payload's echoed `strategy` and `threshold_days`, with `threshold_days` absent for a
-    non-HYBRID fixture.
+    non-HYBRID fixture **and a HYBRID fixture with `threshold_days` omitted printing no threshold
+    segment** — the guard at `PortfolioStatement.tsx:19-22` is defensive, since `analytics.rs:110-112`
+    always sends `threshold_val`.
 
     *Structure, empty fixture* (`assets: []`): `empty-note` and `generated-at` present, and **absent**
     — `data-at`, `rounding-note`, `splits-note`, `run-context`, and all three figure hooks.
@@ -536,8 +537,9 @@ the only one of the three that got an explicit override, for the reason just giv
         the `auth_error=auth_failed` query param and is not in the DOM under this harness.
     *   no horizontal overflow, measured **on the statement**, not the document:
         `expect(await el.scrollWidth()) <= (await el.clientWidth())` for `[data-print="statement"]`.
-        A document-level check is meaningless here — `index.css:47` sets `body { overflow-x: hidden }`,
-        which propagates to the viewport, so the document never reports overflow; it clips silently.
+        A document-level check is meaningless here: `.main-content` declares `overflow-y: auto`
+        (`index.css:163`), which makes its computed `overflow-x` `auto` as well, so an over-wide
+        table is clipped at that container and at the page box and the document never reports it.
         The viewport is resized to the `@page` content box (688px) before the check, because
         `emulateMedia` changes the media type but not the layout viewport, and at the harness's
         1400×1000 this could only fail at a width nobody prints at.
@@ -663,7 +665,7 @@ the page still prints badly. The Playwright smoke is the check; see Alternative 
 | **Empty portfolio prints zeros.** | `analytics.rs:45-51` returns zeros with no `currency` | Goal 7 and *Empty portfolio*: heading, printed date and the empty note only. The negative list is asserted. |
 | **A stale payload prints under the wrong portfolio name.** | `setTaxSummary` is called once (`App.tsx:114`) and never cleared | Target Files 4 gives the form: record the id beside the summary, guard the statement branch, following `App.tsx:68`. |
 | **A print started from another tab is not designed.** | The hide rules are scoped to the statement tab, so other tabs keep their layout | Out of scope and stated under *Other tabs*. Those tabs get two changes they did not ask for: `@page` (A4 with 14 mm margins), which no selector can scope, and the unscoped palette overrides (`print.css:36-49`), which invert their text and cards. The sidebar's background is a hardcoded literal those overrides cannot reach, so `print.css` sets it to white explicitly rather than leave it dark-on-dark. |
-| **Foreign-currency figures are wrong, inherited.** | The pricing-layer spec records that foreign-currency assets cannot be priced correctly today | Not this slice's fix and not this slice's regression. The statement inherits the dashboard's existing behaviour; the pricing-layer change corrects both at once. |
+| **Foreign-currency figures are wrong, inherited.** | The pricing-layer spec recorded at drafting that foreign-currency assets could not be priced correctly; the malformed-pair cause it named has since been closed by that change | Not this slice's fix and not this slice's regression. The statement inherits the dashboard's existing behaviour; the pricing-layer change corrects both at once. |
 | **A failed tax-summary request prints the app shell, not a statement.** | `taxSummary` stays `null` → the guard renders nothing → the `:has()`-scoped hide rules do not match. The FX cause recorded at drafting (`currency_service.rs:234` → 500) was closed by the pricing-layer change | **Accepted gap**, specified in *When there is no payload at all*. The print gets the shell — sidebar, header, error banner — around an empty content column, in the inverted palette, because the palette overrides carry no selector. Not the dashboard, and not illegible. |
 
 ## Decided during drafting
