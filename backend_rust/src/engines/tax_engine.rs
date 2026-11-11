@@ -377,6 +377,9 @@ struct InternalLot {
     date: DateTime<Utc>,
     price: Decimal,
     qty: Decimal,
+    /// The quantity this lot was opened with, split-adjusted alongside `qty`, so a
+    /// lot that has been partly sold still reports what was bought.
+    original_qty: Decimal,
     unit_cost: Decimal,
 }
 
@@ -436,6 +439,7 @@ impl TaxLotEngine {
                     date: tx.date,
                     price: tx_price * tx_rate,
                     qty: tx_qty,
+                    original_qty: tx_qty,
                     unit_cost: unit_cost_base,
                 });
             } else if tx.r#type.to_uppercase() == "SELL" {
@@ -538,6 +542,7 @@ impl TaxLotEngine {
                     let ratio = tx_qty / denominator;
                     for lot in buy_lots.iter_mut() {
                         lot.qty *= ratio;
+                        lot.original_qty *= ratio;
                         lot.unit_cost /= ratio;
                         lot.price /= ratio;
                     }
@@ -612,9 +617,10 @@ impl TaxLotEngine {
                 let latent_roi = if lot_cost > Decimal::ZERO { latent_gain_loss / lot_cost } else { Decimal::ZERO };
 
                 open_lots.push(TaxLot {
+                    buy_transaction_id: lot.source_tx_id,
                     buy_date: lot.date,
                     buy_price: lot.price,
-                    original_qty: lot.qty,
+                    original_qty: lot.original_qty,
                     remaining_qty: lot.qty,
                     latent_gain_loss,
                     latent_roi,

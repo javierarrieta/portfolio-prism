@@ -189,6 +189,12 @@ export interface components {
       /** Format: date-time */
       buy_date: string;
       buy_price: string;
+      /**
+       * Format: int32
+       * @description The buy that opened this lot. Present so a lot can be joined back to the ledger
+       * row a person is reading.
+       */
+      buy_transaction_id: number;
       latent_gain_loss: string;
       latent_roi: string;
       original_qty: string;

@@ -1,7 +1,7 @@
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{build_rocket as lib_build_rocket, get_cors_options, init_db};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rocket::{Build, Rocket};
 use sqlx::SqlitePool;
 
@@ -214,4 +214,40 @@ pub async fn seed_transaction_at(
     .await
     .unwrap();
     res.0
+}
+
+/// One stored close. The pricing layer reads `historical_prices` before the provider,
+/// so a seeded row is what makes a test hermetic — see `stored_window_is_fresh`
+/// (`currency_service.rs:65`), which only answers when the newest row in the window is
+/// within `PRICE_WINDOW_FRESH_DAYS` of the date asked for.
+#[allow(dead_code)]
+pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close: &str) {
+    sqlx::query(
+        "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+             ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
+    )
+    .bind(symbol)
+    .bind(date)
+    .bind(close)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Pin split auto-detection for `symbol` so `sync_splits_for_asset` returns on its
+/// 30-day cache check instead of fetching. Same row `analytics_test.rs:218` writes.
+///
+/// The bound value must be a *bare* date: `sync_splits_for_asset`
+/// (`currency_service.rs:870`) parses this column with `NaiveDate::parse_from_str(..,
+/// "%Y-%m-%d")`, which rejects trailing input, so `datetime('now')` — a datetime string
+/// — fails the parse, falls through the cache check and fetches from Yahoo. Do not
+/// "simplify" the bind back to a SQL datetime function.
+#[allow(dead_code)]
+pub async fn seed_split_sync(pool: &SqlitePool, symbol: &str) {
+    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
+        .bind(symbol)
+        .bind(Utc::now().date_naive())
+        .execute(pool)
+        .await
+        .unwrap();
 }

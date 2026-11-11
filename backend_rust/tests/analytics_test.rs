@@ -1,6 +1,6 @@
 mod common;
 
-use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction};
+use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction, seed_transaction_at, seed_price, seed_split_sync};
 use chrono::{Datelike, NaiveDate, Utc};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
@@ -255,4 +255,36 @@ async fn performance_resolves_a_weekend_from_the_prior_weekday_close() {
         .find(|week| week["date"].as_str() == Some("2024-01-12"))
         .expect("the week holding the first BUY must report Friday's close");
     assert_eq!(buy_week["value"].as_str().unwrap().parse::<f64>().unwrap(), 10000.0);
+}
+
+#[tokio::test]
+async fn a_lot_reports_the_quantity_that_was_bought_and_the_buy_it_came_from() {
+    // Before this change `original_qty` and `remaining_qty` are both the already
+    // decremented quantity, so the Holdings table prints the same number twice and the
+    // originally-bought quantity is not recoverable from the response at all.
+    //
+    // Both seeds are load-bearing for hermeticity: `get_price` answers from today's row
+    // instead of fetching, and `sync_splits_for_asset` returns on its cache check
+    // instead of fetching. Neither call is mocked, so without them this test hits the
+    // network and takes seconds.
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Lot qty", "USD").await;
+    let asset_id = seed_asset(&pool, port_id, "LOTQTY", "Lot qty").await;
+    let buy = seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    seed_transaction_at(&pool, asset_id, "SELL", 20.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
+    seed_price(&pool, "LOTQTY", Utc::now().date_naive(), "110.0").await;
+    seed_split_sync(&pool, "LOTQTY").await;
+
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    let lot = &body["assets"][0]["tax_lots"][0];
+
+    assert_eq!(lot["buy_transaction_id"], buy, "the lot must name the buy it came from");
+    assert_eq!(lot["original_qty"], "60.0", "60 were bought");
+    assert_eq!(lot["remaining_qty"], "40.0", "20 were sold");
 }

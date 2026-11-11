@@ -81,6 +81,7 @@ export const normalizeTaxSummary = (t: unknown): TaxSummary => {
         tax_lots: tax_lots.map((l: unknown) => {
           const lr = asRecord(l);
           return {
+            buy_transaction_id: num(lr, 'buy_transaction_id'),
             buy_date: str(lr, 'buy_date'),
             buy_price: num(lr, 'buy_price'), original_qty: num(lr, 'original_qty'),
             remaining_qty: num(lr, 'remaining_qty'), latent_gain_loss: num(lr, 'latent_gain_loss'),

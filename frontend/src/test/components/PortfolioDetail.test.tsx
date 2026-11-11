@@ -179,11 +179,12 @@ describe('PortfolioDetail', () => {
           realized_pnl: 0,
           tax_lots: [
             {
+              buy_transaction_id: 1,
               buy_date: '2024-01-15T00:00:00Z',
               buy_price: 150,
               original_qty: 50,
-              remaining_qty: 50,
-              latent_gain_loss: 1250,
+              remaining_qty: 30,
+              latent_gain_loss: 750,
               latent_roi: 0.1667,
             },
           ],

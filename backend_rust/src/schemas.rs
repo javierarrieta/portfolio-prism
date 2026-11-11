@@ -88,6 +88,9 @@ pub struct AssetUpdate {
 // --- Tax Lot Out ---
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TaxLot {
+    /// The buy that opened this lot. Present so a lot can be joined back to the ledger
+    /// row a person is reading.
+    pub buy_transaction_id: i32,
     pub buy_date: DateTime<Utc>,
     #[serde(with = "decimal_json")]
     pub buy_price: Decimal,
@@ -336,6 +339,7 @@ mod tests {
     #[test]
     fn test_tax_lot_roundtrip() {
         let lot = TaxLot {
+            buy_transaction_id: 7,
             buy_date: sample_datetime(),
             buy_price: Decimal::from_str("150.0").unwrap(),
             original_qty: Decimal::from_str("100.0").unwrap(),

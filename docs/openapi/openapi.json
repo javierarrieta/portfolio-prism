@@ -1081,6 +1081,7 @@
       "TaxLot": {
         "type": "object",
         "required": [
+          "buy_transaction_id",
           "buy_date",
           "buy_price",
           "original_qty",
@@ -1095,6 +1096,11 @@
           },
           "buy_price": {
             "type": "string"
+          },
+          "buy_transaction_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The buy that opened this lot. Present so a lot can be joined back to the ledger\nrow a person is reading."
           },
           "latent_gain_loss": {
             "type": "string"

@@ -40,6 +40,7 @@ export interface Portfolio {
 }
 
 export interface TaxLot {
+  buy_transaction_id: number;
   buy_date: string;
   buy_price: number;
   original_qty: number;
