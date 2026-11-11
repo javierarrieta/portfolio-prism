@@ -125,21 +125,27 @@ workspace that produced this change has no chromium and none was installed. It i
 syntax-checked and reviewed, which is not the same as executed, and the first real run should
 be read as a first run rather than a regression. Its fixture is deliberately not the narrowest
 table the endpoint can produce: one plain `STOCK` position and one `MUTUAL_FUND` holding carrying
-a six-figure **recorded** realized loss, so the overflow check measures realistic column widths.
-Realized P&L is replayed from the seeded transactions rather than read from the live provider,
-so that loss is deterministic and the run still asserts **no figure** on purpose: prices come
-from a live provider, and a smoke that asserted figures would print zeros and still pass. The
-assertion most likely to fail on that first run is the horizontal-overflow check — nine columns
-inside a 608px box is a tight fit — and `print.css` now shrinks the statement table's cells to
-`4px 6px` at `0.75rem` and lets the Type column break `MUTUAL_FUND` specifically to fit them, so
-the expected outcome is a pass. If it fails anyway, the finding is about the shipped PDF: the
-printed table really is too wide for the page and the three rightmost P&L columns are being
-clipped. Widening the smoke's viewport is not the response, and neither is "make the CSS smaller" —
-for a table this content-bound the levers that move the ceiling are collapsing `.main-content`'s
-40px print padding (+80px), shortening the printed Type token, or moving the currency symbol into
-the column header (~+90px each). **A holding whose values reach 7 digits needs ~712px and cannot
-fit nine columns on A4 portrait at any legible size.** That is a decision about what the statement
-prints, not a CSS bug, and it is going to the owner.
+a recorded realized loss of `-$13,800,000.00`, so the overflow check measures realistic column
+widths. Realized P&L is replayed from the seeded transactions rather than read from the live
+provider, so that loss is deterministic and the run still asserts **no figure** on purpose: prices
+come from a live provider, and a smoke that asserted figures would print zeros and still pass. The
+assertion most likely to fail is the horizontal-overflow check, and it is the one that matters here:
+whether nine columns fit the printed box is a question about glyph widths, so it was measured rather
+than argued — chromium, real print media, at the page content box, across portfolio shapes. A4 at
+210mm less `@page`'s 14mm margins is a **688px** content box, and `print.css` now collapses
+`.main-content`'s 40px side padding for the statement tab, so the statement gets all of it — on
+top of the two levers from the previous round, the statement table's cells down to `4px 6px` at
+`0.75rem` and the Type column allowed to break `MUTUAL_FUND` mid-token. Before
+that rule the box was 608px and a realized of `-$13,800,000.00` overflowed it by 9px; the widest
+shape tested peaked at 635px. Every shape measured now fits 688px with 50px or more to spare —
+which is why the fixture carries that loss:
+at 617px measured it passes with the padding rule and fails without it, so the rule cannot be
+deleted unnoticed. Widening the smoke's viewport is still not the response if it fails.
+
+**Padding is not a solution to an unbounded width problem.** A portfolio whose columns are wide
+enough will overflow again, and the clip stays silent — the smoke is the tripwire, not a guarantee.
+The levers left are content decisions, not CSS ones: shortening the printed Type token, or moving
+the currency symbol into the column header (~+90px each).
 
 **There is no CI browser job.** Issue #45 is open. One is possible — CI could install chromium,
 and `emulateMedia` and `page.pdf()` need no display server — but the job is not browser-only:

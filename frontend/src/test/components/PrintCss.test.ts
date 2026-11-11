@@ -44,6 +44,15 @@ describe('print.css', () => {
     expect(css).toMatch(/\.statement-table\s+td:nth-child\(2\)\s*\{[^}]*overflow-wrap:\s*anywhere/);
   });
 
+  it('collapses .main-content print padding for the statement only, and keeps 24px at the bottom', () => {
+    // The 80px this buys back is what the nine-column fit is measured against: the printed box
+    // is the full 688px @page content box, not 608px. The :has() scope is load-bearing —
+    // unscoped, every other tab loses its padding too — and specificity (0,2,0) beats
+    // .main-content's (0,1,0) in index.css without !important. The smoke's fixture is sized
+    // between the two boxes precisely so that deleting this rule fails the run.
+    expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
+  });
+
   it('collapses the two-column grid and keeps the headline off a page break', () => {
     expect(css).toMatch(/grid-template-columns:\s*1fr/);
     expect(css).toMatch(/\.statement-headline\s*\{[^}]*break-inside:\s*avoid/);

@@ -28,6 +28,20 @@
   /* 2. Collapse the 260px 1fr grid, or the page prints with a 260px gutter of nothing. */
   .app-container:has([data-print="statement"]) { grid-template-columns: 1fr; }
 
+  /* Give the table the 80px the shell was spending on it. .main-content's 40px side padding
+        (index.css:161-162) is screen chrome; on paper it is 80px of white between the page
+        margin and the only thing left on the sheet, and the table below is content-bound and
+        silently clipped when it runs out of room. This is the widest lever that does not ask
+        an adviser reading the page to decode an abbreviation, and the fit arithmetic in rule 4
+        is written against the box it produces. Scoped with :has() for the same reason the hide
+        rules are: unscoped it would strip the padding from every other tab's print too.
+        Specificity is (0,2,0) — :has() contributes the specificity of its most specific
+        argument, here the [data-print="statement"] attribute selector — against (0,1,0) for
+        .main-content, so it wins with no !important (and print.css is imported after
+        index.css regardless, main.tsx:3-4). 24px stays at the bottom so the last row is not
+        flush against the printed edge. */
+  .main-content:has([data-print="statement"]) { padding: 0 0 24px; }
+
   /* 3. Invert the palette. Legibility comes entirely from the TEXT overrides: text is
         always painted and does not depend on the "background graphics" setting. The
         background and border overrides are redundant in that sense and load-bearing in
@@ -65,17 +79,18 @@
 
   /* 4. Fit the nine columns on the page, or the three rightmost ones never reach the
         paper. The box: A4 is 210mm wide and `@page` above takes 14mm of it on each side,
-        so the content box is 182mm = 688px at 96dpi; .main-content keeps the 40px side
-        padding index.css:162 gives it, so the statement is laid out in 608px. A table
+        so the content box is 182mm = 688px at 96dpi, and the padding rule above hands the
+        statement all of it. (Before that rule .main-content kept its 40px each side and the
+        statement was laid out in 608px; every width below is against 688.) A table
         cannot shrink below min-content, and an over-wide one is clipped silently: at
         .main-content — whose computed overflow-x is auto, because index.css:163 sets
         overflow-y:auto and a `visible` paired with a non-visible overflow computes to
         auto — and again at the page box. Nothing scrolls and nothing warns you; Realized,
         Unrealized and Unrealized ROI are just not on the sheet. At .data-table's 16px cell
         padding (index.css:246) the horizontal padding alone costs 32px x 9 columns = 288px,
-        47% of the 608px box before a single glyph, and td inherits the 16px body font (only
+        42% of the 688px box before a single glyph, and td inherits the 16px body font (only
         th drops to 0.875rem, index.css:242), which puts min-content far past what remains.
-        4px 6px is where this lands: 12px x 9 = 108px of padding, leaving ~500px for
+        4px 6px is where this lands: 12px x 9 = 108px of padding, leaving ~580px for
         content — 36px more than 6px 8px left (2px x 2 sides x 9 cells), and 180px more
         than the on-screen padding. The font stays at 0.75rem on purpose: 12px is ~9pt,
         ordinary print body size, and going to 11px buys only ~48px while shrinking exactly
@@ -84,13 +99,17 @@
         does not collapse into a wall of text; 6px horizontal is a 1.6mm gutter, adequate
         between numeric columns. Specificity ties .data-table th/td at (0,1,1), so source
         order decides: print.css is imported after index.css (main.tsx:4).
-        This is a ceiling, not a solution: a holding whose values reach 7 digits needs
-        ~712px and cannot fit nine columns on A4 portrait at legible size. The levers that
-        move that ceiling are collapsing .main-content's 40px print padding (+80px),
-        shortening the printed Type token, or moving the currency symbol into the column
-        header (~+90px each) — a content decision, not a CSS one. .main-content's 40px is
-        left alone here because the smoke measures the shipped 608px box, and collapsing it
-        would widen the very thing that assertion checks. */
+        What is left was MEASURED, not estimated — chromium, real print media, at the page
+        content box, across portfolio shapes. The widest shape tested peaked at 635px and the
+        smoke's fixture, whose realized is -$13,800,000.00, measures 617px; a shape with a large
+        realized but small values in the other columns came back at 608px, which is the point —
+        it is the columns moving together that decide the width, not any one of them. Against
+        688px every shape measured fits with 50px or more to spare. That is a ceiling with a
+        number on it, not a solution: padding is finite and a holding's column content is not,
+        so a wide enough portfolio still overflows and is still clipped silently. The smoke's
+        fixture is sized to 617px on purpose — over the 608px box that existed before the padding
+        rule above, under the 688px box it produces — so deleting that rule fails the run instead
+        of quietly widening the margin. */
   .statement-table th,
   .statement-table td {
     padding: 4px 6px;

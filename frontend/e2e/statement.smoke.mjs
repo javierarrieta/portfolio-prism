@@ -45,21 +45,27 @@ async function seed() {
   // token "STOCK", ~40px -- so the overflow check at the bottom of this file passed for a
   // reason unrelated to the risk it exists to catch. MUTUAL_FUND is the widest asset_type
   // the app can store (types.ts:9) and the widest unbreakable token the table prints, and
-  // the recorded realized loss puts a leading-minus six-figure amount in the Realized
-  // column: 1200 x (5 - 120) = -$138,000.00. Both are deterministic -- realized P&L is
+  // the recorded realized loss puts a leading-minus eight-figure amount in the Realized
+  // column: 120000 x (5 - 120) = -$13,800,000.00. Both are deterministic -- realized P&L is
   // replayed from these transactions, never read from the live provider -- so this still
-  // adds no figure assertion. At the first print padding this fixture measured ~632px
-  // against the 608px box and failed by ~24px; at 4px 6px it should land near 596px. If it
-  // fails on a real run that IS the finding: do not widen the viewport and do not narrow
-  // the fixture.
+  // adds no figure assertion.
+  //
+  // That amount is chosen to straddle the two boxes this check can be run against, which makes
+  // it a regression test for print.css's `.main-content:has([data-print="statement"])` padding
+  // collapse. Measured in a browser at the printed page box, this fixture is 617px: over the
+  // 608px the statement gets while .main-content keeps its 40px side padding, under the 688px
+  // it gets once that padding is collapsed for the statement tab. Delete the rule and the
+  // overflow check below fails. The previous fixture (-$138,000.00, 608px measured, fitting
+  // exactly) fitted both boxes, so it could not see that rule go. If this fails on a real run
+  // that IS the finding: do not widen the viewport and do not narrow the fixture.
   const holdings = [
     { symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', txs: [
       ['BUY', '60', '100', '2024-01-01T00:00:00Z'],
       ['SELL', '20', '130', '2024-12-01T00:00:00Z'],
     ] },
     { symbol: 'MSFT', name: 'Microsoft', asset_type: 'MUTUAL_FUND', txs: [
-      ['BUY', '1500', '120', '2024-01-01T00:00:00Z'],
-      ['SELL', '1200', '5', '2024-12-01T00:00:00Z'],
+      ['BUY', '150000', '120', '2024-01-01T00:00:00Z'],
+      ['SELL', '120000', '5', '2024-12-01T00:00:00Z'],
     ] },
   ]
   for (const { symbol, name, asset_type, txs } of holdings) {
@@ -165,14 +171,15 @@ try {
   // changes the media type but NOT the layout viewport: at 1400px this could only fail
   // at a width nobody prints at. The shipped PDF lays out at the @page CONTENT box -- A4
   // at 210mm minus print.css:13's 14mm margins = 182mm = 688px at 96dpi. (794px is the
-  // whole sheet; the browser lays no content into the margins.) print.css shrinks the
-  // statement table's cells but overrides no container padding, so .main-content keeps the
-  // 40px each side index.css:162 gives it and the statement's box is 688 - 80 = 608px. A
-  // 688px viewport reproduces that 608px exactly, so the residual against what ships is
-  // zero. Nine columns at the on-screen 16px cell padding need 288px of padding alone, which
-  // is what print.css's .statement-table rule buys back -- see the arithmetic in the comment
-  // there. (.main-content is overflow-y:auto, so a page tall enough to scroll would shave
-  // ~15px off clientWidth -- stricter than the printed page, never more permissive.)
+  // whole sheet; the browser lays no content into the margins.) print.css collapses
+  // .main-content's 40px side padding when the statement is what is printing, so the
+  // statement's box IS that 688px content box and a 688px viewport reproduces it exactly --
+  // residual zero. (Before that rule the box was 688 - 80 = 608px and the same viewport
+  // reproduced it exactly: the box moved, the viewport did not need to.) Nine columns at the
+  // on-screen 16px cell padding need 288px of padding alone, which is what print.css's
+  // .statement-table rule buys back -- see the arithmetic in the comment there. (.main-content
+  // is overflow-y:auto, so a page tall enough to scroll would shave ~15px off clientWidth --
+  // stricter than the printed page, never more permissive.)
   //
   // If this fails on a real run it is a finding about the shipped PDF -- the printed
   // table really is too wide for the page -- not a broken assertion. Do not "fix" it by

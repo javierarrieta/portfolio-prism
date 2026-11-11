@@ -542,7 +542,12 @@ the only one of the three that got an explicit override, for the reason just giv
         table is clipped at that container and at the page box and the document never reports it.
         The viewport is resized to the `@page` content box (688px) before the check, because
         `emulateMedia` changes the media type but not the layout viewport, and at the harness's
-        1400×1000 this could only fail at a width nobody prints at.
+        1400×1000 this could only fail at a width nobody prints at. The statement's box is that
+        full 688px: `print.css` collapses `.main-content`'s 40px side padding under
+        `:has([data-print="statement"])`, so a 688px viewport reproduces what ships exactly. (It
+        did before that rule too, when the box was 688 − 80 = 608px — the box moved, the viewport
+        did not need to.) The fixture is sized to land between the two: 617px measured, so the
+        check fails if the padding rule is deleted.
     *   `page.pdf({ format: 'A4', preferCSSPageSize: true, printBackground: false })` is non-empty.
         The options are stated because Playwright's defaults are Letter with
         `preferCSSPageSize: false`, which would measure a page size this slice does not ship. **No

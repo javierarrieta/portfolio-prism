@@ -323,17 +323,27 @@ Either answer is useful. Neither can be found from here.
   dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
   is falsy, so a coincidental fallback can satisfy an eyeball comparison.
 - an empty portfolio prints a short note and no figures
-- all nine columns are on the page — **and run this check on a portfolio that can actually
-  overflow**: a mutual-fund holding, or one whose values reach 6-7 digits. On a small stock
-  position the table fits with room to spare and the check proves nothing; that is exactly the
-  blind check the smoke used to perform, and why its fixture was widened. The rightmost three —
+- all nine columns are on the page — **and run this check on a portfolio whose values reach six
+  digits or more**: a mutual-fund holding, or one carrying a realized P&L of six digits
+  (`-$123,456.00`) or more.
+  Six digits is the threshold because that is where the measurements say the room runs out — a
+  six-digit realized fit the printed box with zero pixels to spare, and the smoke's fixture
+  (`-$13,800,000.00`) overflowed it by 9px before the print padding was collapsed. On a small
+  stock position the table fits with room to spare and the check proves nothing; that is exactly
+  the blind check the smoke used to perform, and why its fixture was widened. The rightmost three —
   Realized, Unrealized, Unrealized ROI — are what a too-wide table loses first, and the clip is
   silent: `.main-content` computes `overflow-x: auto` (because it declares `overflow-y: auto`,
   `index.css:163`), so an over-wide table is cut at that container and at the page box with no
-  scrollbar and no warning. `print.css` shrinks the statement table's cells to `4px 6px` at
-  `0.75rem` and lets the Type column break `MUTUAL_FUND`, which is enough for realistic but not
-  extreme data. A holding whose values reach 7 digits cannot fit nine columns on A4 portrait at
-  any legible size; if that is your portfolio, say so before you hand the page to an adviser.
+  scrollbar and no warning. Three things buy the width, all in `print.css`: the statement table's
+  cells shrink to `4px 6px` at `0.75rem`, the Type column is allowed to break `MUTUAL_FUND`, and
+  `.main-content`'s 40px side padding is collapsed **for the statement tab only**. Measured in a
+  browser at the printed page box, that takes the box from 608px to 688px, and every shape tested —
+  through an eight-digit realized — fits with 50px or more to spare. So what to look for now: all
+  nine headers with their figures under them, the rightmost figure sitting inside the paper with
+  about the same gap as the leftmost one (the table now runs the full width of the text above it,
+  because the side padding is gone), and nothing half-cut at either edge. A missing or clipped
+  rightmost column means the table is over the page box — padding alone cannot fix that, so say so
+  before you hand the page to an adviser.
 
 Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
 scoped, so printing from any other tab now also gets A4 with 14mm margins. The print palette
