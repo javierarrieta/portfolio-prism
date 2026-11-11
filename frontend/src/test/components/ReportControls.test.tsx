@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ReportControls, { TaxReportTable } from '../../components/ReportControls'
-import { currentYearToDate } from '../../utils/reportWindow'
+import { currentYearToDate, buildReportQuery, isoDate } from '../../utils/reportWindow'
 import { REPORT_FIXTURE } from '../mocks/reportFixture'
 import type { ReportErrorBody } from '../../types'
 
@@ -156,5 +156,61 @@ describe('TaxReportTable', () => {
     expect(screen.getByTestId('report-context')).toHaveTextContent('2024-01-01')
     expect(screen.getByTestId('report-context')).toHaveTextContent('2024-06-30')
     expect(screen.getByTestId('row-0-price-date')).toHaveTextContent('2024-06-28')
+  })
+})
+
+describe('the client clock must agree with the server\'s', () => {
+  // The route rejects a `to` after `Utc::now().date_naive()` (analytics.rs:71, :669). Building
+  // the client's "today" from LOCAL parts made the default window a future date for every user
+  // east of UTC during the first hours of their day, so the tab 422'd on open.
+  //
+  // *** Read this test's limitation. *** `test/setup.ts` pins TZ=UTC, where local and UTC parts
+  // are identical, so this cannot fail on the suite's own clock. It pins the definition -- the
+  // value must equal the UTC date -- and would catch a revert to local parts on any host that is
+  // not UTC. The fix itself is verified by the server reading UTC, not by this test.
+  it('derives the date from UTC parts, matching the route', () => {
+    for (const iso of ['2026-02-14T23:30:00Z', '2026-02-15T00:30:00Z', '2026-12-31T23:59:59Z']) {
+      expect(isoDate(new Date(iso))).toBe(iso.slice(0, 10))
+    }
+  })
+})
+
+describe('buildReportQuery', () => {
+  it('omits a window side that is empty instead of sending an empty parameter', () => {
+    // `from=` is not a date: the route answers 422 "from: expected YYYY-MM-DD". A single-sided
+    // window is legal (the server defaults the other side to inception / today), so the empty
+    // side must be absent, not blank.
+    expect(buildReportQuery(1, { from: '', to: '2024-06-30' }, 'FIFO', 30)).toContain('to=2024-06-30')
+    expect(buildReportQuery(1, { from: '', to: '2024-06-30' }, 'FIFO', 30)).not.toContain('from=')
+    expect(buildReportQuery(1, { from: '2024-01-01', to: '' }, 'FIFO', 30)).not.toContain('to=')
+  })
+})
+
+describe('ReportControls guards', () => {
+  const render2 = (over: Record<string, unknown> = {}) => render(
+    <ReportControls
+      window={window2024}
+      onWindowChange={() => {}}
+      csvHref="/api/x"
+      onRetry={() => {}}
+      report={null}
+      error={null}
+      loading={false}
+      today={new Date('2026-02-14T00:00:00Z')}
+      {...over}
+    />,
+  )
+
+  it('caps both date inputs at the server-side today', () => {
+    // The preset clamp is half the rule; a typed future date is the half a user actually hits.
+    render2()
+    expect(screen.getByLabelText('To')).toHaveAttribute('max', '2026-02-14')
+    expect(screen.getByLabelText('From')).toHaveAttribute('max', '2026-02-14')
+  })
+
+  it('says inception when the window had no lower bound', () => {
+    // The fixture always has a requested_from, so this branch was unexercised: `?? ''` passed.
+    render(<TaxReportTable report={{ ...REPORT_FIXTURE, context: { ...REPORT_FIXTURE.context, requested_from: null } }} />)
+    expect(screen.getByTestId('report-context')).toHaveTextContent('inception')
   })
 })

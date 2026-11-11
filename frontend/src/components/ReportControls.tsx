@@ -1,5 +1,5 @@
 import { formatCurrency } from '../utils/formatters';
-import { quarterPresets } from '../utils/reportWindow';
+import { quarterPresets, isoDate } from '../utils/reportWindow';
 import type { ReportWindow } from '../utils/reportWindow';
 import type { ReportErrorBody, ReportRow, TaxReport } from '../types';
 
@@ -47,6 +47,7 @@ export default function ReportControls(props: ReportControlsProps) {
             type="date"
             className="form-control"
             value={window.from}
+            max={isoDate(today)}
             onChange={(e) => onWindowChange({ ...window, from: e.target.value })}
           />
         </div>
@@ -57,6 +58,7 @@ export default function ReportControls(props: ReportControlsProps) {
             type="date"
             className="form-control"
             value={window.to}
+            max={isoDate(today)}
             onChange={(e) => onWindowChange({ ...window, to: e.target.value })}
           />
         </div>

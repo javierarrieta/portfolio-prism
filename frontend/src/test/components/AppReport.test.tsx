@@ -90,3 +90,50 @@ describe('the tax report tab', () => {
     expect(dated).toBe(2)
   })
 })
+
+describe('a failed refetch retires the payload it replaced', () => {
+  // Review Critical: `setReportError` alone leaves the previous payload on screen, so a same-key
+  // refetch that fails shows numbers under an alert saying they could not be produced. Reachable
+  // by a tab round-trip, because `activeTab` is a dependency of the fetch effect.
+  it('removes the table when the refetch for the same selection fails', async () => {
+    let calls = 0
+    server.use(http.get('/api/portfolios/:id/tax-summary', ({ request }) => {
+      const url = new URL(request.url)
+      if (!url.searchParams.has('from') && !url.searchParams.has('to')) {
+        return HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })
+      }
+      calls += 1
+      if (calls === 1) return HttpResponse.json(REPORT_FIXTURE)
+      return HttpResponse.json({ error: 'deadline', missing_prices: [], missing_rates: [], missing_prices_total: 0, missing_rates_total: 0, retryable: true }, { status: 503 })
+    }))
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('total-realized-in-window')).toBeInTheDocument())
+
+    await userEvent.click(screen.getByText('Holdings & Tax lots'))
+    await userEvent.click(screen.getByText('Tax Report'))
+
+    await waitFor(() => expect(screen.getByTestId('report-error')).toBeInTheDocument())
+    expect(screen.queryByTestId('total-realized-in-window')).toBeNull()
+    // And the download goes with it: a link to bytes that were never produced.
+    expect(screen.queryByTestId('download-csv')).toBeNull()
+  })
+
+  it('does not show an error that belongs to another portfolio', async () => {
+    // The mirror of the payload guard, which the controller had already mutation-proved. Without
+    // the keyed check on `reportError`, portfolio 1's failure follows the user to portfolio 2.
+    server.use(
+      http.get('/api/portfolios/1/tax-summary', ({ request }) =>
+        new URL(request.url).searchParams.has('from')
+          ? HttpResponse.json({ error: 'no data', missing_prices: ['ZZZZ'], missing_rates: [], missing_prices_total: 1, missing_rates_total: 0, retryable: false }, { status: 422 })
+          : HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })),
+      http.get('/api/portfolios/2/tax-summary', () => new Promise(() => {})),
+    )
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('report-error')).toBeInTheDocument())
+
+    await userEvent.selectOptions(screen.getByRole('combobox'), 'Retirement Fund')
+    await waitFor(() => expect(screen.queryByTestId('report-error')).toBeNull())
+  })
+})

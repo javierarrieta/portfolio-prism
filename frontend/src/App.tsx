@@ -49,6 +49,27 @@ const reportRequestKey = (
   portfolioId: number, window: ReportWindow, strategy: string, thresholdDays: number,
 ) => `${portfolioId}|${window.from}|${window.to}|${strategy}|${thresholdDays}`;
 
+/**
+ * Coerce whatever came back into the typed error shape.
+ *
+ * `body as ReportErrorBody` is a compile-time cast and nothing checks it at runtime. A body that
+ * is not the typed shape -- `{}` from a proxy, Rocket's own error envelope, a truncated body --
+ * reaches `ReportControls` and `error.missing_prices.length` throws during render, and there is
+ * no error boundary in `main.tsx`, so the user gets a blank page instead of a panel. The lists
+ * are the only part that must exist; everything else degrades to a string.
+ */
+const normaliseErrorBody = (body: unknown): ReportErrorBody => {
+  const b = (body ?? {}) as Partial<ReportErrorBody>;
+  return {
+    error: typeof b.error === 'string' ? b.error : 'The report could not be produced.',
+    missing_prices: Array.isArray(b.missing_prices) ? b.missing_prices : [],
+    missing_rates: Array.isArray(b.missing_rates) ? b.missing_rates : [],
+    missing_prices_total: Number.isFinite(b.missing_prices_total) ? b.missing_prices_total! : 0,
+    missing_rates_total: Number.isFinite(b.missing_rates_total) ? b.missing_rates_total! : 0,
+    retryable: b.retryable === true,
+  };
+};
+
 export default function App() {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -83,7 +104,12 @@ export default function App() {
   // previous window's numbers on screen under a new page's heading.
   const [report, setReport] = useState<{ key: string; payload: TaxReport } | null>(null);
   const [reportError, setReportError] = useState<{ key: string; body: ReportErrorBody } | null>(null);
-  const [reportLoading, setReportLoading] = useState(false);
+  // The key of the report request currently in flight, not a boolean. A boolean stuck at
+  // `true` when a run was cancelled and the next effect invocation early-returned (clear `To`,
+  // then clear `From` mid-flight) and could only be unstuck by a synchronous reset in the
+  // effect body -- which `react-hooks/set-state-in-effect` rightly rejects. Deriving loading
+  // from whether the in-flight key still matches the selection needs no reset at all.
+  const [reportInFlight, setReportInFlight] = useState<string | null>(null);
   // Bumped by "Try again". The other dependencies do not move when a 503 is retried with the
   // same window, so without this the retry button would be inert.
   const [reportAttempt, setReportAttempt] = useState(0);
@@ -210,7 +236,7 @@ export default function App() {
     const query = buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
     let cancelled = false;
     const load = async () => {
-      setReportLoading(true);
+      setReportInFlight(key);
       setReportError(null);
       try {
         const res = await apiFetch(`${API_BASE}${query}`);
@@ -221,13 +247,19 @@ export default function App() {
         if (res.ok) {
           setReport({ key, payload: body as TaxReport });
         } else {
-          setReportError({ key, body: body as ReportErrorBody });
+          // A failed refetch must retire the payload it replaced. Without this, a same-key
+          // refetch that fails (tab round-trip, transient 503, a 401) leaves the table AND the
+          // error panel on screen together: numbers under an alert saying they could not be
+          // produced. That is the one state this tab must never reach.
+          setReport(null);
+          setReportError({ key, body: normaliseErrorBody(body) });
         }
       } catch (err) {
         // A response that is not the typed error at all -- a 500 with an HTML body, a dropped
         // connection: the same keyed shape, so the guard below still decides whether it may
         // render, and `retryable` stays false because nothing here knows what happened.
         if (!cancelled) {
+          setReport(null);
           setReportError({
             key,
             body: {
@@ -237,7 +269,7 @@ export default function App() {
           });
         }
       } finally {
-        if (!cancelled) setReportLoading(false);
+        if (!cancelled) setReportInFlight(null);
       }
     };
     load();
@@ -447,9 +479,18 @@ export default function App() {
     ? ''
     : buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
   // `?format=csv` is only valid with `from` or `to`: without one the route answers 422 naming
-  // `format`. With no window the anchor is absent rather than broken, and the link it does
-  // carry is prefixed with `API_BASE` because `buildReportQuery` returns a server path.
-  const reportCsvHref = reportQuery !== '' && (reportWindow.from !== '' || reportWindow.to !== '')
+  // `format`. The link is prefixed with `API_BASE` because `buildReportQuery` returns a server
+  // path.
+  //
+  // *** It is offered only while a report is actually on screen. *** The route's error responder
+  // sets no `Content-Disposition` (`analytics.rs:582-593`), so a plain anchor click on a failing
+  // window navigates the TOP-LEVEL browsing context to a raw JSON body and throws away the SPA.
+  // Gating on the keyed payload (not merely "has a window") means the anchor is absent during a
+  // 422, a 503, a load, and a stale selection.
+  const reportLoading = reportInFlight !== null && reportInFlight === reportKey;
+  const currentReport = report && report.key === reportKey ? report.payload : null;
+  const currentReportError = reportError && reportError.key === reportKey ? reportError.body : null;
+  const reportCsvHref = currentReport !== null && !reportLoading && reportQuery !== ''
     ? `${API_BASE}${reportQuery}&format=csv`
     : '';
 
@@ -665,11 +706,11 @@ export default function App() {
                   onWindowChange={setReportWindow}
                   csvHref={reportCsvHref}
                   onRetry={() => setReportAttempt((n) => n + 1)}
-                  report={report && report.key === reportKey ? report.payload : null}
-                  error={reportError && reportError.key === reportKey ? reportError.body : null}
+                  report={currentReport}
+                  error={currentReportError}
                   loading={reportLoading}
                 />
-                {report !== null && report.key === reportKey && <TaxReportTable report={report.payload} />}
+                {currentReport !== null && <TaxReportTable report={currentReport} />}
               </>
             )}
 

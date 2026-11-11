@@ -142,11 +142,18 @@ export interface SellPnlBreakdown {
 
 /**
  * The dated tax report. Deliberately NOT normalized through `number` the way every other
- * payload in this file is (see the header): the report's figures are displayed from the
- * exact decimal strings the server produced, and the same strings are what the CSV
- * carries. Round-tripping them through a double here would make the screen and the file
- * two renderings of different numbers, which is the one thing this feature exists to
- * avoid. `formatCurrency` already accepts `string | number`.
+ * payload in this file is (see the header): the strings the server sent are what is held in
+ * React state, what is compared for staleness, and what the CSV carries.
+ *
+ * *** Display is a separate matter, and is quantised. *** `TotalFigure` renders through
+ * `formatCurrency`, which does `Number(value)` and then `Intl` at the currency's fraction
+ * digits. So a figure with more than two fractional digits -- which the engine can produce,
+ * since it never rounds (`tax_engine.rs` has no `.round(`/`.set_scale(`) -- reads as a rounded
+ * amount on screen and verbatim in the file. That is the same display artifact the printable
+ * statement accepted (see `docs/superpowers/specs/2026-11-09-portfolio-statement-print.md`):
+ * the screen is a display, the CSV is the artifact, and the CSV is authoritative. An earlier
+ * revision of this comment claimed screen and file could never differ; that was false, and the
+ * release note says plainly that the file is the one to reconcile against.
  */
 export type ReportRowKind = 'SOLD_LOT' | 'OPEN_LOT' | 'UNMATCHED';
 export type ReportPriceSource = 'database' | 'provider';
