@@ -89,6 +89,7 @@ This is the **only change in this plan that moves a figure on an existing screen
 - Modify: `backend_rust/src/engines/tax_engine.rs` (`InternalLot`, the `replay` buy branch, the split branch, `calculate_lots`'s lot loop)
 - Modify: `backend_rust/src/schemas.rs` (`TaxLot`)
 - Regenerate: `docs/openapi/openapi.json`
+- Regenerate: `frontend/src/types/api.d.ts` (`npm run generate-types`) — it is tracked, generated from `openapi.json`, and committed in sync with it. Leaving it stale for one task breaks an invariant for no reason; CI regenerates it before typecheck, so CI stays green either way and the repo would not notice.
 - Modify: `frontend/src/types.ts` (`TaxLot`)
 - Modify: `frontend/src/utils/decimal.ts:82-88` (`normalizeTaxSummary`'s `tax_lots` map)
 - Modify: `frontend/src/test/components/PortfolioDetail.test.tsx` (the lot fixture at `:180-186`)
@@ -126,10 +127,18 @@ pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close:
 
 /// Pin split auto-detection for `symbol` so `sync_splits_for_asset` returns on its
 /// 30-day cache check instead of fetching. Same row `analytics_test.rs:218` writes.
+///
+/// The bound value MUST be a bare date, not `datetime('now')`. That SQL form writes
+/// "YYYY-MM-DD HH:MM:SS", and `sync_splits_for_asset` parses this column with
+/// `NaiveDate::parse_from_str(&last, "%Y-%m-%d")` (`currency_service.rs:870`), which
+/// rejects trailing input — so the cache check falls through and the test silently
+/// fetches from Yahoo. Symptom: a `WARN: Yahoo Finance returned status ... for splits
+/// of <SYMBOL>` line in an otherwise green test.
 #[allow(dead_code)]
 pub async fn seed_split_sync(pool: &SqlitePool, symbol: &str) {
-    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, datetime('now'))")
+    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
         .bind(symbol)
+        .bind(chrono::Utc::now().date_naive())
         .execute(pool)
         .await
         .unwrap();
@@ -292,7 +301,8 @@ Expected: all green; `openapi.json` matches the regenerated file (`git status` c
 ```bash
 git add backend_rust/src/engines/tax_engine.rs backend_rust/src/schemas.rs \
         backend_rust/tests/common/mod.rs backend_rust/tests/analytics_test.rs \
-        docs/openapi/openapi.json frontend/src/types.ts frontend/src/utils/decimal.ts \
+        docs/openapi/openapi.json frontend/src/types/api.d.ts \
+        frontend/src/types.ts frontend/src/utils/decimal.ts \
         frontend/src/test/components/PortfolioDetail.test.tsx
 git commit -m "fix(tax): report a lot's original quantity and the buy it came from"
 ```
