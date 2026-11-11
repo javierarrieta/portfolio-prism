@@ -418,6 +418,15 @@ Expected: FAIL to compile — `no function or associated item named replay_at`.
 
 - [ ] **Step 3: Add the two return types to `schemas.rs`**
 
+> **Correction found during implementation.** `DatedReplay` holds `Vec<SellBreakdown>`, and
+> neither `SellBreakdown` nor `LotMatch` derives `Clone` in the real `schemas.rs` (both are
+> `#[derive(Debug, Serialize, Deserialize, ToSchema)]`), so the code below does not compile
+> as written: `error[E0277]: the trait bound \`schemas::SellBreakdown: Clone\` is not
+> satisfied`. Add `Clone` to both structs. Neither is registered in `openapi.rs`, so there
+> is no schema regeneration and no byte-diff against the committed contract. Keep
+> `DatedReplay: Clone` — Task 4 hands one replay result to both the CSV writer and the
+> JSON payload, and borrow choreography across two renderers is the thing to avoid.
+
 Immediately after `struct SellBreakdown` in `backend_rust/src/schemas.rs` (engine outputs live here, which is where `TaxLot` and `SellBreakdown` already are; neither type is registered in `openapi.rs`, exactly like `SellBreakdown`, so this changes no committed schema):
 
 ```rust
@@ -1400,6 +1409,13 @@ The route stops being undated: `from` and `to` are optional, either alone is leg
 Three rules this task is the home of, all settled and none of them re-opened here: the 422/503 contract with capped lists, the 20 s elapsed deadline checked between outbound calls, and the undated path keeping its legacy response shape (the shipped statement and `PortfolioDetail` read `assets[].tax_lots`, `current_shares` and `total_portfolio_value`, which the typed payload does not carry).
 
 `?format=csv` is **Task 5**, deliberately: this task adds no `format` parameter and no unreachable branch.
+
+> **Carried forward from Task 2.** `DatedLot` and `DatedReplay` deliberately have **no
+> `Serialize`** — they are engine return types, not the wire shape. Task 3's `ReportResponse`
+> is the payload, so this task owns the mapping from `DatedReplay` to `ReportResponse` and
+> must decide it explicitly rather than discovering it under time pressure. Also note Task 2's
+> `test_replay_at_prices_the_market_value_at_the_valuation_date` assumes a system clock at or
+> after `2024-12-01`; that stays true, but do not backdate its fixtures past the clock.
 
 **Files:**
 - Modify: `backend_rust/src/api_routes/analytics.rs` (the handler, and the report machinery below it)
