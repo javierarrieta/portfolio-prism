@@ -3601,3 +3601,161 @@ git add frontend/src/components/ReportControls.tsx frontend/src/App.tsx \
         frontend/src/test/components/AppReport.test.tsx
 git commit -m "feat(frontend): add the dated tax report tab with a CSV download"
 ```
+
+---
+
+## Task 7: Docs — the release note, the manual download, the concepts correction
+
+Three documents, one commit. The report's own verification is split by design: everything numeric is a gate, and the one thing no gate can see is a real browser carrying a session cookie into a download.
+
+**Files:**
+- Create: `docs/release-notes/2026-11-09-tax-report.md`
+- Modify: `docs/auth-testing.md` (append to §5, beside the statement's print walkthrough)
+- Modify: `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md` (the amended non-goal)
+
+**Interfaces:**
+- Consumes: everything above.
+- Produces: nothing.
+
+- [ ] **Step 1: Write the release note**
+
+Create `docs/release-notes/2026-11-09-tax-report.md` covering:
+
+- **What ships.** `GET /api/portfolios/<id>/tax-summary?from=&to=` answers a dated report: every sell inside the window at lot granularity, every lot still open at the window's end with its unrealized gain at that date, and per-asset and portfolio totals. `?format=csv` returns the same report as `text/csv`; a new Tax Report tab renders it and links the download. No route was added; absent `from`/`to` the endpoint behaves exactly as it did.
+- **The one figure that moves.** `TaxLot.original_qty` is now the quantity originally bought and split-adjusted, instead of the already-decremented quantity. Holdings' **Original Qty** column was printing **Remaining Qty** in both columns; it is correct from this release. `TaxLot` also gains `buy_transaction_id`. Nothing else on an existing screen moves.
+- **Strategy validation is strict on the dated path only.** `?strategy=average_cost&to=2024-06-30` is a 422 naming the accepted values; without a window the same input still falls back to FIFO, and the response now echoes `FIFO` rather than the string the client sent.
+- **The columns that may be summed.** In the CSV, `lot_pnl` filtered to `row_type=SOLD_LOT` is the only column whose sum is a figure — it equals that asset's `asset_realized_in_window`, which the file also carries. Every sell-level column (`proceeds`, `cost_basis`, `realized_pnl`, `sold_qty`, ...) repeats on each of that sell's lot rows and must not be summed; every `asset_*` column is already a total. The disclosure lives here rather than in the file, because anything in the file's first row breaks the importer it is meant to warn.
+- **Splits.** The dated path does not sync splits (issue #50). Split-adjusted history is as recorded, the run context and the CSV both say so, and a split recorded after a quarter is filed legitimately changes that quarter's cost basis on regeneration.
+- **The first request after a deploy may 503 once.** A cold multi-currency portfolio can exceed the 20 s deadline on its first report and succeed on retry, because that attempt warmed the per-pair series cache. That is the design working, not a bug — without this sentence it reads as one.
+- **Reproducibility.** Two downloads over unchanged data are byte-identical, and there is deliberately no generated-at column to break that. The JSON payload is the documented public surface; the CSV is the same payload in another envelope.
+- **Not in this release.** No PDF, no tax computation, no cross-portfolio report, no asset subset.
+
+- [ ] **Step 2: Add the manual download step**
+
+Append to `docs/auth-testing.md` §5, after the statement's print walkthrough:
+
+```markdown
+### Downloading the tax report
+
+Still signed in through the provider (this is the step no gate can take: the download is a
+plain `<a href>`, so the session cookie is what makes it work, and nothing in CI logs in).
+
+1. Open a portfolio, click **Tax Report**. The window defaults to the current year to date.
+2. Click **Download CSV**. The file arrives as `tax-report-<id>-<from>-<to>.csv`, named by the
+   server's `Content-Disposition`, not by the browser's guess at the URL.
+3. Open it in a spreadsheet: row 1 is the header row, there is no `#` row above it, and
+   `splits_note` is a column. Check `lot_pnl` filtered to `SOLD_LOT` against
+   `asset_realized_in_window` on the same rows — that is the reconciliation the file is for.
+4. Copy the URL, add `&format=csv` if it is not there, and load it with `curl --cookie` in a
+   shell that holds the session: the bytes must match the browser's exactly.
+5. Print the report tab (Ctrl-P) and confirm it prints like the other tabs — the whole shell,
+   no print stylesheet — because the statement's `> *:not([data-print="statement"])` rule does
+   not match a page with no statement on it.
+```
+
+- [ ] **Step 3: Correct the predecessor's amended non-goal**
+
+In `docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md`, the amendment at the end of the *Out-of-Scope Non-Goals* paragraph still says a per-user in-flight report slot and a per-request outbound budget are "now in scope". Both were deleted (decision D2) and replaced by the route's elapsed deadline. Replace the amended sentence with:
+
+```markdown
+  *Amended 2026-11-09 by the report design:* the no-machinery clause is narrowed exactly as
+  far as one wall-clock bound. The reports carry a 20 s elapsed deadline, checked between
+  outbound calls and failing closed with the typed 503; the earlier per-user in-flight slot
+  and per-request outbound budget were removed on review, because a slot bounds concurrency
+  rather than cost and the budget duplicated a bound the per-pair series cache already
+  enforces. Batching frameworks, concurrent fan-out and new timeout knobs remain out of scope.
+```
+
+- [ ] **Step 4: Run every gate one last time**
+
+```bash
+cd backend_rust && cargo test && bash scripts/check_access_gate.sh && cargo clippy --all-targets && cargo build --release
+cargo run --bin backend_rust -- --print-openapi | diff - ../docs/openapi/openapi.json
+cd ../frontend && npm run test && npm run lint && npm run typecheck
+```
+
+Expected: all green, and the OpenAPI diff empty.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/release-notes/2026-11-09-tax-report.md docs/auth-testing.md \
+        docs/superpowers/specs/2026-11-09-tax-report-and-statement-concepts.md
+git commit -m "docs: tax report release note, download walkthrough and the amended non-goal"
+```
+
+---
+
+## Spec target-file coverage
+
+Every file in the spec's *Target Files to Create/Modify* list, with where it lands. Anything marked *out* is out because the spec says so, and the reason is in the spec.
+
+| Spec file | Landed in | Note |
+| :-- | :-- | :-- |
+| 1, 2 `currency_service.rs`, `lib.rs` | Task 5 (one line), otherwise out | The pricing-layer half is merged (PR #51). `lib.rs` gains `pub mod report_csv;` and nothing else — see *Deviations* |
+| 3 `report_guard.rs` | out | Deleted (D2): the route's deadline replaces it |
+| 4 `tax_engine.rs` | Tasks 1, 2 | The `TaxLot` fix, then `replay_at` |
+| 5 `schemas.rs` | Tasks 3, 4, 5 | The payload types; then `AssetTotals::empty`/`ReportTotals::zero` |
+| 6 `analytics.rs` | Tasks 4, 5 | The dated route, then `format=csv` |
+| 7 `openapi.rs` | Task 3 | Registration and the retyped 200 |
+| 8 `tests/tax_report_test.rs` | Tasks 3, 4 | Created with the payload tests, extended with the route tests |
+| 9 `tests/isolation_test.rs` | Task 4 | The dated variant, which is the real access gate |
+| 10 `route_coverage_test.rs`, `auth_test.rs` | Task 4 | No route added, so the counts stand; `auth_test` gains the dated pass and loses a stale comment |
+| 11 reconciliation tests | out | Moved to the pricing-layer document with the dated-FX fix |
+| 12 `docs/openapi/openapi.json` | Tasks 1, 3, 5 | Regenerated in each schema-changing commit |
+| 13 `api.d.ts` / `types.ts` | Tasks 1, 3 | `types.ts` carries the hand-written types; `api.d.ts` is regenerated and has no importers |
+| 14 `report_csv.rs` | Task 5 | Outside `src/api_routes/`, so the access gate does not apply to it |
+| 15 `tests/report_csv_test.rs` | Task 5 | Bytes, columns, totals, reproducibility |
+| 16 frontend `decimal.ts` report path | out | No frontend builder exists: the server writes the file, and `formatCurrency` accepts strings |
+| 17 `App.tsx` | Task 6 | Sixth tab, its own fetch, keyed payload |
+| 18 `ReportControls.tsx` | Task 6 | Controls plus, as a second export, the on-screen report |
+| 19-23 statement and print | out | Shipped on this branch by `2026-11-09-portfolio-statement-print.md` |
+| 24 sell-P&L footnote | out | Moved to the pricing-layer document with the dated-FX fix |
+| 25 this plan | done | — |
+| `analytics_test.rs` | Task 1 | The failing test for `original_qty` |
+| `PortfolioDetail.tsx` | Task 1 (fixture only) | The component already renders both columns; only the value was wrong |
+| `PortfolioDetail.test.tsx` | Task 1 | Fixture gains `buy_transaction_id`, and the two quantities are pulled apart |
+| `package.json`, `main.tsx` | out | Shipped with the statement (`e2e:statement`, the `print.css` import) |
+| `reviews/2026-11-09-tax-report.md` | out | The record already exists as `docs/superpowers/reviews/2026-11-09-tax-report/` |
+| concepts doc non-goal | Task 7 | The amendment still calls the deleted guard "in scope" |
+
+## Deviations from the spec
+
+Each of these is a place where the spec's text and the code as it now stands do not agree, or where a decision had to be made to make a task writable. None of them re-opens a settled value.
+
+1. **The undated path keeps its legacy response shape.** The typed `ReportResponse` is returned only when `from` or `to` is present. The spec's file 7 says to replace `body = serde_json::Value` with the typed response; doing that for *both* paths breaks two shipped screens, because the statement and `PortfolioDetail` read `assets[].tax_lots`, `current_shares` and `total_portfolio_value`, none of which the report payload carries — and the spec's own *Route* decision says "absent `from` and `to`, the endpoint behaves exactly as it does today". The committed contract therefore documents the dated shape for 200, and the operation's description states the undated form.
+2. **`backend_rust/src/lib.rs` gains one line.** The spec says nothing in this document edits `lib.rs`, and that is about the pricing-layer work that used to live in the file. `report_csv.rs` must not live under `src/api_routes/` (the access gate's Rule A), and a module has to be declared in its parent, so `pub mod report_csv;` lands there.
+3. **`AssetTotals` carries `asset_type` and `asset_currency`,** which the spec's shape block omits. The CSV writes `sell_price_in_asset_currency` and `buy_price_in_asset_currency` beside base-currency money; without the asset's currency named on the row, those columns are unlabelled. A tax file that mixes currencies without saying so fails Goal 5's "no column is silently substituted".
+4. **The per-asset totals ride in the CSV** as `asset_realized_in_window` and its four siblings. The spec's file 14 column description does not mention them, and its *The payload* section does: "The CSV writes the server-computed totals verbatim and states which columns are legal to sum". A reader cannot check the file against a total the file does not carry.
+5. **`unrealized_roi` is nullable.** The spec says "nulls are nulls" for the payload and does not give the open-lot ROI's zero-cost behaviour. This plan follows `SellPnlResponse.roi`, whose documented rule is null when the cost basis is zero — rather than `TaxLot.latent_roi`, which writes a zero and cannot be told from a genuine 0%.
+6. **Two spec test cases are recorded as unwritable, not faked.** "A missing price returns 422 naming every missing symbol" and "an unreachable provider returns 503" both need a provider seam that does not exist: a seeded database is either fresh — and answers — or stale, and stale routes to the hardcoded provider URL. Task 4 Step 9 names what is pinned instead (the body shape via validation, the caps and the pair rule on `MissingItems`, the mapping on `pricing_failure_status`, and the deadline's 503 with `retryable`). Writing them as integration tests would mean reaching the network.
+7. **The frontend's on-screen report shares `ReportControls.tsx`.** The spec's list gives this work files 17 and 18 and nothing else, and a report view needs somewhere to live; it is a second export in the same file rather than a sixth component.
+8. **`route_coverage_test.rs` is not modified.** No route is added, so its hard counts (15/15/13) must stay exactly as they are; the dated variant is a second parameterised pass in `auth_test.rs`, not a new entry.
+9. **No `docs/superpowers/reviews/2026-11-09-tax-report.md`.** The convention's record for this design already exists as the directory `docs/superpowers/reviews/2026-11-09-tax-report/` (five stage reports plus the consolidated review), and the spec's forced-files table lists it without noticing.
+
+## What this plan does not include
+
+- **No statement or print work.** Shipped on this branch; the spec's Goals 6 and its files 19-23 belong to `2026-11-09-portfolio-statement-print.md`.
+- **No pricing-layer work.** Merged as PR #51; this plan consumes it and edits neither `currency_service.rs`'s behaviour nor `lib.rs`'s startup.
+- **No new route, no new dependency, no new table or column.** The schema change is one field addition on `TaxLot` and a new set of response types; `init_db` is untouched, so there is no DDL and no migration.
+- **No frontend CSV builder, and no string-preserving path in `decimal.ts`.** The server writes the file.
+- **No cost guard, no 429, no asset subset, no split sync, no undated-path strict validation.** All four were decided against (D2, D5, D6, Alternative G).
+- **No end-to-end browser test for the report.** CI has no browser job (issue #45); the CSV is reproducible with `curl`, and the one thing curl cannot prove — that a real browser carries the session cookie into an anchor download — is the Task 7 manual step.
+- **No verification of the access level by the grep-based gate.** It cannot see a parameter-dependent path on an existing route; `isolation_test.rs` is the gate, as the spec says.
+
+## Final gate
+
+```bash
+cd backend_rust
+cargo test
+bash scripts/check_access_gate.sh
+cargo clippy --all-targets
+cargo build --release
+cargo run --bin backend_rust -- --print-openapi | diff - ../docs/openapi/openapi.json
+cd ../frontend
+npm run test
+npm run lint
+npm run typecheck
+```
+
+Then the manual step in Task 7 Step 2 — a real OIDC login and a real browser download — which no gate above performs.
