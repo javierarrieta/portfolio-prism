@@ -318,7 +318,13 @@ pub async fn get_transaction_sell_pnl(
         _ => "FIFO".to_string(),
     };
     let threshold_val = threshold_days.unwrap_or(30);
-    let fx_applied = asset.currency != portfolio.base_currency;
+    // Case-insensitive, deliberately, to match the two places that actually decide whether a
+    // conversion is needed: `get_rate` uppercases (`currency_service.rs:401-403`) and
+    // `replay_at` uses `eq_ignore_ascii_case` (`tax_engine.rs:940`). A case-sensitive `!=`
+    // here takes the FX branch for an asset stored `usd` in a `USD` portfolio, demands a
+    // `USDUSD=X` series that does not exist, and refuses with 422/503 a report the undated
+    // path serves without complaint.
+    let fx_applied = !asset.currency.eq_ignore_ascii_case(&portfolio.base_currency);
 
     // Read-only on purpose -- see the review record for this feature. The two other
     // analytics endpoints insert auto-detected SPLIT rows before reading; this one
@@ -620,11 +626,16 @@ fn parse_window(
         let parsed_from = from.map(|raw| parse_date_param("from", raw)).transpose()?;
         let parsed_to = to.map(|raw| parse_date_param("to", raw)).transpose()?.unwrap_or(today);
         if let Some(from) = parsed_from {
-            if from > parsed_to {
-                return Err(ReportError::validation("from", "must not be after `to`"));
-            }
+            // Future check FIRST. With `to` absent, `parsed_to` is today, so a `from > parsed_to`
+            // test would fire first and answer "must not be after `to`" to a caller that never
+            // sent `to` — naming a parameter it did not supply and sending it looking for one.
+            // With `to` present, `from > today` implies `to >= from > today`, so the `to`
+            // future check below would have swallowed it too. Reordered, both are reachable.
             if from > today {
                 return Err(ReportError::validation("from", "is in the future"));
+            }
+            if from > parsed_to {
+                return Err(ReportError::validation("from", "must not be after `to`"));
             }
         }
         if parsed_to > today {
@@ -736,12 +747,19 @@ async fn resolve_close(
 /// `deadline` is a parameter rather than the constant alone so a test can pass
 /// `Duration::ZERO` and prove the fail-closed path without waiting 20 s.
 ///
-/// Everything that leaves the process happens in this function's own loop, in a fixed
-/// order per asset — one pair fetch, then one close — with the deadline checked before
-/// each. That is the point of resolving the pair here rather than letting `replay_at`
-/// discover transaction dates one at a time: a range fetched now covers every date the
-/// replay will ask about, so the engine's per-transaction `get_rate` calls read
-/// `historical_prices` and the deadline can actually sit between the calls.
+/// The deadline bounds **this function's own** outbound calls, and only those. Per asset the
+/// order is one pair prefetch, then one close, each preceded by a deadline check.
+///
+/// The pair prefetch avoids the network only when the stored pair window is already fresh at
+/// `to` (`currency_service.rs:712-717` returns stored rows without fetching on that condition).
+/// It does **not** check that the stored window reaches back over the transactions, and when it
+/// is fresh-but-short `replay_at`'s per-transaction `get_rate` still falls through to the
+/// provider for the uncovered dates (`currency_service.rs:434-441`) — after the last deadline
+/// check here. So a slow-but-succeeding provider can still push total elapsed past the ingress
+/// bound in that state. No route-local fix exists: `get_historical_prices` owns the fetch
+/// decision, and coverage of the stored window is the pricing layer's own stated follow-up
+/// (`currency_service.rs:392-394`). Fail-closed is unaffected — an in-replay provider failure
+/// still returns 503 or 422 rather than a partial payload.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_tax_report(
     pool: &SqlitePool,
@@ -783,7 +801,8 @@ pub async fn build_tax_report(
     let mut totals = ReportTotals::zero();
 
     for (asset, txs) in &loaded {
-        let fx_applied = asset.currency != portfolio.base_currency;
+        // Same case-insensitive identity rule as above and as in the engine.
+        let fx_applied = !asset.currency.eq_ignore_ascii_case(&portfolio.base_currency);
         // A split dated after the window end changed nothing inside the window, and the
         // replay's filter is what makes that true of the figures as well as the flag.
         let split_applied = txs.iter().any(|tx| {

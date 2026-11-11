@@ -433,10 +433,12 @@ async fn an_undated_call_normalizes_the_strategy_it_echoes() {
 
 #[tokio::test]
 async fn the_undated_path_still_names_the_strategy_the_engine_used() {
-    // The spec's file 6 fix: the handler defaults but does not normalise, so
-    // `?strategy=average_cost` reports `average_cost` while the engine ran FIFO. The
-    // printable statement's run-context line is what depends on this, and the numbers do
-    // not move -- the engine already fell through to FIFO.
+    // The spec's file 6 fix: the response must name the matching method the engine actually
+    // used. It does — by normalizing, not by echoing. `?strategy=average_cost` falls through to
+    // FIFO in the engine (`tax_engine.rs:722`) AND now reports `FIFO`, because the undated path
+    // goes through `normalize_strategy` (`analytics.rs:678-684`). Before Task 4 it echoed
+    // `average_cost` verbatim while the engine ran FIFO, which is the bug this test exists to
+    // keep fixed. See `an_undated_call_normalizes_the_strategy_it_echoes` for the lowercase case.
     let pool = setup_db(&disabled_config()).await;
     let through = Utc::now().date_naive().to_string();
     let (port_id, _, _) = fixture(&pool, &through).await;
@@ -548,6 +550,59 @@ async fn invalid_windows_are_422s_that_name_the_parameter() {
         assert_eq!(body["missing_rates"], serde_json::json!([]), "{label}");
         assert_eq!(body["retryable"], false, "{label}");
     }
+}
+
+/// `?from=<tomorrow>` with no `to` must blame `from` and say *why*. The original ordering tested
+/// `from > to` first, and an absent `to` defaults to today, so that fired first and answered
+/// "must not be after `to`" — naming a parameter the client never sent and sending it looking
+/// for one it did not supply. The status was 422 either way, which is why the table above cannot
+/// catch it; only the detail can.
+#[tokio::test]
+async fn a_future_from_alone_blames_from_and_says_future() {
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let tomorrow = (Utc::now().date_naive() + chrono::Duration::days(1)).to_string();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from={tomorrow}"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::UnprocessableEntity);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(
+        err.contains("future"),
+        "must say the date is in the future, not invent a `to` the client never sent: {err}"
+    );
+    assert!(
+        !err.contains("after"),
+        "must not blame a comparison against a defaulted `to`: {err}"
+    );
+}
+
+/// `from` alone means "through today" — a settled value. Every other valid dated test passes
+/// `to`, so the one-sided branch was only ever exercised in its invalid form.
+#[tokio::test]
+async fn a_from_alone_runs_through_today() {
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(body["context"]["requested_from"], "2024-01-01");
+    assert_eq!(
+        body["context"]["requested_to"], through,
+        "an absent `to` is today, not an error and not the first transaction date"
+    );
+    assert!(body["rows"].as_array().unwrap().iter().count() > 0);
 }
 
 #[tokio::test]
