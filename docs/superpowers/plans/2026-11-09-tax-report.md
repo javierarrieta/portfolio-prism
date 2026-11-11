@@ -2631,3 +2631,508 @@ git add backend_rust/src/api_routes/analytics.rs backend_rust/src/schemas.rs \
         backend_rust/tests/isolation_test.rs backend_rust/tests/auth_test.rs
 git commit -m "feat(api): serve a dated tax report from tax-summary"
 ```
+
+---
+
+## Task 5: `?format=csv` — the server writes the file
+
+The CSV is produced by the server, not assembled in the browser: the same route answers `?format=csv` and serializes the payload it already computed, so the file is emitted where the exact decimals live. That is what makes Goal 4 testable at all — `curl --cookie` (or the Rocket local client) reproduces the bytes — and it is why every argument for server-owned numbers is an argument for emitting the file there.
+
+`report_csv.rs` is **deliberately not under `src/api_routes/`**: the access gate's Rule A requires every file in that directory to import `crate::access` and call a `require*` function, and a serializer has no business calling one.
+
+**Files:**
+- Create: `backend_rust/src/report_csv.rs`
+- Modify: `backend_rust/src/lib.rs` (one line: `pub mod report_csv;`)
+- Modify: `backend_rust/src/api_routes/analytics.rs` (`format` parameter, the `Csv` variant, the filename)
+- Test: `backend_rust/tests/report_csv_test.rs`
+
+**Interfaces:**
+- Consumes: `ReportResponse`, `ReportRow`, `RowKind`, `PriceSource` (Task 3); `ReportError::validation` (Task 4).
+- Produces: `pub fn render(report: &ReportResponse) -> String` and `pub const CSV_COLUMNS: [&str; 49]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `backend_rust/tests/report_csv_test.rs`:
+
+```rust
+//! The CSV the owner archives: its columns, its totals and its bytes.
+
+mod common;
+
+use common::{build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
+use rocket::http::{ContentType, Status};
+use rocket::local::asynchronous::Client;
+use rust_decimal::Decimal;
+use sqlx::sqlite::SqlitePool;
+use std::str::FromStr;
+
+fn dec(s: &str) -> Decimal {
+    Decimal::from_str(s).unwrap()
+}
+
+/// The CSV as `(header, rows)`, split the plain way: no fixture in this file contains a
+/// comma inside a cell except the one that deliberately does.
+fn parse(body: &str) -> (Vec<&str>, Vec<Vec<&str>>) {
+    let lines: Vec<&str> = body.trim_end_matches("\r\n").split("\r\n").collect();
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let rows = lines[1..].iter().map(|l| l.split(',').collect()).collect();
+    (header, rows)
+}
+
+fn cell<'a>(header: &[&str], row: &'a [&'a str], column: &str) -> &'a str {
+    let i = header.iter().position(|c| *c == column).unwrap_or_else(|| panic!("no {column} column"));
+    row[i]
+}
+
+/// One portfolio whose name and symbol both start with a formula character, one sell that
+/// leaves an unmatched tail, and one lot still open: every row kind and both cell hazards
+/// in one request.
+async fn csv_fixture(pool: &SqlitePool) -> i32 {
+    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "=cmd|'/c calc'!A1", "USD").await;
+    let asset_id = common::seed_asset(pool, port_id, "-SYM", "Minus symbol").await;
+    common::seed_transaction_at(pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
+    common::seed_daily_prices(pool, "-SYM", "2024-01-01", "2024-06-28", "110.0").await;
+    seed_split_sync(pool, "-SYM").await;
+    port_id
+}
+
+async fn csv_body(port_id: i32, query: &str) -> (Client, String) {
+    let pool = setup_db(&disabled_config()).await;
+    let _ = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?{query}&format=csv"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    (client, resp.into_string().await.unwrap())
+}
+
+#[tokio::test]
+async fn the_file_is_csv_with_the_servers_own_filename() {
+    let (_, body) = csv_body(1, "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
+    // The body assertion is here so the request is real; the headers are asserted on a
+    // second dispatch, because `into_string` consumes the response.
+    assert!(body.starts_with("row_type,"), "row 1 is the header row: {body:.80}");
+}
+
+#[tokio::test]
+async fn the_headers_are_the_columns_order_and_no_comment_row_precedes_them() {
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&to=2024-06-30&format=csv"))
+        .dispatch()
+        .await;
+
+    assert_eq!(resp.status(), Status::Ok);
+    assert_eq!(resp.content_type(), Some(ContentType::new("text", "csv")));
+    let disposition = resp.headers().get_one("Content-Disposition").unwrap_or("").to_string();
+    assert_eq!(disposition, format!("attachment; filename=\"tax-report-{port_id}-2024-01-01-2024-06-30.csv\""));
+
+    let body = resp.into_string().await.unwrap();
+    let (header, _) = parse(&body);
+    assert_eq!(header, backend_rust::report_csv::CSV_COLUMNS.to_vec());
+    assert!(!body.starts_with('#'), "a leading `#` row maps every column to null on import");
+}
+
+#[tokio::test]
+async fn the_lot_pnl_column_sums_to_the_assets_realized_in_window() {
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&from=2024-01-01&to=2024-06-30"))
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let body = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&from=2024-01-01&to=2024-06-30&format=csv"))
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .unwrap();
+
+    let (header, rows) = parse(&body);
+    let sold: Decimal = rows.iter()
+        .filter(|r| cell(&header, r, "row_type") == "SOLD_LOT")
+        .map(|r| dec(cell(&header, r, "lot_pnl")))
+        .sum();
+    // The JSON totals are the authority; the file has to agree with them, in Decimals and
+    // not in serialized strings.
+    assert_eq!(sold, dec(json["asset_totals"][0]["realized_in_window"].as_str().unwrap()));
+    assert_eq!(sold, dec("1800.0"));
+
+    // And the columns that must NOT be summed are the ones the release note names.
+    let repeated: Decimal = rows.iter()
+        .filter(|r| cell(&header, r, "row_type") == "SOLD_LOT")
+        .map(|r| dec(cell(&header, r, "realized_pnl")))
+        .sum();
+    assert_ne!(repeated, sold, "sell-level columns repeat per lot row; summing them double-counts");
+}
+
+#[tokio::test]
+async fn every_row_kind_reaches_the_file_and_nulls_are_empty_cells() {
+    let (_, body) = csv_body(1, "strategy=FIFO&from=2024-01-01&to=2024-06-30").await;
+    let (header, rows) = parse(&body);
+
+    let kinds: Vec<&str> = rows.iter().map(|r| cell(&header, r, "row_type")).collect();
+    assert!(kinds.contains(&"SOLD_LOT"), "{kinds:?}");
+    assert!(kinds.contains(&"OPEN_LOT"), "{kinds:?}");
+    assert!(kinds.contains(&"UNMATCHED"), "{kinds:?}");
+
+    let unmatched = rows.iter().find(|r| cell(&header, r, "row_type") == "UNMATCHED").unwrap();
+    assert_eq!(cell(&header, unmatched, "unmatched_qty"), "20.0");
+    assert_eq!(cell(&header, unmatched, "lot_pnl"), "", "nulls are empty cells, not `0` or `n/a`");
+    assert_eq!(cell(&header, unmatched, "market_value"), "");
+
+    // A comma-free fixture, so the only way to see quoting is this cell.
+    assert!(
+        body.contains("\"'=cmd|'/c calc'!A1\""),
+        "a free-text cell with a formula lead is quoted and apostrophe-guarded",
+    );
+    assert!(body.contains("'-SYM"), "and so is a symbol");
+    assert!(!body.contains("e-"), "money is written verbatim and never in exponent notation");
+}
+
+#[tokio::test]
+async fn two_dispatches_over_unchanged_data_are_byte_identical() {
+    // Goal 4, and the reason the file carries no generated-at column: a timestamp would
+    // make this unreachable and would make every regenerated file a different file.
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let path = format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&from=2024-01-01&to=2024-06-30&format=csv");
+
+    let first = client.get(&path).dispatch().await.into_string().await.unwrap();
+    let second = client.get(&path).dispatch().await.into_string().await.unwrap();
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn format_csv_without_a_window_is_a_422_naming_format() {
+    // The legacy summary shape has no rows to write, and answering with "everything,
+    // priced at the latest close" would quietly answer a different question than the file
+    // claims to answer.
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?format=csv"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::UnprocessableEntity);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("format"));
+
+    let unknown = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&format=json"))
+        .dispatch()
+        .await;
+    assert_eq!(unknown.status(), Status::UnprocessableEntity);
+}
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd backend_rust && cargo test --test report_csv_test`
+Expected: FAIL to compile — `backend_rust::report_csv` does not exist.
+
+- [ ] **Step 3: Write `report_csv.rs`**
+
+Create `backend_rust/src/report_csv.rs`:
+
+```rust
+//! Server-side CSV for the dated tax report.
+//!
+//! Deliberately not under `src/api_routes/`: the access gate's Rule A requires every file
+//! in that directory to import `crate::access` and call a `require*` function, and a
+//! serializer has no business calling one.
+//!
+//! Row 1 is always the header row and no comment row precedes it. That is evidence rather
+//! than taste: `detectColumns` (`frontend/src/utils/csvParser.ts:25`) normalises every cell
+//! of row 1 against `FIELD_ALIASES`, so a leading `#` row maps every column to `null` and
+//! an import silently yields nothing. Caveats therefore ride as columns, exactly as the
+//! single-sell export already does (`sellPnlCsv.ts:13-16`), and the split caveat comes from
+//! the payload (`ReportContext.splits_note`) rather than from a string typed in here.
+//!
+//! There is no generated-at column on purpose: two dispatches over unchanged data must be
+//! byte-identical, which is Goal 4 and is only testable because the file is server-side.
+
+use crate::schemas::{ReportResponse, ReportRow};
+use rust_decimal::Decimal;
+
+/// The header, in order: run context, then the asset and its pricing provenance, then the
+/// asset's server-computed totals, then the sell, the lot, and the open-lot cells.
+///
+/// The per-asset totals ride as columns so a reader can check the file against them without
+/// recomputing anything, and so a spreadsheet can be reconciled against the screen.
+/// `lot_pnl` is the one column whose sum over `SOLD_LOT` rows is a figure at all
+/// (`AssetTotals.realized_in_window`); every sell-level column repeats on each lot row and
+/// must not be summed, and every `asset_*` column is already a total.
+pub const CSV_COLUMNS: [&str; 49] = [
+    // run context
+    "row_type", "portfolio_id", "portfolio_name", "base_currency", "strategy",
+    "threshold_days", "window_from", "window_to", "splits_note",
+    // asset and pricing provenance
+    "asset_id", "symbol", "asset_type", "asset_currency", "fx_applied", "split_applied",
+    "price_source", "price_date_used", "fx_rate_date_used",
+    // this asset's server-computed totals
+    "asset_realized_in_window", "asset_realized_cumulative", "asset_unrealized_at_end",
+    "asset_market_value", "asset_cost_basis",
+    // sell context, repeated on each of the sell's lot rows
+    "sell_transaction_id", "sell_date", "sold_qty", "sell_price_in_asset_currency",
+    "sell_fee_in_asset_currency", "proceeds", "cost_basis", "realized_pnl", "matched_qty",
+    "unmatched_qty",
+    // the buy lot a sell consumed
+    "buy_transaction_id", "buy_date", "buy_price_in_asset_currency", "unit_cost",
+    "lot_matched_qty", "lot_qty_before_match", "lot_cost_basis", "lot_proceeds", "lot_pnl",
+    "holding_days", "term",
+    // the lot still open at the window end
+    "original_qty", "remaining_qty", "market_value", "unrealized_gain_loss", "unrealized_roi",
+];
+
+/// Characters that make Excel and Google Sheets run a cell instead of showing it. A symbol
+/// reaches the file as free text — `csvValidator` checks only that it is non-empty and the
+/// backend stores it uppercased and unfiltered — so it is attacker-chosen by the time it is
+/// exported. The leading apostrophe is what makes a spreadsheet render the cell as text.
+/// Applied to every text cell rather than to an enumerated set: none of the literal cells
+/// this file writes starts with one of these characters, so the guard is free.
+const FORMULA_LEAD: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+fn text_cell(value: &str) -> String {
+    let guarded = if value.starts_with(FORMULA_LEAD) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    // RFC 4180: a cell containing a comma, a quote or a newline is quoted, and inner
+    // quotes are doubled.
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// Money and quantities, verbatim from the `Decimal`. Never through `f64`, and never with
+/// an exponent: `Decimal`'s display is fixed-point at the stored scale.
+fn decimal_cell(value: Option<Decimal>) -> String {
+    value.map(|d| d.to_string()).unwrap_or_default()
+}
+
+/// A CSV row as cells, already escaped and joined with `,`.
+fn line(cells: impl IntoIterator<Item = String>) -> String {
+    let mut out = cells.into_iter().collect::<Vec<_>>().join(",");
+    out.push_str("\r\n");
+    out
+}
+
+/// The whole file, `\r\n`-terminated per row (RFC 4180, and what Excel expects).
+pub fn render(report: &ReportResponse) -> String {
+    let mut out = line(CSV_COLUMNS.iter().map(|c| c.to_string()));
+
+    for row in &report.rows {
+        // The asset's totals are looked up, never computed: the CSV is a projection of the
+        // payload, so the numbers in the file are the numbers the route produced.
+        let totals = report.asset_totals.iter().find(|t| t.asset_id == row.asset_id);
+        out.push_str(&render_row(report, row, totals));
+    }
+
+    out
+}
+
+fn render_row(
+    report: &ReportResponse,
+    row: &ReportRow,
+    totals: Option<&crate::schemas::AssetTotals>,
+) -> String {
+    let context = &report.context;
+    line([
+        text_cell(row.row_type.as_str()),
+        context.portfolio_id.to_string(),
+        text_cell(&context.portfolio_name),
+        text_cell(&context.base_currency),
+        text_cell(&context.strategy),
+        context.threshold_days.to_string(),
+        context.requested_from.map(|d| d.to_string()).unwrap_or_default(),
+        context.requested_to.to_string(),
+        text_cell(&context.splits_note),
+        row.asset_id.to_string(),
+        text_cell(&row.symbol),
+        text_cell(&row.asset_type),
+        text_cell(&row.asset_currency),
+        row.fx_applied().to_string(),
+        row.split_applied().to_string(),
+        row.price_source.map(|s| s.as_str().to_string()).unwrap_or_default(),
+        row.price_date_used.map(|d| d.to_string()).unwrap_or_default(),
+        row.fx_rate_date_used.map(|d| d.to_string()).unwrap_or_default(),
+        decimal_cell(totals.map(|t| t.realized_in_window)),
+        decimal_cell(totals.map(|t| t.realized_cumulative)),
+        decimal_cell(totals.map(|t| t.unrealized_at_end)),
+        decimal_cell(totals.map(|t| t.market_value)),
+        decimal_cell(totals.map(|t| t.cost_basis)),
+        row.sell_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
+        row.sell_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        decimal_cell(row.sold_qty),
+        decimal_cell(row.sell_price),
+        decimal_cell(row.sell_fee),
+        decimal_cell(row.proceeds),
+        decimal_cell(row.cost_basis),
+        decimal_cell(row.realized_pnl),
+        decimal_cell(row.matched_qty),
+        decimal_cell(row.unmatched_qty),
+        row.buy_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
+        row.buy_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        decimal_cell(row.buy_price),
+        decimal_cell(row.unit_cost),
+        decimal_cell(row.lot_matched_qty),
+        decimal_cell(row.lot_qty_before_match),
+        decimal_cell(row.lot_cost_basis),
+        decimal_cell(row.lot_proceeds),
+        decimal_cell(row.lot_pnl),
+        row.holding_days.map(|v| v.to_string()).unwrap_or_default(),
+        row.term.clone().map(|t| text_cell(&t)).unwrap_or_default(),
+        decimal_cell(row.original_qty),
+        decimal_cell(row.remaining_qty),
+        decimal_cell(row.market_value),
+        decimal_cell(row.unrealized_gain_loss),
+        decimal_cell(row.unrealized_roi),
+    ])
+}
+```
+
+`fx_applied` and `split_applied` are **per asset**, not per row, so `ReportRow` does not carry them. Read them off the asset's totals with two one-line private helpers in this module rather than adding fields:
+
+```rust
+impl ReportRow {
+    /// `fx_applied` lives on the asset's totals, not on the row: it is a fact about the
+    /// asset, and repeating it per row in the payload would be 40 bytes of noise per row.
+    fn fx_applied(&self) -> bool { self.fx_applied }
+    fn split_applied(&self) -> bool { self.split_applied }
+}
+```
+
+— which means `ReportRow` **does** carry both flags per row after all, since the CSV is a projection of the rows. Add them to the struct in `schemas.rs` (`pub fx_applied: bool`, `pub split_applied: bool`) and to `ReportRow::of`, and drop the two helpers above. That is a twelve-line change to Task 3's struct, and it is the resolution the file needs: a flat projection cannot read a fact it does not carry. **Regenerate `docs/openapi/openapi.json` after this change** (`cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json`) and commit it with this task.
+
+Then add to `backend_rust/src/lib.rs`, after `pub mod access;`:
+
+```rust
+pub mod report_csv;
+```
+
+This is the one line this plan adds to a file the spec says it does not edit, and the reason is in *Deviations from the spec*: a module that must not live under `api_routes/` still has to be declared somewhere.
+
+- [ ] **Step 4: Add the `format` parameter to the route**
+
+In `backend_rust/src/api_routes/analytics.rs`: extend the `TaxSummaryResponse` enum and its `Responder`, add `parse_format`, and thread it through the handler.
+
+```rust
+pub enum TaxSummaryResponse {
+    Legacy(Json<serde_json::Value>),
+    Report(Json<ReportResponse>),
+    Csv { body: String, filename: String },
+}
+
+impl<'r> Responder<'r, 'static> for TaxSummaryResponse {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        match self {
+            TaxSummaryResponse::Legacy(json) => json.respond_to(request),
+            TaxSummaryResponse::Report(json) => json.respond_to(request),
+            TaxSummaryResponse::Csv { body, filename } => Response::build()
+                .status(Status::Ok)
+                // `ContentType::new` rather than a constant: Rocket has no CSV constant
+                // (`rocket_http-0.5.1/src/header/content_type.rs:230`).
+                .header(ContentType::new("text", "csv"))
+                .raw_header("Content-Disposition", format!("attachment; filename=\"{filename}\""))
+                .sized_body(body.len(), Cursor::new(body))
+                .ok(),
+        }
+    }
+}
+
+/// `csv` or nothing. The default is JSON, and JSON is the documented surface: the OpenAPI
+/// document describes the typed payload, and `?format=csv` is the same bytes in another
+/// envelope, described in the operation's summary rather than as a second content type for
+/// status 200 (which utoipa's response map, keyed by status, cannot express).
+fn parse_format(format: Option<&str>, dated: bool) -> Result<bool, ReportError> {
+    match format {
+        None => Ok(false),
+        Some("csv") if dated => Ok(true),
+        Some("csv") => Err(ReportError::validation("format", "`csv` needs `from` or `to`")),
+        Some(other) => Err(ReportError::validation(
+            "format",
+            &format!("`{other}` is not a known format; only `csv` is accepted"),
+        )),
+    }
+}
+```
+
+In the handler: add `format: Option<String>` as the last parameter, change the route attribute to `#[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>&<format>")]`, and after `let window = parse_window(...)`, add:
+
+```rust
+    let csv = parse_format(format.as_deref(), window.is_some())?;
+```
+
+The dated arm becomes:
+
+```rust
+        Some(window) => {
+            let report = build_tax_report(
+                pool, currency_service.inner(), &portfolio, &assets,
+                &strategy_val, threshold_val, &window, REPORT_DEADLINE,
+            )
+            .await?;
+            if csv {
+                let filename = format!(
+                    "tax-report-{}-{}-{}.csv",
+                    report.context.portfolio_id,
+                    report.context.requested_from.map(|d| d.to_string()).unwrap_or_else(|| "inception".to_string()),
+                    report.context.requested_to,
+                );
+                Ok(TaxSummaryResponse::Csv { body: report_csv::render(&report), filename })
+            } else {
+                Ok(TaxSummaryResponse::Report(Json(report)))
+            }
+        }
+```
+
+An error in CSV mode returns the typed JSON body, not a CSV: `ReportError::respond_to` is the only error path, and the frontend does not offer a download URL when the JSON probe fails.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cd backend_rust && cargo test --test report_csv_test`
+
+Expected: PASS. If `the_headers_are_the_columns_order_and_no_comment_row_precedes_them` fails on the disposition header, check `CSV_COLUMNS`' length against the number of cells `render_row` writes — a mismatch moves every column one place and is the failure mode this test exists for.
+
+- [ ] **Step 6: Regenerate the contract and run every gate**
+
+```bash
+cd backend_rust
+cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
+cargo test && bash scripts/check_access_gate.sh && cargo clippy --all-targets
+cd ../frontend && npm run test && npm run lint && npm run typecheck
+```
+
+Expected: all green. `report_csv.rs` is not under `src/api_routes/`, so the gate's Rule A does not apply to it and its printed handler count is unchanged.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend_rust/src/report_csv.rs backend_rust/src/lib.rs backend_rust/src/schemas.rs \
+        backend_rust/src/api_routes/analytics.rs backend_rust/tests/report_csv_test.rs \
+        docs/openapi/openapi.json frontend/src/types.ts frontend/src/types/api.d.ts
+git commit -m "feat(api): serve the dated tax report as CSV from the same route"
+```
+
+(`types/api.d.ts` is regenerated because the two new `ReportRow` fields appear there too. `npm run generate-types` — the file has no importers, so it cannot break a renderer.)
