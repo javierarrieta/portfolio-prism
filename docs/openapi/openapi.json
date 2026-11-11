@@ -291,8 +291,19 @@
         "tags": [
           "crate::api_routes::analytics"
         ],
+        "summary": "The tax summary, or — with `from` and/or `to` — the dated tax report.",
+        "description": "Same route, same access level, two shapes. Without a window the response is the\nsummary object this endpoint has always returned, which carries `assets` with the\nopen lots the Holdings tab renders; it is not described here, and its shape is\ndeliberately unchanged (the printable statement and `PortfolioDetail` both read it).\nWith a window the response is `ReportResponse`.\n\nNo `params(...)` block, deliberately: the parameters come from the handler's own\narguments, which is why `strategy` and `threshold_days` are already in the committed\ndocument without one. `from` and `to` arrive here, where the route starts accepting\nthem: the contract never advertises a parameter or a response shape the route does\nnot produce, which is why the CSV format is not named here or anywhere in this block\nuntil the route can answer it.",
         "operationId": "get_portfolio_tax_summary",
         "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
           {
             "name": "id",
             "in": "path",
@@ -320,14 +331,25 @@
               "format": "int64",
               "nullable": true
             }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Tax summary retrieved",
+            "description": "Dated tax report when a window is given; the legacy summary object otherwise",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
               }
             }
           },
@@ -335,7 +357,34 @@
             "description": "Not authenticated"
           },
           "404": {
-            "description": "Portfolio not found"
+            "description": "Portfolio not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid window, or a price or rate does not exist at or before the window end",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A pricing provider is unreachable, or the report exceeded its elapsed deadline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }

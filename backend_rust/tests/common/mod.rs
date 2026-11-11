@@ -242,6 +242,22 @@ pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close:
     .unwrap();
 }
 
+/// A close for `symbol` on every calendar day in `[start, end]`. Dense on purpose: the
+/// pricing layer answers from the database only when the newest stored row is within
+/// `PRICE_WINDOW_FRESH_DAYS` of the date asked for, so a sparse seed reaches the
+/// provider and the test is no longer hermetic. `analytics_test.rs`'s own fixture skips
+/// weekends for the opposite reason — to exercise the gap — and that is why this one is
+/// shared rather than copied.
+#[allow(dead_code)]
+pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end: &str, close: &str) {
+    let mut day = NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap();
+    let last = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
+    while day <= last {
+        seed_price(pool, symbol, day, close).await;
+        day = day.succ_opt().expect("a date has a successor");
+    }
+}
+
 /// Pin split auto-detection for `symbol` so `sync_splits_for_asset` returns on its
 /// 30-day cache check instead of fetching. Same row `analytics_test.rs:218` writes.
 ///

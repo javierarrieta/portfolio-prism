@@ -24,6 +24,21 @@ export interface paths {
     get: operations["get_portfolio_performance"];
   };
   "/api/portfolios/<id>/tax-summary": {
+    /**
+     * The tax summary, or — with `from` and/or `to` — the dated tax report.
+     * @description Same route, same access level, two shapes. Without a window the response is the
+     * summary object this endpoint has always returned, which carries `assets` with the
+     * open lots the Holdings tab renders; it is not described here, and its shape is
+     * deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+     * With a window the response is `ReportResponse`.
+     *
+     * No `params(...)` block, deliberately: the parameters come from the handler's own
+     * arguments, which is why `strategy` and `threshold_days` are already in the committed
+     * document without one. `from` and `to` arrive here, where the route starts accepting
+     * them: the contract never advertises a parameter or a response shape the route does
+     * not produce, which is why the CSV format is not named here or anywhere in this block
+     * until the route can answer it.
+     */
     get: operations["get_portfolio_tax_summary"];
   };
   "/api/portfolios/<portfolio_id>/assets": {
@@ -615,21 +630,38 @@ export interface operations {
       };
     };
   };
+  /**
+   * The tax summary, or — with `from` and/or `to` — the dated tax report.
+   * @description Same route, same access level, two shapes. Without a window the response is the
+   * summary object this endpoint has always returned, which carries `assets` with the
+   * open lots the Holdings tab renders; it is not described here, and its shape is
+   * deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+   * With a window the response is `ReportResponse`.
+   *
+   * No `params(...)` block, deliberately: the parameters come from the handler's own
+   * arguments, which is why `strategy` and `threshold_days` are already in the committed
+   * document without one. `from` and `to` arrive here, where the route starts accepting
+   * them: the contract never advertises a parameter or a response shape the route does
+   * not produce, which is why the CSV format is not named here or anywhere in this block
+   * until the route can answer it.
+   */
   get_portfolio_tax_summary: {
     parameters: {
       query?: {
+        from?: string | null;
         strategy?: string | null;
         threshold_days?: number | null;
+        to?: string | null;
       };
       path: {
         id: number;
       };
     };
     responses: {
-      /** @description Tax summary retrieved */
+      /** @description Dated tax report when a window is given; the legacy summary object otherwise */
       200: {
         content: {
-          "application/json": unknown;
+          "application/json": components["schemas"]["ReportResponse"];
         };
       };
       /** @description Not authenticated */
@@ -638,7 +670,21 @@ export interface operations {
       };
       /** @description Portfolio not found */
       404: {
-        content: never;
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
+      };
+      /** @description Invalid window, or a price or rate does not exist at or before the window end */
+      422: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
+      };
+      /** @description A pricing provider is unreachable, or the report exceeded its elapsed deadline */
+      503: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
       };
     };
   };

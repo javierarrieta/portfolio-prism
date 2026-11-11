@@ -574,6 +574,41 @@ impl ReportRow {
     }
 }
 
+impl AssetTotals {
+    /// An asset with nothing dated at or before the window end: no realized figure, no
+    /// open lot, and no close to report.
+    pub fn empty(asset: &Asset, fx_applied: bool, split_applied: bool) -> Self {
+        AssetTotals {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
+            asset_type: asset.asset_type.clone(),
+            asset_currency: asset.currency.clone(),
+            realized_in_window: Decimal::ZERO,
+            realized_cumulative: Decimal::ZERO,
+            unrealized_at_end: Decimal::ZERO,
+            market_value: Decimal::ZERO,
+            cost_basis: Decimal::ZERO,
+            price_date_used: None,
+            fx_rate_date_used: None,
+            price_source: None,
+            fx_applied,
+            split_applied,
+        }
+    }
+}
+
+impl ReportTotals {
+    pub fn zero() -> Self {
+        ReportTotals {
+            realized_in_window: Decimal::ZERO,
+            realized_cumulative: Decimal::ZERO,
+            unrealized_at_end: Decimal::ZERO,
+            market_value: Decimal::ZERO,
+            cost_basis: Decimal::ZERO,
+        }
+    }
+}
+
 /// The dated report: the run context, per-asset totals, the portfolio rollup and every row.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReportResponse {

@@ -4,14 +4,25 @@
 //! Hermetic by construction, like `fx_pricing_test.rs`: every price and rate a test here
 //! needs is seeded into `historical_prices`, and the pricing layer reads the database
 //! before the provider. The two payload tests below need no price and no rate at all —
-//! they never open a database, so `mod common` is deliberately not declared until the
-//! first test that seeds something lands (Task 4).
+//! they never open a database; `mod common` arrived with the first test that seeds one
+//! (Task 4), which is also what retires the dead-code warnings on its helpers.
 
-use backend_rust::models::{Asset, Transaction};
+mod common;
+
+use backend_rust::api_routes::analytics::{
+    build_tax_report, pricing_failure_status, MissingItems, ReportError, ReportWindow,
+};
+use backend_rust::models::{Asset, Portfolio, Transaction};
 use backend_rust::schemas::{DatedLot, LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
+use backend_rust::services::currency_service::{CurrencyService, PricingError};
 use chrono::{DateTime, NaiveDate, Utc};
+use common::{build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
+use rocket::http::Status;
+use rocket::local::asynchronous::Client;
 use rust_decimal::Decimal;
+use sqlx::sqlite::SqlitePool;
 use std::str::FromStr;
+use std::time::Duration;
 
 fn day(s: &str) -> NaiveDate {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
@@ -221,3 +232,411 @@ fn an_open_lot_row_maps_every_dated_lot_field_and_leaves_the_sell_side_null() {
     assert_eq!(row.holding_days, None);
     assert_eq!(row.term, None);
 }
+
+// --------------------------------------------------------------------------------------
+// The dated route: the window, the reconciliation equalities and the failure contract.
+// --------------------------------------------------------------------------------------
+
+/// One portfolio, two assets and four transactions, with a close seeded for each asset
+/// up to `through`. The window end a test uses must be no later than `through`, or the
+/// pricing layer stops answering from the database.
+///
+/// SOLDIT: buys 60 @ 100 (Jan) and 40 @ 130 (Mar), sells 100 @ 130 (May) and 10 @ 140
+/// (late June) — so the May sell drains both lots (60 * 30 + 40 * 0 = 1800 realized) and
+/// the 10 June units have no lot left to match, which is the row kind that carries nulls.
+/// HELDIT: one buy of 50 @ 200 (Feb), which is the open lot.
+///
+/// *** DEVIATION FROM THE BRIEF, RECORDED: the brief's buy was 40 @ 120. *** With 120 the
+/// fixture is 100 bought against 90 sold, so the June sell is fully matched (10 of lot2's
+/// remaining 20), nothing is unmatched, `realized_in_window` is 200 and
+/// `realized_cumulative` is 2200 — every one of the money assertions in
+/// `the_window_selects_the_sells_but_not_the_lots_behind_them` is then false while the
+/// fixture's own comment ("10 units are unmatched") is also false. The assertions encode
+/// the test's point (a sell outside the window still counts in the cumulative total, and
+/// an unmatched tail realizes nothing and is a row of its own), so the *fixture* is what
+/// moved: 40 @ 130 puts the May sell's realized at exactly 1800 and leaves the June sell
+/// with nothing to match. See the task-4 report, defects §1.
+async fn fixture(pool: &SqlitePool, through: &str) -> (i32, i32, i32) {
+    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "Dated", "USD").await;
+    let sold = common::seed_asset(pool, port_id, "SOLDIT", "Sold it").await;
+    let held = common::seed_asset(pool, port_id, "HELDIT", "Held it").await;
+
+    common::seed_transaction_at(pool, sold, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "BUY", 40.0, 130.0, 0.0, "2024-03-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "SELL", 100.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
+    common::seed_transaction_at(pool, sold, "SELL", 10.0, 140.0, 0.0, "2024-06-25T00:00:00Z").await;
+    common::seed_transaction_at(pool, held, "BUY", 50.0, 200.0, 0.0, "2024-02-01T00:00:00Z").await;
+
+    common::seed_daily_prices(pool, "SOLDIT", "2024-01-01", through, "110.0").await;
+    common::seed_daily_prices(pool, "HELDIT", "2024-02-01", through, "220.0").await;
+    // No split is seeded, so this only has to keep `sync_splits_for_asset` on its cache
+    // path for the undated call.
+    seed_split_sync(pool, "SOLDIT").await;
+    seed_split_sync(pool, "HELDIT").await;
+
+    (port_id, sold, held)
+}
+
+fn dec_at(v: &serde_json::Value, path: &str) -> Decimal {
+    Decimal::from_str(v.pointer(path).and_then(|p| p.as_str()).unwrap_or_else(|| panic!("{path} missing"))).unwrap()
+}
+
+/// The loaded rows `build_tax_report` takes, read back through SQLx: two three-line
+/// helpers, because that function takes the rows rather than the ids.
+async fn load_fixture_portfolio(pool: &SqlitePool, id: i32) -> Portfolio {
+    sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn load_fixture_assets(pool: &SqlitePool, portfolio_id: i32) -> Vec<Asset> {
+    sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = ?")
+        .bind(portfolio_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_dated_report_sums_its_own_rows_and_agrees_with_the_undated_summary() {
+    // Goal 1, all three equalities, under all three strategies:
+    // (a) the sold-lot rows' `lot_pnl` sum to the asset's `realized_in_window`;
+    // (b) with `from` at the portfolio's first transaction, that sum is also the asset's
+    //     `realized_pnl` on the undated endpoint, which is fully driven here because the
+    //     window is the whole history and both calls price from the same seeded rows;
+    // (c) the open-lot rows' `unrealized_gain_loss` sums to `unrealized_at_end`.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    for strategy in ["FIFO", "LIFO", "HYBRID"] {
+        let dated = client
+            .get(format!(
+                "/api/portfolios/{port_id}/tax-summary?strategy={strategy}&threshold_days=30&from=2024-01-01&to={through}"
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(dated.status(), Status::Ok, "{strategy}");
+        let report: serde_json::Value = serde_json::from_str(&dated.into_string().await.unwrap()).unwrap();
+
+        for totals in report["asset_totals"].as_array().unwrap() {
+            let symbol = totals["symbol"].as_str().unwrap();
+            let rows: Vec<&serde_json::Value> = report["rows"].as_array().unwrap().iter()
+                .filter(|r| r["symbol"] == symbol)
+                .collect();
+
+            let sold: Decimal = rows.iter()
+                .filter(|r| r["row_type"] == "SOLD_LOT")
+                .map(|r| dec_at(r, "/lot_pnl"))
+                .sum();
+            assert_eq!(sold, dec_at(totals, "/realized_in_window"), "{strategy}/{symbol}: rows must sum to the server total");
+
+            let open: Decimal = rows.iter()
+                .filter(|r| r["row_type"] == "OPEN_LOT")
+                .map(|r| dec_at(r, "/unrealized_gain_loss"))
+                .sum();
+            assert_eq!(open, dec_at(totals, "/unrealized_at_end"), "{strategy}/{symbol}");
+        }
+
+        // The rollup is the server's, and the rows must not be the only source of it.
+        let rollup: Decimal = report["asset_totals"].as_array().unwrap().iter()
+            .map(|t| dec_at(t, "/realized_in_window"))
+            .sum();
+        assert_eq!(rollup, dec_at(&report, "/totals/realized_in_window"), "{strategy}");
+
+        let undated = client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?strategy={strategy}&threshold_days=30"))
+            .dispatch()
+            .await;
+        let summary: serde_json::Value = serde_json::from_str(&undated.into_string().await.unwrap()).unwrap();
+        for asset in summary["assets"].as_array().unwrap() {
+            let symbol = asset["symbol"].as_str().unwrap();
+            let dated_asset = report["asset_totals"].as_array().unwrap().iter()
+                .find(|t| t["symbol"] == symbol)
+                .unwrap();
+            assert_eq!(
+                dec_at(dated_asset, "/realized_cumulative"),
+                dec_at(asset, "/realized_pnl"),
+                "{strategy}/{symbol}: cumulative realized must equal what the Holdings tab shows",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_undated_call_still_returns_the_shape_the_statement_reads() {
+    // Review Focus 5. The printable statement and `PortfolioDetail` read `assets[].tax_lots`,
+    // `current_shares` and `total_portfolio_value`, none of which the typed report carries.
+    // If this test fails because `context` appears and `assets` does not, the typed payload
+    // has replaced the legacy response and both shipped screens are broken.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert!(body["assets"].is_array());
+    assert!(body["assets"][0]["tax_lots"].is_array());
+    assert!(body["assets"][0]["current_shares"].is_string());
+    assert!(body["total_portfolio_value"].is_string());
+    assert_eq!(body["strategy"], "FIFO");
+    assert!(body.get("rows").is_none(), "the legacy shape has no rows");
+    assert!(body.get("context").is_none(), "and no run context");
+}
+
+#[tokio::test]
+async fn the_undated_path_still_names_the_strategy_the_engine_used() {
+    // The spec's file 6 fix: the handler defaults but does not normalise, so
+    // `?strategy=average_cost` reports `average_cost` while the engine ran FIFO. The
+    // printable statement's run-context line is what depends on this, and the numbers do
+    // not move -- the engine already fell through to FIFO.
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=average_cost&threshold_days=30"))
+        .dispatch()
+        .await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "FIFO", "the response must not name a method the engine did not use");
+}
+
+#[tokio::test]
+async fn a_window_end_on_a_non_trading_day_reports_the_close_it_used() {
+    // 2024-06-30 is a Sunday and the fixture stops on the Friday before it (2 days, inside
+    // `PRICE_WINDOW_FRESH_DAYS = 4`), so the database answers and the file states which
+    // close priced the position. Silent substitution is the failure Goal 5 names.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&to=2024-06-30"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(report["context"]["requested_to"], "2024-06-30");
+    assert_eq!(
+        report["context"]["requested_from"], "2024-01-01",
+        "`to` alone is cumulative from the portfolio's first transaction",
+    );
+    for totals in report["asset_totals"].as_array().unwrap() {
+        assert_eq!(totals["price_date_used"], "2024-06-28", "{}", totals["symbol"]);
+        assert_eq!(totals["price_source"], "database");
+    }
+    for row in report["rows"].as_array().unwrap() {
+        assert_eq!(row["price_date_used"], "2024-06-28", "one close per asset, repeated on its rows");
+    }
+}
+
+#[tokio::test]
+async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
+    // A sell dated before `from` is out of the window's rows and out of
+    // `realized_in_window`, and still part of `realized_cumulative` — and the buy lots it
+    // consumed still show up as open lots (or not) at `end`. Getting this wrong changes a
+    // filed quarter.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&from=2024-06-01&to=2024-06-30"))
+        .dispatch()
+        .await;
+    let report: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert!(report["rows"].as_array().unwrap().iter().all(|r| r["sell_date"].is_null() || r["sell_date"].as_str().unwrap() >= "2024-06-01"));
+    let soldit = report["asset_totals"].as_array().unwrap().iter()
+        .find(|t| t["symbol"] == "SOLDIT").unwrap();
+    // Only the 10 June units are in the window, and all 10 of them are unmatched: FIFO
+    // takes the oldest lot first, and the May sell already consumed both lots.
+    assert_eq!(dec_at(soldit, "/realized_in_window"), dec("0.0"), "an unmatched tail realizes nothing");
+    assert_eq!(dec_at(soldit, "/realized_cumulative"), dec("1800.0") + dec("-0.0") + dec("0.0"));
+    let unmatched = report["rows"].as_array().unwrap().iter()
+        .filter(|r| r["row_type"] == "UNMATCHED")
+        .collect::<Vec<_>>();
+    assert_eq!(unmatched.len(), 1, "the June sell's unmatched tail is a row of its own");
+    assert!(unmatched[0]["realized_pnl"].is_null());
+    assert_eq!(unmatched[0]["unmatched_qty"], "10.0");
+}
+
+/// The validation failures, each of which names the parameter and carries two empty
+/// lists. They are all 422 with `retryable: false`: the client typed something the
+/// server cannot act on, and retrying changes nothing.
+#[tokio::test]
+async fn invalid_windows_are_422s_that_name_the_parameter() {
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let today = Utc::now().date_naive();
+    let tomorrow = (today + chrono::Duration::days(1)).to_string();
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("from after to", "from=2024-06-30&to=2024-06-01".to_string(), "from"),
+        ("future to", format!("to={tomorrow}"), "to"),
+        ("future from", format!("from={tomorrow}"), "from"),
+        ("unparseable to", "to=31-06-2024".to_string(), "to"),
+        ("unparseable from", "from=not-a-date".to_string(), "from"),
+        ("unknown strategy", "to=2024-06-30&strategy=average_cost".to_string(), "strategy"),
+        ("negative threshold", "to=2024-06-30&threshold_days=-1".to_string(), "threshold_days"),
+    ];
+
+    for (label, query, param) in cases {
+        let resp = client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?{query}"))
+            .dispatch()
+            .await;
+        assert_eq!(resp.status(), Status::UnprocessableEntity, "{label}");
+        let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains(param),
+            "{label}: the body must name the offending parameter, got {}",
+            body["error"],
+        );
+        assert_eq!(body["missing_prices"], serde_json::json!([]), "{label}");
+        assert_eq!(body["missing_rates"], serde_json::json!([]), "{label}");
+        assert_eq!(body["retryable"], false, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_portfolio_is_404_and_an_unknown_strategy_on_the_undated_path_is_not_an_error() {
+    let pool = setup_db(&disabled_config()).await;
+    // Today, not a past date: the undated call below prices through `get_price`, which
+    // answers only from a row dated exactly today and otherwise asks the provider. A
+    // `through` of 2024-06-28 would make this test reach the network.
+    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let missing = client.get("/api/portfolios/9999/tax-summary?strategy=FIFO").dispatch().await;
+    assert_eq!(missing.status(), Status::NotFound);
+
+    // Dated-only strictness (decision D6): the same unknown value that is a 422 with a
+    // window is a 200 without one.
+    let undated = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=average_cost"))
+        .dispatch()
+        .await;
+    assert_eq!(undated.status(), Status::Ok);
+}
+
+#[test]
+fn the_missing_item_lists_are_capped_and_the_totals_say_so() {
+    // The cap is testable without a provider because it is applied when the collected
+    // failures render, not when they are found. See Step 9 for why the collection itself
+    // has no hermetic test.
+    let mut missing = MissingItems::new();
+    for i in 0..21 {
+        missing.add_price(&format!("SYM{i}"));
+    }
+    for i in 0..11 {
+        missing.add_rate(&format!("C{i}"), "USD");
+    }
+    // Duplicates are not items: the list names symbols and pairs, once each.
+    missing.add_price("SYM0");
+    missing.add_rate("C0", "USD");
+
+    let body = missing.into_error_body("no price or rate exists at or before the requested date");
+    assert_eq!(body.missing_prices.len(), 20);
+    assert_eq!(body.missing_prices_total, 21);
+    assert_eq!(body.missing_rates.len(), 10);
+    assert_eq!(body.missing_rates_total, 11);
+    assert!(!body.retryable);
+}
+
+#[test]
+fn a_missing_rate_is_named_as_a_pair_not_a_symbol() {
+    let mut missing = MissingItems::new();
+    missing.add_rate("EUR", "USD");
+    let body = missing.into_error_body("no price or rate exists at or before the requested date");
+    assert_eq!(body.missing_rates[0].from, "EUR");
+    assert_eq!(body.missing_rates[0].to, "USD");
+    assert!(body.missing_prices.is_empty());
+}
+
+#[test]
+fn the_two_failure_classes_carry_the_right_status_and_retryable_flag() {
+    // The contract, pinned on the constructors rather than through a provider.
+    let no_data = ReportError::no_data(MissingItems::new());
+    assert_eq!(no_data.status, Status::UnprocessableEntity);
+    assert!(!no_data.body.retryable);
+
+    let provider = ReportError::provider("timeout".to_string());
+    assert_eq!(provider.status, Status::ServiceUnavailable);
+    assert!(provider.body.retryable);
+
+    let deadline = ReportError::deadline();
+    assert_eq!(deadline.status, Status::ServiceUnavailable);
+    assert!(deadline.body.retryable);
+
+    // `PricingError`'s two variants mean different user actions, and the report's mapping
+    // is the place that difference becomes a status code.
+    assert_eq!(pricing_failure_status(&PricingError::NoData), Status::UnprocessableEntity);
+    assert_eq!(
+        pricing_failure_status(&PricingError::ProviderUnavailable("timeout".to_string())),
+        Status::ServiceUnavailable,
+    );
+}
+
+#[tokio::test]
+async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
+    // The one hermetic route to a 503: the check runs before the first pricing step, so
+    // `Duration::ZERO` trips it with no outbound call at all. A test that waited 20 s
+    // would not be worth having.
+    let pool = setup_db(&disabled_config()).await;
+    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let portfolio = load_fixture_portfolio(&pool, port_id).await;
+    let assets = load_fixture_assets(&pool, port_id).await;
+    let svc = CurrencyService::new();
+
+    let err = build_tax_report(
+        &pool, &svc, &portfolio, &assets, "FIFO", 30,
+        &ReportWindow { from: None, to: day("2024-06-30") },
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("a zero deadline must not produce a report");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert!(err.body.retryable);
+    assert!(err.body.missing_prices.is_empty(), "no partial payload, and no missing items either");
+}
+
+// --------------------------------------------------------------------------------------
+// What cannot be tested here, and why (Task 4, Step 9)
+// --------------------------------------------------------------------------------------
+//
+// Two cases the spec asks for have no hermetic test, and this file does not pretend
+// otherwise. Both are the same missing seam; the compensating tests are above.
+//
+// 1. "A missing price returns 422 naming every missing symbol." A seeded database cannot
+//    produce `Err(NoData)`: `get_historical_prices` answers from `historical_prices` when
+//    the window's newest row is within `PRICE_WINDOW_FRESH_DAYS` of the requested date,
+//    and otherwise asks the provider (`currency_service.rs:713-717`). There is no third
+//    path, so "no data" is only ever the provider's answer — and the provider is a
+//    hardcoded Yahoo URL (`CurrencyService::new()` takes no arguments), so a test that
+//    wants it reaches the network. Pinned instead: the *shape* of the 422
+//    (`missing_prices`, `missing_rates`, both totals, `retryable: false`) through the
+//    validation failures, which share the body; the caps and the pair-not-symbol rule
+//    through `MissingItems`; and `pricing_failure_status` for the mapping itself.
+// 2. "An unreachable provider returns 503 with `retryable: true`." Same seam, and the
+//    deadline test is the hermetic path to that body:
+//    `the_deadline_fails_closed_instead_of_returning_a_partial_report` asserts the
+//    status, `retryable`, and that no partial payload comes back.
+//
+// If a future change adds a provider seam, both become writable and should be added;
+// until then a test asserting them would either hit the network or pass for the wrong
+// reason.
