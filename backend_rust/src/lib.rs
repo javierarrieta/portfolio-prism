@@ -7,6 +7,7 @@ pub mod services;
 pub mod engines;
 pub mod openapi;
 pub mod access;
+pub mod report_csv;
 pub mod auth;
 pub mod api_routes {
     pub mod portfolios;

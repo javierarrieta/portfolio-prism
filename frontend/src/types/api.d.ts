@@ -33,11 +33,12 @@ export interface paths {
      * With a window the response is `ReportResponse`.
      *
      * No `params(...)` block, deliberately: the parameters come from the handler's own
-     * arguments, which is why `strategy` and `threshold_days` are already in the committed
-     * document without one. `from` and `to` arrive here, where the route starts accepting
-     * them: the contract never advertises a parameter or a response shape the route does
-     * not produce, which is why the CSV format is not named here or anywhere in this block
-     * until the route can answer it.
+     * arguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are
+     * all in the committed document without one. `?format=csv` (dated requests only) answers
+     * the same bytes the JSON payload carries, as a server-generated file: the CSV is a
+     * projection of `ReportResponse`, so no number in it is re-derived. It is described here
+     * rather than as a second content type for status 200, which utoipa's response map —
+     * keyed by status — cannot express.
      */
     get: operations["get_portfolio_tax_summary"];
   };
@@ -639,15 +640,17 @@ export interface operations {
    * With a window the response is `ReportResponse`.
    *
    * No `params(...)` block, deliberately: the parameters come from the handler's own
-   * arguments, which is why `strategy` and `threshold_days` are already in the committed
-   * document without one. `from` and `to` arrive here, where the route starts accepting
-   * them: the contract never advertises a parameter or a response shape the route does
-   * not produce, which is why the CSV format is not named here or anywhere in this block
-   * until the route can answer it.
+   * arguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are
+   * all in the committed document without one. `?format=csv` (dated requests only) answers
+   * the same bytes the JSON payload carries, as a server-generated file: the CSV is a
+   * projection of `ReportResponse`, so no number in it is re-derived. It is described here
+   * rather than as a second content type for status 200, which utoipa's response map —
+   * keyed by status — cannot express.
    */
   get_portfolio_tax_summary: {
     parameters: {
       query?: {
+        format?: string | null;
         from?: string | null;
         strategy?: string | null;
         threshold_days?: number | null;

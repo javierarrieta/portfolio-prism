@@ -292,9 +292,18 @@
           "crate::api_routes::analytics"
         ],
         "summary": "The tax summary, or — with `from` and/or `to` — the dated tax report.",
-        "description": "Same route, same access level, two shapes. Without a window the response is the\nsummary object this endpoint has always returned, which carries `assets` with the\nopen lots the Holdings tab renders; it is not described here, and its shape is\ndeliberately unchanged (the printable statement and `PortfolioDetail` both read it).\nWith a window the response is `ReportResponse`.\n\nNo `params(...)` block, deliberately: the parameters come from the handler's own\narguments, which is why `strategy` and `threshold_days` are already in the committed\ndocument without one. `from` and `to` arrive here, where the route starts accepting\nthem: the contract never advertises a parameter or a response shape the route does\nnot produce, which is why the CSV format is not named here or anywhere in this block\nuntil the route can answer it.",
+        "description": "Same route, same access level, two shapes. Without a window the response is the\nsummary object this endpoint has always returned, which carries `assets` with the\nopen lots the Holdings tab renders; it is not described here, and its shape is\ndeliberately unchanged (the printable statement and `PortfolioDetail` both read it).\nWith a window the response is `ReportResponse`.\n\nNo `params(...)` block, deliberately: the parameters come from the handler's own\narguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are\nall in the committed document without one. `?format=csv` (dated requests only) answers\nthe same bytes the JSON payload carries, as a server-generated file: the CSV is a\nprojection of `ReportResponse`, so no number in it is re-derived. It is described here\nrather than as a second content type for status 200, which utoipa's response map —\nkeyed by status — cannot express.",
         "operationId": "get_portfolio_tax_summary",
         "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
           {
             "name": "from",
             "in": "query",

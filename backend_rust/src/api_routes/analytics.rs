@@ -11,6 +11,7 @@ use crate::services::currency_service::{
     FX_LOOKBACK_DAYS,
 };
 use crate::engines::tax_engine::TaxLotEngine;
+use crate::report_csv;
 use crate::schemas::{
     AssetTotals, ErrorBody, MissingRate, PriceSource, ReportContext, ReportResponse, ReportRow,
     ReportTotals, SellPnlResponse,
@@ -30,11 +31,12 @@ use crate::auth::guard::AuthedUser;
 /// With a window the response is `ReportResponse`.
 ///
 /// No `params(...)` block, deliberately: the parameters come from the handler's own
-/// arguments, which is why `strategy` and `threshold_days` are already in the committed
-/// document without one. `from` and `to` arrive here, where the route starts accepting
-/// them: the contract never advertises a parameter or a response shape the route does
-/// not produce, which is why the CSV format is not named here or anywhere in this block
-/// until the route can answer it.
+/// arguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are
+/// all in the committed document without one. `?format=csv` (dated requests only) answers
+/// the same bytes the JSON payload carries, as a server-generated file: the CSV is a
+/// projection of `ReportResponse`, so no number in it is re-derived. It is described here
+/// rather than as a second content type for status 200, which utoipa's response map —
+/// keyed by status — cannot express.
 #[utoipa::path(
     get,
     path = "/api/portfolios/<id>/tax-summary",
@@ -46,7 +48,7 @@ use crate::auth::guard::AuthedUser;
     )
 )]
 #[allow(clippy::too_many_arguments)]
-#[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>")]
+#[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>&<format>")]
 pub async fn get_portfolio_tax_summary(
     user: AuthedUser,
     id: i32,
@@ -56,6 +58,7 @@ pub async fn get_portfolio_tax_summary(
     threshold_days: Option<i64>,
     from: Option<String>,
     to: Option<String>,
+    format: Option<String>,
 ) -> Result<TaxSummaryResponse, ReportError> {
     // First statement in the body on purpose: `check_access_gate.sh`'s Rule B ends a
     // handler at the first column-0 `}` and requires a `require*` call before any
@@ -67,6 +70,7 @@ pub async fn get_portfolio_tax_summary(
     let pool = pool.inner();
     let today = Utc::now().date_naive();
     let window = parse_window(from.as_deref(), to.as_deref(), today)?;
+    let csv = parse_format(format.as_deref(), window.is_some())?;
 
     // Strict on the dated path, permissive on the undated one (decision D6).
     let strategy_val = match &window {
@@ -88,7 +92,20 @@ pub async fn get_portfolio_tax_summary(
                 &strategy_val, threshold_val, &window, REPORT_DEADLINE,
             )
             .await?;
-            Ok(TaxSummaryResponse::Report(Json(report)))
+            if csv {
+                // `inception` when `requested_from` is None — the portfolio has no
+                // transaction at or before the window end. The filename names the window
+                // the file actually covers, not the parameters as typed.
+                let filename = format!(
+                    "tax-report-{}-{}-{}.csv",
+                    report.context.portfolio_id,
+                    report.context.requested_from.map(|d| d.to_string()).unwrap_or_else(|| "inception".to_string()),
+                    report.context.requested_to,
+                );
+                Ok(TaxSummaryResponse::Csv { body: report_csv::render(&report), filename })
+            } else {
+                Ok(TaxSummaryResponse::Report(Json(report)))
+            }
         }
         None => {
             let summary = undated_summary(pool, currency_service.inner(), &portfolio, &assets, &strategy_val, threshold_val).await?;
@@ -586,16 +603,18 @@ pub fn pricing_failure_status(error: &PricingError) -> Status {
     }
 }
 
-/// The route's two shapes. The enum is hand-written rather than Rocket's `Either`: that
-/// type is re-exported `#[doc(hidden)]` (`rocket-0.5.1/src/lib.rs:186`), and this match is
-/// where Task 5 adds the CSV arm.
-// The two arms differ in size because one carries the legacy `Value` and the other the
-// typed payload. Boxing the report would change the shape Task 5's CSV arm consumes, and
-// this value exists for the length of one request.
+/// The route's three shapes. The enum is hand-written rather than Rocket's `Either`: that
+/// type is re-exported `#[doc(hidden)]` (`rocket-0.5.1/src/lib.rs:186`).
+// The arms differ in size because one carries the legacy `Value` and another the typed
+// payload. Boxing the report would change the shape the CSV arm consumes, and this value
+// exists for the length of one request.
 #[allow(clippy::large_enum_variant)]
 pub enum TaxSummaryResponse {
     Legacy(Json<serde_json::Value>),
     Report(Json<ReportResponse>),
+    /// The dated payload as a server-generated file: `render` projects `ReportResponse`,
+    /// so the file's numbers are the route's numbers and nothing is re-derived here.
+    Csv { body: String, filename: String },
 }
 
 impl<'r> Responder<'r, 'static> for TaxSummaryResponse {
@@ -603,6 +622,14 @@ impl<'r> Responder<'r, 'static> for TaxSummaryResponse {
         match self {
             TaxSummaryResponse::Legacy(json) => json.respond_to(request),
             TaxSummaryResponse::Report(json) => json.respond_to(request),
+            TaxSummaryResponse::Csv { body, filename } => Response::build()
+                .status(Status::Ok)
+                // `ContentType::new` rather than a constant: Rocket has no CSV constant
+                // (`rocket_http-0.5.1/src/header/content_type.rs:230`).
+                .header(ContentType::new("text", "csv"))
+                .raw_header("Content-Disposition", format!("attachment; filename=\"{filename}\""))
+                .sized_body(body.len(), Cursor::new(body))
+                .ok(),
         }
     }
 }
@@ -656,6 +683,22 @@ fn parse_window(
         return Err(ReportError::validation("to", "is in the future"));
     }
     Ok(Some(ReportWindow { from: Some(parsed_from), to: parsed_to }))
+}
+
+/// `csv` or nothing. The default is JSON, and JSON is the documented surface: the OpenAPI
+/// document describes the typed payload, and `?format=csv` is the same bytes in another
+/// envelope, described in the operation's summary rather than as a second content type for
+/// status 200 (which utoipa's response map, keyed by status, cannot express).
+fn parse_format(format: Option<&str>, dated: bool) -> Result<bool, ReportError> {
+    match format {
+        None => Ok(false),
+        Some("csv") if dated => Ok(true),
+        Some("csv") => Err(ReportError::validation("format", "`csv` needs `from` or `to`")),
+        Some(other) => Err(ReportError::validation(
+            "format",
+            &format!("`{other}` is not a known format; only `csv` is accepted"),
+        )),
+    }
 }
 
 fn parse_date_param(param: &str, raw: &str) -> Result<NaiveDate, ReportError> {
