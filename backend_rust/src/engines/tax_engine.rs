@@ -1,8 +1,8 @@
 use crate::models::Transaction;
-use crate::schemas::{AssetTaxSummary, LotMatch, SellBreakdown, TaxLot};
+use crate::schemas::{AssetTaxSummary, DatedLot, DatedReplay, LotMatch, SellBreakdown, TaxLot};
 use crate::services::currency_service::CurrencyService;
 use rust_decimal::Decimal;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use anyhow::Result;
 use sqlx::sqlite::SqlitePool;
 
@@ -30,6 +30,35 @@ mod tests {
     /// There are no seeded prices in this file to look for.
     async fn empty_pool() -> SqlitePool {
         SqlitePool::connect(":memory:").await.unwrap()
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    /// A pool with the real schema, for the fixtures that seed FX rows. `empty_pool()`
+    /// above is a bare `:memory:` connection with no tables, which is enough for the
+    /// USD/USD fixtures and not enough for these.
+    async fn priced_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let cfg = crate::auth::StartupConfig::from_env_with(&|key| {
+            (key == "AUTH_MODE").then(|| "disabled".to_string())
+        })
+        .expect("AUTH_MODE=disabled parses in a debug build");
+        crate::init_db(&pool, &cfg).await.unwrap();
+        pool
+    }
+
+    async fn seed_fx(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+        for (date, price) in rows {
+            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+                .bind(symbol)
+                .bind(day(date))
+                .bind(*price)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
     }
 
     async fn run_engine(transactions: &[Transaction], strategy: &str, threshold_days: i64) -> AssetTaxSummary {
@@ -368,6 +397,133 @@ mod tests {
             assert_eq!(sold, accounted, "every sold unit is either matched or declared unmatched under {strategy}");
         }
     }
+
+    #[tokio::test]
+    async fn test_replay_at_excludes_a_sell_after_the_end_date() {
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SELL", "100.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let svc = CurrencyService::new();
+        let pool = empty_pool().await;
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-06-30"), day("2024-06-30"),
+            Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.sell_breakdowns.is_empty(), "a sell after `end` is outside the window");
+        assert_eq!(out.open_lots.len(), 1);
+        assert_eq!(out.open_lots[0].remaining_qty, Decimal::from_str("100.0").unwrap());
+        assert_eq!(out.open_lots[0].buy_transaction_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_replay_at_a_split_after_end_does_not_move_the_window() {
+        // The split branch rescales every lot in scope, so the filter has to run before
+        // sorting and matching rather than after. Without the filter this fixture
+        // reports a 200-unit lot at a 50.0 unit cost for a window that closed a month
+        // before the split happened.
+        let txs = vec![
+            make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "SPLIT", "2.0", "1.0", "0.0", "2024-08-01T00:00:00Z"),
+        ];
+        let svc = CurrencyService::new();
+        let pool = empty_pool().await;
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-06-30"), day("2024-06-30"),
+            Decimal::from_str("100.0").unwrap(), "USD", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.open_lots.len(), 1);
+        assert_eq!(out.open_lots[0].remaining_qty, Decimal::from_str("100.0").unwrap());
+        assert_eq!(out.open_lots[0].original_qty, Decimal::from_str("100.0").unwrap());
+        assert_eq!(out.open_lots[0].unit_cost, Decimal::from_str("100.0").unwrap());
+        assert!(out.sell_breakdowns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_replay_at_prices_the_market_value_at_the_valuation_date() {
+        // Review Focus 1. The realized leg converts the buy at the buy's own date
+        // (1.0000 here) and the market-value leg converts at `valuation_date` (1.2500).
+        // A replay that used one rate for both legs reports a 10000.0 market value and
+        // no gain at all -- plausible enough to survive a reader who is not looking for
+        // a date.
+        let pool = priced_pool().await;
+        seed_fx(&pool, "EURUSD=X", &[
+            ("2024-01-01", "1.0000"),
+            ("2024-03-29", "1.2500"),
+            ("2024-03-30", "1.2500"),
+            ("2024-03-31", "1.2500"),
+        ]).await;
+        let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z")];
+        let svc = CurrencyService::new();
+
+        let out = TaxLotEngine::replay_at(
+            &txs, day("2024-03-31"), day("2024-03-31"),
+            Decimal::from_str("100.0").unwrap(), "EUR", "USD", &svc, "FIFO", 30, &pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.fx_rate_date_used, Some(day("2024-03-31")));
+        assert_eq!(out.current_price_base, Decimal::from_str("125.0").unwrap());
+        assert_eq!(out.open_lots[0].unit_cost, Decimal::from_str("100.0").unwrap(),
+            "the realized leg converts the buy at the buy's own date");
+        assert_eq!(out.open_lots[0].market_value, Decimal::from_str("12500.0").unwrap());
+        assert_eq!(out.open_lots[0].unrealized_gain_loss, Decimal::from_str("2500.0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_replay_at_agrees_with_calculate_lots_when_both_look_at_today() {
+        // Two copies of the same valuation loop is the cost of leaving `calculate_lots`
+        // alone; this is what keeps them from drifting. USD/USD, so neither leg needs a
+        // rate and `calculate_lots`'s `Utc::now()` is a no-op.
+        let txs = vec![
+            make_tx(1, "BUY", "60.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
+            make_tx(2, "BUY", "40.0", "120.0", "0.0", "2024-06-01T00:00:00Z"),
+            make_tx(3, "SELL", "80.0", "130.0", "0.0", "2024-12-01T00:00:00Z"),
+        ];
+        let today = ChronoUtc::now().date_naive();
+        let price = Decimal::from_str("110.0").unwrap();
+
+        for strategy in ["FIFO", "LIFO", "HYBRID"] {
+            let svc = CurrencyService::new();
+            let pool = empty_pool().await;
+            let summary = TaxLotEngine::calculate_lots(
+                "TEST", "STOCK", &txs, price, "USD", "USD", &svc, strategy, 30, &pool,
+            )
+            .await
+            .unwrap();
+            let out = TaxLotEngine::replay_at(
+                &txs, today, today, price, "USD", "USD", &svc, strategy, 30, &pool,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(out.open_lots.len(), summary.tax_lots.len(), "{strategy}: one row per open lot");
+            for (dated, taxed) in out.open_lots.iter().zip(summary.tax_lots.iter()) {
+                assert_eq!(dated.buy_transaction_id, taxed.buy_transaction_id, "{strategy}");
+                assert_eq!(dated.buy_price, taxed.buy_price, "{strategy}");
+                assert_eq!(dated.original_qty, taxed.original_qty, "{strategy}");
+                assert_eq!(dated.remaining_qty, taxed.remaining_qty, "{strategy}");
+                assert_eq!(dated.unrealized_gain_loss, taxed.latent_gain_loss, "{strategy}");
+                assert_eq!(
+                    dated.unrealized_roi.unwrap_or(Decimal::ZERO),
+                    taxed.latent_roi,
+                    "{strategy}: the dated report calls a zero-cost lot's ROI null, the undated summary calls it zero",
+                );
+            }
+            assert_eq!(
+                out.sell_breakdowns.iter().map(|b| b.realized_pnl).sum::<Decimal>(),
+                summary.realized_pnl,
+                "{strategy}: every breakdown is present, so the selection is the only difference",
+            );
+        }
+    }
 }
 
 pub struct TaxLotEngine;
@@ -646,6 +802,115 @@ impl TaxLotEngine {
             realized_pnl,
             tax_lots: open_lots,
         })
+    }
+
+    /// The engine's one dated entry point: the open lots and every sell's lot
+    /// attribution at `end`, from a single pass.
+    ///
+    /// `end` filters transactions; `valuation_date` prices them for the market value. A
+    /// caller that has no separate valuation date passes `end` for both — which is what
+    /// the terminated report does. The two are separate parameters because the
+    /// alternative (deriving the FX date from the transaction list, the way the old
+    /// `latest_date` did) silently prices a past date with whatever rate the last
+    /// transaction happened to carry.
+    ///
+    /// The `date <= end` filter runs *before* `sorted_transactions`, not after, because
+    /// the SPLIT branch rescales every lot in scope: a split dated after `end` would
+    /// move the cost basis of a window that closed before it happened.
+    ///
+    /// `too_many_arguments` is silenced for the same reason as `calculate_lots`: the
+    /// tenth is the `SqlitePool` threaded through for `get_rate`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replay_at(
+        transactions: &[Transaction],
+        end: NaiveDate,
+        valuation_date: NaiveDate,
+        current_price: Decimal,
+        asset_currency: &str,
+        base_currency: &str,
+        currency_service: &CurrencyService,
+        strategy: &str,
+        hybrid_threshold_days: i64,
+        pool: &SqlitePool,
+    ) -> Result<DatedReplay> {
+        let in_window: Vec<Transaction> = transactions
+            .iter()
+            .filter(|tx| tx.date.date_naive() <= end)
+            .cloned()
+            .collect();
+        let sorted_txs = Self::sorted_transactions(&in_window);
+
+        // An asset with nothing dated at or before `end` has no lots and needs no rate:
+        // returning here is what keeps a position bought after the window from costing
+        // an outbound FX call.
+        if sorted_txs.is_empty() {
+            return Ok(DatedReplay {
+                open_lots: Vec::new(),
+                sell_breakdowns: Vec::new(),
+                current_price_base: Decimal::ZERO,
+                fx_rate_date_used: None,
+            });
+        }
+
+        let mut fx_rate_date_used = None;
+        let current_price_base = if asset_currency != base_currency {
+            // The market-value leg marks the position at the close the caller quoted for
+            // `valuation_date`, so it is converted at that date's rate. The realized legs
+            // in `replay` are each converted at their own transaction date, which is the
+            // correct rule for a historical figure and why the two legs cannot share one
+            // lookup.
+            let at = currency_service
+                .get_rate(
+                    asset_currency,
+                    base_currency,
+                    valuation_date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                    pool,
+                )
+                .await?;
+            fx_rate_date_used = Some(at.date_used);
+            current_price * at.rate
+        } else {
+            current_price
+        };
+
+        let (buy_lots, sell_breakdowns) = Self::replay(
+            &sorted_txs,
+            pool,
+            currency_service,
+            asset_currency,
+            base_currency,
+            strategy,
+            hybrid_threshold_days,
+        )
+        .await?;
+
+        let mut open_lots = Vec::new();
+        for lot in buy_lots {
+            if lot.qty <= Decimal::ZERO {
+                continue;
+            }
+            let lot_cost = lot.qty * lot.unit_cost;
+            let lot_market_value = lot.qty * current_price_base;
+            let unrealized_gain_loss = lot_market_value - lot_cost;
+            let unrealized_roi = if lot_cost > Decimal::ZERO {
+                Some(unrealized_gain_loss / lot_cost)
+            } else {
+                None
+            };
+            open_lots.push(DatedLot {
+                buy_transaction_id: lot.source_tx_id,
+                buy_date: lot.date,
+                buy_price: lot.price,
+                original_qty: lot.original_qty,
+                remaining_qty: lot.qty,
+                unit_cost: lot.unit_cost,
+                market_value: lot_market_value,
+                unrealized_gain_loss,
+                unrealized_roi,
+            });
+        }
+
+        Ok(DatedReplay { open_lots, sell_breakdowns, current_price_base, fx_rate_date_used })
     }
 
     /// Realized-P&L breakdown for one sell. Replays the whole asset history

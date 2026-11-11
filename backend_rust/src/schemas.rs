@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use utoipa::ToSchema;
 use rust_decimal::Decimal;
 use crate::db_types::{decimal_json, decimal_opt_json};
@@ -132,7 +132,7 @@ pub struct AssetTaxSummary {
 /// One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
 /// split-adjusted and expressed in the portfolio base currency; `unit_cost`
 /// additionally carries the amortised buy fee.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LotMatch {
     pub buy_transaction_id: i32,
     pub buy_date: DateTime<Utc>,
@@ -161,7 +161,7 @@ pub struct LotMatch {
 ///
 /// Engine-internal: not registered in the OpenAPI components, because no
 /// response body is of this type.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SellBreakdown {
     pub sell_transaction_id: i32,
     pub sell_date: DateTime<Utc>,
@@ -178,6 +178,40 @@ pub struct SellBreakdown {
     #[serde(with = "decimal_json")]
     pub realized_pnl: Decimal,
     pub matches: Vec<LotMatch>,
+}
+
+/// One lot still open at `end`, valued at the requested date. The report's OPEN_LOT row
+/// is this struct; `unrealized_roi` is `None` rather than zero when the lot has no cost
+/// basis, so a consumer can tell "not applicable" from "0%".
+#[derive(Debug, Clone)]
+pub struct DatedLot {
+    pub buy_transaction_id: i32,
+    pub buy_date: DateTime<Utc>,
+    /// Split-adjusted purchase price per unit, in the asset's own currency.
+    pub buy_price: Decimal,
+    /// The quantity originally bought, split-adjusted: a 100-share lot after a 2:1 split
+    /// is 200 whether or not any of it has been sold.
+    pub original_qty: Decimal,
+    pub remaining_qty: Decimal,
+    /// Fee-amortised cost per unit, in the portfolio's base currency.
+    pub unit_cost: Decimal,
+    pub market_value: Decimal,
+    pub unrealized_gain_loss: Decimal,
+    pub unrealized_roi: Option<Decimal>,
+}
+
+/// One dated replay: the open lots and every sell's lot attribution, from a single pass
+/// over the transactions with `date <= end`.
+#[derive(Debug, Clone)]
+pub struct DatedReplay {
+    pub open_lots: Vec<DatedLot>,
+    pub sell_breakdowns: Vec<SellBreakdown>,
+    /// The base-currency price the open lots were valued at. The report sums lot values
+    /// and never multiplies this by a quantity of its own.
+    pub current_price_base: Decimal,
+    /// The date whose close priced the market value, or `None` when the asset and the
+    /// base currency are the same and no conversion happened.
+    pub fx_rate_date_used: Option<NaiveDate>,
 }
 
 /// Endpoint payload: the breakdown flattened next to the context needed to read
