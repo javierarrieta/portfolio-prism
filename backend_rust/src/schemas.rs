@@ -397,12 +397,23 @@ pub struct ReportRow {
     /// As entered, in `asset_currency`.
     #[serde(with = "decimal_opt_json")]
     pub sell_price: Option<Decimal>,
+    /// As entered, in `asset_currency` — same rule as `sell_price`, and the only other
+    /// field on this row that is not in the portfolio's base currency.
     #[serde(with = "decimal_opt_json")]
     pub sell_fee: Option<Decimal>,
+    /// Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+    /// from the per-match figures (`tax_engine.rs:761-763`), so it never includes the
+    /// unmatched tail and must not be added to the `lot_proceeds` of the sell's rows.
     #[serde(with = "decimal_opt_json")]
     pub proceeds: Option<Decimal>,
+    /// Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+    /// from the per-match figures; excludes the unmatched tail.
     #[serde(with = "decimal_opt_json")]
     pub cost_basis: Option<Decimal>,
+    /// Sell-level, **matched quantity only**, in the portfolio's base currency:
+    /// `proceeds - cost_basis` over the matched lots. This is the whole sell's figure and
+    /// repeats on every `SOLD_LOT` row of that sell — the column to SUM is `lot_pnl`, not
+    /// this one.
     #[serde(with = "decimal_opt_json")]
     pub realized_pnl: Option<Decimal>,
     #[serde(with = "decimal_opt_json")]
@@ -512,8 +523,12 @@ impl ReportRow {
         row
     }
 
-    /// A sell's unmatched tail: the quantity no buy lot covers. Money cells stay null;
-    /// `unmatched_qty` is a quantity, not money.
+    /// A sell's unmatched tail: the quantity no buy lot covers. The sell's **computed
+    /// money allocations** (`proceeds`, `cost_basis`, `realized_pnl`, every `lot_*`) stay
+    /// null, because there is no matched quantity for them to describe — a zero would read
+    /// as a realized figure of nothing. What the row does carry is the sell's identity, its
+    /// quantities, and the **as-entered** `sell_price` and `sell_fee`, which are facts
+    /// about the transaction rather than an allocation of it.
     pub fn unmatched(
         asset: &Asset,
         price_date_used: Option<NaiveDate>,

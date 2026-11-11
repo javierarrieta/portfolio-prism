@@ -43,38 +43,58 @@ fn fixture_sell(id: i32) -> Transaction {
         id,
         asset_id: 1,
         r#type: "SELL".to_string(),
-        quantity: "80.0".to_string(),
+        quantity: "100.0".to_string(),
         price: "130.0".to_string(),
         fee: "0.0".to_string(),
         date: ts("2024-12-01"),
     }
 }
 
-/// A sell of 80 units against one 60-unit lot, so 20 units are unmatched: the fixture
-/// that carries both shapes, and the same one the engine's own tests use.
+/// A sell of 100 units against TWO buy lots (60 matched + 20 matched) with 20 units
+/// unmatched. Two matches is the point: with a single match, `LotMatch.pnl`,
+/// `.cost_basis` and `.proceeds` are numerically identical to the `SellBreakdown`'s
+/// aggregates, so wiring `lot_pnl` from the breakdown instead of the match compiles
+/// clean and passes every assertion — while over-reporting on any real multi-lot sell,
+/// because every lot row would carry the whole sell's P&L. `lot_pnl` is the column the
+/// CSV sums. The two sources now differ (1800 vs 2200) and a swap fails.
 fn fixture_breakdown(sell_id: i32) -> SellBreakdown {
     SellBreakdown {
         sell_transaction_id: sell_id,
         sell_date: ts("2024-12-01"),
-        sold_qty: dec("80.0"),
-        matched_qty: dec("60.0"),
+        sold_qty: dec("100.0"),
+        matched_qty: dec("80.0"),
         unmatched_qty: dec("20.0"),
-        proceeds: dec("7800.0"),
-        cost_basis: dec("6000.0"),
-        realized_pnl: dec("1800.0"),
-        matches: vec![LotMatch {
-            buy_transaction_id: 1,
-            buy_date: ts("2024-01-01"),
-            buy_price: dec("100.0"),
-            unit_cost: dec("100.0"),
-            matched_qty: dec("60.0"),
-            lot_qty_before_match: dec("60.0"),
-            cost_basis: dec("6000.0"),
-            proceeds: dec("7800.0"),
-            pnl: dec("1800.0"),
-            holding_days: 335,
-            term: None,
-        }],
+        proceeds: dec("10200.0"),
+        cost_basis: dec("8000.0"),
+        realized_pnl: dec("2200.0"),
+        matches: vec![
+            LotMatch {
+                buy_transaction_id: 1,
+                buy_date: ts("2024-01-01"),
+                buy_price: dec("100.0"),
+                unit_cost: dec("100.0"),
+                matched_qty: dec("60.0"),
+                lot_qty_before_match: dec("60.0"),
+                cost_basis: dec("6000.0"),
+                proceeds: dec("7800.0"),
+                pnl: dec("1800.0"),
+                holding_days: 335,
+                term: None,
+            },
+            LotMatch {
+                buy_transaction_id: 2,
+                buy_date: ts("2024-02-01"),
+                buy_price: dec("100.0"),
+                unit_cost: dec("100.0"),
+                matched_qty: dec("20.0"),
+                lot_qty_before_match: dec("40.0"),
+                cost_basis: dec("2000.0"),
+                proceeds: dec("2400.0"),
+                pnl: dec("400.0"),
+                holding_days: 304,
+                term: None,
+            },
+        ],
     }
 }
 
@@ -95,8 +115,20 @@ fn an_unmatched_row_serialises_its_money_cells_as_null_not_zero() {
     assert!(v["lot_pnl"].is_null(), "money that does not exist is null, not \"0\"");
     assert!(v["realized_pnl"].is_null());
     assert!(v["proceeds"].is_null());
+    assert!(v["cost_basis"].is_null(), "the sell's matched-only allocations stay null");
+    assert!(v["lot_cost_basis"].is_null());
+    assert!(v["lot_proceeds"].is_null());
     assert!(v["buy_transaction_id"].is_null());
     assert_eq!(v["price_source"], "database");
+    // The as-entered sell facts are NOT money allocations: they are what the user typed,
+    // and dropping them would make the row unlabelable.
+    assert_eq!(v["sell_price"], "130.0");
+    assert_eq!(v["sell_fee"], "0.0");
+    // Asset identity is plumbed through `of` and was asserted by nothing.
+    assert_eq!(v["asset_id"], 1);
+    assert_eq!(v["symbol"], "AAPL");
+    assert_eq!(v["asset_type"], "STOCK");
+    assert_eq!(v["asset_currency"], "USD");
 }
 
 #[test]
@@ -112,12 +144,23 @@ fn a_sold_lot_row_carries_money_as_decimal_strings() {
     let v = serde_json::to_value(&row).unwrap();
 
     assert_eq!(v["row_type"], RowKind::SoldLot.as_str());
-    assert_eq!(v["lot_pnl"], "1800.0", "LotMatch.pnl under the CSV's name for it");
-    assert_eq!(v["realized_pnl"], "1800.0");
+    // The two P&L figures come from DIFFERENT sources and the fixture makes them differ:
+    // `lot_pnl` is this match's `LotMatch.pnl` (1800), `realized_pnl` is the whole sell's
+    // matched total from `SellBreakdown` (2200). Wiring either from the other compiles
+    // clean and would make every lot row of a multi-lot sell carry the entire sell's P&L.
+    assert_eq!(v["lot_pnl"], "1800.0", "this match's pnl, not the sell's total");
+    assert_eq!(v["realized_pnl"], "2200.0", "the sell's matched total, not this match's");
+    assert_eq!(v["lot_cost_basis"], "6000.0");
+    assert_eq!(v["lot_proceeds"], "7800.0");
+    assert_eq!(v["cost_basis"], "8000.0", "sell-level matched-only figure");
+    assert_eq!(v["proceeds"], "10200.0", "sell-level matched-only figure");
     assert_eq!(v["sell_price"], "130.0", "as entered, in the asset's currency");
     assert_eq!(v["unmatched_qty"], "20.0", "the sell's context repeats on every lot row");
+    assert_eq!(v["sell_transaction_id"], 3, "from the sell, not the breakdown");
     assert!(v["market_value"].is_null(), "an open-lot cell on a sold-lot row");
     assert_eq!(v["price_date_used"], "2024-06-30");
+    assert_eq!(v["symbol"], "AAPL");
+    assert_eq!(v["asset_currency"], "USD");
 }
 
 /// `open_lot` is the one `ReportRow` constructor that reads a type with no `Serialize`
@@ -174,4 +217,7 @@ fn an_open_lot_row_maps_every_dated_lot_field_and_leaves_the_sell_side_null() {
     assert_eq!(row.proceeds, None);
     assert_eq!(row.cost_basis, None);
     assert_eq!(row.realized_pnl, None);
+    // An open lot has no holding period and no HYBRID term bucket claimed for it.
+    assert_eq!(row.holding_days, None);
+    assert_eq!(row.term, None);
 }

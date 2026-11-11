@@ -265,6 +265,10 @@ export interface components {
       buy_price?: string | null;
       /** Format: int32 */
       buy_transaction_id?: number | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+       * from the per-match figures; excludes the unmatched tail.
+       */
       cost_basis?: string | null;
       /** Format: date */
       fx_rate_date_used?: string | null;
@@ -282,12 +286,27 @@ export interface components {
       /** Format: date */
       price_date_used?: string | null;
       price_source?: components["schemas"]["PriceSource"] | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+       * from the per-match figures (`tax_engine.rs:761-763`), so it never includes the
+       * unmatched tail and must not be added to the `lot_proceeds` of the sell's rows.
+       */
       proceeds?: string | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency:
+       * `proceeds - cost_basis` over the matched lots. This is the whole sell's figure and
+       * repeats on every `SOLD_LOT` row of that sell — the column to SUM is `lot_pnl`, not
+       * this one.
+       */
       realized_pnl?: string | null;
       remaining_qty?: string | null;
       row_type: components["schemas"]["RowKind"];
       /** Format: date-time */
       sell_date?: string | null;
+      /**
+       * @description As entered, in `asset_currency` — same rule as `sell_price`, and the only other
+       * field on this row that is not in the portfolio's base currency.
+       */
       sell_fee?: string | null;
       /** @description As entered, in `asset_currency`. */
       sell_price?: string | null;
