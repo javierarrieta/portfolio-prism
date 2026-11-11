@@ -216,10 +216,18 @@ pub async fn seed_transaction_at(
     res.0
 }
 
-/// One stored close. The pricing layer reads `historical_prices` before the provider,
-/// so a seeded row is what makes a test hermetic — see `stored_window_is_fresh`
-/// (`currency_service.rs:65`), which only answers when the newest row in the window is
-/// within `PRICE_WINDOW_FRESH_DAYS` of the date asked for.
+/// One stored close. The pricing layer reads `historical_prices` before the provider, so
+/// a seeded row is what makes a test hermetic. Which row is needed depends on the path:
+///
+/// * `get_price` (`currency_service.rs:511-535`) answers only from a row whose `date`
+///   equals the date asked for, and today's tax-summary route asks for
+///   `Utc::now().date_naive()`. Seed **exactly today** or the provider is called.
+/// * The dated series path is governed by `stored_window_is_fresh`
+///   (`currency_service.rs:65`), which accepts any row within
+///   `PRICE_WINDOW_FRESH_DAYS` of the date asked for.
+///
+/// Do not assume the window rule covers a `get_price` call: a row two days old satisfies
+/// the window and still reaches Yahoo.
 #[allow(dead_code)]
 pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close: &str) {
     sqlx::query(

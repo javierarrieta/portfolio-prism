@@ -16,7 +16,8 @@
 - **The backend owns every total.** Every figure the screen or the file shows comes from the payload. No renderer — Rust or TypeScript — adds, averages or otherwise combines payload figures.
 - **No new dependency.** Nothing is added to `backend_rust/Cargo.toml` or `frontend/package.json`.
 - **No network in tests.** There is no `[dev-dependencies]` section and no HTTP mock: tests are hermetic *by construction*, which means every price and rate a test needs is seeded into `historical_prices` and every pricing call is answered by the database-first read path. A test that would need a provider seam is mis-designed and must be rewritten or explicitly recorded as unwritable (see Task 4, Step 8).
-- **A stored price window answers only when it reaches the requested date.** `stored_window_is_fresh` (`currency_service.rs:65`) accepts a newest row within `PRICE_WINDOW_FRESH_DAYS = 4` of the requested end date. Every hermetic seed in this plan must reach within 4 days of the window's `to`, or the route will ask the provider and the test will reach the network.
+- **A stored price window answers only when it reaches the requested date.** `stored_window_is_fresh` (`currency_service.rs:65`) accepts a newest row within `PRICE_WINDOW_FRESH_DAYS = 4` of the requested end date. Every hermetic seed in this plan must reach within 4 days of the window's `to`, or the route will ask the provider and the test will reach the network. Note this is a **different rule from `get_price`**, which answers only from a row whose `date` equals the date asked for — the undated tax-summary path asks for `Utc::now().date_naive()`, so a seed two days old satisfies the window rule and still calls Yahoo.
+- **Tripwire: a green test that prints `WARN: Yahoo` is not hermetic.** Nothing asserts hermeticity, so it must be observed. Two signals, both cheap: any `WARN: Yahoo Finance returned status ...` line in test output means a provider call happened regardless of what the test asserted, and a hermetic test finishes in hundredths of a second while a networked one takes seconds. `cargo test 2>&1 | grep -c "WARN: Yahoo"` must print `0`. The existing `test_sync_splits_skips_fetch_within_throttle_window` (`currency_service.rs:1387-1427`) cannot serve as the guard: it asserts `inserted == 0`, which the 404 path also returns, so it passes whether the cache check worked or fell through to the provider.
 - **Schema changes ship with a regenerated `docs/openapi/openapi.json`** in the same commit. CI diffs it byte-for-byte (`.github/workflows/ci.yml`, "Generate and Validate OpenAPI Spec"):
   ```bash
   cd backend_rust && cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
@@ -108,9 +109,13 @@ Append to `backend_rust/tests/common/mod.rs`:
 
 ```rust
 /// One stored close. The pricing layer reads `historical_prices` before the provider,
-/// so a seeded row is what makes a test hermetic — see `stored_window_is_fresh`
-/// (`currency_service.rs:65`), which only answers when the newest row in the window is
-/// within `PRICE_WINDOW_FRESH_DAYS` of the date asked for.
+/// One stored close. The pricing layer reads `historical_prices` before the provider, so
+/// a seeded row is what makes a test hermetic. Which row is needed depends on the path:
+/// `get_price` (`currency_service.rs:511-535`) answers only from a row whose `date`
+/// equals the date asked for (today, on the undated path), while the dated series path is
+/// governed by `stored_window_is_fresh` (`currency_service.rs:65`), which accepts any row
+/// within `PRICE_WINDOW_FRESH_DAYS`. Do not assume the window rule covers a `get_price`
+/// call: a row two days old satisfies the window and still reaches Yahoo.
 #[allow(dead_code)]
 pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close: &str) {
     sqlx::query(
