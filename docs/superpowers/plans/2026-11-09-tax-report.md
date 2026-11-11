@@ -3125,3 +3125,475 @@ git commit -m "feat(api): serve the dated tax report as CSV from the same route"
 ```
 
 (`frontend/src/types/api.d.ts` is regenerated from the committed contract with `npm run generate-types`, so the generated file and the committed one cannot disagree. It has no importers, so it cannot break a renderer.)
+
+---
+
+## Task 6: The report tab — fetch, controls, download, error surface
+
+The dated report is a sixth tab: `ReportControls` (the window, the presets, the download link, the error panel) and `TaxReportTable` (the run context, the five totals, the rows). Both live in `ReportControls.tsx`, the one frontend file the spec's list gives this work; the report's own rendering has no file of its own, so it shares this one as a second export rather than adding a component the spec did not sanction.
+
+Three things this task is the home of:
+
+- **App holds the payload, separately from `taxSummary`.** The normalized summary is never the source for anything here, and the dated fetch is its own request.
+- **The report is renderable only while it matches the current selection.** A fetch in flight, a portfolio switch, or a strategy change must not leave the previous window's numbers on screen under the new page's heading — the statement's bug, and the reason it keys its payload.
+- **The download is an anchor, not a fetch.** The same `href` the JSON probe used, plus `format=csv`: the bytes the server produced reach the disk unchanged, and the session cookie rides along because `/api` is same-origin in dev and prod (`nginx.conf:12`).
+
+**Files:**
+- Create: `frontend/src/components/ReportControls.tsx`
+- Modify: `frontend/src/App.tsx` (state, the fetch effect, the nav list, the tab branch)
+- Modify: `frontend/src/test/mocks/handlers.ts` (branch the existing `tax-summary` handler on the window)
+- Test: `frontend/src/test/components/ReportControls.test.tsx` (props-driven)
+- Test: `frontend/src/test/components/AppReport.test.tsx` (MSW, the wiring)
+
+**Interfaces:**
+- Consumes: `TaxReport`, `ReportErrorBody`, `ReportRow`, `ReportRowKind` (Task 3), `formatCurrency` / `formatPercent` (`utils/formatters.ts`, both of which accept decimal **strings**), `apiFetch` and `API_BASE`.
+- Produces: `ReportControls`, `TaxReportTable`, `currentYearToDate`, `buildReportQuery`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `frontend/src/test/components/ReportControls.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import ReportControls, { TaxReportTable, currentYearToDate } from '../../components/ReportControls'
+import type { ReportErrorBody, TaxReport } from '../../types'
+
+const window2024 = { from: '2024-01-01', to: '2024-06-30' }
+
+/**
+ * Totals that deliberately disagree with the rows: `lot_pnl` sums to 1800.00 while
+ * `realized_in_window` says 1234.56. A renderer that adds rows up shows 1800.00 and fails.
+ * The money is strings on purpose, exactly as the server sends it — the report is the one
+ * payload that is not normalized through `number`, so a renderer that tried to add these
+ * would concatenate them and be visible immediately.
+ */
+function fixture(): TaxReport {
+  return {
+    context: {
+      portfolio_id: 1, portfolio_name: 'Retirement', base_currency: 'USD', strategy: 'FIFO',
+      threshold_days: 30, requested_from: '2024-01-01', requested_to: '2024-06-30',
+      splits_note: 'Splits are as recorded.',
+    },
+    asset_totals: [{
+      asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK', asset_currency: 'USD',
+      realized_in_window: '1234.56', realized_cumulative: '9999.99',
+      unrealized_at_end: '2500.00', market_value: '12500.00', cost_basis: '10000.00',
+      price_date_used: '2024-06-28', fx_rate_date_used: null, price_source: 'database',
+      fx_applied: false, split_applied: false,
+    }],
+    totals: {
+      realized_in_window: '1234.56', realized_cumulative: '9999.99',
+      unrealized_at_end: '2500.00', market_value: '12500.00', cost_basis: '10000.00',
+    },
+    rows: [
+      {
+        row_type: 'SOLD_LOT', asset_id: 1, symbol: 'AAPL', asset_type: 'STOCK', asset_currency: 'USD',
+        price_date_used: '2024-06-28', fx_rate_date_used: null, price_source: 'database',
+        sell_transaction_id: 3, sell_date: '2024-05-01T00:00:00Z', sold_qty: '80.0',
+        sell_price: '130.0', sell_fee: '0.0', proceeds: '7800.0', cost_basis: '6000.0',
+        realized_pnl: '1800.0', matched_qty: '60.0', unmatched_qty: '20.0',
+        buy_transaction_id: 1, buy_date: '2024-01-01T00:00:00Z', buy_price: '100.0',
+        unit_cost: '100.0', lot_matched_qty: '60.0', lot_qty_before_match: '60.0',
+        lot_cost_basis: '6000.0', lot_proceeds: '7800.0', lot_pnl: '1800.0',
+        holding_days: 121, term: null, original_qty: null, remaining_qty: null,
+        market_value: null, unrealized_gain_loss: null, unrealized_roi: null,
+      },
+    ],
+  }
+}
+
+describe('currentYearToDate', () => {
+  it('defaults to January 1 through today, not December 31', () => {
+    // A default ending on December 31 is a future date for most of the year, and the route
+    // rejects a future date with a 422 — so the default would be an error, not a default.
+    const w = currentYearToDate(new Date('2026-02-14T00:00:00Z'))
+    expect(w.from).toBe('2026-01-01')
+    expect(w.to).toBe('2026-02-14')
+  })
+})
+
+describe('ReportControls', () => {
+  it('shows the window it was given and links the download at the same window', () => {
+    render(
+      <ReportControls
+        window={window2024}
+        onWindowChange={() => {}}
+        csvHref="/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-06-30&strategy=FIFO&threshold_days=30&format=csv"
+        onRetry={() => {}}
+        report={null}
+        error={null}
+        loading={false}
+      />,
+    )
+    expect(screen.getByLabelText('From')).toHaveValue('2024-01-01')
+    expect(screen.getByLabelText('To')).toHaveValue('2024-06-30')
+    expect(screen.getByTestId('download-csv')).toHaveAttribute(
+      'href',
+      '/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-06-30&strategy=FIFO&threshold_days=30&format=csv',
+    )
+  })
+
+  it('offers a quarter that has not happened yet as unavailable', async () => {
+    const onWindowChange = vi.fn()
+    render(
+      <ReportControls
+        window={{ from: '', to: '' }}
+        onWindowChange={onWindowChange}
+        csvHref=""
+        onRetry={() => {}}
+        report={null}
+        error={null}
+        loading={false}
+        today={new Date('2026-02-14T00:00:00Z')}
+      />,
+    )
+    // Q1 is in the past, Q3 is not. A preset that filled 2026-07-01..2026-09-30 would be a
+    // 422, and a preset that silently clamped its end would be an invented date.
+    await userEvent.click(screen.getByRole('button', { name: 'Q1' }))
+    expect(onWindowChange).toHaveBeenCalledWith({ from: '2026-01-01', to: '2026-03-31' })
+    expect(screen.getByRole('button', { name: 'Q3' })).toBeDisabled()
+  })
+
+  it('reports a 422 by naming the symbols and the count of what was omitted', () => {
+    const error: ReportErrorBody = {
+      error: 'no price or rate exists at or before the requested date',
+      missing_prices: ['AAA', 'BBB'],
+      missing_rates: [],
+      missing_prices_total: 22,
+      missing_rates_total: 0,
+      retryable: false,
+    }
+    render(
+      <ReportControls window={window2024} onWindowChange={() => {}} csvHref="" onRetry={() => {}}
+        report={null} error={error} loading={false} />,
+    )
+    expect(screen.getByTestId('report-error')).toHaveTextContent('AAA, BBB')
+    expect(screen.getByTestId('report-error')).toHaveTextContent('20 more')
+  })
+
+  it('offers a retry when the deadline trips', async () => {
+    const onRetry = vi.fn()
+    const error: ReportErrorBody = {
+      error: 'the report exceeded its 20 second deadline',
+      missing_prices: [], missing_rates: [], missing_prices_total: 0, missing_rates_total: 0,
+      retryable: true,
+    }
+    render(
+      <ReportControls window={window2024} onWindowChange={() => {}} csvHref="" onRetry={onRetry}
+        report={null} error={error} loading={false} />,
+    )
+    await userEvent.click(screen.getByRole('button', { name: /try again/i }))
+    expect(onRetry).toHaveBeenCalled()
+  })
+})
+
+describe('TaxReportTable', () => {
+  it('prints the payload totals and never a sum of the rows', () => {
+    // Review Focus 2. The rows' `lot_pnl` sums to 1800.00 and the payload's total is
+    // 1234.56; the screen must show the server's figure.
+    render(<TaxReportTable report={fixture()} />)
+    expect(screen.getByTestId('total-realized-in-window')).toHaveTextContent('$1,234.56')
+    expect(screen.getByTestId('total-realized-in-window')).not.toHaveTextContent('1,800.00')
+  })
+
+  it('names the window that was actually applied and the close it used', () => {
+    render(<TaxReportTable report={fixture()} />)
+    expect(screen.getByTestId('report-context')).toHaveTextContent('2024-01-01')
+    expect(screen.getByTestId('report-context')).toHaveTextContent('2024-06-30')
+    expect(screen.getByTestId('row-0-price-date')).toHaveTextContent('2024-06-28')
+  })
+})
+```
+
+Create `frontend/src/test/components/AppReport.test.tsx`:
+
+```tsx
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { http, HttpResponse } from 'msw'
+import App from '../../App'
+import { server } from '../mocks/server'
+
+/** The dated branch of the shared handler, with the query the tab sent. */
+const seen: string[] = []
+
+function datedHandler() {
+  return http.get('/api/portfolios/:id/tax-summary', ({ request }) => {
+    const url = new URL(request.url)
+    seen.push(url.search)
+    if (!url.searchParams.has('from') && !url.searchParams.has('to')) {
+      return HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })
+    }
+    return HttpResponse.json(REPORT_FIXTURE)
+  })
+}
+
+describe('the tax report tab', () => {
+  beforeEach(() => { seen.length = 0; vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('fetches the dated variant with the current year to date when the tab is opened', async () => {
+    server.use(datedHandler())
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('total-realized-in-window')).toBeInTheDocument())
+
+    const dated = seen.find((q) => q.includes('from=') || q.includes('to='))
+    expect(dated).toBeDefined()
+    expect(dated).toContain(`to=${new Date().getFullYear()}-`)
+    // The tab's own fetch is dated; the undated summary the rest of the app reads is a
+    // separate request and stays undated.
+    expect(seen.filter((q) => !q.includes('from=') && !q.includes('to=')).length).toBeGreaterThan(0)
+  })
+
+  it('does not render a report that belongs to another portfolio', async () => {
+    // Review Focus 3: portfolio 2's report never resolves, so after the switch the state
+    // still holds portfolio 1's payload while `selectedId` has moved on. A page with B's
+    // numbers under A's heading is the failure this guard exists for.
+    server.use(datedHandler())
+    server.use(http.get('/api/portfolios/2/tax-summary', () => new Promise(() => {})))
+    render(<App />)
+    await userEvent.click(await screen.findByText('Tax Report'))
+    await waitFor(() => expect(screen.getByTestId('total-realized-in-window')).toBeInTheDocument())
+
+    await userEvent.selectOptions(screen.getByRole('combobox'), 'Retirement Fund')
+    await waitFor(() => expect(screen.queryByTestId('total-realized-in-window')).toBeNull())
+  })
+})
+
+const REPORT_FIXTURE = { /* the `fixture()` object from ReportControls.test.tsx, inlined */ }
+```
+
+`REPORT_FIXTURE` is the same object `ReportControls.test.tsx` builds, with `context.portfolio_id` matching the portfolio the shared handlers return (`handlers.ts:14` gives portfolio 1).
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cd frontend && npx vitest run src/test/components/ReportControls.test.tsx src/test/components/AppReport.test.tsx`
+Expected: FAIL — `../../components/ReportControls` does not exist, and `App` has no `Tax Report` nav item.
+
+- [ ] **Step 3: Write the component**
+
+Create `frontend/src/components/ReportControls.tsx`. The shape of it, with the load-bearing parts spelled out:
+
+```tsx
+import { formatCurrency, formatPercent } from '../utils/formatters';
+import type { ReportErrorBody, ReportRow, TaxReport } from '../types';
+
+export interface ReportWindow { from: string; to: string }
+
+/** Local-date ISO, not `toISOString()`: the latter shifts the date across midnight UTC. */
+const isoDate = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+/**
+ * The default window: the current year to date. Not January 1 to December 31 -- a December
+ * 31 `to` is a future date for most of the year and the route answers 422, so the default
+ * would be an error rather than a default.
+ */
+export function currentYearToDate(today: Date = new Date()): ReportWindow {
+  return { from: `${today.getFullYear()}-01-01`, to: isoDate(today) };
+}
+
+/** Four quarters plus the current year, each a window the route will accept. */
+export function quarterPresets(today: Date): { label: string; window: ReportWindow }[] {
+  const year = today.getFullYear();
+  const quarters: ReportWindow[] = [
+    { from: `${year}-01-01`, to: `${year}-03-31` },
+    { from: `${year}-04-01`, to: `${year}-06-30` },
+    { from: `${year}-07-01`, to: `${year}-09-30` },
+    { from: `${year}-10-01`, to: `${year}-12-31` },
+  ];
+  return [
+    ...quarters.map((window, i) => ({ label: `Q${i + 1}`, window })),
+    { label: 'This year to date', window: currentYearToDate(today) },
+  ];
+}
+
+/**
+ * The query the download link and the probe share, so the file cannot describe a different
+ * window from the one on screen. An empty input omits its parameter rather than inventing a
+ * date: `from` absent means inception and `to` absent means today, and inventing either
+ * silently changes the number.
+ */
+export function buildReportQuery(
+  portfolioId: number, window: ReportWindow, strategy: string, thresholdDays: number,
+): string {
+  const qs = new URLSearchParams();
+  if (window.from) qs.set('from', window.from);
+  if (window.to) qs.set('to', window.to);
+  qs.set('strategy', strategy);
+  qs.set('threshold_days', String(thresholdDays));
+  return `/portfolios/${portfolioId}/tax-summary?${qs.toString()}`;
+}
+```
+
+`ReportControls` renders, in order: the two `<input type="date">` fields (labelled `From` / `To` through `<label htmlFor>`, because the tests query by label), the five preset buttons (each `disabled` when its window ends after `today`, with `title` explaining why), an `<a data-testid="download-csv" className="btn btn-primary" href={csvHref}>` that is rendered only when `csvHref` is non-empty, the error panel, and the loading state. The error panel:
+
+```tsx
+      {error && (
+        <div data-testid="report-error" role="alert" className="glass-card">
+          <p>{error.missing_prices.length > 0
+            ? `No price for ${error.missing_prices.join(', ')}`
+            : error.missing_rates.length > 0
+              ? `No rate for ${error.missing_rates.map((r) => `${r.from}→${r.to}`).join(', ')}`
+              : error.error}</p>
+          {error.missing_prices_total > error.missing_prices.length && (
+            <p>{`and ${error.missing_prices_total - error.missing_prices.length} more`}</p>
+          )}
+          {error.retryable
+            ? <button className="btn btn-secondary" onClick={onRetry}>Try again</button>
+            : <p>The range or the strategy has to change before this can be answered.</p>}
+        </div>
+      )}
+```
+
+`TaxReportTable` renders the run context (`data-testid="report-context"`, one line naming the
+window that was actually applied, the strategy, the threshold, and the split caveat), the
+five totals from `report.totals` (each with its own `data-testid`), and one table row per
+`report.rows` entry — `Symbol`, `Kind` (`row_type`), `Date`, `Quantity`, `Value`,
+`Gain/Loss`, mapped per kind:
+
+```tsx
+function cells(row: ReportRow) {
+  switch (row.row_type) {
+    case 'SOLD_LOT':
+      return { date: row.sell_date, qty: row.lot_matched_qty, value: row.lot_proceeds, gain: row.lot_pnl };
+    case 'OPEN_LOT':
+      return { date: row.buy_date, qty: row.remaining_qty, value: row.market_value, gain: row.unrealized_gain_loss };
+    case 'UNMATCHED':
+      // No money exists for this row, and an em dash is what the null means.
+      return { date: row.sell_date, qty: row.unmatched_qty, value: null, gain: null };
+  }
+}
+```
+
+The first row's price-date cell carries `data-testid="row-0-price-date"` (index-derived, like
+`PortfolioDetail`'s lot rows), and every money cell goes through `formatCurrency` / `formatPercent`,
+which accept the payload's exact strings. **No `reduce`, no `+`, no arithmetic of any kind in this
+file** — the em-dash mapping above is the only conditional, and it decides what to *show*, never
+what to compute.
+
+- [ ] **Step 4: Wire the sixth tab**
+
+In `frontend/src/App.tsx`:
+
+1. Imports: `ReportControls, TaxReportTable, currentYearToDate, buildReportQuery` from `./components/ReportControls`; `Receipt` from `lucide-react`; `ReportErrorBody, TaxReport` from `./types`.
+2. State and the fetch, next to the tax state (not inside `fetchPortfolioData` — the report is its own request, and Profile/Dashboard never pay for it):
+
+```tsx
+  const [reportWindow, setReportWindow] = useState<ReportWindow>(() => currentYearToDate());
+  // Keyed by what the payload describes, so a switch, a strategy change or an in-flight
+  // fetch cannot leave the previous window's numbers on screen under a new page heading.
+  // Derived rather than cleared from an effect: five places change selectedId, and a reset
+  // that has to be remembered in each one is a reset that gets forgotten.
+  const [report, setReport] = useState<{ key: string; payload: TaxReport } | null>(null);
+  const [reportError, setReportError] = useState<{ key: string; body: ReportErrorBody } | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportAttempt, setReportAttempt] = useState(0);
+
+  const reportKey = `${selectedId}|${reportWindow.from}|${reportWindow.to}|${strategy}|${thresholdDays}`;
+  const reportQuery = selectedId === null
+    ? ''
+    : buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
+
+  useEffect(() => {
+    // Only on the report tab, and only with a window: without one the route answers with the
+    // legacy summary, which is a different question from the one this tab asks.
+    if (activeTab !== 'report' || selectedId === null) return;
+    if (!reportWindow.from && !reportWindow.to) return;
+    const key = reportKey;
+    let cancelled = false;
+    const load = async () => {
+      setReportLoading(true);
+      setReportError(null);
+      try {
+        const res = await apiFetch(`${API_BASE}${reportQuery}`);
+        const body = await res.json();
+        if (cancelled) return;
+        if (res.ok) setReport({ key, payload: body as TaxReport });
+        else setReportError({ key, body: body as ReportErrorBody });
+      } catch (err) {
+        if (!cancelled) setReportError({ key, body: { error: String(err), missing_prices: [], missing_rates: [], missing_prices_total: 0, missing_rates_total: 0, retryable: false } });
+      } finally {
+        if (!cancelled) setReportLoading(false);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [activeTab, reportKey, reportQuery, selectedId, reportAttempt, reportWindow.from, reportWindow.to]);
+```
+
+3. The nav item, after the statement's, using the same `selectTab` so opening the report closes
+   the sell breakdown like every other tab:
+
+```tsx
+          <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
+            <Receipt size={18} /> Tax Report
+          </li>
+```
+
+4. The branch, as a sibling of the statement branch — a fragment, no layout wrapper, for the same
+   reason the statement's comment gives:
+
+```tsx
+            {activeTab === 'report' && (
+              <>
+                <ReportControls
+                  window={reportWindow}
+                  onWindowChange={setReportWindow}
+                  csvHref={reportQuery ? `${reportQuery}&format=csv` : ''}
+                  onRetry={() => setReportAttempt((n) => n + 1)}
+                  report={report?.key === reportKey ? report.payload : null}
+                  error={reportError?.key === reportKey ? reportError.body : null}
+                  loading={reportLoading}
+                />
+                {report?.key === reportKey && <TaxReportTable report={report.payload} />}
+              </>
+            )}
+```
+
+5. `DEFAULT_TAB` and the tab-count comment above it stay as they are: five tabs plus this one is six, and the comment enumerates names rather than a count.
+
+- [ ] **Step 5: Branch the MSW handler**
+
+In `frontend/src/test/mocks/handlers.ts`, the existing `tax-summary` handler (`:121-123`) becomes a branch on the query. This is what the review calls for — a branch on the existing handler, not a second route, because MSW matches by path:
+
+```ts
+  http.get('/api/portfolios/:id/tax-summary', ({ request }) => {
+    const url = new URL(request.url)
+    // The dated report and the legacy summary are the same route. Without this branch the
+    // report tab would receive the summary body and its renderer would show nothing, which
+    // is exactly the failure the dated tests exist to catch.
+    if (url.searchParams.has('from') || url.searchParams.has('to')) {
+      return HttpResponse.json(REPORT_FIXTURE)
+    }
+    return HttpResponse.json({ currency: 'USD', total_portfolio_value: 5000, total_realized_pnl: 0, total_unrealized_pnl: 0, assets: [] })
+  }),
+```
+
+`REPORT_FIXTURE` is declared once near the top of `handlers.ts` with `portfolio_id: 1`, matching the portfolio the file's other handlers return. `handlers.test.ts` asserts handler *behaviour* and never the handler count, so nothing there moves.
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `cd frontend && npx vitest run src/test/components/ReportControls.test.tsx src/test/components/AppReport.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 7: Run every gate**
+
+```bash
+cd frontend && npm run test && npm run lint && npm run typecheck
+```
+
+Expected: all green, including the statement's own suite (`AppStatement.test.tsx`, `PortfolioStatement.test.tsx`, `PrintCss.test.ts`) — this task adds a tab and does not touch `print.css`, which hides chrome by the statement root's *position*, not by class.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add frontend/src/components/ReportControls.tsx frontend/src/App.tsx \
+        frontend/src/test/mocks/handlers.ts frontend/src/test/components/ReportControls.test.tsx \
+        frontend/src/test/components/AppReport.test.tsx
+git commit -m "feat(frontend): add the dated tax report tab with a CSV download"
+```
