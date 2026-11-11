@@ -14,6 +14,7 @@
 //! There is no generated-at column on purpose: two dispatches over unchanged data must be
 //! byte-identical, which is Goal 4 and is only testable because the file is server-side.
 
+use chrono::SecondsFormat;
 use crate::schemas::{ReportResponse, ReportRow};
 use rust_decimal::Decimal;
 
@@ -136,7 +137,9 @@ fn render_row(
         decimal_cell(totals.map(|t| t.market_value)),
         decimal_cell(totals.map(|t| t.cost_basis)),
         row.sell_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
-        row.sell_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        row.sell_date
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_default(),
         decimal_cell(row.sold_qty),
         decimal_cell(row.sell_price),
         decimal_cell(row.sell_fee),
@@ -146,7 +149,9 @@ fn render_row(
         decimal_cell(row.matched_qty),
         decimal_cell(row.unmatched_qty),
         row.buy_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
-        row.buy_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        row.buy_date
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_default(),
         decimal_cell(row.buy_price),
         decimal_cell(row.unit_cost),
         decimal_cell(row.lot_matched_qty),

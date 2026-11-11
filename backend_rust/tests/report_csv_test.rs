@@ -67,6 +67,57 @@ async fn csv_body(query: &str) -> String {
     resp.into_string().await.unwrap()
 }
 
+/// The claim this whole feature rests on is that the CSV is a **projection** of the same
+/// payload the JSON serves -- no number re-derived. That has to be true of the dates too, and
+/// it was not: `to_rfc3339()` renders UTC as `+00:00` while serde renders the same instant as
+/// `Z`. Same instant, different text, so a preparer reconciling the two surfaces saw two
+/// different strings for one field. Pinned here because nothing else would notice.
+#[tokio::test]
+async fn a_date_cell_reads_the_same_text_as_the_json_field_it_projects() {
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let q = "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30";
+
+    let json: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("/api/portfolios/{port_id}/tax-summary?{q}"))
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let csv = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?{q}&format=csv"))
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .unwrap();
+
+    let mut lines = csv.trim_end().split("\r\n");
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let idx = header
+        .iter()
+        .position(|c| *c == "sell_date")
+        .expect("sell_date column");
+    let first = lines.next().unwrap();
+    let cell = first.split(',').nth(idx).unwrap().trim_matches('"');
+
+    let json_date = json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["sell_date"].is_string())
+        .expect("a row with a sell_date")["sell_date"]
+        .as_str()
+        .unwrap();
+    assert_eq!(cell, json_date, "the CSV cell must read exactly what the JSON field reads");
+    assert!(json_date.ends_with('Z'), "and the JSON form is the Z one: {json_date}");
+}
+
 #[tokio::test]
 async fn the_file_is_csv_with_the_servers_own_filename() {
     let body = csv_body("strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
