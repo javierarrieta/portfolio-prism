@@ -48,8 +48,11 @@ describe('print.css', () => {
     // The 80px this buys back is what the nine-column fit is measured against: the printed box
     // is the full 688px @page content box, not 608px. The :has() scope is load-bearing —
     // unscoped, every other tab loses its padding too — and specificity (0,2,0) beats
-    // .main-content's (0,1,0) in index.css without !important. The smoke's fixture is sized
-    // between the two boxes precisely so that deleting this rule fails the run.
+    // .main-content's (0,1,0) in index.css without !important. This file only pins the rule as
+    // text; what deleting it costs was measured, and it is not an overflow. At 608px the table
+    // still fits the box — it squeezes the Type column to 37px and breaks MUTUAL_FUND across
+    // lines instead — so the smoke's body-cell line-count assertion is what fails here, not its
+    // overflow check.
     expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
   });
 

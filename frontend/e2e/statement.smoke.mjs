@@ -50,14 +50,24 @@ async function seed() {
   // replayed from these transactions, never read from the live provider -- so this still
   // adds no figure assertion.
   //
-  // That amount is chosen to straddle the two boxes this check can be run against, which makes
-  // it a regression test for print.css's `.main-content:has([data-print="statement"])` padding
-  // collapse. Measured in a browser at the printed page box, this fixture is 617px: over the
-  // 608px the statement gets while .main-content keeps its 40px side padding, under the 688px
-  // it gets once that padding is collapsed for the statement tab. Delete the rule and the
-  // overflow check below fails. The previous fixture (-$138,000.00, 608px measured, fitting
-  // exactly) fitted both boxes, so it could not see that rule go. If this fails on a real run
-  // that IS the finding: do not widen the viewport and do not narrow the fixture.
+  // That amount is what makes this fixture a regression test for print.css's
+  // `.main-content:has([data-print="statement"])` padding collapse -- but NOT through the
+  // overflow check below, which cannot see that rule at all. Measured in a browser at the
+  // printed page box, with exactly the two-asset fixture seeded here:
+  //
+  //   .main-content padding | clientWidth | statement scrollWidth | Type cell
+  //   0px (rule present)     | 688         | 688, no overflow      | 96px, MUTUAL_FUND whole
+  //   40px (rule deleted)    | 608         | 608, no overflow      | 37px, MUTUAL_FUND broken
+  //
+  // The table overflows NEITHER box. print.css's `overflow-wrap: anywhere` on the Type column
+  // lets MUTUAL_FUND shatter into a 37px fragment, and that is what lets the table survive
+  // 608px at all -- the break rule absorbed what the overflow check was supposed to detect.
+  // What the fixture buys is the difference the body-cell line-count check below CAN see: this
+  // fixture renders its Type token whole and every body cell on one line at 688px, and breaks
+  // that token across lines at 608px. (An earlier version of this comment claimed the fixture
+  // measured 617px, sat between the two boxes, and so failed the overflow check without the
+  // padding rule. Measured, that is false.) If the line-count check fails on a real run that IS
+  // the finding: do not widen the viewport and do not narrow the fixture.
   const holdings = [
     { symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', txs: [
       ['BUY', '60', '100', '2024-01-01T00:00:00Z'],
@@ -133,6 +143,19 @@ try {
     ok('statement table keeps its 16px on-screen padding')
   }
 
+  // Same argument again, for the rule that would be visible on screen if it escaped: print.css
+  // collapses .main-content's 40px side padding (index.css:162) when the statement is what is
+  // printing, and that rule belongs inside @media print. Move it outside and the statement tab
+  // loses its padding on screen while PrintCss.test.ts stays green -- it pins the rule as text
+  // and cannot see @media membership at all. Nothing else in any gate would notice.
+  const mainPaddingLeft = await page.locator('.main-content')
+    .evaluate((el) => getComputedStyle(el).paddingLeft)
+  if (mainPaddingLeft !== '40px') {
+    fail(`.main-content computes paddingLeft ${mainPaddingLeft} on screen, expected 40px: the statement print padding collapse escaped @media print`)
+  } else {
+    ok('.main-content keeps its 40px on-screen padding, so the print collapse is inside @media print')
+  }
+
   await page.emulateMedia({ media: 'print' })
 
   const box = await statement.boundingBox()
@@ -181,12 +204,59 @@ try {
   // is overflow-y:auto, so a page tall enough to scroll would shave ~15px off clientWidth --
   // stricter than the printed page, never more permissive.)
   //
+  // What this CAN see: a table whose min-content exceeds the box -- a shape whose unbreakable
+  // content is genuinely wider than the page, which is the silent clip described above.
+  // What it CANNOT see: a table that is merely squeezed, because print.css's
+  // `overflow-wrap: anywhere` on the Type column lets MUTUAL_FUND shatter into a fragment small
+  // enough to hold min-content under the box. Measured with this fixture (table in seed()): at
+  // 40px .main-content padding the box is 608px and the statement's scrollWidth is 608 -- no
+  // overflow -- while the Type cell falls to 37px and MUTUAL_FUND is broken apart; at 0px
+  // padding the box is 688px, scrollWidth is 688, and the Type cell is 96px with the token
+  // whole. So this check is weaker than its comments used to claim and cannot see the padding
+  // rule at all. It stays because it still catches the min-content case; the body-cell
+  // line-count check below is what guards the padding rule.
+  //
   // If this fails on a real run it is a finding about the shipped PDF -- the printed
   // table really is too wide for the page -- not a broken assertion. Do not "fix" it by
   // moving the viewport back toward the desktop width.
   await page.setViewportSize({ width: 688, height: 1123 })
   const [sw, cw] = await statement.evaluate((el) => [el.scrollWidth, el.clientWidth])
   if (sw > cw) fail(`horizontal overflow at the printed page box: scrollWidth ${sw} > clientWidth ${cw}`)
+
+  // No body cell may wrap onto a second line. This is the only assertion anywhere that can see
+  // print.css's `.main-content:has([data-print="statement"]) { padding: 0 0 24px }` being
+  // DELETED (the on-screen check above only sees it escaping @media print): as the measurement
+  // above shows, removing that rule does NOT make the table overflow, it squeezes the Type column
+  // from 96px to 37px and breaks MUTUAL_FUND across two lines. A squeezed table therefore shows
+  // up as an extra line box, not as overflow.
+  //
+  // Element height cannot answer this. Cells in a row share the row's height, so in a wrapped
+  // row every td in it measures the row's height and none of them discriminates. A Range over a
+  // cell's contents returns one client rectangle per line box that text actually occupies --
+  // per cell, independent of the row -- so its rectangle count IS the line count.
+  //
+  // Body cells only, on purpose. The table's max-content width is 694px, wider than either box,
+  // so something always gives; there is no width at which this table is relaxed. A wrapped header
+  // is acceptable -- "Unrealized ROI" is two words -- so the check is scoped to tbody, where a
+  // wrap means the squeeze has reached the figures themselves.
+  //
+  // No empty-list guard: the figure-realized colour check above throws if the populated branch
+  // did not render at all, so there is no path to this check seeing zero body cells and passing.
+  const cells = await page.locator('[data-print="statement"] tbody td').evaluateAll((tds) =>
+    tds.map((td, i) => {
+      const r = document.createRange()
+      r.selectNodeContents(td)
+      return { i, text: td.textContent ?? '', lines: r.getClientRects().length }
+    }),
+  )
+  const wrapped = cells.filter((c) => c.lines > 1)
+  if (wrapped.length) {
+    fail(`${wrapped.length} statement body cell(s) render across more than one line: `
+      + wrapped.map((c) => `#${c.i} ${JSON.stringify(c.text)} (${c.lines} lines)`).join(', ')
+      + ' -- the table has been squeezed below what it needs, which the overflow check above cannot see')
+  } else {
+    ok(`no statement body cell wraps to more than one line (worst cell ${Math.max(1, ...cells.map((c) => c.lines))} line(s) across ${cells.length} cells)`)
+  }
 
   // A non-empty PDF. No page-count assertion: that needs a PDF parser and
   // frontend/package.json has none. preferCSSPageSize:true so the A4 @page rule is

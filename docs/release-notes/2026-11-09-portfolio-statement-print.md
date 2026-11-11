@@ -94,7 +94,7 @@ unaffected regardless, because rule 1 hides the sidebar there.
 
 ## What is verified, and what is not
 
-**Covered by `npm test` (20 files, 177 tests, green as of this note):**
+**Covered by `npm test` (20 files, 178 tests, green as of this note):**
 
 - `PortfolioStatement.test.tsx` — the structural hooks, the literal copy on **both** P&L labels,
   the nine table columns, the empty branch's negative list, the HYBRID-only threshold including
@@ -112,35 +112,44 @@ unaffected regardless, because rule 1 hides the sidebar there.
   position the hide rules need (a wrapper there prints a blank page from a tab that looks
   right on screen); nothing renders while the loaded summary belongs to another portfolio.
 
-**Written but never executed.** `frontend/e2e/statement.smoke.mjs` (`npm run e2e:statement`,
+**Run locally — and only locally.** `frontend/e2e/statement.smoke.mjs` (`npm run e2e:statement`,
 prerequisites in `frontend/e2e/README.md`) is the only test in the repository that sees real
 print CSS: it emulates print media, checks the sidebar computes `display: none`, checks the
 text colour is `rgb(17, 17, 17)`, checks no control sits inside the printed subtree, checks
-for horizontal overflow at the A4 content box, and checks `page.pdf()` returns a non-empty
-buffer. Before it emulates print media it also checks the sidebar is visible, still dark, and
-that a statement cell still carries its 16px padding — the only check anywhere that a print rule
-did not escape `@media print` into the running app, because `PrintCss.test.ts` reads the file as
-text and cannot see `@media` membership. **It has never been run.** The
-workspace that produced this change has no chromium and none was installed. It is
-syntax-checked and reviewed, which is not the same as executed, and the first real run should
-be read as a first run rather than a regression. Its fixture is deliberately not the narrowest
-table the endpoint can produce: one plain `STOCK` position and one `MUTUAL_FUND` holding carrying
-a recorded realized loss of `-$13,800,000.00`, so the overflow check measures realistic column
-widths. Realized P&L is replayed from the seeded transactions rather than read from the live
+for horizontal overflow at the A4 content box, checks that no table **body** cell renders across
+more than one line, and checks `page.pdf()` returns a non-empty buffer. Before it emulates print
+media it also checks the sidebar is visible, still dark, that a statement cell still carries its
+16px padding, and that `.main-content` still carries its 40px left padding — the only checks
+anywhere that a print rule did not escape `@media print` into the running app, because
+`PrintCss.test.ts` reads the file as text and cannot see `@media` membership.
+
+**It has been run, and every assertion passed** — locally, under chromium 157, against the real
+Rocket API and Vite with the fixture seeded through the API. That is still not a gate. There is no
+browser job in CI (#45), so running it remains a step an operator has to take by hand, and a change
+to the print CSS can still merge with nobody having run it. Its fixture is deliberately not the
+narrowest table the endpoint can produce: one plain `STOCK` position and one `MUTUAL_FUND` holding
+carrying a recorded realized loss of `-$13,800,000.00`, so the width checks measure realistic
+column widths. Realized P&L is replayed from the seeded transactions rather than read from the live
 provider, so that loss is deterministic and the run still asserts **no figure** on purpose: prices
-come from a live provider, and a smoke that asserted figures would print zeros and still pass. The
-assertion most likely to fail is the horizontal-overflow check, and it is the one that matters here:
-whether nine columns fit the printed box is a question about glyph widths, so it was measured rather
+come from a live provider, and a smoke that asserted figures would print zeros and still pass.
+
+Whether nine columns fit the printed box is a question about glyph widths, so it was measured rather
 than argued — chromium, real print media, at the page content box, across portfolio shapes. A4 at
 210mm less `@page`'s 14mm margins is a **688px** content box, and `print.css` now collapses
 `.main-content`'s 40px side padding for the statement tab, so the statement gets all of it — on
 top of the two levers from the previous round, the statement table's cells down to `4px 6px` at
-`0.75rem` and the Type column allowed to break `MUTUAL_FUND` mid-token. Before
-that rule the box was 608px and a realized of `-$13,800,000.00` overflowed it by 9px; the widest
-shape tested peaked at 635px. Every shape measured now fits 688px with 50px or more to spare —
-which is why the fixture carries that loss:
-at 617px measured it passes with the padding rule and fails without it, so the rule cannot be
-deleted unnoticed. Widening the smoke's viewport is still not the response if it fails.
+`0.75rem` and the Type column allowed to break `MUTUAL_FUND` mid-token. Measuring the smoke's own
+fixture, rather than a narrower probe, then invalidated two claims made here: the table's
+max-content width is **694px**, wider than both boxes, so something always wraps, and at 608px the
+fixture does **not** overflow — it drops the Type column from 96px to 37px and breaks `MUTUAL_FUND`
+across two lines instead. (What was written here before — that the fixture overflowed the 608px box,
+and that at 617px it passed with the padding rule and failed without it — came from a narrower
+single-asset shape and did not survive measuring this fixture.) So the fixture's value is that
+it renders whole-word at 688px and shatters the Type token at 608px, and the assertion that detects
+the padding rule being deleted is the body-cell line count — the horizontal-overflow check cannot
+see that rule at any width. It stays because it still catches a shape whose min-content genuinely
+does exceed the page. Widening the smoke's viewport is still not the response if either of them
+fails.
 
 **Padding is not a solution to an unbounded width problem.** A portfolio whose columns are wide
 enough will overflow again, and the clip stays silent — the smoke is the tripwire, not a guarantee.

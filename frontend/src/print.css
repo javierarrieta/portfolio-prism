@@ -100,16 +100,21 @@
         between numeric columns. Specificity ties .data-table th/td at (0,1,1), so source
         order decides: print.css is imported after index.css (main.tsx:4).
         What is left was MEASURED, not estimated — chromium, real print media, at the page
-        content box, across portfolio shapes. The widest shape tested peaked at 635px and the
-        smoke's fixture, whose realized is -$13,800,000.00, measures 617px; a shape with a large
-        realized but small values in the other columns came back at 608px, which is the point —
-        it is the columns moving together that decide the width, not any one of them. Against
-        688px every shape measured fits with 50px or more to spare. That is a ceiling with a
+        content box, across portfolio shapes. The widest shape tested peaked at 635px; a shape with
+        a large realized but small values in the other columns came back at 608px, which is the
+        point — it is the columns moving together that decide the width, not any one of them.
+        Against 688px every shape measured fits without overflowing. That is a ceiling with a
         number on it, not a solution: padding is finite and a holding's column content is not,
-        so a wide enough portfolio still overflows and is still clipped silently. The smoke's
-        fixture is sized to 617px on purpose — over the 608px box that existed before the padding
-        rule above, under the 688px box it produces — so deleting that rule fails the run instead
-        of quietly widening the margin. */
+        so a wide enough portfolio still overflows and is still clipped silently.
+        What this rule actually buys is narrower than "it stops the overflow", and the smoke's own
+        fixture proves it. Measured with that fixture (two assets, realized -$13,800,000.00), the
+        table's max-content width is 694px — wider than BOTH boxes — so something always wraps and
+        there is no width at which this table is relaxed. Delete the rule and the table does not
+        overflow the 608px box that remains: scrollWidth is 608, and the Type column gives way
+        instead, falling from 96px to 37px and breaking MUTUAL_FUND across two lines. So the
+        padding rule buys whole-word, single-line body cells, not the absence of overflow, and the
+        smoke's horizontal-overflow check cannot see it either way — its body-cell line-count
+        assertion is what detects this rule being deleted. */
   .statement-table th,
   .statement-table td {
     padding: 4px 6px;

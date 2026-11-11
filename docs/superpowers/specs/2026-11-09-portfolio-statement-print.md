@@ -546,8 +546,25 @@ the only one of the three that got an explicit override, for the reason just giv
         full 688px: `print.css` collapses `.main-content`'s 40px side padding under
         `:has([data-print="statement"])`, so a 688px viewport reproduces what ships exactly. (It
         did before that rule too, when the box was 688 − 80 = 608px — the box moved, the viewport
-        did not need to.) The fixture is sized to land between the two: 617px measured, so the
-        check fails if the padding rule is deleted.
+        did not need to.) **This check cannot see the padding rule.** Measured with the smoke's
+        fixture, the table's max-content width is 694px — wider than both boxes — so something
+        always wraps, and at 608px the table does not overflow at all: it squeezes the Type column
+        from 96px to 37px and breaks `MUTUAL_FUND` across lines instead. An earlier claim here,
+        that the fixture measured 617px and so failed this check with the rule deleted, was
+        measured false and does not survive. The assertion that guards the rule is the next one.
+    *   no **body** cell renders across more than one line box: for each
+        `[data-print="statement"] tbody td`, build a `Range` with `selectNodeContents` and count
+        `getClientRects().length` — one client rectangle per line box the text actually occupies.
+        Element height cannot do this: cells in a row share the row's height, so in a wrapped row
+        every cell in it measures the row's height and none discriminates. Body cells only, because
+        the 694px max-content has to wrap somewhere and the header row is the harmless place.
+        Expects one line per cell at 688px; at 608px it fails listing every offending cell's index,
+        text and line count. This is the only assertion anywhere that detects the padding rule
+        being deleted.
+    *   before `emulateMedia`, on screen, `.main-content`'s computed `paddingLeft` is `40px`. Same
+        shape as the other pre-`emulateMedia` checks: `PrintCss.test.ts` pins the statement print
+        padding collapse as text and cannot see `@media` membership, so if that rule escaped the
+        statement tab would lose its padding on screen with every other gate green.
     *   `page.pdf({ format: 'A4', preferCSSPageSize: true, printBackground: false })` is non-empty.
         The options are stated because Playwright's defaults are Letter with
         `preferCSSPageSize: false`, which would measure a page size this slice does not ship. **No
