@@ -1215,7 +1215,15 @@ pub struct ErrorBody {
 }
 ```
 
-- [ ] **Step 4: Register the types and retype the response**
+- [ ] **Step 4: Register the types**
+
+> **Correction before implementing.** The original Step 4 also retyped the `tax-summary`
+> `#[utoipa::path]` `responses(...)` block here. That is the same defect this plan removes
+> the `params(...)` block for, one field over: between this commit and Task 4 the committed
+> document would claim `body = ReportResponse` and 422/503 while the handler still returns
+> the legacy `Json<Value>`. **The `#[utoipa::path]` change belongs to Task 4**, where the
+> handler actually produces the new shape. Task 3 registers the component schemas only — a
+> defined-but-unreferenced schema is a vocabulary entry, not a claim about behaviour.
 
 In `backend_rust/src/openapi.rs`, add to `components(schemas(...))` after `schemas::SellPnlResponse`:
 
@@ -1231,36 +1239,8 @@ In `backend_rust/src/openapi.rs`, add to `components(schemas(...))` after `schem
         schemas::MissingRate,
 ```
 
-In `backend_rust/src/api_routes/analytics.rs`, replace the `tax-summary` `#[utoipa::path]` block (`:10-19`) with:
-
-```rust
-/// The tax summary, or — with `from` and/or `to` — the dated tax report.
-///
-/// Same route, same access level, two shapes. Without a window the response is the
-/// summary object this endpoint has always returned, which carries `assets` with the
-/// open lots the Holdings tab renders; it is not described here, and its shape is
-/// deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
-/// With a window the response is `ReportResponse`.
-///
-/// `format=csv` returns the same report as `text/csv`, byte-identical between calls over
-/// unchanged data. JSON stays the documented public surface.
-///
-/// No `params(...)` block, deliberately: utoipa derives the query parameters from the route
-/// attribute, which is why `strategy` and `threshold_days` are already in the committed
-/// document without one. `from`, `to` and `format` therefore arrive in the contract when the
-/// route attribute gains them — in Task 4 and Task 5 — and the contract never advertises a
-/// parameter the route ignores.
-#[utoipa::path(
-    get,
-    path = "/api/portfolios/<id>/tax-summary",
-    responses(
-        (status = 200, description = "Dated tax report when a window is given; the legacy summary object otherwise", body = ReportResponse),
-        (status = 404, description = "Portfolio not found", body = ErrorBody),
-        (status = 422, description = "Invalid window, or a price or rate does not exist at or before the window end", body = ErrorBody),
-        (status = 503, description = "A pricing provider is unreachable, or the report exceeded its elapsed deadline", body = ErrorBody)
-    )
-)]
-```
+**Do not touch `analytics.rs`'s `#[utoipa::path]` in this task.** The replacement block,
+with its `responses(...)` and its "no `params(...)`" rationale, is reproduced in Task 4.
 
 - [ ] **Step 5: Regenerate both contracts**
 
@@ -1269,7 +1249,7 @@ cd backend_rust && cargo run --bin backend_rust -- --print-openapi > ../docs/ope
 cd ../frontend && npm run generate-types
 ```
 
-Expected: `openapi.json` gains `ReportContext`, `AssetTotals`, `ReportTotals`, `ReportRow`, `RowKind`, `PriceSource`, `ReportResponse`, `ErrorBody`, `MissingRate` in `components.schemas`, gains `from`/`to`/`format` query parameters on the `tax-summary` operation, replaces its empty 200 schema with a `$ref` to `ReportResponse`, and gains 422/503 responses. `api.d.ts` follows. Neither file has a consumer that can break: nothing imports `api.d.ts`, and the hand-written types in `types.ts` are what the renderers use.
+Expected: `openapi.json` gains `ReportContext`, `AssetTotals`, `ReportTotals`, `ReportRow`, `RowKind`, `PriceSource`, `ReportResponse`, `ErrorBody`, `MissingRate` in `components.schemas` and **nothing on the `tax-summary` operation** — no new parameters, no changed 200 body, no 422/503. If the operation block moved, Step 4 was done wrong. `api.d.ts` follows. Neither file has a consumer that can break: nothing imports `api.d.ts`, and the hand-written types in `types.ts` are what the renderers use.
 
 - [ ] **Step 6: Add the hand-written frontend types**
 
@@ -2448,7 +2428,38 @@ impl ReportTotals {
 
 - [ ] **Step 7: Rewire the handler**
 
-Replace the body of `get_portfolio_tax_summary` in `backend_rust/src/api_routes/analytics.rs`. The signature gains two parameters and its return type changes; the `#[utoipa::path]` block is the one Task 3 wrote, and `from`/`to` enter the document through the route attribute below, which is how `strategy` and `threshold_days` got there.
+Replace the body of `get_portfolio_tax_summary` in `backend_rust/src/api_routes/analytics.rs`. The signature gains two parameters and its return type changes, and **this is where the `#[utoipa::path]` `responses(...)` block moves to** — the document may only claim `ReportResponse` and 422/503 once the handler actually produces them. `from`/`to` enter the document through the route attribute below, which is how `strategy` and `threshold_days` got there.
+
+Replace the `tax-summary` `#[utoipa::path]` block with:
+
+```rust
+/// The tax summary, or — with `from` and/or `to` — the dated tax report.
+///
+/// Same route, same access level, two shapes. Without a window the response is the
+/// summary object this endpoint has always returned, which carries `assets` with the
+/// open lots the Holdings tab renders; it is not described here, and its shape is
+/// deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+/// With a window the response is `ReportResponse`.
+///
+/// `format=csv` returns the same report as `text/csv`, byte-identical between calls over
+/// unchanged data. JSON stays the documented public surface.
+///
+/// No `params(...)` block, deliberately: utoipa derives the query parameters from the route
+/// attribute, which is why `strategy` and `threshold_days` are already in the committed
+/// document without one. `from` and `to` arrive here, where the route starts accepting them,
+/// and `format` arrives in Task 5 for the same reason — the contract never advertises a
+/// parameter or a response shape the route does not produce.
+#[utoipa::path(
+    get,
+    path = "/api/portfolios/<id>/tax-summary",
+    responses(
+        (status = 200, description = "Dated tax report when a window is given; the legacy summary object otherwise", body = ReportResponse),
+        (status = 404, description = "Portfolio not found", body = ErrorBody),
+        (status = 422, description = "Invalid window, or a price or rate does not exist at or before the window end", body = ErrorBody),
+        (status = 503, description = "A pricing provider is unreachable, or the report exceeded its elapsed deadline", body = ErrorBody)
+    )
+)]
+```
 
 ```rust
 #[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>")]
