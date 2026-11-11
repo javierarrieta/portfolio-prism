@@ -8,7 +8,7 @@
 //! first test that seeds something lands (Task 4).
 
 use backend_rust::models::{Asset, Transaction};
-use backend_rust::schemas::{LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
+use backend_rust::schemas::{DatedLot, LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -118,4 +118,60 @@ fn a_sold_lot_row_carries_money_as_decimal_strings() {
     assert_eq!(v["unmatched_qty"], "20.0", "the sell's context repeats on every lot row");
     assert!(v["market_value"].is_null(), "an open-lot cell on a sold-lot row");
     assert_eq!(v["price_date_used"], "2024-06-30");
+}
+
+/// `open_lot` is the one `ReportRow` constructor that reads a type with no `Serialize`
+/// (`DatedLot`), so until Task 4 builds a real replay nothing else would notice a wrong
+/// field mapping. `market_value` taken from the wrong source, or the two quantity fields
+/// swapped, compiles clean and silently misreports an open position on a tax file.
+/// Asserted by value, not by wire form: this is a mapping test, not a contract test.
+#[test]
+fn an_open_lot_row_maps_every_dated_lot_field_and_leaves_the_sell_side_null() {
+    let lot = DatedLot {
+        buy_transaction_id: 7,
+        buy_date: ts("2024-01-01"),
+        buy_price: dec("100.0"),
+        original_qty: dec("120.0"),
+        remaining_qty: dec("80.0"),
+        unit_cost: dec("50.0"),
+        market_value: dec("12500.0"),
+        unrealized_gain_loss: dec("2500.0"),
+        unrealized_roi: Some(dec("0.25")),
+    };
+
+    let row = ReportRow::open_lot(
+        &fixture_asset(),
+        Some(day("2024-06-30")),
+        Some(day("2024-06-29")),
+        Some(PriceSource::Database),
+        &lot,
+    );
+
+    assert_eq!(row.row_type, RowKind::OpenLot);
+    assert_eq!(row.buy_transaction_id, Some(7));
+    assert_eq!(row.buy_date, Some(ts("2024-01-01")));
+    assert_eq!(row.buy_price, Some(dec("100.0")));
+    assert_eq!(row.unit_cost, Some(dec("50.0")));
+    assert_eq!(row.original_qty, Some(dec("120.0")));
+    assert_eq!(
+        row.remaining_qty,
+        Some(dec("80.0")),
+        "the two quantity fields must not land in each other's column"
+    );
+    assert_eq!(row.market_value, Some(dec("12500.0")));
+    assert_eq!(row.unrealized_gain_loss, Some(dec("2500.0")));
+    assert_eq!(row.unrealized_roi, Some(dec("0.25")));
+    assert_eq!(row.price_date_used, Some(day("2024-06-30")));
+    assert_eq!(row.fx_rate_date_used, Some(day("2024-06-29")));
+
+    // An open lot has no sell. Every sell-side cell is null, not zero — a zero would read
+    // as a realized figure of nothing rather than the absence of a sale.
+    assert_eq!(row.sell_transaction_id, None);
+    assert_eq!(row.sell_date, None);
+    assert_eq!(row.sold_qty, None);
+    assert_eq!(row.sell_price, None);
+    assert_eq!(row.sell_fee, None);
+    assert_eq!(row.proceeds, None);
+    assert_eq!(row.cost_basis, None);
+    assert_eq!(row.realized_pnl, None);
 }
