@@ -474,11 +474,11 @@ Add these three to the same in-file test module. They are the assertions the imp
 
     #[tokio::test]
     async fn test_replay_at_prices_the_market_value_at_the_valuation_date() {
-        // Review Focus 1. The realized leg converts each transaction at its own date
-        // (1.00 here) and the market-value leg converts at `valuation_date` (1.25).
-        // A replay that converted both at the transaction date would report 12500.0
-        // ... no: it would report 10000.0 market value and no gain at all, and every
-        // number would still look plausible.
+        // Review Focus 1. The realized leg converts the buy at the buy's own date
+        // (1.0000 here) and the market-value leg converts at `valuation_date` (1.2500).
+        // A replay that used one rate for both legs reports a 10000.0 market value and
+        // no gain at all -- plausible enough to survive a reader who is not looking for
+        // a date.
         let pool = priced_pool().await;
         seed_fx(&pool, "EURUSD=X", &[
             ("2024-01-01", "1.0000"),
@@ -686,4 +686,624 @@ Expected: all green. No schema is registered in `openapi.rs` by this task, so `d
 ```bash
 git add backend_rust/src/engines/tax_engine.rs backend_rust/src/schemas.rs
 git commit -m "feat(engine): add a dated replay returning open lots and sell breakdowns"
+```
+
+---
+
+## Task 3: The report payload — types, registration, generated contract
+
+The payload is a typed `ToSchema` struct, not the `serde_json::Value` that `tax-summary` declares today (`analytics.rs:16`, which produces `"schema": {}` in the committed spec). Every money field is a decimal string: `decimal_json` for required money, `decimal_opt_json` for nullable money, because `UNMATCHED` rows carry nulls and "nulls are nulls" rather than zeros.
+
+This task lands the contract one commit ahead of the behavior: the route's documented 200 body becomes `ReportResponse` here and Task 4 makes the route produce it. Nothing asserts the served response schema beyond `route_coverage_test.rs`'s operation counts, and no route is added, so those counts stay at 15.
+
+**Files:**
+- Modify: `backend_rust/src/schemas.rs` (the report payload types, at the end of the file)
+- Modify: `backend_rust/src/openapi.rs` (`components(schemas(...))` at `:26-40`, and the `tax-summary` `responses` block in `analytics.rs:10-19`)
+- Regenerate: `docs/openapi/openapi.json`
+- Regenerate: `frontend/src/types/api.d.ts` (`npm run generate-types`)
+- Modify: `frontend/src/types.ts` (hand-written report types — `api.d.ts` has zero importers, so these are what the renderer in Task 6 uses)
+- Test: `backend_rust/tests/tax_report_test.rs` (new file)
+
+**Interfaces:**
+- Consumes: `DatedLot`, `DatedReplay` (Task 2), `SellBreakdown`, `LotMatch`, `Asset`, `Transaction`.
+- Produces:
+  ```rust
+  pub enum RowKind { SoldLot, OpenLot, Unmatched }        // "SOLD_LOT" | "OPEN_LOT" | "UNMATCHED"
+  pub enum PriceSource { Database, Provider }             // "database" | "provider"
+  pub struct ReportContext { portfolio_id, portfolio_name, base_currency, strategy,
+                             threshold_days, requested_from: Option<NaiveDate>,
+                             requested_to: NaiveDate, splits_note: String }
+  pub struct AssetTotals { asset_id, symbol, asset_type, asset_currency,
+                           realized_in_window, realized_cumulative, unrealized_at_end,
+                           market_value, cost_basis, price_date_used, fx_rate_date_used,
+                           price_source, fx_applied, split_applied }
+  pub struct ReportTotals { realized_in_window, realized_cumulative, unrealized_at_end,
+                            market_value, cost_basis }
+  pub struct ReportRow { .. }                             // one shape, three kinds, nulls not omissions
+  pub struct ReportResponse { context, asset_totals, totals, rows }
+  pub struct ErrorBody { error, missing_prices, missing_rates, missing_prices_total,
+                         missing_rates_total, retryable }
+  impl ReportRow { pub fn sold_lot(..), pub fn open_lot(..), pub fn unmatched(..) }
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Create `backend_rust/tests/tax_report_test.rs` (it grows in Tasks 4 and 5):
+
+```rust
+//! The dated tax report: the three reconciliation equalities, the typing of the payload
+//! and the failure contract.
+//!
+//! Hermetic by construction, like `fx_pricing_test.rs`: every price and rate these tests
+//! need is seeded into `historical_prices`, and the pricing layer reads the database
+//! before the provider.
+
+mod common;
+
+use backend_rust::schemas::{ReportRow, RowKind};
+use chrono::NaiveDate;
+
+fn day(s: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+}
+
+#[test]
+fn an_unmatched_row_serialises_its_money_cells_as_null_not_zero() {
+    // The rule the whole payload obeys: a consumer has to be able to tell "not
+    // applicable" from "zero". `UNMATCHED` is the row kind where every money cell is
+    // inapplicable, so it is where the rule is easiest to break by defaulting.
+    let row = ReportRow::unmatched(1, "AAPL", "STOCK", "USD", Some("database"), 7, "80.0");
+    let v = serde_json::to_value(&row).unwrap();
+
+    assert_eq!(v["row_type"], "UNMATCHED");
+    assert_eq!(v["sell_transaction_id"], 7);
+    assert_eq!(v["unmatched_qty"], "80.0");
+    assert!(v["lot_pnl"].is_null(), "money that does not exist is null, not \"0\"");
+    assert!(v["realized_pnl"].is_null());
+    assert!(v["proceeds"].is_null());
+    assert!(v["buy_transaction_id"].is_null());
+    assert_eq!(v["price_source"], "database");
+}
+
+#[test]
+fn a_sold_lot_row_carries_money_as_decimal_strings() {
+    let row = ReportRow::sold_lot(
+        1, "AAPL", "STOCK", "USD", Some(day("2024-06-30")), None, Some("database"),
+        3, day("2024-12-01"), // sell id and date
+        "80.0", "130.0", "0.0",                 // sold_qty, sell_price, sell_fee
+        "10400.0", "8400.0", "2000.0", "80.0", "0.0",  // proceeds, cost_basis, realized_pnl, matched, unmatched
+        1, day("2024-01-01"), "100.0", "100.0", // buy id, date, price, unit_cost
+        "60.0", "60.0", "6000.0", "7800.0", "1800.0", 335, None, // lot cells, holding_days, term
+    );
+    let v = serde_json::to_value(&row).unwrap();
+
+    assert_eq!(v["row_type"], "SOLD_LOT");
+    assert_eq!(v["lot_pnl"], "1800.0");
+    assert_eq!(v["realized_pnl"], "2000.0");
+    assert!(v["market_value"].is_null(), "an open-lot cell on a sold-lot row");
+    assert_eq!(v["price_date_used"], "2024-06-30");
+    assert_eq!(v["row_type"], RowKind::SoldLot.as_str());
+}
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cd backend_rust && cargo test --test tax_report_test`
+Expected: FAIL to compile — no `ReportRow` in `schemas`.
+
+- [ ] **Step 3: Add the payload types**
+
+Append to `backend_rust/src/schemas.rs` (imports: extend the `chrono` line to `use chrono::{DateTime, NaiveDate, Utc};`):
+
+```rust
+// --- Dated tax report -------------------------------------------------------------
+
+/// How the dated report priced an asset's close. Recorded so a regenerated file can
+/// state where its numbers came from (Goal 4), and so a database-answered report can be
+/// told from a provider-answered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    Database,
+    Provider,
+}
+
+impl PriceSource {
+    /// The token the CSV column carries. One spelling per concept.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PriceSource::Database => "database",
+            PriceSource::Provider => "provider",
+        }
+    }
+}
+
+/// Which selection a row is. Exhaustive on purpose: both renderers switch on it, and the
+/// CSV's "this column totals, that one does not" rule is expressed through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RowKind {
+    SoldLot,
+    OpenLot,
+    Unmatched,
+}
+
+impl RowKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowKind::SoldLot => "SOLD_LOT",
+            RowKind::OpenLot => "OPEN_LOT",
+            RowKind::Unmatched => "UNMATCHED",
+        }
+    }
+}
+
+/// What a dated request was answered about. `ReportContext` is the single authority for
+/// `strategy` and `threshold_days`: the response does not repeat them at top level.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReportContext {
+    pub portfolio_id: i32,
+    pub portfolio_name: String,
+    pub base_currency: String,
+    pub strategy: String,
+    pub threshold_days: i64,
+    /// The window actually applied, not the parameters as typed. `requested_to` is the
+    /// call's `to`, or today when `to` was absent; `requested_from` is the call's `from`,
+    /// or the portfolio's first transaction on or before `requested_to`, or `None` when
+    /// the portfolio has no transaction at all. An open end is visible in the artifact
+    /// rather than inferred by its reader.
+    pub requested_from: Option<NaiveDate>,
+    pub requested_to: NaiveDate,
+    /// Splits are as recorded when this was generated; the dated path deliberately does
+    /// not sync them (issue #50), so a split recorded after the fact changes past
+    /// figures. A constant string in the payload rather than prose in each renderer,
+    /// because the CSV carries it as a cell (the file's first row is the header row).
+    pub splits_note: String,
+}
+
+/// One asset's dated totals. Every field is computed in Rust from the same replay that
+/// produced the rows; no renderer sums anything.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AssetTotals {
+    pub asset_id: i32,
+    pub symbol: String,
+    pub asset_type: String,
+    pub asset_currency: String,
+    #[serde(with = "decimal_json")]
+    pub realized_in_window: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_cumulative: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unrealized_at_end: Decimal,
+    #[serde(with = "decimal_json")]
+    pub market_value: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+    /// The close that priced this asset, and the date it actually came from. Null when
+    /// the asset has no transaction at or before the window end, so no close was needed.
+    pub price_date_used: Option<NaiveDate>,
+    pub fx_rate_date_used: Option<NaiveDate>,
+    pub price_source: Option<PriceSource>,
+    pub fx_applied: bool,
+    /// A SPLIT dated on or before the window end was applied to the lots in scope.
+    pub split_applied: bool,
+}
+
+/// The portfolio rollup: exactly the five per-asset figures, summed across assets.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReportTotals {
+    #[serde(with = "decimal_json")]
+    pub realized_in_window: Decimal,
+    #[serde(with = "decimal_json")]
+    pub realized_cumulative: Decimal,
+    #[serde(with = "decimal_json")]
+    pub unrealized_at_end: Decimal,
+    #[serde(with = "decimal_json")]
+    pub market_value: Decimal,
+    #[serde(with = "decimal_json")]
+    pub cost_basis: Decimal,
+}
+
+/// One report row. Three selections share one shape: the kind-specific cells are null on
+/// the rows where they do not apply, never omitted and never zero.
+///
+/// The asset-level pricing facts repeat on every row of that asset — one close per asset,
+/// not one per lot — so the CSV is a projection of this vector and needs no join.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReportRow {
+    pub row_type: RowKind,
+    pub asset_id: i32,
+    pub symbol: String,
+    pub asset_type: String,
+    pub asset_currency: String,
+    pub price_date_used: Option<NaiveDate>,
+    pub fx_rate_date_used: Option<NaiveDate>,
+    pub price_source: Option<PriceSource>,
+
+    // Sell-level, mirrored from `SellBreakdown` and the sell transaction. Repeated on
+    // every lot row of that sell so the file pivots, exactly as `sellPnlCsv.ts` does.
+    pub sell_transaction_id: Option<i32>,
+    pub sell_date: Option<DateTime<Utc>>,
+    #[serde(with = "decimal_opt_json")]
+    pub sold_qty: Option<Decimal>,
+    /// As entered, in `asset_currency`.
+    #[serde(with = "decimal_opt_json")]
+    pub sell_price: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub sell_fee: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub proceeds: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub cost_basis: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub realized_pnl: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub matched_qty: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub unmatched_qty: Option<Decimal>,
+
+    // Buy-lot cells: present on SOLD_LOT and OPEN_LOT.
+    pub buy_transaction_id: Option<i32>,
+    pub buy_date: Option<DateTime<Utc>>,
+    /// Split-adjusted, in `asset_currency`.
+    #[serde(with = "decimal_opt_json")]
+    pub buy_price: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub unit_cost: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub lot_matched_qty: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub lot_qty_before_match: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub lot_cost_basis: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub lot_proceeds: Option<Decimal>,
+    /// The column that totals. `LotMatch.pnl` under the name the CSV uses.
+    #[serde(with = "decimal_opt_json")]
+    pub lot_pnl: Option<Decimal>,
+    pub holding_days: Option<i64>,
+    /// "SHORT" | "LONG" for HYBRID only; null otherwise, and never claimed on an open lot.
+    pub term: Option<String>,
+
+    // Open-lot cells, on OPEN_LOT only.
+    #[serde(with = "decimal_opt_json")]
+    pub original_qty: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub remaining_qty: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub market_value: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub unrealized_gain_loss: Option<Decimal>,
+    #[serde(with = "decimal_opt_json")]
+    pub unrealized_roi: Option<Decimal>,
+}
+
+impl ReportRow {
+    /// The empty row every constructor starts from: every kind-specific cell null.
+    fn of(kind: RowKind, asset_id: i32, symbol: &str, asset_type: &str, asset_currency: &str,
+          price_source: Option<PriceSource>) -> Self {
+        ReportRow {
+            row_type: kind,
+            asset_id,
+            symbol: symbol.to_string(),
+            asset_type: asset_type.to_string(),
+            asset_currency: asset_currency.to_string(),
+            price_date_used: None,
+            fx_rate_date_used: None,
+            price_source,
+            sell_transaction_id: None, sell_date: None, sold_qty: None, sell_price: None,
+            sell_fee: None, proceeds: None, cost_basis: None, realized_pnl: None,
+            matched_qty: None, unmatched_qty: None,
+            buy_transaction_id: None, buy_date: None, buy_price: None, unit_cost: None,
+            lot_matched_qty: None, lot_qty_before_match: None, lot_cost_basis: None,
+            lot_proceeds: None, lot_pnl: None, holding_days: None, term: None,
+            original_qty: None, remaining_qty: None, market_value: None,
+            unrealized_gain_loss: None, unrealized_roi: None,
+        }
+    }
+
+    /// One buy lot a sell consumed, with the sell's context repeated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sold_lot(
+        asset: &Asset,
+        price_date_used: Option<NaiveDate>,
+        fx_rate_date_used: Option<NaiveDate>,
+        price_source: Option<PriceSource>,
+        sell: &Transaction,
+        breakdown: &SellBreakdown,
+        matched: &LotMatch,
+    ) -> Self {
+        let mut row = ReportRow::of(RowKind::SoldLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        row.price_date_used = price_date_used;
+        row.fx_rate_date_used = fx_rate_date_used;
+        row.sell_transaction_id = Some(sell.id);
+        row.sell_date = Some(sell.date);
+        row.sold_qty = Some(breakdown.sold_qty);
+        row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
+        row.sell_fee = Some(crate::db_types::str_to_decimal(&sell.fee));
+        row.proceeds = Some(breakdown.proceeds);
+        row.cost_basis = Some(breakdown.cost_basis);
+        row.realized_pnl = Some(breakdown.realized_pnl);
+        row.matched_qty = Some(breakdown.matched_qty);
+        row.unmatched_qty = Some(breakdown.unmatched_qty);
+        row.buy_transaction_id = Some(matched.buy_transaction_id);
+        row.buy_date = Some(matched.buy_date);
+        row.buy_price = Some(matched.buy_price);
+        row.unit_cost = Some(matched.unit_cost);
+        row.lot_matched_qty = Some(matched.matched_qty);
+        row.lot_qty_before_match = Some(matched.lot_qty_before_match);
+        row.lot_cost_basis = Some(matched.cost_basis);
+        row.lot_proceeds = Some(matched.proceeds);
+        row.lot_pnl = Some(matched.pnl);
+        row.holding_days = Some(matched.holding_days);
+        row.term = matched.term.clone();
+        row
+    }
+
+    /// A sell's unmatched tail: the quantity no buy lot covers. Money cells stay null;
+    /// `unmatched_qty` is a quantity, not money.
+    pub fn unmatched(
+        asset: &Asset,
+        price_date_used: Option<NaiveDate>,
+        fx_rate_date_used: Option<NaiveDate>,
+        price_source: Option<PriceSource>,
+        sell: &Transaction,
+        breakdown: &SellBreakdown,
+    ) -> Self {
+        let mut row = ReportRow::of(RowKind::Unmatched, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        row.price_date_used = price_date_used;
+        row.fx_rate_date_used = fx_rate_date_used;
+        row.sell_transaction_id = Some(sell.id);
+        row.sell_date = Some(sell.date);
+        row.sold_qty = Some(breakdown.sold_qty);
+        row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
+        row.sell_fee = Some(crate::db_types::str_to_decimal(&sell.fee));
+        row.matched_qty = Some(breakdown.matched_qty);
+        row.unmatched_qty = Some(breakdown.unmatched_qty);
+        row
+    }
+
+    /// One lot still open at the window end, valued at the requested date.
+    pub fn open_lot(
+        asset: &Asset,
+        price_date_used: Option<NaiveDate>,
+        fx_rate_date_used: Option<NaiveDate>,
+        price_source: Option<PriceSource>,
+        lot: &DatedLot,
+    ) -> Self {
+        let mut row = ReportRow::of(RowKind::OpenLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        row.price_date_used = price_date_used;
+        row.fx_rate_date_used = fx_rate_date_used;
+        row.buy_transaction_id = Some(lot.buy_transaction_id);
+        row.buy_date = Some(lot.buy_date);
+        row.buy_price = Some(lot.buy_price);
+        row.unit_cost = Some(lot.unit_cost);
+        row.original_qty = Some(lot.original_qty);
+        row.remaining_qty = Some(lot.remaining_qty);
+        row.market_value = Some(lot.market_value);
+        row.unrealized_gain_loss = Some(lot.unrealized_gain_loss);
+        row.unrealized_roi = lot.unrealized_roi;
+        row
+    }
+}
+
+/// The dated report: the run context, per-asset totals, the portfolio rollup and every row.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReportResponse {
+    pub context: ReportContext,
+    pub asset_totals: Vec<AssetTotals>,
+    pub totals: ReportTotals,
+    pub rows: Vec<ReportRow>,
+}
+
+/// One currency pair a rate could not be found for. A missing rate is a pair, not a
+/// symbol, and the body says which it is.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MissingRate {
+    pub from: String,
+    pub to: String,
+}
+
+/// The one body every failure returns. Validation failures carry an empty pair of lists
+/// and name the offending parameter in `error`; a pricing failure populates them.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ErrorBody {
+    pub error: String,
+    pub missing_prices: Vec<String>,
+    pub missing_rates: Vec<MissingRate>,
+    /// How many were found, before the lists were capped. Truncation is never silent.
+    pub missing_prices_total: usize,
+    pub missing_rates_total: usize,
+    pub retryable: bool,
+}
+```
+
+Note the test's constructor calls in Step 1 are written against a *different* signature than the final one for `sold_lot`/`unmatched`: the final constructors take `&Asset` and the engine's types, because that is what the route has in hand. **Fix the test in Step 1 to match the final signatures before running Step 6** — construct an `Asset` and a `SellBreakdown` in the test (the `Asset` struct is `models::Asset`, all public fields; `SellBreakdown`/`LotMatch` are `schemas` types with public fields). This is the one place in this plan where the test is written against the interface it *should* have: write it against the implemented signature as soon as Step 3 lands.
+
+- [ ] **Step 4: Register the types and retype the response**
+
+In `backend_rust/src/openapi.rs`, add to `components(schemas(...))` after `schemas::SellPnlResponse`:
+
+```rust
+        schemas::ReportContext,
+        schemas::AssetTotals,
+        schemas::ReportTotals,
+        schemas::ReportRow,
+        schemas::RowKind,
+        schemas::PriceSource,
+        schemas::ReportResponse,
+        schemas::ErrorBody,
+        schemas::MissingRate,
+```
+
+In `backend_rust/src/api_routes/analytics.rs`, replace the `tax-summary` `#[utoipa::path]` block (`:10-19`) with:
+
+```rust
+/// The tax summary, or — with `from` and/or `to` — the dated tax report.
+///
+/// Same route, same access level, two shapes. Without a window the response is the
+/// summary object this endpoint has always returned, which carries `assets` with the
+/// open lots the Holdings tab renders; it is not described here, and its shape is
+/// deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+/// With a window the response is `ReportResponse`.
+///
+/// `format=csv` returns the same report as `text/csv`, byte-identical between calls over
+/// unchanged data. JSON stays the documented public surface.
+#[utoipa::path(
+    get,
+    path = "/api/portfolios/<id>/tax-summary",
+    params(
+        ("from" = Option<String>, Query, description = "Window start, YYYY-MM-DD, inclusive, UTC. Absent means from the portfolio's first transaction."),
+        ("to" = Option<String>, Query, description = "Window end, YYYY-MM-DD, inclusive, UTC. Absent means today."),
+        ("format" = Option<String>, Query, description = "`csv` returns the report as text/csv. Any other value is a 422.")
+    ),
+    responses(
+        (status = 200, description = "Dated tax report when a window is given; the legacy summary object otherwise", body = ReportResponse),
+        (status = 404, description = "Portfolio not found", body = ErrorBody),
+        (status = 422, description = "Invalid window, or a price or rate does not exist at or before the window end", body = ErrorBody),
+        (status = 503, description = "A pricing provider is unreachable, or the report exceeded its elapsed deadline", body = ErrorBody)
+    )
+)]
+```
+
+- [ ] **Step 5: Regenerate both contracts**
+
+```bash
+cd backend_rust && cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
+cd ../frontend && npm run generate-types
+```
+
+Expected: `openapi.json` gains `ReportContext`, `AssetTotals`, `ReportTotals`, `ReportRow`, `RowKind`, `PriceSource`, `ReportResponse`, `ErrorBody`, `MissingRate` in `components.schemas`, gains `from`/`to`/`format` query parameters on the `tax-summary` operation, replaces its empty 200 schema with a `$ref` to `ReportResponse`, and gains 422/503 responses. `api.d.ts` follows. Neither file has a consumer that can break: nothing imports `api.d.ts`, and the hand-written types in `types.ts` are what the renderers use.
+
+- [ ] **Step 6: Add the hand-written frontend types**
+
+Append to `frontend/src/types.ts`:
+
+```ts
+/**
+ * The dated tax report. Deliberately NOT normalized through `number` the way every other
+ * payload in this file is (see the header): the report's figures are displayed from the
+ * exact decimal strings the server produced, and the same strings are what the CSV
+ * carries. Round-tripping them through a double here would make the screen and the file
+ * two renderings of different numbers, which is the one thing this feature exists to
+ * avoid. `formatCurrency` already accepts `string | number`.
+ */
+export type ReportRowKind = 'SOLD_LOT' | 'OPEN_LOT' | 'UNMATCHED';
+export type ReportPriceSource = 'database' | 'provider';
+
+export interface ReportContext {
+  portfolio_id: number;
+  portfolio_name: string;
+  base_currency: string;
+  strategy: string;
+  threshold_days: number;
+  /** The window actually applied; null when the portfolio has no transaction at all. */
+  requested_from: string | null;
+  requested_to: string;
+  splits_note: string;
+}
+
+export interface ReportAssetTotals {
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  asset_currency: string;
+  realized_in_window: string;
+  realized_cumulative: string;
+  unrealized_at_end: string;
+  market_value: string;
+  cost_basis: string;
+  price_date_used: string | null;
+  fx_rate_date_used: string | null;
+  price_source: ReportPriceSource | null;
+  fx_applied: boolean;
+  split_applied: boolean;
+}
+
+export interface ReportTotals {
+  realized_in_window: string;
+  realized_cumulative: string;
+  unrealized_at_end: string;
+  market_value: string;
+  cost_basis: string;
+}
+
+export interface ReportRow {
+  row_type: ReportRowKind;
+  asset_id: number;
+  symbol: string;
+  asset_type: string;
+  asset_currency: string;
+  price_date_used: string | null;
+  fx_rate_date_used: string | null;
+  price_source: ReportPriceSource | null;
+  sell_transaction_id: number | null;
+  sell_date: string | null;
+  sold_qty: string | null;
+  sell_price: string | null;
+  sell_fee: string | null;
+  proceeds: string | null;
+  cost_basis: string | null;
+  realized_pnl: string | null;
+  matched_qty: string | null;
+  unmatched_qty: string | null;
+  buy_transaction_id: number | null;
+  buy_date: string | null;
+  buy_price: string | null;
+  unit_cost: string | null;
+  lot_matched_qty: string | null;
+  lot_qty_before_match: string | null;
+  lot_cost_basis: string | null;
+  lot_proceeds: string | null;
+  /** The only column whose sum over SOLD_LOT rows is an asset's realized_in_window. */
+  lot_pnl: string | null;
+  holding_days: number | null;
+  term: 'SHORT' | 'LONG' | null;
+  original_qty: string | null;
+  remaining_qty: string | null;
+  market_value: string | null;
+  unrealized_gain_loss: string | null;
+  unrealized_roi: string | null;
+}
+
+export interface TaxReport {
+  context: ReportContext;
+  asset_totals: ReportAssetTotals[];
+  totals: ReportTotals;
+  rows: ReportRow[];
+}
+
+export interface ReportErrorBody {
+  error: string;
+  missing_prices: string[];
+  missing_rates: { from: string; to: string }[];
+  missing_prices_total: number;
+  missing_rates_total: number;
+  retryable: boolean;
+}
+```
+
+The header comment at the top of `types.ts` gains one sentence so the exception is stated where the rule is:
+
+```ts
+ * The dated tax report (`TaxReport`) is the one exception and says so at its definition:
+ * its money stays in the exact decimal strings the server sent.
+```
+
+- [ ] **Step 7: Run the tests and both gates**
+
+```bash
+cd backend_rust && cargo test --test tax_report_test && cargo test --test route_coverage_test
+cd ../frontend && npm run test && npm run lint && npm run typecheck
+```
+
+Expected: PASS. `route_coverage_test` still sees 15 operations because no route was added; `to_document_path` (`:86-92`) truncates at `?`, so the new query parameters do not move the count.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add backend_rust/src/schemas.rs backend_rust/src/openapi.rs backend_rust/src/api_routes/analytics.rs \
+        backend_rust/tests/tax_report_test.rs docs/openapi/openapi.json \
+        frontend/src/types.ts frontend/src/types/api.d.ts
+git commit -m "feat(api): type the dated tax report payload and document it"
 ```
