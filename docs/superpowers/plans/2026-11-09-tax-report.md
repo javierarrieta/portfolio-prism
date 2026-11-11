@@ -3481,7 +3481,7 @@ what to compute.
 In `frontend/src/App.tsx`:
 
 1. Imports: `ReportControls, TaxReportTable, currentYearToDate, buildReportQuery` from `./components/ReportControls`; `Receipt` from `lucide-react`; `ReportErrorBody, TaxReport` from `./types`.
-2. State and the fetch, next to the tax state (not inside `fetchPortfolioData` — the report is its own request, and Profile/Dashboard never pay for it):
+2. State and the fetch, next to the tax state (not inside `fetchPortfolioData` — the report is its own request, and the Holdings and Dashboard tabs never pay for it):
 
 ```tsx
   const [reportWindow, setReportWindow] = useState<ReportWindow>(() => currentYearToDate());
@@ -3505,12 +3505,13 @@ In `frontend/src/App.tsx`:
     if (activeTab !== 'report' || selectedId === null) return;
     if (!reportWindow.from && !reportWindow.to) return;
     const key = reportKey;
+    const query = reportQuery;
     let cancelled = false;
     const load = async () => {
       setReportLoading(true);
       setReportError(null);
       try {
-        const res = await apiFetch(`${API_BASE}${reportQuery}`);
+        const res = await apiFetch(`${API_BASE}${query}`);
         const body = await res.json();
         if (cancelled) return;
         if (res.ok) setReport({ key, payload: body as TaxReport });
@@ -3523,7 +3524,10 @@ In `frontend/src/App.tsx`:
     };
     load();
     return () => { cancelled = true; };
-  }, [activeTab, reportKey, reportQuery, selectedId, reportAttempt, reportWindow.from, reportWindow.to]);
+    // `reportKey` and `reportQuery` are derived inside the effect, not listed here: extra
+    // derived dependencies are what `react-hooks/exhaustive-deps` reports as unnecessary,
+    // and the primitives below are what actually change.
+  }, [activeTab, selectedId, reportWindow.from, reportWindow.to, strategy, thresholdDays, reportAttempt]);
 ```
 
 3. The nav item, after the statement's, using the same `selectTab` so opening the report closes
