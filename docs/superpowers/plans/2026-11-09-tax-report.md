@@ -2697,21 +2697,23 @@ async fn csv_fixture(pool: &SqlitePool) -> i32 {
     port_id
 }
 
-async fn csv_body(port_id: i32, query: &str) -> (Client, String) {
+/// A client and the CSV body for `query`, over a freshly seeded fixture. The portfolio id
+/// comes back from the seeding helper rather than being assumed.
+async fn csv_body(query: &str) -> String {
     let pool = setup_db(&disabled_config()).await;
-    let _ = csv_fixture(&pool).await;
+    let port_id = csv_fixture(&pool).await;
     let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?{query}&format=csv"))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Ok);
-    (client, resp.into_string().await.unwrap())
+    resp.into_string().await.unwrap()
 }
 
 #[tokio::test]
 async fn the_file_is_csv_with_the_servers_own_filename() {
-    let (_, body) = csv_body(1, "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
+    let body = csv_body("strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
     // The body assertion is here so the request is real; the headers are asserted on a
     // second dispatch, because `into_string` consumes the response.
     assert!(body.starts_with("row_type,"), "row 1 is the header row: {body:.80}");
@@ -2782,7 +2784,7 @@ async fn the_lot_pnl_column_sums_to_the_assets_realized_in_window() {
 
 #[tokio::test]
 async fn every_row_kind_reaches_the_file_and_nulls_are_empty_cells() {
-    let (_, body) = csv_body(1, "strategy=FIFO&from=2024-01-01&to=2024-06-30").await;
+    let body = csv_body("strategy=FIFO&from=2024-01-01&to=2024-06-30").await;
     let (header, rows) = parse(&body);
 
     let kinds: Vec<&str> = rows.iter().map(|r| cell(&header, r, "row_type")).collect();
@@ -3142,6 +3144,7 @@ Three things this task is the home of:
 - Create: `frontend/src/components/ReportControls.tsx`
 - Modify: `frontend/src/App.tsx` (state, the fetch effect, the nav list, the tab branch)
 - Modify: `frontend/src/test/mocks/handlers.ts` (branch the existing `tax-summary` handler on the window)
+- Create: `frontend/src/test/mocks/reportFixture.ts` (one payload, shared by both test files and the handler)
 - Test: `frontend/src/test/components/ReportControls.test.tsx` (props-driven)
 - Test: `frontend/src/test/components/AppReport.test.tsx` (MSW, the wiring)
 
@@ -3151,26 +3154,19 @@ Three things this task is the home of:
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `frontend/src/test/components/ReportControls.test.tsx`:
+Create `frontend/src/test/mocks/reportFixture.ts` — one fixture, so the component test, the App test and the MSW branch all describe the same payload:
 
-```tsx
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
-import ReportControls, { TaxReportTable, currentYearToDate } from '../../components/ReportControls'
-import type { ReportErrorBody, TaxReport } from '../../types'
-
-const window2024 = { from: '2024-01-01', to: '2024-06-30' }
+```ts
+import type { TaxReport } from '../../types'
 
 /**
  * Totals that deliberately disagree with the rows: `lot_pnl` sums to 1800.00 while
- * `realized_in_window` says 1234.56. A renderer that adds rows up shows 1800.00 and fails.
- * The money is strings on purpose, exactly as the server sends it — the report is the one
- * payload that is not normalized through `number`, so a renderer that tried to add these
- * would concatenate them and be visible immediately.
+ * `realized_in_window` says 1234.56. A renderer that adds rows up shows 1800.00 and the
+ * test fails. The money is strings on purpose, exactly as the server sends it -- the report
+ * is the one payload that is not normalized through `number` (types.ts), so a renderer that
+ * tried to add these would concatenate them and be visible immediately.
  */
-function fixture(): TaxReport {
-  return {
+export const REPORT_FIXTURE: TaxReport = {
     context: {
       portfolio_id: 1, portfolio_name: 'Retirement', base_currency: 'USD', strategy: 'FIFO',
       threshold_days: 30, requested_from: '2024-01-01', requested_to: '2024-06-30',
@@ -3201,8 +3197,20 @@ function fixture(): TaxReport {
         market_value: null, unrealized_gain_loss: null, unrealized_roi: null,
       },
     ],
-  }
 }
+```
+
+Create `frontend/src/test/components/ReportControls.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import ReportControls, { TaxReportTable, currentYearToDate } from '../../components/ReportControls'
+import { REPORT_FIXTURE } from '../mocks/reportFixture'
+import type { ReportErrorBody } from '../../types'
+
+const window2024 = { from: '2024-01-01', to: '2024-06-30' }
 
 describe('currentYearToDate', () => {
   it('defaults to January 1 through today, not December 31', () => {
@@ -3293,13 +3301,13 @@ describe('TaxReportTable', () => {
   it('prints the payload totals and never a sum of the rows', () => {
     // Review Focus 2. The rows' `lot_pnl` sums to 1800.00 and the payload's total is
     // 1234.56; the screen must show the server's figure.
-    render(<TaxReportTable report={fixture()} />)
+    render(<TaxReportTable report={REPORT_FIXTURE} />)
     expect(screen.getByTestId('total-realized-in-window')).toHaveTextContent('$1,234.56')
     expect(screen.getByTestId('total-realized-in-window')).not.toHaveTextContent('1,800.00')
   })
 
   it('names the window that was actually applied and the close it used', () => {
-    render(<TaxReportTable report={fixture()} />)
+    render(<TaxReportTable report={REPORT_FIXTURE} />)
     expect(screen.getByTestId('report-context')).toHaveTextContent('2024-01-01')
     expect(screen.getByTestId('report-context')).toHaveTextContent('2024-06-30')
     expect(screen.getByTestId('row-0-price-date')).toHaveTextContent('2024-06-28')
@@ -3316,6 +3324,7 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import App from '../../App'
 import { server } from '../mocks/server'
+import { REPORT_FIXTURE } from '../mocks/reportFixture'
 
 /** The dated branch of the shared handler, with the query the tab sent. */
 const seen: string[] = []
@@ -3364,10 +3373,8 @@ describe('the tax report tab', () => {
   })
 })
 
-const REPORT_FIXTURE = { /* the `fixture()` object from ReportControls.test.tsx, inlined */ }
 ```
 
-`REPORT_FIXTURE` is the same object `ReportControls.test.tsx` builds, with `context.portfolio_id` matching the portfolio the shared handlers return (`handlers.ts:14` gives portfolio 1).
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -3430,7 +3437,10 @@ export function buildReportQuery(
 }
 ```
 
-`ReportControls` renders, in order: the two `<input type="date">` fields (labelled `From` / `To` through `<label htmlFor>`, because the tests query by label), the five preset buttons (each `disabled` when its window ends after `today`, with `title` explaining why), an `<a data-testid="download-csv" className="btn btn-primary" href={csvHref}>` that is rendered only when `csvHref` is non-empty, the error panel, and the loading state. The error panel:
+`ReportControls` takes `{ window, onWindowChange, csvHref, onRetry, report, error, loading, today }`,
+where `today` is optional and defaults to `new Date()` — it is a prop so the preset test can
+name a date instead of depending on when the suite runs. It renders, in order: the two
+`<input type="date">` fields (labelled `From` / `To` through `<label htmlFor>`, because the tests query by label), the five preset buttons (each `disabled` when its window ends after `today`, with `title` explaining why), an `<a data-testid="download-csv" className="btn btn-primary" href={csvHref}>` that is rendered only when `csvHref` is non-empty, the error panel, and the loading state. The error panel:
 
 ```tsx
       {error && (
@@ -3578,7 +3588,7 @@ In `frontend/src/test/mocks/handlers.ts`, the existing `tax-summary` handler (`:
   }),
 ```
 
-`REPORT_FIXTURE` is declared once near the top of `handlers.ts` with `portfolio_id: 1`, matching the portfolio the file's other handlers return. `handlers.test.ts` asserts handler *behaviour* and never the handler count, so nothing there moves.
+`REPORT_FIXTURE` is imported from `src/test/mocks/reportFixture.ts`, and its `context.portfolio_id` is 1, matching the portfolio the file's other handlers return (`handlers.ts:14`). `handlers.test.ts` asserts handler *behaviour* and never the handler count, so nothing there moves.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
