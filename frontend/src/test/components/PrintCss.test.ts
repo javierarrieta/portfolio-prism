@@ -37,11 +37,16 @@ describe('print.css', () => {
     expect(css).toMatch(/\.statement-table\s+th\s*,\s*\.statement-table\s+td\s*\{[^}]*font-size:\s*0\.75rem/);
   });
 
-  it('lets the Type column break mid-token, and only the Type column', () => {
-    // td:nth-child(2) is Type, whose widest token MUTUAL_FUND cannot break on the underscore.
-    // Scoped on purpose: overflow-wrap anywhere on a numeric column would let a figure
-    // break mid-number, which is worse than the overflow it prevents.
-    expect(css).toMatch(/\.statement-table\s+td:nth-child\(2\)\s*\{[^}]*overflow-wrap:\s*anywhere/);
+  it('has no token-break rule anywhere, so an over-wide cell fails a check instead of shattering', () => {
+    // print.css used to carry `overflow-wrap: anywhere` on td:nth-child(2) (Type) so the raw
+    // MUTUAL_FUND enum could survive a narrow column. That rule is what let the table hold a box
+    // it did not fit: the token broke in half and every check stayed green. The column prints a
+    // display label now (PortfolioStatement.tsx), so nothing needs to break, and an overflow-wrap
+    // anywhere on a numeric column would let a figure break mid-number -- worse than the overflow
+    // it prevents. Pinned as an absence over the DECLARATIONS only -- the stylesheet's prose
+    // names the retired rule on purpose, and a comment is not a declaration.
+    const declarations = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(declarations).not.toMatch(/overflow-wrap|word-break|hyphens/);
   });
 
   it('collapses .main-content print padding for the statement only, and keeps 24px at the bottom', () => {
@@ -49,10 +54,12 @@ describe('print.css', () => {
     // is the full 688px @page content box, not 608px. The :has() scope is load-bearing —
     // unscoped, every other tab loses its padding too — and specificity (0,2,0) beats
     // .main-content's (0,1,0) in index.css without !important. This file only pins the rule as
-    // text; what deleting it costs was measured, and it is not an overflow. At 608px the table
-    // still fits the box — it squeezes the Type column to 37px and breaks MUTUAL_FUND across
-    // lines instead — so the smoke's body-cell line-count assertion is what fails here, not its
-    // overflow check.
+    // text; the smoke is what shows that deleting it costs anything. It used to be measurable as
+    // a Type column squeezed from 96px to 37px with MUTUAL_FUND broken across lines, but that
+    // measurement belonged to the raw enum and to the Type-column break rule this stylesheet no
+    // longer has. Which of the smoke's two width checks a deletion trips now is a browser
+    // measurement, not something this text assertion can claim.
+    expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
     expect(css).toMatch(/\.main-content:has\(\[data-print="statement"\]\)\s*\{\s*padding:\s*0 0 24px/);
   });
 

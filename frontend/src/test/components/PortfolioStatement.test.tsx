@@ -7,6 +7,13 @@ const portfolio: Portfolio = {
   id: 1, name: 'Long-Term', currency: 'EUR', assets: [],
 };
 
+const asset = {
+  symbol: 'AAPL', asset_type: 'stock', current_shares: 10, average_cost: 100,
+  current_price: 120, total_cost: 1000, market_value: 1200,
+  unrealized_pnl: 200, unrealized_roi: 0.2, realized_pnl: 1234.565,
+  tax_lots: [],
+};
+
 const summary = (over: Partial<TaxSummary> = {}): TaxSummary => ({
   currency: 'EUR',
   strategy: 'HYBRID',
@@ -14,12 +21,7 @@ const summary = (over: Partial<TaxSummary> = {}): TaxSummary => ({
   total_portfolio_value: 10400,
   total_realized_pnl: 1234.565,
   total_unrealized_pnl: -800,
-  assets: [{
-    symbol: 'AAPL', asset_type: 'stock', current_shares: 10, average_cost: 100,
-    current_price: 120, total_cost: 1000, market_value: 1200,
-    unrealized_pnl: 200, unrealized_roi: 0.2, realized_pnl: 1234.565,
-    tax_lots: [],
-  }],
+  assets: [asset],
   ...over,
 });
 
@@ -106,6 +108,25 @@ describe('PortfolioStatement, populated', () => {
       'Market value', 'Realized', 'Unrealized', 'Unrealized ROI',
     ]);
     expect(document.querySelectorAll('[data-testid="holdings"] tbody tr')).toHaveLength(1);
+  });
+
+  it('prints a display label for the asset type, and falls through for a type it has never seen', () => {
+    render(
+      <PortfolioStatement
+        taxSummary={summary({ assets: [
+          { ...asset, asset_type: 'MUTUAL_FUND' },
+          { ...asset, asset_type: 'BOND' },
+        ] })}
+        portfolio={portfolio} fetchedAt={fetchedAt}
+      />
+    );
+    const types = Array.from(
+      document.querySelectorAll('[data-testid="holdings"] tbody td:nth-child(2)')
+    ).map((td) => td.textContent);
+    // MUTUAL_FUND is the widest unbreakable token the enum can carry and an internal label, not
+    // financial data, so the printed document shortens it. An unmapped value must still print --
+    // a blank Type cell would lose information silently.
+    expect(types).toEqual(['Fund', 'BOND']);
   });
 
   it('keeps interactive and painted elements out of the printed subtree', () => {

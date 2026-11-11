@@ -106,29 +106,33 @@
         Against 688px every shape measured fits without overflowing. That is a ceiling with a
         number on it, not a solution: padding is finite and a holding's column content is not,
         so a wide enough portfolio still overflows and is still clipped silently.
-        What this rule actually buys is narrower than "it stops the overflow", and the smoke's own
-        fixture proves it. Measured with that fixture (two assets, realized -$13,800,000.00), the
-        table's max-content width is 694px — wider than BOTH boxes — so something always wraps and
-        there is no width at which this table is relaxed. Delete the rule and the table does not
-        overflow the 608px box that remains: scrollWidth is 608, and the Type column gives way
-        instead, falling from 96px to 37px and breaking MUTUAL_FUND across two lines. So the
-        padding rule buys whole-word, single-line body cells, not the absence of overflow, and the
-        smoke's horizontal-overflow check cannot see it either way — its body-cell line-count
-        assertion is what detects this rule being deleted. */
+        What this rule buys is legibility, not the absence of overflow. That was measured on the
+        smoke's own fixture when the Type column still printed the raw enum: the table's
+        max-content measured 694px — wider than BOTH boxes — so something always gave, and
+        deleting this rule did not overflow the 608px box that remained, something else gave way
+        instead. Two parts of that measurement have since been retired on purpose: the Type column
+        prints a display label (PortfolioStatement.tsx), and the smoke keeps its live-priced
+        columns narrow so its checks are not price-sensitive. So the current max-content is not
+        restated here, and neither is WHICH of the smoke's two width checks sees this rule
+        deleted — both checks are in the smoke, and only a browser run can say which one fires.
+        What has not changed is the risk: padding is finite, a holding's column content is not,
+        and an over-wide table is still clipped silently. */
   .statement-table th,
   .statement-table td {
     padding: 4px 6px;
     font-size: 0.75rem;
   }
 
-  /* The Type column, and only it, may break mid-token. MUTUAL_FUND is a valid AssetType
-        (types.ts:9) and what the backend normalises "Mutual Fund" to (lookup.rs:116), and
-        it is the widest unbreakable token this table can print: `_` is not a line-break
-        opportunity under UAX #14, so all 11 characters claim their column at once — worth
-        ~46px at 0.75rem. Scoped to that column deliberately: overflow-wrap anywhere on a
-        numeric column would let "-$138,000.00" break mid-number, which is worse than the
-        overflow it prevents. */
-  .statement-table td:nth-child(2) { overflow-wrap: anywhere; }
+  /* No break rule on the Type column, on purpose. One used to sit here: `overflow-wrap: anywhere`
+        on td:nth-child(2), added so MUTUAL_FUND — a valid AssetType (types.ts:9) and what the
+        backend normalises "Mutual Fund" to (lookup.rs:116), unbreakable because `_` is not a
+        line-break opportunity under UAX #14 — could survive a narrow column. It did more harm
+        than good: it is what let the table survive a box it did not fit, so a squeezed table
+        printed a shattered token instead of failing anything. The Type column now prints a
+        display label (PortfolioStatement.tsx) whose widest token is far shorter than the enum,
+        so nothing here needs to break. If a future token is too wide for the page, the smoke's
+        body-cell line-count check or its overflow check has to fail — silently breaking the word
+        in half is exactly the outcome this absence exists to prevent. */
 
   /* 5. Break rules. */
   tr { break-inside: avoid; }

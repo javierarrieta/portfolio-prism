@@ -11,6 +11,17 @@ const DATE_OPTS: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', 
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = { ...DATE_OPTS, hour: '2-digit', minute: '2-digit' };
 const QTY_OPTS: Intl.NumberFormatOptions = { maximumFractionDigits: 6 };
 
+/* The Type column prints a display label, not the stored enum: MUTUAL_FUND is an internal
+ * identifier rather than financial data, and at 11 unbreakable characters (`_` is not a
+ * line-break opportunity) it was the widest token the table printed, so it alone decided whether
+ * the row fit. The `??` fallback is load-bearing: AssetTaxSummary.asset_type is a plain string
+ * (types.ts:53), so an AssetType this map has never seen still prints instead of blanking the
+ * cell. PortfolioDetail.tsx still prints the raw enum on screen: different artifact, different
+ * width budget, deliberately left alone. */
+const ASSET_TYPE_LABEL: Record<string, string> = {
+  STOCK: 'Stock', CRYPTO: 'Crypto', ETF: 'ETF', MUTUAL_FUND: 'Fund',
+};
+
 export default function PortfolioStatement(
   { taxSummary, portfolio, fetchedAt }: PortfolioStatementProps,
 ) {
@@ -75,7 +86,7 @@ export default function PortfolioStatement(
               {taxSummary.assets.map((a) => (
                 <tr key={`${a.symbol}-${a.asset_type}`}>
                   <td>{a.symbol}</td>
-                  <td>{a.asset_type}</td>
+                  <td>{ASSET_TYPE_LABEL[a.asset_type] ?? a.asset_type}</td>
                   <td>{a.current_shares.toLocaleString(undefined, QTY_OPTS)}</td>
                   <td>{formatCurrency(a.average_cost, currency)}</td>
                   <td>{formatCurrency(a.current_price, currency)}</td>

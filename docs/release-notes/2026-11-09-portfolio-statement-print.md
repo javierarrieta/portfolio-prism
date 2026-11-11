@@ -94,16 +94,19 @@ unaffected regardless, because rule 1 hides the sidebar there.
 
 ## What is verified, and what is not
 
-**Covered by `npm test` (20 files, 178 tests, green as of this note):**
+**Covered by `npm test` (20 files, 179 tests, green as of this note):**
 
 - `PortfolioStatement.test.tsx` — the structural hooks, the literal copy on **both** P&L labels,
-  the nine table columns, the empty branch's negative list, the HYBRID-only threshold including
+  the nine table columns, the Type column's display label (`MUTUAL_FUND` prints `Fund`) and its
+  fall-through for a type the label map has never seen, the empty branch's negative list, the
+  HYBRID-only threshold including
   `HYBRID` with no `threshold_days`, and one rounding golden (`1234.565` at EUR renders
   `€1,234.57`). jsdom does not apply `@media print`, so this proves structure and formatting and
   nothing about the printed page.
 - `PrintCss.test.ts` — `print.css` read **as text**: both hide rules scoped with `:has()`,
   the inverted palette values, the `.statement-table td` border override, the `.statement-table`
-  cell-padding rule that makes nine columns fit the page, the Type-column token break, the white
+  cell-padding rule that makes nine columns fit the page, the **absence** of any token-break rule
+  (nothing may shatter a word to make the table fit), the white
   `.sidebar` background, the break rules, and exactly one `@page` block declaring A4/14 mm. Text,
   not rendering — it cannot tell you the rules apply to the elements they name, and it cannot see
   `@media` membership at all; the smoke's on-screen checks are what close that.
@@ -123,38 +126,53 @@ media it also checks the sidebar is visible, still dark, that a statement cell s
 anywhere that a print rule did not escape `@media print` into the running app, because
 `PrintCss.test.ts` reads the file as text and cannot see `@media` membership.
 
-**It has been run, and every assertion passed** — locally, under chromium 157, against the real
-Rocket API and Vite with the fixture seeded through the API. That is still not a gate. There is no
+**It has been run** — locally, under chromium 157, against the real Rocket API and Vite with the
+fixture seeded through the API. That is still not a gate. There is no
 browser job in CI (#45), so running it remains a step an operator has to take by hand, and a change
-to the print CSS can still merge with nobody having run it. Its fixture is deliberately not the
-narrowest table the endpoint can produce: one plain `STOCK` position and one `MUTUAL_FUND` holding
-carrying a recorded realized loss of `-$13,800,000.00`, so the width checks measure realistic
-column widths. Realized P&L is replayed from the seeded transactions rather than read from the live
-provider, so that loss is deterministic and the run still asserts **no figure** on purpose: prices
-come from a live provider, and a smoke that asserted figures would print zeros and still pass.
+to the print CSS can still merge with nobody having run it. The last run was **red**, and correctly
+so: the body-cell line-count assertion failed on `MUTUAL_FUND` in the Type column, which is what
+sent this round. What that round changed, and what still needs a browser to confirm, is below.
+
+Its fixture is deliberately not the narrowest table the endpoint can produce, and it is now shaped
+by two rules at once. One column must stay wide so the width checks measure something real: the
+`MUTUAL_FUND` holding sells all but 30 of its 150,000 shares and carries a recorded realized loss
+of `-$17,246,550.00`, replayed from the seeded transactions and therefore deterministic. The
+live-priced columns must stay **narrow**, because price, market value and unrealized come from a
+live provider and a table's columns are interdependent: at 30 shares the market-value cell is
+around `$16,000` instead of the ~$16m the same fixture measured with 30,000 shares, so a 10x move
+in the quote moves that cell by one character. That is what keeps the run honest about width while
+still asserting **no figure** — the wide value is the deterministic one, and a provider outage
+makes the live columns narrower, never wider.
 
 Whether nine columns fit the printed box is a question about glyph widths, so it was measured rather
 than argued — chromium, real print media, at the page content box, across portfolio shapes. A4 at
 210mm less `@page`'s 14mm margins is a **688px** content box, and `print.css` now collapses
-`.main-content`'s 40px side padding for the statement tab, so the statement gets all of it — on
-top of the two levers from the previous round, the statement table's cells down to `4px 6px` at
-`0.75rem` and the Type column allowed to break `MUTUAL_FUND` mid-token. Measuring the smoke's own
+`.main-content`'s 40px side padding for the statement tab, so the statement gets all of it. The
+previous round had bought width two other ways: the statement table's cells down to `4px 6px` at
+`0.75rem`, and a Type-column break rule — the same round added that rule and this one removes it.
+Measuring the smoke's own
 fixture, rather than a narrower probe, then invalidated two claims made here: the table's
-max-content width is **694px**, wider than both boxes, so something always wraps, and at 608px the
-fixture does **not** overflow — it drops the Type column from 96px to 37px and breaks `MUTUAL_FUND`
-across two lines instead. (What was written here before — that the fixture overflowed the 608px box,
-and that at 617px it passed with the padding rule and failed without it — came from a narrower
-single-asset shape and did not survive measuring this fixture.) So the fixture's value is that
-it renders whole-word at 688px and shatters the Type token at 608px, and the assertion that detects
-the padding rule being deleted is the body-cell line count — the horizontal-overflow check cannot
-see that rule at any width. It stays because it still catches a shape whose min-content genuinely
-does exceed the page. Widening the smoke's viewport is still not the response if either of them
-fails.
+max-content width was **694px**, wider than both boxes, so something always wrapped, and at 608px
+the fixture did **not** overflow — it dropped the Type column from 96px to 37px and broke
+`MUTUAL_FUND` across two lines instead. (What was written here before — that the fixture overflowed
+the 608px box, and that at 617px it passed with the padding rule and failed without it — came from a
+narrower single-asset shape and did not survive measuring this fixture.)
+
+That red run invalidated a third claim, and this round is the fix for it. The break rule was not a
+lever, it was the thing hiding the failure: with the raw enum, an eight-figure live market value and
+that rule in place, the table was over-subscribed at the shipped width and the Type column gave way.
+So the Type column now prints a **display label** — `Stock`, `Crypto`, `ETF`, `Fund`, with a
+fall-through so an AssetType the map has never seen still prints rather than blanking the cell — and
+`print.css` no longer carries a token-break rule anywhere, because a rule that shatters a word is
+what let a squeezed table pass every check. No max-content figure is restated for the fixed table:
+it has not been re-measured, and the smoke is what will measure it. If it still fails, the finding
+has not changed — widening the smoke's viewport or narrowing the fixture is not the response.
 
 **Padding is not a solution to an unbounded width problem.** A portfolio whose columns are wide
 enough will overflow again, and the clip stays silent — the smoke is the tripwire, not a guarantee.
-The levers left are content decisions, not CSS ones: shortening the printed Type token, or moving
-the currency symbol into the column header (~+90px each).
+The levers left are content decisions, not CSS ones: moving the currency symbol into the column
+header (~+90px each). Shortening the printed Type token, the other one named here before, has now
+been taken.
 
 **There is no CI browser job.** Issue #45 is open. One is possible — CI could install chromium,
 and `emulateMedia` and `page.pdf()` need no display server — but the job is not browser-only:
@@ -173,6 +191,11 @@ this slice deliberately ships the print path unverified by CI.
 
 - No backend change of any kind: no new route, no new field, no new figure, no OpenAPI
   regeneration.
+- The on-screen holdings table is untouched. `PortfolioDetail.tsx:278-280` still prints the raw
+  enum inside its `.badge`, and the sell-P&L CSV still carries it (`sellPnlCsv.ts:30,73`). The
+  printed statement now shows a display label where the screen shows `MUTUAL_FUND`; that
+  divergence is deliberate — the two artifacts have different width budgets — but it means the
+  screen is no longer a preview of the printed Type column.
 - No print stylesheet for the other four tabs — no hide rules for them and
   no layout work. Printing from them still prints the sidebar, the nav and the tab's own
   content — including the Recharts SVGs on the analytics tab — now

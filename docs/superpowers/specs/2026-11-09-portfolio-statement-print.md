@@ -226,7 +226,7 @@ named per column so no one has to guess which of the repo's three number formatt
 | `<th>` | Renderer |
 | :-- | :-- |
 | `Symbol` | plain text |
-| `Type` | plain text — **not** the `.badge` markup `PortfolioDetail.tsx:272-276` uses, whose background is not a variable and would not invert |
+| `Type` | display label from a module-level map (`STOCK`→`Stock`, `CRYPTO`→`Crypto`, `ETF`→`ETF`, `MUTUAL_FUND`→`Fund`), falling through to the raw value for a type the map has never seen, so an unseen enum member cannot blank the cell. Printed as plain text — **not** the `.badge` markup `PortfolioDetail.tsx:272-276` uses, whose background is not a variable and would not invert. The label, not the stored enum, because the enum's widest token is what decided whether the row fit |
 | `Quantity` | `toLocaleString(undefined, { maximumFractionDigits: 6 })`, as `PortfolioDetail.tsx:277` does |
 | `Avg cost`, `Price`, `Market value`, `Realized`, `Unrealized` | `formatCurrency(v, taxSummary.currency)` |
 | `Unrealized ROI` | `formatPercent(v)`, as `PortfolioDetail.tsx:292-294` does |
@@ -546,21 +546,31 @@ the only one of the three that got an explicit override, for the reason just giv
         full 688px: `print.css` collapses `.main-content`'s 40px side padding under
         `:has([data-print="statement"])`, so a 688px viewport reproduces what ships exactly. (It
         did before that rule too, when the box was 688 − 80 = 608px — the box moved, the viewport
-        did not need to.) **This check cannot see the padding rule.** Measured with the smoke's
-        fixture, the table's max-content width is 694px — wider than both boxes — so something
-        always wraps, and at 608px the table does not overflow at all: it squeezes the Type column
-        from 96px to 37px and breaks `MUTUAL_FUND` across lines instead. An earlier claim here,
-        that the fixture measured 617px and so failed this check with the rule deleted, was
-        measured false and does not survive. The assertion that guards the rule is the next one.
+        did not need to.) **What this check cannot see on its own is a table that is merely
+        squeezed** — it fails when min-content exceeds the box, and on nothing else. Measured with
+        the fixture as it stood when this was written, the table's max-content was 694px — wider
+        than both boxes — and deleting the padding rule did not overflow the 608px box at all: the
+        Type column was squeezed from 96px to 37px and `MUTUAL_FUND` broke across lines instead.
+        (An earlier claim here, that the fixture measured 617px and so failed this check with the
+        rule deleted, was measured false and does not survive.) That measurement belonged to the
+        raw enum in the Type column, an eight-figure live market value, and an
+        `overflow-wrap: anywhere` rule on the Type column; all three have since been removed on
+        purpose, so no max-content figure is claimed here for the current fixture and **which of
+        the two width checks a padding-rule deletion trips is an open browser question.**
     *   no **body** cell renders across more than one line box: for each
         `[data-print="statement"] tbody td`, build a `Range` with `selectNodeContents` and count
         `getClientRects().length` — one client rectangle per line box the text actually occupies.
         Element height cannot do this: cells in a row share the row's height, so in a wrapped row
         every cell in it measures the row's height and none discriminates. Body cells only, because
-        the 694px max-content has to wrap somewhere and the header row is the harmless place.
-        Expects one line per cell at 688px; at 608px it fails listing every offending cell's index,
-        text and line count. This is the only assertion anywhere that detects the padding rule
-        being deleted.
+        a wrapped header is harmless ("Unrealized ROI" is two words) while a wrapped figure is the
+        squeeze reaching the numbers. **All** body cells, the live-priced ones included: the
+        fixture keeps those columns deliberately narrow (30 shares left, market value around
+        $16,000) precisely so this check does not depend on what a provider quotes today. Expects
+        one line per cell at the shipped width, and fails listing every offending cell's index,
+        text and line count — every one, because the columns are interdependent and one wrapped
+        cell and five are different diagnoses. Together with the overflow check above this is what
+        detects the padding rule being deleted; the on-screen `paddingLeft` check below only
+        detects that rule escaping `@media print`.
     *   before `emulateMedia`, on screen, `.main-content`'s computed `paddingLeft` is `40px`. Same
         shape as the other pre-`emulateMedia` checks: `PrintCss.test.ts` pins the statement print
         padding collapse as text and cannot see `@media` membership, so if that rule escaped the
@@ -572,7 +582,10 @@ the only one of the three that got an explicit override, for the reason just giv
         `frontend/package.json`. Decided item 2's one-page claim moves to the manual check.
     *   **no figure is asserted.** Figures come from a live price provider; when it is unreachable the
         fallback returns zero, and a smoke that asserted figures would then print zeros and still
-        pass. The smoke pins structure and visibility, which are unaffected by price. The seeded
+        pass. The smoke pins structure and visibility, which are unaffected by price. This binds on
+        the width checks too, not only on value assertions: a wide live-priced cell makes the table's
+        layout price-sensitive, so the fixture keeps every live-priced column narrow and leaves the
+        one wide value (`realized`) to the deterministic replay. The seeded
         holdings are denominated in the portfolio's base currency so that no rate lookup is needed at
         all: a cross pair goes to the live provider, which can fail outright on a rate nobody can
         supply or answer with an older close than the date asked for, and a smoke that asserts no

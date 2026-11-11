@@ -40,34 +40,35 @@ async function seed() {
   // answer, or be priced at whatever older close the lookback substituted -- and this
   // smoke asserts no figure, so it must not depend on one.
   //
-  // Width is the other half of the fixture. The first version seeded two STOCK assets at
-  // $100-130, which is the narrowest table this endpoint can produce -- widest unbreakable
-  // token "STOCK", ~40px -- so the overflow check at the bottom of this file passed for a
-  // reason unrelated to the risk it exists to catch. MUTUAL_FUND is the widest asset_type
-  // the app can store (types.ts:9) and the widest unbreakable token the table prints, and
-  // the recorded realized loss puts a leading-minus eight-figure amount in the Realized
-  // column: 120000 x (5 - 120) = -$13,800,000.00. Both are deterministic -- realized P&L is
-  // replayed from these transactions, never read from the live provider -- so this still
-  // adds no figure assertion.
+  // Width is the other half of the fixture, and it is where the live provider would sneak in.
+  // Only `realized` is deterministic here: it is replayed from the transactions below and never
+  // read from a quote. Price, market value and unrealized all come from the live provider, and a
+  // table's columns are interdependent, so a wide live-priced cell would make the body-cell
+  // line-count check at the bottom of this file depend on what a provider quotes today -- which
+  // the header of this file forbids. The fixture is shaped so that cannot happen:
   //
-  // That amount is what makes this fixture a regression test for print.css's
-  // `.main-content:has([data-print="statement"])` padding collapse -- but NOT through the
-  // overflow check below, which cannot see that rule at all. Measured in a browser at the
-  // printed page box, with exactly the two-asset fixture seeded here:
+  //   realized      149970 x (5 - 120) = -$17,246,550.00. A leading-minus eight-figure value,
+  //                 fully deterministic, so the table is never tested at its narrowest.
+  //   market value  30 shares x live price. The 30,000-share version of this fixture measured
+  //                 $15,994,799.19 in a probe; at 30 shares the cell is around $16,000, three
+  //                 digits narrower, so a 10x move in the quote moves the cell by one character.
+  //                 Price and unrealized shrink with it, and a provider outage (prices of 0)
+  //                 makes every live column narrower still, never wider.
   //
-  //   .main-content padding | clientWidth | statement scrollWidth | Type cell
-  //   0px (rule present)     | 688         | 688, no overflow      | 96px, MUTUAL_FUND whole
-  //   40px (rule deleted)    | 608         | 608, no overflow      | 37px, MUTUAL_FUND broken
+  // That is the whole reason the sell is 149970 and not a round 120000: the leftover position is
+  // 30 shares ON PURPOSE, and nobody should tidy it back to a round number.
   //
-  // The table overflows NEITHER box. print.css's `overflow-wrap: anywhere` on the Type column
-  // lets MUTUAL_FUND shatter into a 37px fragment, and that is what lets the table survive
-  // 608px at all -- the break rule absorbed what the overflow check was supposed to detect.
-  // What the fixture buys is the difference the body-cell line-count check below CAN see: this
-  // fixture renders its Type token whole and every body cell on one line at 688px, and breaks
-  // that token across lines at 608px. (An earlier version of this comment claimed the fixture
-  // measured 617px, sat between the two boxes, and so failed the overflow check without the
-  // padding rule. Measured, that is false.) If the line-count check fails on a real run that IS
-  // the finding: do not widen the viewport and do not narrow the fixture.
+  // The Type column prints the display label `Fund` (PortfolioStatement.tsx), not the stored
+  // MUTUAL_FUND, so the widest Type token this fixture prints is now `Stock`. Earlier versions of
+  // this comment
+  // recorded MUTUAL_FUND rendering whole in a 96px Type cell at 688px and shattered into 37px at
+  // 608px, and a table max-content of 694px against the 688px page box. All of those were
+  // measured with the raw enum, an eight-figure market value and the Type-column break rule, and
+  // all three are gone, so no max-content figure is restated here. What has not changed is what
+  // the two checks at the bottom are for: at the shipped width every body cell must render on one
+  // line, and a table squeezed below what it needs must show up as a failure rather than as
+  // smaller, broken type. If the line-count check fails on a real run that IS the finding: do not
+  // widen the viewport and do not narrow the fixture.
   const holdings = [
     { symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', txs: [
       ['BUY', '60', '100', '2024-01-01T00:00:00Z'],
@@ -75,7 +76,7 @@ async function seed() {
     ] },
     { symbol: 'MSFT', name: 'Microsoft', asset_type: 'MUTUAL_FUND', txs: [
       ['BUY', '150000', '120', '2024-01-01T00:00:00Z'],
-      ['SELL', '120000', '5', '2024-12-01T00:00:00Z'],
+      ['SELL', '149970', '5', '2024-12-01T00:00:00Z'],
     ] },
   ]
   for (const { symbol, name, asset_type, txs } of holdings) {
@@ -205,16 +206,16 @@ try {
   // stricter than the printed page, never more permissive.)
   //
   // What this CAN see: a table whose min-content exceeds the box -- a shape whose unbreakable
-  // content is genuinely wider than the page, which is the silent clip described above.
-  // What it CANNOT see: a table that is merely squeezed, because print.css's
-  // `overflow-wrap: anywhere` on the Type column lets MUTUAL_FUND shatter into a fragment small
-  // enough to hold min-content under the box. Measured with this fixture (table in seed()): at
-  // 40px .main-content padding the box is 608px and the statement's scrollWidth is 608 -- no
-  // overflow -- while the Type cell falls to 37px and MUTUAL_FUND is broken apart; at 0px
-  // padding the box is 688px, scrollWidth is 688, and the Type cell is 96px with the token
-  // whole. So this check is weaker than its comments used to claim and cannot see the padding
-  // rule at all. It stays because it still catches the min-content case; the body-cell
-  // line-count check below is what guards the padding rule.
+  // content is genuinely wider than the page, which is the silent clip described above. What it
+  // could not see on its own, and still cannot: a table that is merely squeezed. print.css used to
+  // carry `overflow-wrap: anywhere` on the Type column, which let MUTUAL_FUND shatter into a
+  // fragment small enough to hold min-content under the box -- measured at 608px scrollWidth with
+  // a 37px Type cell, while the same fixture at 688px measured 694px of max-content and a 96px
+  // Type cell with the token whole. That break rule is gone (see print.css) and the Type column
+  // prints a display label now, so a squeeze has nothing left to shatter. Whether it now surfaces
+  // here, in the line-count check below, or in both is a browser measurement to take again, not
+  // something to assert from here; no max-content figure is restated for the same reason. Both
+  // checks stay, because between them a squeezed or over-wide table cannot pass quietly.
   //
   // If this fails on a real run it is a finding about the shipped PDF -- the printed
   // table really is too wide for the page -- not a broken assertion. Do not "fix" it by
@@ -223,22 +224,29 @@ try {
   const [sw, cw] = await statement.evaluate((el) => [el.scrollWidth, el.clientWidth])
   if (sw > cw) fail(`horizontal overflow at the printed page box: scrollWidth ${sw} > clientWidth ${cw}`)
 
-  // No body cell may wrap onto a second line. This is the only assertion anywhere that can see
-  // print.css's `.main-content:has([data-print="statement"]) { padding: 0 0 24px }` being
-  // DELETED (the on-screen check above only sees it escaping @media print): as the measurement
-  // above shows, removing that rule does NOT make the table overflow, it squeezes the Type column
-  // from 96px to 37px and breaks MUTUAL_FUND across two lines. A squeezed table therefore shows
-  // up as an extra line box, not as overflow.
+  // No body cell may wrap onto a second line. This check and the overflow check above are the only
+  // assertions anywhere that can see print.css's
+  // `.main-content:has([data-print="statement"]) { padding: 0 0 24px }` being DELETED (the
+  // on-screen check earlier only sees it escaping @media print). Which of the two a deletion trips
+  // now is an open browser question: the measurement that made THIS one the discriminator (Type
+  // column 96px -> 37px, MUTUAL_FUND broken across two lines) belonged to the raw enum and to the
+  // Type-column break rule, and both are gone.
   //
   // Element height cannot answer this. Cells in a row share the row's height, so in a wrapped
   // row every td in it measures the row's height and none of them discriminates. A Range over a
   // cell's contents returns one client rectangle per line box that text actually occupies --
   // per cell, independent of the row -- so its rectangle count IS the line count.
   //
-  // Body cells only, on purpose. The table's max-content width is 694px, wider than either box,
-  // so something always gives; there is no width at which this table is relaxed. A wrapped header
-  // is acceptable -- "Unrealized ROI" is two words -- so the check is scoped to tbody, where a
-  // wrap means the squeeze has reached the figures themselves.
+  // ALL body cells, the live-priced ones included, on purpose. Narrowing this to the deterministic
+  // columns would be the weaker assertion for no gain, because seed() keeps the live-priced
+  // columns narrow -- 30 shares left, so market value is around $16,000 instead of the eight
+  // figures an earlier fixture carried -- precisely so that a wrap here is a layout finding and not
+  // a report of what a provider quoted today. A wrapped header is acceptable -- "Unrealized ROI"
+  // is two words -- so the check stays scoped to tbody, where a wrap means the squeeze has reached
+  // the figures themselves.
+  //
+  // The failure names EVERY offender, not just the first: the columns are interdependent, so one
+  // wrapped cell and five wrapped cells are different diagnoses.
   //
   // No empty-list guard: the figure-realized colour check above throws if the populated branch
   // did not render at all, so there is no path to this check seeing zero body cells and passing.
