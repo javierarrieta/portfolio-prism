@@ -93,8 +93,16 @@ fn line(cells: impl IntoIterator<Item = String>) -> String {
 }
 
 /// The whole file, `\r\n`-terminated per row (RFC 4180, and what Excel expects).
+///
+/// Opens with a UTF-8 BOM, matching the app's own encoding spec (`frontend/src/utils/download.ts`):
+/// "the BOM is part of the contract, not decoration", because Excel decides the encoding from it
+/// and otherwise falls back to the machine's ANSI codepage, mojibake-ing any non-ASCII cell.
+/// This file carries free text from the user (`portfolio_name`, `symbol`, asset name), and the
+/// client-side single-sell export already ships a BOM — a server file without one would be the
+/// only CSV in the app that Excel can misread.
 pub fn render(report: &ReportResponse) -> String {
-    let mut out = line(CSV_COLUMNS.iter().map(|c| c.to_string()));
+    let mut out = String::from("\u{FEFF}");
+    out.push_str(&line(CSV_COLUMNS.iter().map(|c| c.to_string())));
 
     for row in &report.rows {
         // The asset's totals are looked up, never computed: the CSV is a projection of the
@@ -138,7 +146,7 @@ fn render_row(
         decimal_cell(totals.map(|t| t.cost_basis)),
         row.sell_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
         row.sell_date
-            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::AutoSi, true))
             .unwrap_or_default(),
         decimal_cell(row.sold_qty),
         decimal_cell(row.sell_price),
@@ -150,7 +158,7 @@ fn render_row(
         decimal_cell(row.unmatched_qty),
         row.buy_transaction_id.map(|v| v.to_string()).unwrap_or_default(),
         row.buy_date
-            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::AutoSi, true))
             .unwrap_or_default(),
         decimal_cell(row.buy_price),
         decimal_cell(row.unit_cost),
