@@ -393,6 +393,44 @@ async fn an_undated_call_still_returns_the_shape_the_statement_reads() {
     assert!(body.get("context").is_none(), "and no run context");
 }
 
+/// The undated path's response *shape* is unchanged, but its `strategy` **value** is not,
+/// and this is the one place Task 4 silently altered live behaviour. Before Task 4 the route
+/// did `strategy.unwrap_or_else(|| "FIFO")` and passed the string through verbatim, so
+/// `?strategy=lifo` reached the engine's `_ =>` arm (`tax_engine.rs:722`), computed **FIFO**,
+/// and echoed back `"lifo"` — a number labelled with a method that produced it. Task 4 routes
+/// the undated path through `normalize_strategy`, so the same request now computes LIFO and
+/// echoes `"LIFO"`. That is the truthful reading and it is what the dated path already did,
+/// so it is kept — but it is a behaviour change, not a preservation, and the shipped UI only
+/// ever sends the three uppercase tokens (`PortfolioDetail.tsx:179-181`), which is why no
+/// other test noticed. Pinned here so the next person does not rediscover it.
+#[tokio::test]
+async fn an_undated_call_normalizes_the_strategy_it_echoes() {
+    let pool = setup_db(&disabled_config()).await;
+    let through = Utc::now().date_naive().to_string();
+    let (port_id, _, _) = fixture(&pool, &through).await;
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=lifo"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+
+    assert_eq!(
+        body["strategy"], "LIFO",
+        "lowercase is normalized, not echoed verbatim as it was before Task 4"
+    );
+    // An unrecognised token still collapses to FIFO rather than erroring: permissive is the
+    // dated path's opposite, and this is decision D6.
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=nonsense"))
+        .dispatch()
+        .await;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["strategy"], "FIFO");
+}
+
 #[tokio::test]
 async fn the_undated_path_still_names_the_strategy_the_engine_used() {
     // The spec's file 6 fix: the handler defaults but does not normalise, so
