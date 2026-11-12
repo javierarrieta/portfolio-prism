@@ -214,7 +214,7 @@ the dated report and a **zero** `latent_roi` on the undated summary.
   --all-targets`, `cargo build --release`, and `cargo run --bin backend_rust -- --print-openapi`
   diffing empty against `docs/openapi/openapi.json`.
 
-**Covered by `npm test` (22 files, 201 tests), from `frontend/`:** the default window being
+**Covered by `npm test` (22 files, 203 tests), from `frontend/`:** the default window being
 January 1 through today rather than December 31 (a December default is a future date and the route
 answers 422), the date being derived from UTC parts rather than the local calendar and both date
 inputs being capped at the server's today — that is the bug that made the tab fail on open for

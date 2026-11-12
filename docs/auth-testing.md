@@ -49,7 +49,7 @@ diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi
 ```
 
 ```fish
-# Frontend: 201 tests, types, lint
+# Frontend: 203 tests, types, lint
 cd ../frontend
 npm test
 npx tsc --noEmit
