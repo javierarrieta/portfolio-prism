@@ -3,9 +3,10 @@ use backend_rust::get_cors_options;
 use backend_rust::parse_allowed_origins;
 mod common;
 
+use common::offline_pricing_service;
+
 use backend_rust::auth::finalise_auth;
 use backend_rust::init_db;
-use backend_rust::services::currency_service::CurrencyService;
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
 use sqlx::SqlitePool;
@@ -16,7 +17,7 @@ async fn test_cors_allowed_origin() {
     let cfg = common::disabled_config();
     init_db(&pool, &cfg).await.unwrap();
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
 
     let allowed_origin: &'static str =
         Box::leak("http://localhost:5173".to_string().into_boxed_str());
@@ -87,7 +88,7 @@ async fn test_cors_disallowed_origin() {
     let cfg = common::disabled_config();
     init_db(&pool, &cfg).await.unwrap();
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
 
     let allowed_origin: &'static str =
         Box::leak("http://localhost:5173".to_string().into_boxed_str());
@@ -114,7 +115,7 @@ async fn test_cors_multiple_origins() {
     let cfg = common::disabled_config();
     init_db(&pool, &cfg).await.unwrap();
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
 
     let allowed_origins_raw = vec![
         "http://localhost:5173".to_string(),
@@ -162,7 +163,7 @@ async fn test_cors_trailing_comma_origin_is_allowed() {
     let cfg = common::disabled_config();
     init_db(&pool, &cfg).await.unwrap();
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
 
     let cors = get_cors_options(parse_allowed_origins(Some("http://localhost:5173,")));
     let rocket = build_rocket(pool, currency_service, cors, auth);
@@ -189,7 +190,7 @@ async fn test_cors_blank_env_falls_back_to_dev_defaults() {
     let cfg = common::disabled_config();
     init_db(&pool, &cfg).await.unwrap();
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
 
     let cors = get_cors_options(parse_allowed_origins(Some("")));
     let rocket = build_rocket(pool, currency_service, cors, auth);

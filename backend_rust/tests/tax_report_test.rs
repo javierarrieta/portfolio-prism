@@ -14,9 +14,9 @@ use backend_rust::api_routes::analytics::{
 };
 use backend_rust::models::{Asset, Portfolio, Transaction};
 use backend_rust::schemas::{DatedLot, LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
-use backend_rust::services::currency_service::{CurrencyService, PricingError};
+use backend_rust::services::currency_service::PricingError;
 use chrono::{DateTime, NaiveDate, Utc};
-use common::{build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
+use common::{offline_pricing_service, build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rust_decimal::Decimal;
@@ -842,7 +842,7 @@ async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
     let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
     let portfolio = load_fixture_portfolio(&pool, port_id).await;
     let assets = load_fixture_assets(&pool, port_id).await;
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
 
     let err = build_tax_report(
         &pool, &svc, &portfolio, &assets, "FIFO", 30,
@@ -869,7 +869,7 @@ async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
 //    the window's newest row is within `PRICE_WINDOW_FRESH_DAYS` of the requested date,
 //    and otherwise asks the provider (`currency_service.rs:713-717`). There is no third
 //    path, so "no data" is only ever the provider's answer — and the provider is a
-//    hardcoded Yahoo URL (`CurrencyService::new()` takes no arguments), so a test that
+//    hardcoded Yahoo URL (`offline_pricing_service()` takes no arguments), so a test that
 //    wants it reaches the network. Pinned instead: the *shape* of the 422
 //    (`missing_prices`, `missing_rates`, both totals, `retryable: false`) through the
 //    validation failures, which share the body; the caps and the pair-not-symbol rule

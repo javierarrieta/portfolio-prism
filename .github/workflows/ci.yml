@@ -20,6 +20,13 @@ jobs:
           cd backend_rust
           cargo test
 
+      - name: Pricing-seam gate
+        # Static rule: no test may construct a pricing service pointed at the live
+        # provider. The suite used to make 21 outbound calls per run and still passed
+        # — the failure mode a green check cannot see. The script documents why the
+        # rule is static rather than a grep over test output.
+        run: bash backend_rust/scripts/check_pricing_seam.sh
+
       - name: Access-control gate
         # Static rules over the handler surface. Prints what it inspected, so a
         # gate that silently matched nothing fails instead of passing.

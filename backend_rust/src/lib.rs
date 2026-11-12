@@ -16,6 +16,22 @@ pub mod api_routes {
     pub mod lookup;
 }
 
+/// Test-only stand-in for the pricing provider, compiled into the library's own
+/// test build. The same file is included by `tests/common/mod.rs` for integration
+/// tests; it lives in `src/` so both can reach it and in no build that ships.
+#[cfg(test)]
+#[path = "test_provider.rs"]
+pub mod test_provider;
+
+/// A `CurrencyService` pointed at the local provider stand-in instead of the
+/// internet, for engine unit tests that must not depend on a network. A 404 rather
+/// than a closed port on purpose: a refused connection is retried three times with
+/// backoff, which would add seconds per call to the unit suite.
+#[cfg(test)]
+pub(crate) fn offline_pricing_service() -> services::currency_service::CurrencyService {
+    services::currency_service::CurrencyService::with_base_url(test_provider::mock_pricing_url())
+}
+
 use rocket::{Rocket, Build};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnection;
