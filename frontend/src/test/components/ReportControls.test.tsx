@@ -8,6 +8,20 @@ import type { ReportErrorBody } from '../../types'
 
 const window2024 = { from: '2024-01-01', to: '2024-06-30' }
 
+const renderControls = (over: Partial<Record<string, unknown>> = {}) => render(
+  <ReportControls
+    window={window2024}
+    onWindowChange={() => {}}
+    csvHref=""
+    onRetry={() => {}}
+    report={null}
+    error={null}
+    loading={false}
+    today={new Date('2026-02-14T00:00:00Z')}
+    {...over}
+  />,
+)
+
 describe('currentYearToDate', () => {
   it('defaults to January 1 through today, not December 31', () => {
     // A default ending on December 31 is a future date for most of the year, and the route
@@ -149,6 +163,32 @@ describe('TaxReportTable', () => {
     render(<TaxReportTable report={REPORT_FIXTURE} />)
     expect(screen.getByTestId('total-realized-in-window')).toHaveTextContent('$1,234.56')
     expect(screen.getByTestId('total-realized-in-window')).not.toHaveTextContent('1,800.00')
+  })
+
+  it('does not blame the dates when the server named what is missing', () => {
+    // Two different 422s reach the same panel. When the response listed missing symbols or
+    // pairs, changing the dates or the strategy cannot help -- the price or rate is not
+    // there -- and telling the user otherwise sends them fiddling with a control that is
+    // not even on this tab.
+    renderControls({
+      error: {
+        error: 'no price or rate exists at or before the requested date',
+        missing_prices: ['ZZZZ'], missing_rates: [],
+        missing_prices_total: 1, missing_rates_total: 0, retryable: false,
+      },
+    })
+    expect(screen.getByText(/no price or rate for what is listed/i)).toBeInTheDocument()
+    expect(screen.queryByText(/the dates or the strategy have to change/i)).toBeNull()
+  })
+
+  it('does blame the window when nothing was listed', () => {
+    renderControls({
+      error: {
+        error: '`to` is in the future', missing_prices: [], missing_rates: [],
+        missing_prices_total: 0, missing_rates_total: 0, retryable: false,
+      },
+    })
+    expect(screen.getByText(/the dates or the strategy have to change/i)).toBeInTheDocument()
   })
 
   it('names the window that was actually applied and the close it used', () => {
