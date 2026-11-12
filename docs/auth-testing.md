@@ -374,6 +374,65 @@ backgrounds is a hardcoded dark literal the palette overrides cannot reach, so `
 the sidebar white for print; if you enable background graphics and still get a dark-on-dark
 sidebar on another tab, that rule is what went missing.
 
+### Downloading the tax report
+
+Still signed in through the provider. This is the step no gate can take: the download is a plain
+`<a href>`, so the session cookie is what makes it work, and nothing in CI logs in.
+
+1. Open a portfolio, click **Tax Report**. The window defaults to the current year to date, and
+   the tab fetches as soon as it opens. If it opens on an error instead of a table, read the
+   error panel before going further — the steps below assume a report is on screen.
+2. Click **Download CSV**. The link is only there while a report is on screen: the route's error
+   responses carry no `Content-Disposition`, so a link on a failing window would take the
+   browser to a raw JSON body and throw away the app. If you do not see the button, the report
+   did not load; that is the finding, not a missing control.
+3. The file arrives as `tax-report-<id>-<from>-<to>.csv`, named by the server's
+   `Content-Disposition` and not by the browser's guess at the URL. An absent `from` renders as
+   the literal `inception`, so the name describes the window the file actually covers.
+4. Open it in a spreadsheet: row 1 is the header row, there is no `#` row above it, the file
+   starts with a UTF-8 BOM (Excel needs it to pick UTF-8), and `splits_note` is a column. Check
+   `lot_pnl` filtered to `SOLD_LOT` against `asset_realized_in_window` on the same rows — that is
+   the reconciliation the file is for, and it is the **only** summable column. Summing
+   `realized_pnl` instead counts a four-lot sell four times.
+5. Copy the URL from the address bar of the tab (or the link's `href`), add `&format=csv` if it
+   is not there, and load it in a shell that holds the session. `pp_session` is HttpOnly, so it is
+   not in `document.cookie` — read it from devtools' Application tab, or from the `Cookie:` header
+   of a request the page already made:
+
+   ```bash
+   # the URL from step 5, not this example's id and dates
+   curl --silent --show-error \
+        --cookie "pp_session=<the value from devtools>" \
+        "http://localhost:8000/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-12-31&strategy=FIFO&threshold_days=30&format=csv" \
+        -o /tmp/report.csv -D /tmp/report.headers
+   ```
+
+   The bytes must match the browser's exactly — compare `/tmp/report.csv` against the downloaded
+   file, and confirm `/tmp/report.headers` carries `Content-Type: text/csv` and the
+   `Content-Disposition` filename. Two runs over unchanged data must also be byte-identical to
+   each other; there is no generated-at column, so a difference is a real difference.
+6. **Now ask for a window that fails** — a `to` in the future, or a `strategy` that is not
+   `FIFO`/`LIFO`/`HYBRID` — with the same `curl` minus the `-o` and `-D` flags, and look at what
+   comes back. It is **not a file**: the status is 422 (or 503), the body is JSON with `error`,
+   `missing_prices`, `missing_rates`, `missing_prices_total`, `missing_rates_total` and
+   `retryable`, and there is **no `Content-Disposition` header at all**. That is why step 2's link
+   is absent in an error state, and it is what a plain link click would have navigated the browser
+   to. On screen the same failure is the error panel: the missing symbols and pairs with their
+   omitted counts, and a **Try again** button only when `retryable` is true.
+7. Print the report tab (Ctrl-P) and confirm it prints like the other four tabs — the whole
+   shell, sidebar and nav included, no print stylesheet applied. The statement's hide rules are
+   `:has()`-scoped (`.main-content:has([data-print="statement"]) > *:not([data-print="statement"])`,
+   `print.css:26`) and match nothing on a page with no statement root, which is the intended
+   behaviour here. If the report tab prints like the *statement* — no sidebar, no controls — a
+   hide rule escaped its `:has()` scope.
+
+Two things this walkthrough cannot check, and no automated check here does either: whether the
+provider's answer for a pair that has no series is an error status or an empty chart, and
+therefore whether a delisted currency pair reports 422 or 503 (see the release note — a 503 every
+time is a possible and correct answer). And whether a genuinely cold multi-currency portfolio
+exceeds the 20 s deadline on its first report; that path is only exercised at a zero deadline in
+the tests.
+
 ---
 
 ## 6. `BOOTSTRAP_OWNER_SUBJ` — read this before setting it

@@ -230,11 +230,14 @@ reports is **"no `SPLIT` inserts"**, not "no writes".
   cross-portfolio reports; concurrency work, batching frameworks, cache layers or
   timeout knobs beyond the work-set shrink; a calendar component — a quarter is two date
   inputs and four preset buttons.
-  *Amended 2026-11-09 by the design draft:* the no-machinery clause is narrowed. A
-  per-user in-flight report slot and a per-request outbound budget are now in scope,
-  because the access-level decision made during drafting made report cost a live question
-  and authorization does not bound it. Batching frameworks, concurrent fan-out and new
-  timeout knobs remain out of scope.
+  *Amended 2026-11-09 by the report design:* the no-machinery clause is narrowed exactly as
+  far as one wall-clock bound. The reports carry a 20 s elapsed deadline, checked between
+  outbound calls and failing closed with the typed 503; the earlier per-user in-flight slot
+  and per-request outbound budget were removed on review, because a slot bounds concurrency
+  rather than cost and the budget duplicated a bound the per-pair series cache already
+  enforces. The bound is on the route starting new outbound work, not on the request's total
+  duration — a call already in flight is not preempted, so a report can still run past 20 s.
+  Batching frameworks, concurrent fan-out and new timeout knobs remain out of scope.
 
 ## Alternatives Weighed
 
