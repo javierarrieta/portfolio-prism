@@ -155,6 +155,12 @@ jobs:
     # compiled. The statement step is deliberately *not* `if: always()` — if the sell-pnl run
     # could not even start the backend, the statement run would burn another 420 s proving it
     # could not either.
+    #
+    # No cargo cache, deliberately. The first run of this job built the crate from nothing in
+    # ~86 s and finished in 3m15s, so a cache would save about a minute while storing 504 MB
+    # against the 10 GB per-repo budget shared with every other key, and paying ~6 s to save on
+    # every run. `build-and-test` caches nothing either. Revisit only if the cold build stops
+    # being the cheap part.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -162,23 +168,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        # `run.sh` starts the API with `cargo run`, so this job pays a full debug build of the
-        # crate on a cold cache — measured locally, see the PR. `restore-keys` rather than an
-        # exact key alone: any Cargo.lock change would otherwise throw away a multi-GB target/
-        # and rebuild from nothing. The 10 GB per-repo cache budget is shared across keys, so if
-        # this entry starts evicting the others, drop `backend_rust/target` from `path` and take
-        # the cold build rather than thrash the cache for everyone.
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            backend_rust/target
-          key: cargo-e2e-${{ hashFiles('backend_rust/Cargo.lock') }}
-          restore-keys: |
-            cargo-e2e-
 
       - name: Setup Node.js
         # v7 for the action's own runtime, for the reason recorded on `frontend-tests`. The app

@@ -96,9 +96,10 @@ Four things the job has to do that a local run does not:
     the resolved `chromium.executablePath()` is written to `$GITHUB_ENV` as
     `CHROMIUM`.
 *   **Pay for a debug build.** `run.sh` starts the API with `cargo run`, so the job
-    costs a full cargo build of the crate on a cold cache. `backend_rust/target` is
-    cached with `restore-keys`; the comment on that step says when to stop caching
-    it.
+    compiles the crate from scratch. That is ~86 s on a runner and the job finishes in
+    ~3m15s, so there is deliberately **no cargo cache**: it would save about a minute
+    while storing half a gigabyte against the shared 10 GB per-repo budget. The step
+    comment on `e2e-smoke` records the numbers it was judged on.
 *   **Keep the logs.** `run.sh` deletes its temp dir on exit, so the job sets
     `SMOKE_LOG_DIR` per smoke and uploads both server logs and both screenshots with
     `if: always()`.
