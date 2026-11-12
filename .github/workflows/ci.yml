@@ -9,6 +9,10 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # Observed 1-2 min on main. A cap is not here to police slow builds; it is here
+    # because an uncapped job that stalls produces no log and reads as still running
+    # for six hours. Same reasoning as the release-workflow caps.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -50,6 +54,8 @@ jobs:
     # it and the claim would otherwise be unverified. `cargo test --release` is
     # deliberately not used: the integration tests need the `Disabled` variant and
     # do not compile without it.
+    # Observed 2-3 min on main, which is a full release compile of the backend.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -93,6 +99,8 @@ jobs:
 
   frontend-tests:
     runs-on: ubuntu-latest
+    # Observed 1 min on main.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -236,6 +244,9 @@ jobs:
 
   docker-build-backend:
     runs-on: ubuntu-latest
+    # Observed 0-5 min on main; the cold build is the 5 min one. Matches the
+    # release workflow's backend cap.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -254,6 +265,11 @@ jobs:
 
   docker-build-frontend:
     runs-on: ubuntu-latest
+    # Observed 0-7 min on main. This is the emulated-arm64 build that has stalled
+    # twice with no log output at all — once on the v0.0.6-M5 release, once on a
+    # backend-only PR where nothing in `frontend/` had changed. Uncapped, that reads
+    # as a run in progress for six hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
