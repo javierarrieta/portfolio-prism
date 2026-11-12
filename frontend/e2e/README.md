@@ -9,6 +9,9 @@ missing Vite proxy rule, or a table column too narrow to hold a date.
 
 ## Running it
 
+CI runs both of these on every push to `main` and every pull request, as the
+`e2e-smoke` job. The steps below are for running them by hand.
+
 ```bash
 cd frontend
 npm install
@@ -72,31 +75,50 @@ reconciliation invariant are pinned by the backend test suite; a browser cannot
 improve on that. The FX conversion path is still untested end to end — every
 fixture in the repo is USD-into-USD, so `get_rate` is never reached.
 
-## Why it is not in CI
+## Running it in CI
 
-CI would need a browser plus a booted backend on every push, for a check whose
-value is catching wiring mistakes rather than logic errors. Run it before
-releasing a change that touches the ledger, the modal, or the endpoint.
+The `e2e-smoke` job in `.github/workflows/ci.yml` runs both smokes on every push to
+`main` and every pull request, and it is **blocking**. A browser job with
+`continue-on-error: true` reads as coverage while checking nothing, which is worse
+than no job at all.
 
-This is a choice about CI cost, not an impossibility, and the details are worth
-recording before anyone tries to add the job:
+Four things the job has to do that a local run does not:
 
-*   **A CI browser job is cheap to start.** CI runs `ubuntu-latest`, where
-    `npx playwright install chromium` is one line, and `emulateMedia` and
-    `page.pdf()` need no display server.
-*   **The job is not browser-only.** `run.sh` compiles and starts the Rust API
-    against a throwaway SQLite file and starts Vite, so the job costs a full
-    cargo build and needs seeded data. A `continue-on-error` job nobody reads
-    would read as a pass; the useful form is a blocking job.
-*   **The harness needs `AUTH_MODE=disabled` or the backend refuses to launch.**
-    With no `AUTH_MODE` and no `backend_rust/.env` the server asks for OIDC, bails
-    naming four missing variables (`backend_rust/src/auth/mod.rs:136-138`), and
-    `wait_for backend` burns its whole 420-second budget. `run.sh` now exports it
+*   **Install a browser.** `playwright-core` ships the downloader but, unlike
+    `playwright`, has no postinstall that runs it, so the job calls
+    `npx playwright-core install --with-deps chromium` itself. `--with-deps` also
+    pulls the distro font packages, which is what stops currency symbols rendering
+    as tofu in the statement PDF; it needs sudo, which GitHub-hosted runners have
+    passwordless. Not `--only-shell` — both smokes launch a full browser with
+    `--no-sandbox --disable-dev-shm-usage`, and the headless shell is not
+    interchangeable for that.
+*   **Hand `run.sh` the binary.** The install and the smoke are separate steps, so
+    the resolved `chromium.executablePath()` is written to `$GITHUB_ENV` as
+    `CHROMIUM`.
+*   **Pay for a debug build.** `run.sh` starts the API with `cargo run`, so the job
+    compiles the crate from scratch. That is ~86 s on a runner and the job finishes in
+    ~3m15s, so there is deliberately **no cargo cache**: it would save about a minute
+    while storing half a gigabyte against the shared 10 GB per-repo budget. The step
+    comment on `e2e-smoke` records the numbers it was judged on.
+*   **Keep the logs.** `run.sh` deletes its temp dir on exit, so the job sets
+    `SMOKE_LOG_DIR` per smoke and uploads both server logs and both screenshots with
+    `if: always()`.
+
+The stack boots twice, once per smoke, because each `run.sh` invocation owns its own
+throwaway database, backend and vite. The second boot is cheap — the binary is
+already compiled.
+
+### Traps that are already handled — do not re-break them
+
+*   **`AUTH_MODE=disabled`.** With no `AUTH_MODE` and no `backend_rust/.env` the
+    server asks for OIDC, bails naming four missing variables
+    (`backend_rust/src/auth/mod.rs:136-138`), and `wait_for backend` burns its whole
+    420-second budget. `run.sh` exports it
     beside `DATABASE_URL`, following the precedent at `start.sh:21`. That is safe
     only because `run.sh` builds debug; `disabled` is compiled out of release builds
     (`auth/mod.rs:96-101`).
-*   **The target defaults through `${1:-sell-pnl.smoke.mjs}`, not `$1`.** `run.sh:16`
-    is `set -uo pipefail`, so a bare `$1` aborts the script when called with no
+*   **The target defaults through `${1:-sell-pnl.smoke.mjs}`, not `$1`.** `run.sh`
+    runs under `set -uo pipefail`, so a bare `$1` aborts the script when called with no
     argument and breaks `npm run e2e:sell-pnl`, which calls it with none.
 *   **Do not pin prices by writing to `historical_prices`.** No API route writes
     that table — the only writers are internal cache writes after a successful
