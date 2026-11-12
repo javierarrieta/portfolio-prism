@@ -9,7 +9,6 @@ use sqlx::sqlite::SqlitePool;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::currency_service::CurrencyService;
     use chrono::Utc as ChronoUtc;
     use std::str::FromStr;
 
@@ -62,7 +61,7 @@ mod tests {
     }
 
     async fn run_engine(transactions: &[Transaction], strategy: &str, threshold_days: i64) -> AssetTaxSummary {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         TaxLotEngine::calculate_lots(
             "TEST", "STOCK", transactions, Decimal::from_str("110.0").unwrap(), "USD", "USD", &svc, strategy, threshold_days, &pool,
@@ -242,7 +241,7 @@ mod tests {
     }
 
     async fn run_breakdown(txs: &[Transaction], sell_id: i32, strategy: &str, threshold: i64) -> Option<SellBreakdown> {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         TaxLotEngine::sell_breakdown(
             sell_id, txs, "USD", "USD", &svc, strategy, threshold, &pool,
@@ -377,7 +376,7 @@ mod tests {
             make_tx(5, "SELL", "300.0", "70.0", "0.0", "2025-01-01T00:00:00Z"),
         ];
         for strategy in ["FIFO", "LIFO", "HYBRID"] {
-            let svc = CurrencyService::new();
+            let svc = crate::offline_pricing_service();
             let pool = empty_pool().await;
             let summary = TaxLotEngine::calculate_lots(
                 "TEST", "STOCK", &txs, Decimal::from_str("110.0").unwrap(),
@@ -404,7 +403,7 @@ mod tests {
             make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
             make_tx(2, "SELL", "100.0", "120.0", "0.0", "2024-12-01T00:00:00Z"),
         ];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-06-30"), day("2024-06-30"),
@@ -429,7 +428,7 @@ mod tests {
             make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
             make_tx(2, "SELL", "40.0", "120.0", "0.0", "2024-06-30T00:00:00Z"),
         ];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-06-30"), day("2024-06-30"),
@@ -456,7 +455,7 @@ mod tests {
         // foreign-currency fixture that proved it would reach the provider when the code
         // was wrong, which the no-network rule forbids.
         let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-07-01T00:00:00Z")];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-06-30"), day("2024-06-30"),
@@ -481,7 +480,7 @@ mod tests {
             make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
             make_tx(2, "SPLIT", "2.0", "1.0", "0.0", "2024-08-01T00:00:00Z"),
         ];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-06-30"), day("2024-06-30"),
@@ -517,7 +516,7 @@ mod tests {
             ("2024-03-30", "1.2500"),
         ]).await;
         let txs = vec![make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z")];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
 
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-03-31"), day("2024-03-31"),
@@ -546,7 +545,7 @@ mod tests {
             make_tx(1, "BUY", "100.0", "100.0", "0.0", "2024-01-01T00:00:00Z"),
             make_tx(2, "SPLIT", "2.0", "1.0", "0.0", "2024-06-30T00:00:00Z"),
         ];
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         let out = TaxLotEngine::replay_at(
             &txs, day("2024-06-30"), day("2024-06-30"),
@@ -575,7 +574,7 @@ mod tests {
         let price = Decimal::from_str("110.0").unwrap();
 
         for strategy in ["FIFO", "LIFO", "HYBRID"] {
-            let svc = CurrencyService::new();
+            let svc = crate::offline_pricing_service();
             let pool = empty_pool().await;
             let summary = TaxLotEngine::calculate_lots(
                 "TEST", "STOCK", &txs, price, "USD", "USD", &svc, strategy, 30, &pool,

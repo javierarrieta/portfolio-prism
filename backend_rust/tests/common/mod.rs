@@ -5,6 +5,16 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rocket::{Build, Rocket};
 use sqlx::SqlitePool;
 
+// The mock lives in `src/test_provider.rs` so the library's own unit tests can use
+// it too; this include compiles the same file into the integration-test binary.
+#[path = "../../src/test_provider.rs"]
+mod test_provider;
+
+// Each integration-test binary uses a subset of these; the ones it does not use are
+// not dead code in the file, only in that binary.
+#[allow(unused_imports)]
+pub use test_provider::{mock_pricing_url, MockYahoo};
+
 /// The user every existing test runs as: the placeholder row `init_db` creates
 /// unconditionally, which is `id = 1` on a fresh in-memory database.
 pub const DEFAULT_USER: i32 = 1;
@@ -43,7 +53,31 @@ pub fn oidc_config() -> StartupConfig {
 /// Build the app running as `as_user` (development mode). Tests that need the
 /// cookie path construct `AuthMode::Oidc(oidc_cfg())` themselves.
 pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
-    let currency_service = CurrencyService::new();
+    rocket_with_service(pool, offline_pricing_service(), as_user)
+}
+
+/// `build_rocket` with pricing pointed at a specific provider URL — normally a
+/// [`MockYahoo::serving`] with canned data, rather than the plain 404 the default
+/// mock gives. `build_rocket` is already offline; this is for tests that need the
+/// provider to answer *something*.
+#[allow(dead_code)]
+pub fn build_rocket_pricing(pool: SqlitePool, as_user: i32, base_url: &str) -> Rocket<Build> {
+    rocket_with_service(pool, CurrencyService::with_base_url(base_url), as_user)
+}
+
+#[allow(dead_code)]
+/// A `CurrencyService` whose provider is the local 404 mock. Every test rocket uses
+/// this; `scripts/check_pricing_seam.sh` fails the build if one does not.
+pub fn offline_pricing_service() -> CurrencyService {
+    CurrencyService::with_base_url(mock_pricing_url())
+}
+
+#[allow(dead_code)]
+fn rocket_with_service(
+    pool: SqlitePool,
+    currency_service: CurrencyService,
+    as_user: i32,
+) -> Rocket<Build> {
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
     let mode = AuthMode::Disabled { as_user };
@@ -53,7 +87,7 @@ pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
 /// Build the app in OIDC mode — the mode production runs in, and the only one in
 /// which unauthenticated requests are actually denied.
 pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
 }
@@ -62,7 +96,7 @@ pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
 /// about how CORS and authentication are ordered.
 #[allow(dead_code)]
 pub fn build_rocket_oidc_with_cors(pool: SqlitePool, origins: Vec<String>) -> Rocket<Build> {
-    let currency_service = CurrencyService::new();
+    let currency_service = offline_pricing_service();
     let cors = get_cors_options(origins);
     lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
 }

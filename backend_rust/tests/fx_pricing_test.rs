@@ -8,14 +8,14 @@
 
 mod common;
 
-use common::{seed_asset_currency, seed_portfolio, seed_transaction_at, DEFAULT_USER};
+use common::{offline_pricing_service, seed_asset_currency, seed_portfolio, seed_transaction_at, DEFAULT_USER};
 use backend_rust::auth::StartupConfig;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use sqlx::sqlite::SqlitePool;
 use std::str::FromStr;
 
-use backend_rust::services::currency_service::{no_rate_error, CurrencyService, PricingError};
+use backend_rust::services::currency_service::{no_rate_error, PricingError};
 
 async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
     for (date, price) in rows {
@@ -58,7 +58,7 @@ async fn get_rate_returns_the_seeded_past_dated_rate() {
     // A Friday close and nothing after it: the Saturday request must resolve to it.
     seed_pair(&pool, "EURUSD=X", &[("2024-03-07", "0.9100"), ("2024-03-08", "0.9125")]).await;
 
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let got = svc.get_rate("EUR", "USD", ts("2024-03-09"), &pool).await.unwrap();
 
     assert_eq!(got.rate, dec("0.9125"));
@@ -85,7 +85,7 @@ async fn get_rate_does_not_return_todays_rate_for_a_past_date() {
     )
     .await;
 
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let got = svc.get_rate("EUR", "USD", ts("2024-03-31"), &pool).await.unwrap();
 
     assert_eq!(got.rate, dec("0.9125"), "a past date must not pick up the latest close");
@@ -150,7 +150,7 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     .await
     .unwrap();
 
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let summary = TaxLotEngine::calculate_lots(
         "AAPL",
         "STOCK",
@@ -217,7 +217,7 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     .await
     .unwrap();
 
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let summary = TaxLotEngine::calculate_lots(
         "AAPL",
         "STOCK",
@@ -252,7 +252,7 @@ async fn get_rate_short_circuits_the_same_currency() {
     // Review Focus 5, and the only existing get_rate behaviour the suite pins
     // (currency_service.rs same-currency tests): same currency is exactly one.
     let pool = pool_with_prices().await;
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let got = svc.get_rate("USD", "USD", ts("2020-01-01"), &pool).await.unwrap();
     assert_eq!(got.rate, Decimal::ONE);
     assert_eq!(got.date_used, NaiveDate::parse_from_str("2020-01-01", "%Y-%m-%d").unwrap());
@@ -263,7 +263,7 @@ async fn get_rate_short_circuits_a_case_difference() {
     // The cache key and the FX symbology both uppercase, so a case difference is the
     // same currency. Compared raw, "eur" -> "EUR" asked the provider for EUREUR=X.
     let pool = pool_with_prices().await;
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     let got = svc.get_rate("eur", "EUR", ts("2020-01-01"), &pool).await.unwrap();
     assert_eq!(got.rate, Decimal::ONE);
 }
@@ -281,7 +281,7 @@ async fn get_price_answers_from_the_database_without_the_provider() {
     let pool = pool_with_prices().await;
     let today = chrono::Utc::now().date_naive();
     seed_pair(&pool, "SEEDED", &[(today.format("%Y-%m-%d").to_string().as_str(), "42.0")]).await;
-    let svc = CurrencyService::new();
+    let svc = offline_pricing_service();
     assert_eq!(svc.get_price("SEEDED", None, &pool).await.unwrap(), dec("42.0"));
 }
 

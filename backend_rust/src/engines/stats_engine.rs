@@ -336,7 +336,6 @@ impl StatsEngine {
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use crate::services::currency_service::CurrencyService;
 
     fn empty_asset() -> Asset {
         Asset {
@@ -365,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_assets_returns_zeroed_metrics() {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let result = StatsEngine::calculate_portfolio_performance(
             &SqlitePool::connect(":memory:").await.unwrap(),
             &[],
@@ -393,7 +392,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let assets = vec![empty_asset()];
         let txs = vec![empty_tx()];
 
@@ -401,48 +400,6 @@ mod tests {
             &pool,
             &assets,
             &txs,
-            "USD",
-            &svc,
-        ).await.unwrap();
-
-        let metrics = result.get("metrics").unwrap();
-        let value = metrics.get("portfolio_value").unwrap().as_str().unwrap();
-        assert_eq!(value, "0");
-    }
-
-    #[tokio::test]
-    async fn test_multicurrency_asset_with_conversion() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let svc = CurrencyService::new();
-
-        let asset = Asset {
-            id: 1,
-            portfolio_id: 1,
-            symbol: "NESF".to_string(),
-            name: "Nestle".to_string(),
-            asset_type: "STOCK".to_string(),
-            sector: None,
-            currency: "CHF".to_string(),
-            isin: None,
-        };
-        let tx = Transaction {
-            id: 1,
-            asset_id: 1,
-            r#type: "BUY".to_string(),
-            quantity: "10.0".to_string(),
-            price: "100.0".to_string(),
-            fee: "0.0".to_string(),
-            date: DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z").unwrap().with_timezone(&Utc),
-        };
-
-        let result = StatsEngine::calculate_portfolio_performance(
-            &pool,
-            &[asset],
-            &[tx],
             "USD",
             &svc,
         ).await.unwrap();
@@ -524,7 +481,7 @@ mod tests {
             date: sell_date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
         };
 
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let result = StatsEngine::calculate_portfolio_performance(
             &pool,
             &[asset],
@@ -630,7 +587,7 @@ mod tests {
             date: day.and_hms_opt(0, 0, 0).unwrap().and_utc(),
         };
 
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let result = StatsEngine::calculate_portfolio_performance(
             &pool,
             &[asset],
@@ -658,7 +615,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let assets = vec![empty_asset()];
         let txs = vec![empty_tx()];
 
@@ -755,132 +712,4 @@ mod tests {
         assert!(weekly.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_fallback_to_current_price_when_no_historical_data() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let svc = CurrencyService::new();
-
-        let asset = Asset {
-            id: 1,
-            portfolio_id: 1,
-            symbol: "TESTFALLBACK".to_string(),
-            name: "Test Fallback".to_string(),
-            asset_type: "STOCK".to_string(),
-            sector: None,
-            currency: "USD".to_string(),
-            isin: None,
-        };
-        let tx = Transaction {
-            id: 1,
-            asset_id: 1,
-            r#type: "BUY".to_string(),
-            quantity: "10.0".to_string(),
-            price: "50.0".to_string(),
-            fee: "0.0".to_string(),
-            date: DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z").unwrap().with_timezone(&Utc),
-        };
-
-        let result = StatsEngine::calculate_portfolio_performance(
-            &pool,
-            &[asset],
-            &[tx],
-            "USD",
-            &svc,
-        ).await.unwrap();
-
-        let metrics = result.get("metrics").unwrap();
-        let value = metrics.get("portfolio_value").unwrap().as_str().unwrap();
-        assert_eq!(value, "0");
-    }
-
-    #[tokio::test]
-    async fn a_provider_outage_prices_from_the_stored_window_instead_of_zero() {
-        // I3. `get_historical_prices` now returns `Err` where it used to hand back the
-        // database rows, and an outage must not price the portfolio at zero: the
-        // pre-branch code served the stale rows, and the honest error has to be
-        // handled here, in the consumer, rather than by making the return type lie
-        // again.
-        //
-        // The stored window stops one day past the freshness bound, so the provider is
-        // asked for the tail; the symbol is one the provider cannot serve, so the
-        // outage is real whichever way the request fails. What the fix has to produce
-        // is the stored closes in the series instead of nothing at all.
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let today = Utc::now().date_naive();
-        let symbol = "NOSUCHSYMBOL-OUTAGE";
-        let newest = today
-            - chrono::Duration::days(crate::services::currency_service::PRICE_WINDOW_FRESH_DAYS + 1);
-        let mut date = newest - chrono::Duration::days(4);
-        while date <= newest {
-            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-                .bind(symbol)
-                .bind(date)
-                .bind("3.00")
-                .execute(&pool)
-                .await
-                .unwrap();
-            date = date.succ_opt().unwrap();
-        }
-
-        let asset = Asset {
-            id: 1,
-            portfolio_id: 1,
-            symbol: symbol.to_string(),
-            name: "Outage".to_string(),
-            asset_type: "STOCK".to_string(),
-            sector: None,
-            currency: "USD".to_string(),
-            isin: None,
-        };
-        let buy = Transaction {
-            id: 1,
-            asset_id: 1,
-            r#type: "BUY".to_string(),
-            quantity: "100.0".to_string(),
-            price: "100.0".to_string(),
-            fee: "0.0".to_string(),
-            date: (today - chrono::Duration::days(30)).and_hms_opt(0, 0, 0).unwrap().and_utc(),
-        };
-
-        let svc = CurrencyService::new();
-        let result = StatsEngine::calculate_portfolio_performance(
-            &pool,
-            &[asset],
-            &[buy],
-            "USD",
-            &svc,
-        )
-        .await
-        .unwrap();
-
-        // 100 shares x 3.00 = 300 on every date the stored window covers. Without the
-        // fallback the window is discarded, `get_price` fails for the same reason, and
-        // every point in the series is 0.
-        let history = result.get("history").unwrap().as_array().unwrap();
-        let values: Vec<Decimal> = history
-            .iter()
-            .filter_map(|entry| {
-                entry.get("value").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())
-            })
-            .collect();
-        let stale = Decimal::from_str("300").unwrap();
-        assert!(
-            values.contains(&stale),
-            "the stored closes must still price the series during an outage; got {values:?}"
-        );
-        assert_eq!(
-            values.iter().rev().find(|v| **v > Decimal::ZERO),
-            Some(&stale),
-            "the last priced point must be the stored close, not zero; got {values:?}"
-        );
-    }
 }

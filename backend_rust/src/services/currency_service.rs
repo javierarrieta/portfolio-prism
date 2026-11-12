@@ -28,7 +28,11 @@ pub(crate) const FX_LOOKBACK_DAYS: i64 = 30;
 /// How stale a stored series may be and still answer for a window ending at
 /// `end_date`. Four days covers a long market weekend; beyond that the window is
 /// treated as incomplete and the provider is asked for the tail.
-pub(crate) const PRICE_WINDOW_FRESH_DAYS: i64 = 4;
+///
+/// `pub` rather than `pub(crate)` so `tests/pricing_outage_test.rs` can place a
+/// stored window exactly one day past this bound instead of hardcoding the number
+/// and silently testing the wrong thing if it changes.
+pub const PRICE_WINDOW_FRESH_DAYS: i64 = 4;
 
 /// Yahoo's FX pair symbology. `EUR=USD` returns "No data found"; `EURUSD=X`
 /// returns data. `get_rate` built the first form, which is why every asset whose
@@ -204,6 +208,8 @@ pub struct CurrencyService {
     cache: Arc<RwLock<HashMap<(String, String), FxSeries>>>,
     last_request: Mutex<Option<Instant>>,
     eodhd_api_key: Option<String>,
+    /// Chart-API host, without a trailing slash. See [`CurrencyService::with_base_url`].
+    base_url: String,
 }
 
 /// One fetched window of a pair's dated closes. Keyed by pair, not by pair-and-date:
@@ -288,8 +294,30 @@ pub fn no_rate_error(symbol: &str, date: NaiveDate, lookback_days: i64) -> anyho
     )
 }
 
+/// Chart-API host used when `YAHOO_BASE_URL` is unset.
+const DEFAULT_YAHOO_BASE_URL: &str = "https://query1.finance.yahoo.com";
+
 impl CurrencyService {
     pub fn new() -> Self {
+        Self::with_base_url(
+            &std::env::var("YAHOO_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_YAHOO_BASE_URL.to_string()),
+        )
+    }
+
+    /// Build the service against a different chart-API host.
+    ///
+    /// This exists so the test suite can point every outbound pricing call at a
+    /// local listener instead of the internet. `cargo test` used to make 21 outbound
+    /// calls per run — measured, not guessed — and one of them was a provider-outage
+    /// test that proved the outage by making a real request that happened to fail.
+    /// A constructor rather than an
+    /// env var in tests because this crate is edition 2024, where `std::env::set_var`
+    /// is `unsafe`, and the environment is process-global, so parallel tests would
+    /// race on it.
+    ///
+    /// A trailing slash is trimmed, so both forms work at the call site.
+    pub fn with_base_url(base_url: &str) -> Self {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -300,6 +328,7 @@ impl CurrencyService {
             cache: Arc::new(RwLock::new(HashMap::new())),
             last_request: Mutex::new(None),
             eodhd_api_key: std::env::var("EODHD_API_KEY").ok(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -566,7 +595,7 @@ impl CurrencyService {
     /// reported apart from each other, because `get_price` decides what to tell the
     /// user from that difference.
     async fn fetch_yahoo_price(&self, symbol: &str) -> Result<Decimal, PricingError> {
-        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
+        let url = format!("{}/v8/finance/chart/{}", self.base_url, symbol);
         let response = match self.fetch_with_retry(&url).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -732,8 +761,8 @@ impl CurrencyService {
         let end_ts = end_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
 
         let url = format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d&includePrePost=false",
-            symbol, start_ts, end_ts
+            "{}/v8/finance/chart/{}?period1={}&period2={}&interval=1d&includePrePost=false",
+            self.base_url, symbol, start_ts, end_ts
         );
 
         let response = match self.fetch_with_retry(&url).await {
@@ -889,8 +918,8 @@ impl CurrencyService {
 
         let end_ts = Utc::now().timestamp();
         let url = format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1=0&period2={}&interval=1d&events=splits",
-            asset.symbol, end_ts
+            "{}/v8/finance/chart/{}?period1=0&period2={}&interval=1d&events=splits",
+            self.base_url, asset.symbol, end_ts
         );
 
         let response = match self.fetch_with_retry(&url).await {
@@ -1029,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_currency_returns_one() {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let date = DateTime::from_timestamp(1705312200, 0).unwrap();
         let pool = empty_pool().await;
         let result = svc.get_rate("USD", "USD", date, &pool).await;
@@ -1039,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_currency_returns_one_consistently() {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let date1 = DateTime::from_timestamp(1700000001, 0).unwrap();
         let date2 = DateTime::from_timestamp(1700000001, 0).unwrap();
         let pool = empty_pool().await;
@@ -1112,7 +1141,7 @@ mod tests {
         let pool = empty_pool().await;
         let end = date_of("2024-06-14");
         let window_start = end - chrono::Duration::days(30);
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
 
         let fresh_newest = end - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS);
         let fresh_newest_str = fresh_newest.format("%Y-%m-%d").to_string();
@@ -1134,7 +1163,7 @@ mod tests {
         let pool = empty_pool().await;
         seed_prices(&pool, "EURUSD=X", &[("2024-03-08", "0.9125"), ("2024-03-22", "1.0500")]).await;
 
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         // Exactly what a request for 2024-03-08 leaves behind.
         svc.cache.write().await.insert(
             ("EUR".to_string(), "USD".to_string()),
@@ -1158,7 +1187,7 @@ mod tests {
     /// so `select_rate` alone serves it and the provider is never asked.
     #[tokio::test]
     async fn rate_from_db_refuses_a_stored_window_that_stops_short_of_the_date() {
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let requested = date_of("2024-03-25");
         let window_start = requested - chrono::Duration::days(FX_SERIES_WINDOW_DAYS);
 
@@ -1220,7 +1249,7 @@ mod tests {
         .execute(&pool)
         .await;
 
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let price = svc.get_price("TEST", None, &pool).await.unwrap();
         assert_eq!(price, Decimal::from_str("42.0").unwrap());
     }
@@ -1251,10 +1280,11 @@ mod tests {
         .execute(&pool)
         .await;
 
-        let svc = CurrencyService::new();
-        // The stale row must not answer for today. Whether the provider then has a
-        // price for `TEST` is not this test's business; what it pins is that the
-        // 2020 close is not the answer, whichever branch the provider takes.
+        let svc = crate::offline_pricing_service();
+        // The stale row must not answer for today. The mock provider has no price
+        // for `TEST`; what this pins is that the 2020 close is not the answer. It
+        // used to be the live provider that had no price for `TEST`, which made a
+        // network call the load-bearing part of a cache test.
         let price = svc.get_price("TEST", None, &pool).await;
         assert_ne!(price.ok(), Some(Decimal::from_str("99.0").unwrap()));
     }
@@ -1420,7 +1450,7 @@ mod tests {
             isin: None,
         };
 
-        let svc = CurrencyService::new();
+        let svc = crate::offline_pricing_service();
         let inserted = svc.sync_splits_for_asset(&asset, &pool).await.unwrap();
         assert_eq!(inserted, 0);
 

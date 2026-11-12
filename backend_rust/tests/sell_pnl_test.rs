@@ -1,6 +1,9 @@
 mod common;
 
-use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset, seed_transaction_at};
+use common::{
+    build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction_at, setup_db,
+    DEFAULT_USER,
+};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::{Build, Rocket};
