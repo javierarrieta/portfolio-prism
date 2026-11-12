@@ -39,6 +39,15 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::AssetTaxSummary,
         schemas::LotMatch,
         schemas::SellPnlResponse,
+        schemas::ReportContext,
+        schemas::AssetTotals,
+        schemas::ReportTotals,
+        schemas::ReportRow,
+        schemas::RowKind,
+        schemas::PriceSource,
+        schemas::ReportResponse,
+        schemas::ErrorBody,
+        schemas::MissingRate,
         AssetLookupResult,
     ))
 )]

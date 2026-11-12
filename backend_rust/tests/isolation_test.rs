@@ -211,6 +211,19 @@ async fn b_cannot_read_a_s_tax_summary_performance_or_sell_pnl() {
     let pnl = format!("/api/transactions/{sell}/pnl?{q}");
     assert_eq!(b.get(&pnl).dispatch().await.status(), Status::NotFound);
     assert_eq!(a.get(&pnl).dispatch().await.status(), Status::Ok);
+
+    // The dated variant, which the grep-based access gate cannot see: it is a
+    // parameter-dependent path on an existing route, so this matrix is the real gate
+    // (Access level, spec). `require` runs before the window is even parsed, so B's
+    // dated request is a 404 and not a 422.
+    let dated_b = format!("/api/portfolios/{}/tax-summary?strategy=FIFO&threshold_days=365&from=2024-01-01&to=2024-12-31", u.a_portfolio);
+    assert_eq!(b.get(&dated_b).dispatch().await.status(), Status::NotFound);
+
+    // A's own dated request gets past the access check and stops at the window: the
+    // fixture has one transaction and no seeded close, so a window that could be answered
+    // would reach the provider. `from > to` proves the request arrived instead.
+    let invalid_a = format!("/api/portfolios/{}/tax-summary?from=2024-12-31&to=2024-01-01", u.a_portfolio);
+    assert_eq!(a.get(&invalid_a).dispatch().await.status(), Status::UnprocessableEntity);
 }
 
 #[tokio::test]

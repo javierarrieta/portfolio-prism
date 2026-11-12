@@ -10,11 +10,17 @@ import {
   FolderOpen,
   Sparkles,
   LogOut,
+  Printer,
+  Receipt,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
 import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
+import PortfolioStatement from './components/PortfolioStatement';
+import ReportControls, { TaxReportTable } from './components/ReportControls';
+import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
+import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
 import { normalizePerformance, normalizeTaxSummary, normalizeTransactionList, normalizeAssetList } from './utils/decimal';
 import { apiFetch, API_BASE } from './utils/apiFetch';
@@ -24,11 +30,45 @@ import {
   TaxSummary, 
   Transaction, 
   Asset,
-  TransactionType
+  TransactionType,
+  ReportErrorBody,
+  TaxReport,
 } from './types';
 
-// dashboard, portfolios, analytics, ledger
+// dashboard, portfolios, analytics, ledger, statement, report
 const DEFAULT_TAB = 'dashboard';
+
+/**
+ * The identity of a report request: the portfolio it is about and the window, strategy and
+ * threshold it was asked with, and nothing else. A payload or an error is rendered only
+ * while the selection still carries its own key, which is what stops the previous window's
+ * numbers surviving a portfolio switch, a strategy change or an in-flight fetch. Derived
+ * here rather than cleared from an effect, for the reason `taxMeta` gives below.
+ */
+const reportRequestKey = (
+  portfolioId: number, window: ReportWindow, strategy: string, thresholdDays: number,
+) => `${portfolioId}|${window.from}|${window.to}|${strategy}|${thresholdDays}`;
+
+/**
+ * Coerce whatever came back into the typed error shape.
+ *
+ * `body as ReportErrorBody` is a compile-time cast and nothing checks it at runtime. A body that
+ * is not the typed shape -- `{}` from a proxy, Rocket's own error envelope, a truncated body --
+ * reaches `ReportControls` and `error.missing_prices.length` throws during render, and there is
+ * no error boundary in `main.tsx`, so the user gets a blank page instead of a panel. The lists
+ * are the only part that must exist; everything else degrades to a string.
+ */
+const normaliseErrorBody = (body: unknown): ReportErrorBody => {
+  const b = (body ?? {}) as Partial<ReportErrorBody>;
+  return {
+    error: typeof b.error === 'string' ? b.error : 'The report could not be produced.',
+    missing_prices: Array.isArray(b.missing_prices) ? b.missing_prices : [],
+    missing_rates: Array.isArray(b.missing_rates) ? b.missing_rates : [],
+    missing_prices_total: Number.isFinite(b.missing_prices_total) ? b.missing_prices_total! : 0,
+    missing_rates_total: Number.isFinite(b.missing_rates_total) ? b.missing_rates_total! : 0,
+    retryable: b.retryable === true,
+  };
+};
 
 export default function App() {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
@@ -42,7 +82,37 @@ export default function App() {
   // Loaded analytics
   const [performance, setPerformance] = useState<PortfolioPerformance | null>(null);
   const [taxSummary, setTaxSummary] = useState<TaxSummary | null>(null);
+  // setTaxSummary runs once and is never cleared, so a portfolio switch leaves the
+  // previous portfolio's summary in state until the new fetch resolves. A page with B's
+  // numbers under A's heading is the one failure this artifact cannot absorb quietly --
+  // unlike the zeros case, it looks right. The payload carries no portfolio id, so
+  // record the id beside it and guard the statement branch on the match. Same shape as
+  // sellPnl below, and for the reason that comment gives: five places change
+  // selectedId, and a reset that has to be remembered in each one is a reset that gets
+  // forgotten. Derived, not cleared from an effect.
+  const [taxMeta, setTaxMeta] = useState<{ portfolioId: number; fetchedAt: Date } | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+
+  // The dated report: its own state, its own request, its own payload. The normalized
+  // `taxSummary` above is never the source for anything on that tab -- the two answer
+  // different questions and the report's money stays in the exact decimal strings the
+  // server sent, so nothing here round-trips it through `number`.
+  const [reportWindow, setReportWindow] = useState<ReportWindow>(() => currentYearToDate());
+  // Both the payload and the error are keyed by the request they describe, and rendered only
+  // while the current selection still carries that key. Same guard, and the same reason, as
+  // `taxMeta` above: a switch, a strategy change or an in-flight fetch must not leave the
+  // previous window's numbers on screen under a new page's heading.
+  const [report, setReport] = useState<{ key: string; payload: TaxReport } | null>(null);
+  const [reportError, setReportError] = useState<{ key: string; body: ReportErrorBody } | null>(null);
+  // The key of the report request currently in flight, not a boolean. A boolean stuck at
+  // `true` when a run was cancelled and the next effect invocation early-returned (clear `To`,
+  // then clear `From` mid-flight) and could only be unstuck by a synchronous reset in the
+  // effect body -- which `react-hooks/set-state-in-effect` rightly rejects. Deriving loading
+  // from whether the in-flight key still matches the selection needs no reset at all.
+  const [reportInFlight, setReportInFlight] = useState<string | null>(null);
+  // Bumped by "Try again". The other dependencies do not move when a 503 is retried with the
+  // same window, so without this the retry button would be inert.
+  const [reportAttempt, setReportAttempt] = useState(0);
 
   // UI state
   const [loading, setLoading] = useState(false);
@@ -111,7 +181,11 @@ export default function App() {
       const taxRes = await apiFetch(`${API_BASE}/portfolios/${id}/tax-summary?strategy=${strategy}&threshold_days=${thresholdDays}`);
       if (!taxRes.ok) throw new Error('Failed to load tax lot summary');
       const taxData = await taxRes.json();
-      setTaxSummary(normalizeTaxSummary(taxData));
+      const normalizedTax = normalizeTaxSummary(taxData);
+      setTaxSummary(normalizedTax);
+      // The data-at line needs a source, and the statement renders cached state, so the
+      // fetch time is captured here rather than at render time.
+      setTaxMeta({ portfolioId: id, fetchedAt: new Date() });
 
       // 3. Fetch transactions list
       const txRes = await apiFetch(`${API_BASE}/portfolios/${id}/transactions/`);
@@ -149,6 +223,61 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, [selectedId, fetchPortfolioData]);
+
+  // The report tab's own fetch, next to the tax state rather than inside `fetchPortfolioData`:
+  // the Holdings and Dashboard tabs never pay for a dated report, and this request is
+  // answered by a different branch of the same route.
+  useEffect(() => {
+    // Only on the report tab, and only with a window: without one the route answers with the
+    // legacy summary, which is a different question from the one this tab asks.
+    if (activeTab !== 'report' || selectedId === null) return;
+    if (!reportWindow.from && !reportWindow.to) return;
+    const key = reportRequestKey(selectedId, reportWindow, strategy, thresholdDays);
+    const query = buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
+    let cancelled = false;
+    const load = async () => {
+      setReportInFlight(key);
+      setReportError(null);
+      try {
+        const res = await apiFetch(`${API_BASE}${query}`);
+        const body = await res.json();
+        // A cancelled run is one whose selection has already moved on; its body must not be
+        // stamped with the key the current selection is rendering under.
+        if (cancelled) return;
+        if (res.ok) {
+          setReport({ key, payload: body as TaxReport });
+        } else {
+          // A failed refetch must retire the payload it replaced. Without this, a same-key
+          // refetch that fails (tab round-trip, transient 503, a 401) leaves the table AND the
+          // error panel on screen together: numbers under an alert saying they could not be
+          // produced. That is the one state this tab must never reach.
+          setReport(null);
+          setReportError({ key, body: normaliseErrorBody(body) });
+        }
+      } catch (err) {
+        // A response that is not the typed error at all -- a 500 with an HTML body, a dropped
+        // connection: the same keyed shape, so the guard below still decides whether it may
+        // render, and `retryable` stays false because nothing here knows what happened.
+        if (!cancelled) {
+          setReport(null);
+          setReportError({
+            key,
+            body: {
+              error: String(err), missing_prices: [], missing_rates: [],
+              // Retryable: this branch is a dropped connection or an unreadable body, both of
+              // which are worth another click. Telling the user their dates are wrong is worse
+              // advice than offering a retry they did not need.
+              missing_prices_total: 0, missing_rates_total: 0, retryable: true,
+            },
+          });
+        }
+      } finally {
+        if (!cancelled) setReportInFlight(null);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [activeTab, selectedId, reportWindow, strategy, thresholdDays, reportAttempt]);
 
   const handleCreatePortfolio = async (e: FormEvent) => {
     e.preventDefault();
@@ -343,6 +472,31 @@ export default function App() {
 
   const currentPortfolio = portfolios.find(p => p.id === selectedId);
 
+  // The request the current selection asks for, derived once for both the effect that fetches
+  // it and the guard that decides what may render. Built from `reportRequestKey` so the two
+  // cannot drift into two different identities.
+  const reportKey = selectedId === null
+    ? null
+    : reportRequestKey(selectedId, reportWindow, strategy, thresholdDays);
+  const reportQuery = selectedId === null
+    ? ''
+    : buildReportQuery(selectedId, reportWindow, strategy, thresholdDays);
+  // `?format=csv` is only valid with `from` or `to`: without one the route answers 422 naming
+  // `format`. The link is prefixed with `API_BASE` because `buildReportQuery` returns a server
+  // path.
+  //
+  // *** It is offered only while a report is actually on screen. *** The route's error responder
+  // sets no `Content-Disposition` (`analytics.rs:582-593`), so a plain anchor click on a failing
+  // window navigates the TOP-LEVEL browsing context to a raw JSON body and throws away the SPA.
+  // Gating on the keyed payload (not merely "has a window") means the anchor is absent during a
+  // 422, a 503, a load, and a stale selection.
+  const reportLoading = reportInFlight !== null && reportInFlight === reportKey;
+  const currentReport = report && report.key === reportKey ? report.payload : null;
+  const currentReportError = reportError && reportError.key === reportKey ? reportError.body : null;
+  const reportCsvHref = currentReport !== null && !reportLoading && reportQuery !== ''
+    ? `${API_BASE}${reportQuery}&format=csv`
+    : '';
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('auth_error') === 'auth_failed') {
@@ -394,6 +548,12 @@ export default function App() {
           </li>
           <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => selectTab('ledger')}>
             <History size={18} /> Transaction Ledger
+          </li>
+          <li className={`nav-item ${activeTab === 'statement' ? 'active' : ''}`} onClick={() => selectTab('statement')}>
+            <Printer size={18} /> Printable Statement
+          </li>
+          <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
+            <Receipt size={18} /> Tax Report
           </li>
         </ul>
 
@@ -513,6 +673,48 @@ export default function App() {
                 onDeleteTransaction={handleDeleteTransaction}
                 onSelectSell={(txId) => setSellPnl({ txId, portfolioId: currentPortfolio.id })}
               />
+            )}
+
+            {/* The fragment creates no DOM node, which is what keeps both children direct
+                children of .main-content -- the position print.css needs to hide the Print
+                control and leave only the statement. A layout <div> here would be hidden
+                with the control, and the tab would print a blank page while looking correct
+                on screen. */}
+            {activeTab === 'statement' && taxSummary && taxMeta?.portfolioId === selectedId && (
+              <>
+                <button
+                  className="btn btn-primary"
+                  data-testid="print-button"
+                  onClick={() => window.print()}
+                >
+                  Print
+                </button>
+                <PortfolioStatement
+                  taxSummary={taxSummary}
+                  portfolio={currentPortfolio}
+                  fetchedAt={taxMeta.fetchedAt}
+                />
+              </>
+            )}
+
+            {/* A fragment, no layout wrapper, for the reason the statement branch's comment
+                gives: the controls and the table stay direct children of .main-content. The
+                table renders only while the loaded payload belongs to the current selection;
+                `TaxReportTable` is rendered from the same guarded payload the controls are
+                handed, so neither can show another portfolio's window. */}
+            {activeTab === 'report' && (
+              <>
+                <ReportControls
+                  window={reportWindow}
+                  onWindowChange={setReportWindow}
+                  csvHref={reportCsvHref}
+                  onRetry={() => setReportAttempt((n) => n + 1)}
+                  report={currentReport}
+                  error={currentReportError}
+                  loading={reportLoading}
+                />
+                {currentReport !== null && <TaxReportTable report={currentReport} />}
+              </>
             )}
 
             {sellPnl !== null && sellPnl.portfolioId === selectedId && (

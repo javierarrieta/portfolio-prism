@@ -40,9 +40,9 @@ async fn all_api_routes() -> Vec<(Method, String)> {
                 .replace("<id>", "1")
                 .replace("<portfolio_id>", "1")
                 .replace("<asset_id>", "1");
-            // The two tax routes require a strategy; without one the handler answers
-            // 422 before the access check, which would still not be a 401 but would
-            // stop proving the route was reached with a session.
+            // The tax routes default `strategy` and `threshold_days`; the parameters are
+            // here so the sweep exercises the same shape the UI sends, not because the
+            // route requires them.
             if path.ends_with("/tax-summary") || path.ends_with("/pnl") {
                 (r.method, format!("{path}?strategy=FIFO&threshold_days=365"))
             } else if path.starts_with("/api/assets/lookup") {
@@ -262,6 +262,20 @@ async fn reachable_api_routes() -> Vec<(Method, String)> {
         .into_iter()
         .filter(|(_, path)| !path.starts_with("/api/assets/lookup"))
         .collect()
+}
+
+/// The same tax route again, dated. `from`/`to` select a *response shape* on an existing
+/// route rather than a route of their own, so the sweep above does not cover them: no new
+/// entry exists to sweep. The window is denied before the handler runs.
+#[tokio::test]
+async fn every_tax_route_denies_the_dated_variant_without_a_session() {
+    let client = oidc_client().await;
+    let dated = "/api/portfolios/1/tax-summary?strategy=FIFO&threshold_days=365&from=2024-01-01&to=2024-12-31";
+    assert_eq!(client.get(dated).dispatch().await.status(), Status::Unauthorized);
+    // The bare window too: `strategy` and `threshold_days` are optional, so a request
+    // that names neither must not fall outside the check.
+    let csvish = "/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-12-31";
+    assert_eq!(client.get(csvish).dispatch().await.status(), Status::Unauthorized);
 }
 
 #[tokio::test]

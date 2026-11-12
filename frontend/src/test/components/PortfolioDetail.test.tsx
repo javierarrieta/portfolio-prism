@@ -179,11 +179,12 @@ describe('PortfolioDetail', () => {
           realized_pnl: 0,
           tax_lots: [
             {
+              buy_transaction_id: 1,
               buy_date: '2024-01-15T00:00:00Z',
               buy_price: 150,
               original_qty: 50,
-              remaining_qty: 50,
-              latent_gain_loss: 1250,
+              remaining_qty: 30,
+              latent_gain_loss: 750,
               latent_roi: 0.1667,
             },
           ],
@@ -217,6 +218,19 @@ describe('PortfolioDetail', () => {
     expect(expandButton).toBeDefined()
     fireEvent.click(expandButton!)
     expect(screen.getByText('Tax Lots (Unrealized Profit Details)')).toBeVisible()
+
+    // The two quantity columns must read from two different fields. The engine used to
+    // send the same already-decremented number for both, so the fixture gives them
+    // different values (remaining 30, original 50) and the cells are asserted -- without
+    // these two lines, putting `lot.remaining_qty` back in the Original Qty cell is
+    // invisible to the whole frontend suite.
+    // Anchored on the header because the <h4> heading is a sibling of this inner table,
+    // so `closest('table')` from it would land on the outer holdings table.
+    const lotTable = screen.getByText('Original Qty').closest('table')!
+    const lotCells = Array.from(lotTable.querySelectorAll('tbody tr td')).map((td) => td.textContent)
+    expect(lotCells[2]).toBe('30') // Remaining Qty  <- lot.remaining_qty
+    expect(lotCells[3]).toBe('50') // Original Qty   <- lot.original_qty
+    expect(lotCells[2]).not.toBe(lotCells[3])
   })
 
   it('shows empty state message when no assets are registered', () => {

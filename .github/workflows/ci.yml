@@ -110,6 +110,13 @@ jobs:
         run: npm run generate-types
         working-directory: frontend
 
+      - name: Generated API types are committed
+        # `openapi.json` is diffed above; this is the other generated artifact and it
+        # had no freshness check, so a commit could leave `api.d.ts` stale against the
+        # spec and CI would never notice. It has zero importers, so nothing else can
+        # catch the drift either.
+        run: git diff --exit-code frontend/src/types/api.d.ts
+
       - name: Auth proxy is configured
         # Both proxy files sit outside every test suite, so a missing `/auth` rule
         # only shows up as a login that silently loops in production. Grep is the

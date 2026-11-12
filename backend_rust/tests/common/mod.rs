@@ -1,7 +1,7 @@
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{build_rocket as lib_build_rocket, get_cors_options, init_db};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rocket::{Build, Rocket};
 use sqlx::SqlitePool;
 
@@ -214,4 +214,64 @@ pub async fn seed_transaction_at(
     .await
     .unwrap();
     res.0
+}
+
+/// One stored close. The pricing layer reads `historical_prices` before the provider, so
+/// a seeded row is what makes a test hermetic. Which row is needed depends on the path:
+///
+/// * `get_price` (`currency_service.rs:511-535`) answers only from a row whose `date`
+///   equals the date asked for, and today's tax-summary route asks for
+///   `Utc::now().date_naive()`. Seed **exactly today** or the provider is called.
+/// * The dated series path is governed by `stored_window_is_fresh`
+///   (`currency_service.rs:65`), which accepts any row within
+///   `PRICE_WINDOW_FRESH_DAYS` of the date asked for.
+///
+/// Do not assume the window rule covers a `get_price` call: a row two days old satisfies
+/// the window and still reaches Yahoo.
+#[allow(dead_code)]
+pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close: &str) {
+    sqlx::query(
+        "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+             ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
+    )
+    .bind(symbol)
+    .bind(date)
+    .bind(close)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A close for `symbol` on every calendar day in `[start, end]`. Dense on purpose: the
+/// pricing layer answers from the database only when the newest stored row is within
+/// `PRICE_WINDOW_FRESH_DAYS` of the date asked for, so a sparse seed reaches the
+/// provider and the test is no longer hermetic. `analytics_test.rs`'s own fixture skips
+/// weekends for the opposite reason — to exercise the gap — and that is why this one is
+/// shared rather than copied.
+#[allow(dead_code)]
+pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end: &str, close: &str) {
+    let mut day = NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap();
+    let last = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
+    while day <= last {
+        seed_price(pool, symbol, day, close).await;
+        day = day.succ_opt().expect("a date has a successor");
+    }
+}
+
+/// Pin split auto-detection for `symbol` so `sync_splits_for_asset` returns on its
+/// 30-day cache check instead of fetching. Same row `analytics_test.rs:218` writes.
+///
+/// The bound value must be a *bare* date: `sync_splits_for_asset`
+/// (`currency_service.rs:870`) parses this column with `NaiveDate::parse_from_str(..,
+/// "%Y-%m-%d")`, which rejects trailing input, so `datetime('now')` — a datetime string
+/// — fails the parse, falls through the cache check and fetches from Yahoo. Do not
+/// "simplify" the bind back to a SQL datetime function.
+#[allow(dead_code)]
+pub async fn seed_split_sync(pool: &SqlitePool, symbol: &str) {
+    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
+        .bind(symbol)
+        .bind(Utc::now().date_naive())
+        .execute(pool)
+        .await
+        .unwrap();
 }

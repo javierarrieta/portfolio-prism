@@ -62,7 +62,12 @@ pub(crate) fn select_rate(
 ///
 /// Pure for the same reason as [`select_rate`]: the rule is what needs testing, and
 /// a test of it must not need a pool, a provider, or a network.
-fn stored_window_is_fresh(newest: Option<NaiveDate>, end_date: NaiveDate) -> bool {
+///
+/// `pub(crate)` because the dated tax report resolves one close per asset before
+/// replaying, and it has to decide "can the database answer?" the *same* way this
+/// function does. Re-implementing the comparison in the route is how the route's read
+/// order and this one drift apart.
+pub(crate) fn stored_window_is_fresh(newest: Option<NaiveDate>, end_date: NaiveDate) -> bool {
     matches!(newest, Some(d) if (end_date - d).num_days() <= PRICE_WINDOW_FRESH_DAYS)
 }
 

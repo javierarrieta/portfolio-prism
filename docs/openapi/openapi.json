@@ -291,8 +291,28 @@
         "tags": [
           "crate::api_routes::analytics"
         ],
+        "summary": "The tax summary, or — with `from` and/or `to` — the dated tax report.",
+        "description": "Same route, same access level, two shapes. Without a window the response is the\nsummary object this endpoint has always returned, which carries `assets` with the\nopen lots the Holdings tab renders; it is not described here, and its shape is\ndeliberately unchanged (the printable statement and `PortfolioDetail` both read it).\nWith a window the response is `ReportResponse`.\n\nNo `params(...)` block, deliberately: the parameters come from the handler's own\narguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are\nall in the committed document without one. `?format=csv` (dated requests only) answers\nthe same bytes the JSON payload carries, as a server-generated file: the CSV is a\nprojection of `ReportResponse`, so no number in it is re-derived. It is described here\nrather than as a second content type for status 200, which utoipa's response map —\nkeyed by status — cannot express.",
         "operationId": "get_portfolio_tax_summary",
         "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
           {
             "name": "id",
             "in": "path",
@@ -320,14 +340,25 @@
               "format": "int64",
               "nullable": true
             }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Tax summary retrieved",
+            "description": "Dated tax report when a window is given; the legacy summary object otherwise",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
               }
             }
           },
@@ -335,7 +366,34 @@
             "description": "Not authenticated"
           },
           "404": {
-            "description": "Portfolio not found"
+            "description": "Portfolio not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid window, or a price or rate does not exist at or before the window end",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A pricing provider is unreachable, or the report exceeded its elapsed deadline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }
@@ -832,6 +890,120 @@
           }
         }
       },
+      "AssetTotals": {
+        "type": "object",
+        "description": "One asset's dated totals. Every field is computed in Rust from the same replay that\nproduced the rows; no renderer sums anything.",
+        "required": [
+          "asset_id",
+          "symbol",
+          "asset_type",
+          "asset_currency",
+          "realized_in_window",
+          "realized_cumulative",
+          "unrealized_at_end",
+          "market_value",
+          "cost_basis",
+          "fx_applied",
+          "split_applied"
+        ],
+        "properties": {
+          "asset_currency": {
+            "type": "string"
+          },
+          "asset_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "asset_type": {
+            "type": "string"
+          },
+          "cost_basis": {
+            "type": "string"
+          },
+          "fx_applied": {
+            "type": "boolean"
+          },
+          "fx_rate_date_used": {
+            "type": "string",
+            "format": "date",
+            "nullable": true
+          },
+          "market_value": {
+            "type": "string"
+          },
+          "price_date_used": {
+            "type": "string",
+            "format": "date",
+            "description": "The close that priced this asset, and the date it actually came from. Null when\nthe asset has no transaction at or before the window end, so no close was needed.",
+            "nullable": true
+          },
+          "price_source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PriceSource"
+              }
+            ],
+            "nullable": true
+          },
+          "realized_cumulative": {
+            "type": "string"
+          },
+          "realized_in_window": {
+            "type": "string"
+          },
+          "split_applied": {
+            "type": "boolean",
+            "description": "A SPLIT dated on or before the window end was applied to the lots in scope."
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "unrealized_at_end": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "The one body every failure returns. Validation failures carry an empty pair of lists\nand name the offending parameter in `error`; a pricing failure populates them.",
+        "required": [
+          "error",
+          "missing_prices",
+          "missing_rates",
+          "missing_prices_total",
+          "missing_rates_total",
+          "retryable"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "missing_prices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "missing_prices_total": {
+            "type": "integer",
+            "description": "How many were found, before the lists were capped. Truncation is never silent.",
+            "minimum": 0
+          },
+          "missing_rates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MissingRate"
+            }
+          },
+          "missing_rates_total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
       "LotMatch": {
         "type": "object",
         "description": "One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are\nsplit-adjusted and expressed in the portfolio base currency; `unit_cost`\nadditionally carries the amortised buy fee.",
@@ -884,6 +1056,22 @@
             "nullable": true
           },
           "unit_cost": {
+            "type": "string"
+          }
+        }
+      },
+      "MissingRate": {
+        "type": "object",
+        "description": "One currency pair a rate could not be found for. A missing rate is a pair, not a\nsymbol, and the body says which it is.",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
             "type": "string"
           }
         }
@@ -976,6 +1164,291 @@
             "type": "string"
           }
         }
+      },
+      "PriceSource": {
+        "type": "string",
+        "description": "How the dated report priced an asset's close. Recorded so a regenerated file can\nstate where its numbers came from (Goal 4), and so a database-answered report can be\ntold from a provider-answered one.",
+        "enum": [
+          "database",
+          "provider"
+        ]
+      },
+      "ReportContext": {
+        "type": "object",
+        "description": "What a dated request was answered about. `ReportContext` is the single authority for\n`strategy` and `threshold_days`: the response does not repeat them at top level.",
+        "required": [
+          "portfolio_id",
+          "portfolio_name",
+          "base_currency",
+          "strategy",
+          "threshold_days",
+          "requested_to",
+          "splits_note"
+        ],
+        "properties": {
+          "base_currency": {
+            "type": "string"
+          },
+          "portfolio_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "portfolio_name": {
+            "type": "string"
+          },
+          "requested_from": {
+            "type": "string",
+            "format": "date",
+            "description": "The window actually applied, not the parameters as typed. `requested_to` is the\ncall's `to`, or today when `to` was absent; `requested_from` is the call's `from`,\nor the portfolio's first transaction on or before `requested_to`, or `None` when\nthe portfolio has no transaction at all. An open end is visible in the artifact\nrather than inferred by its reader.",
+            "nullable": true
+          },
+          "requested_to": {
+            "type": "string",
+            "format": "date"
+          },
+          "splits_note": {
+            "type": "string",
+            "description": "Splits are as recorded when this was generated; the dated path deliberately does\nnot sync them (issue #50), so a split recorded after the fact changes past\nfigures. A constant string in the payload rather than prose in each renderer,\nbecause the CSV carries it as a cell (the file's first row is the header row)."
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "threshold_days": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ReportResponse": {
+        "type": "object",
+        "description": "The dated report: the run context, per-asset totals, the portfolio rollup and every row.",
+        "required": [
+          "context",
+          "asset_totals",
+          "totals",
+          "rows"
+        ],
+        "properties": {
+          "asset_totals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetTotals"
+            }
+          },
+          "context": {
+            "$ref": "#/components/schemas/ReportContext"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReportRow"
+            }
+          },
+          "totals": {
+            "$ref": "#/components/schemas/ReportTotals"
+          }
+        }
+      },
+      "ReportRow": {
+        "type": "object",
+        "description": "One report row. Three selections share one shape: the kind-specific cells are null on\nthe rows where they do not apply, never omitted and never zero.\n\nThe asset-level pricing facts repeat on every row of that asset — one close per asset,\nnot one per lot — so the CSV is a projection of this vector and needs no join.",
+        "required": [
+          "row_type",
+          "asset_id",
+          "symbol",
+          "asset_type",
+          "asset_currency"
+        ],
+        "properties": {
+          "asset_currency": {
+            "type": "string"
+          },
+          "asset_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "asset_type": {
+            "type": "string"
+          },
+          "buy_date": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "buy_price": {
+            "type": "string",
+            "description": "Split-adjusted, in the portfolio's **base** currency — converted at the buy's own\ndate. NOT `asset_currency`: `DatedLot.buy_price` and `LotMatch.buy_price` are both\n`tx_price * get_rate(asset, base, buy_date)`, and the frontend already renders\n`LotMatch.buy_price` with the base currency (`SellPnlModal.tsx:255`). The sell-side\nprice on the same row IS asset currency, so the two columns must not share a label.",
+            "nullable": true
+          },
+          "buy_transaction_id": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "cost_basis": {
+            "type": "string",
+            "description": "Sell-level, **matched quantity only**, in the portfolio's base currency. Summed\nfrom the per-match figures; excludes the unmatched tail.",
+            "nullable": true
+          },
+          "fx_rate_date_used": {
+            "type": "string",
+            "format": "date",
+            "nullable": true
+          },
+          "holding_days": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "lot_cost_basis": {
+            "type": "string",
+            "nullable": true
+          },
+          "lot_matched_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "lot_pnl": {
+            "type": "string",
+            "description": "The column that totals. `LotMatch.pnl` under the name the CSV uses.",
+            "nullable": true
+          },
+          "lot_proceeds": {
+            "type": "string",
+            "nullable": true
+          },
+          "lot_qty_before_match": {
+            "type": "string",
+            "nullable": true
+          },
+          "market_value": {
+            "type": "string",
+            "nullable": true
+          },
+          "matched_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "original_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "price_date_used": {
+            "type": "string",
+            "format": "date",
+            "nullable": true
+          },
+          "price_source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PriceSource"
+              }
+            ],
+            "nullable": true
+          },
+          "proceeds": {
+            "type": "string",
+            "description": "Sell-level, **matched quantity only**, in the portfolio's base currency. Summed\nfrom the per-match figures (`tax_engine.rs:761-763`), so it never includes the\nunmatched tail and must not be added to the `lot_proceeds` of the sell's rows.",
+            "nullable": true
+          },
+          "realized_pnl": {
+            "type": "string",
+            "description": "Sell-level, **matched quantity only**, in the portfolio's base currency:\n`proceeds - cost_basis` over the matched lots. This is the whole sell's figure and\nrepeats on every `SOLD_LOT` row of that sell — the column to SUM is `lot_pnl`, not\nthis one.",
+            "nullable": true
+          },
+          "remaining_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "row_type": {
+            "$ref": "#/components/schemas/RowKind"
+          },
+          "sell_date": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "sell_fee": {
+            "type": "string",
+            "description": "As entered, in `asset_currency` — same rule as `sell_price`, and the only other\nfield on this row that is not in the portfolio's base currency.",
+            "nullable": true
+          },
+          "sell_price": {
+            "type": "string",
+            "description": "As entered, in `asset_currency`.",
+            "nullable": true
+          },
+          "sell_transaction_id": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "sold_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "term": {
+            "type": "string",
+            "description": "\"SHORT\" | \"LONG\" for HYBRID only; null otherwise, and never claimed on an open lot.",
+            "nullable": true
+          },
+          "unit_cost": {
+            "type": "string",
+            "nullable": true
+          },
+          "unmatched_qty": {
+            "type": "string",
+            "nullable": true
+          },
+          "unrealized_gain_loss": {
+            "type": "string",
+            "nullable": true
+          },
+          "unrealized_roi": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ReportTotals": {
+        "type": "object",
+        "description": "The portfolio rollup: exactly the five per-asset figures, summed across assets.",
+        "required": [
+          "realized_in_window",
+          "realized_cumulative",
+          "unrealized_at_end",
+          "market_value",
+          "cost_basis"
+        ],
+        "properties": {
+          "cost_basis": {
+            "type": "string"
+          },
+          "market_value": {
+            "type": "string"
+          },
+          "realized_cumulative": {
+            "type": "string"
+          },
+          "realized_in_window": {
+            "type": "string"
+          },
+          "unrealized_at_end": {
+            "type": "string"
+          }
+        }
+      },
+      "RowKind": {
+        "type": "string",
+        "description": "Which selection a row is. Exhaustive on purpose: both renderers switch on it, and the\nCSV's \"this column totals, that one does not\" rule is expressed through it.",
+        "enum": [
+          "SOLD_LOT",
+          "OPEN_LOT",
+          "UNMATCHED"
+        ]
       },
       "SellPnlResponse": {
         "type": "object",
@@ -1081,6 +1554,7 @@
       "TaxLot": {
         "type": "object",
         "required": [
+          "buy_transaction_id",
           "buy_date",
           "buy_price",
           "original_qty",
@@ -1095,6 +1569,11 @@
           },
           "buy_price": {
             "type": "string"
+          },
+          "buy_transaction_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The buy that opened this lot. Present so a lot can be joined back to the ledger\nrow a person is reading."
           },
           "latent_gain_loss": {
             "type": "string"

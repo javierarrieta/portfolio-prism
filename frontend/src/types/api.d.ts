@@ -24,6 +24,22 @@ export interface paths {
     get: operations["get_portfolio_performance"];
   };
   "/api/portfolios/<id>/tax-summary": {
+    /**
+     * The tax summary, or — with `from` and/or `to` — the dated tax report.
+     * @description Same route, same access level, two shapes. Without a window the response is the
+     * summary object this endpoint has always returned, which carries `assets` with the
+     * open lots the Holdings tab renders; it is not described here, and its shape is
+     * deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+     * With a window the response is `ReportResponse`.
+     *
+     * No `params(...)` block, deliberately: the parameters come from the handler's own
+     * arguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are
+     * all in the committed document without one. `?format=csv` (dated requests only) answers
+     * the same bytes the JSON payload carries, as a server-generated file: the CSV is a
+     * projection of `ReportResponse`, so no number in it is re-derived. It is described here
+     * rather than as a second content type for status 200, which utoipa's response map —
+     * keyed by status — cannot express.
+     */
     get: operations["get_portfolio_tax_summary"];
   };
   "/api/portfolios/<portfolio_id>/assets": {
@@ -102,6 +118,47 @@ export interface components {
       unrealized_roi: string;
     };
     /**
+     * @description One asset's dated totals. Every field is computed in Rust from the same replay that
+     * produced the rows; no renderer sums anything.
+     */
+    AssetTotals: {
+      asset_currency: string;
+      /** Format: int32 */
+      asset_id: number;
+      asset_type: string;
+      cost_basis: string;
+      fx_applied: boolean;
+      /** Format: date */
+      fx_rate_date_used?: string | null;
+      market_value: string;
+      /**
+       * Format: date
+       * @description The close that priced this asset, and the date it actually came from. Null when
+       * the asset has no transaction at or before the window end, so no close was needed.
+       */
+      price_date_used?: string | null;
+      price_source?: components["schemas"]["PriceSource"] | null;
+      realized_cumulative: string;
+      realized_in_window: string;
+      /** @description A SPLIT dated on or before the window end was applied to the lots in scope. */
+      split_applied: boolean;
+      symbol: string;
+      unrealized_at_end: string;
+    };
+    /**
+     * @description The one body every failure returns. Validation failures carry an empty pair of lists
+     * and name the offending parameter in `error`; a pricing failure populates them.
+     */
+    ErrorBody: {
+      error: string;
+      missing_prices: string[];
+      /** @description How many were found, before the lists were capped. Truncation is never silent. */
+      missing_prices_total: number;
+      missing_rates: components["schemas"]["MissingRate"][];
+      missing_rates_total: number;
+      retryable: boolean;
+    };
+    /**
      * @description One row per buy lot consumed by one sell. `buy_price` and `unit_cost` are
      * split-adjusted and expressed in the portfolio base currency; `unit_cost`
      * additionally carries the amortised buy fee.
@@ -122,6 +179,14 @@ export interface components {
       /** @description "SHORT" | "LONG", populated for the HYBRID strategy only; null otherwise. */
       term?: string | null;
       unit_cost: string;
+    };
+    /**
+     * @description One currency pair a rate could not be found for. A missing rate is a pair, not a
+     * symbol, and the body says which it is.
+     */
+    MissingRate: {
+      from: string;
+      to: string;
     };
     Portfolio: {
       base_currency: string;
@@ -147,6 +212,145 @@ export interface components {
     PortfolioUpdate: {
       currency: string;
     };
+    /**
+     * @description How the dated report priced an asset's close. Recorded so a regenerated file can
+     * state where its numbers came from (Goal 4), and so a database-answered report can be
+     * told from a provider-answered one.
+     * @enum {string}
+     */
+    PriceSource: "database" | "provider";
+    /**
+     * @description What a dated request was answered about. `ReportContext` is the single authority for
+     * `strategy` and `threshold_days`: the response does not repeat them at top level.
+     */
+    ReportContext: {
+      base_currency: string;
+      /** Format: int32 */
+      portfolio_id: number;
+      portfolio_name: string;
+      /**
+       * Format: date
+       * @description The window actually applied, not the parameters as typed. `requested_to` is the
+       * call's `to`, or today when `to` was absent; `requested_from` is the call's `from`,
+       * or the portfolio's first transaction on or before `requested_to`, or `None` when
+       * the portfolio has no transaction at all. An open end is visible in the artifact
+       * rather than inferred by its reader.
+       */
+      requested_from?: string | null;
+      /** Format: date */
+      requested_to: string;
+      /**
+       * @description Splits are as recorded when this was generated; the dated path deliberately does
+       * not sync them (issue #50), so a split recorded after the fact changes past
+       * figures. A constant string in the payload rather than prose in each renderer,
+       * because the CSV carries it as a cell (the file's first row is the header row).
+       */
+      splits_note: string;
+      strategy: string;
+      /** Format: int64 */
+      threshold_days: number;
+    };
+    /** @description The dated report: the run context, per-asset totals, the portfolio rollup and every row. */
+    ReportResponse: {
+      asset_totals: components["schemas"]["AssetTotals"][];
+      context: components["schemas"]["ReportContext"];
+      rows: components["schemas"]["ReportRow"][];
+      totals: components["schemas"]["ReportTotals"];
+    };
+    /**
+     * @description One report row. Three selections share one shape: the kind-specific cells are null on
+     * the rows where they do not apply, never omitted and never zero.
+     *
+     * The asset-level pricing facts repeat on every row of that asset — one close per asset,
+     * not one per lot — so the CSV is a projection of this vector and needs no join.
+     */
+    ReportRow: {
+      asset_currency: string;
+      /** Format: int32 */
+      asset_id: number;
+      asset_type: string;
+      /** Format: date-time */
+      buy_date?: string | null;
+      /**
+       * @description Split-adjusted, in the portfolio's **base** currency — converted at the buy's own
+       * date. NOT `asset_currency`: `DatedLot.buy_price` and `LotMatch.buy_price` are both
+       * `tx_price * get_rate(asset, base, buy_date)`, and the frontend already renders
+       * `LotMatch.buy_price` with the base currency (`SellPnlModal.tsx:255`). The sell-side
+       * price on the same row IS asset currency, so the two columns must not share a label.
+       */
+      buy_price?: string | null;
+      /** Format: int32 */
+      buy_transaction_id?: number | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+       * from the per-match figures; excludes the unmatched tail.
+       */
+      cost_basis?: string | null;
+      /** Format: date */
+      fx_rate_date_used?: string | null;
+      /** Format: int64 */
+      holding_days?: number | null;
+      lot_cost_basis?: string | null;
+      lot_matched_qty?: string | null;
+      /** @description The column that totals. `LotMatch.pnl` under the name the CSV uses. */
+      lot_pnl?: string | null;
+      lot_proceeds?: string | null;
+      lot_qty_before_match?: string | null;
+      market_value?: string | null;
+      matched_qty?: string | null;
+      original_qty?: string | null;
+      /** Format: date */
+      price_date_used?: string | null;
+      price_source?: components["schemas"]["PriceSource"] | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
+       * from the per-match figures (`tax_engine.rs:761-763`), so it never includes the
+       * unmatched tail and must not be added to the `lot_proceeds` of the sell's rows.
+       */
+      proceeds?: string | null;
+      /**
+       * @description Sell-level, **matched quantity only**, in the portfolio's base currency:
+       * `proceeds - cost_basis` over the matched lots. This is the whole sell's figure and
+       * repeats on every `SOLD_LOT` row of that sell — the column to SUM is `lot_pnl`, not
+       * this one.
+       */
+      realized_pnl?: string | null;
+      remaining_qty?: string | null;
+      row_type: components["schemas"]["RowKind"];
+      /** Format: date-time */
+      sell_date?: string | null;
+      /**
+       * @description As entered, in `asset_currency` — same rule as `sell_price`, and the only other
+       * field on this row that is not in the portfolio's base currency.
+       */
+      sell_fee?: string | null;
+      /** @description As entered, in `asset_currency`. */
+      sell_price?: string | null;
+      /** Format: int32 */
+      sell_transaction_id?: number | null;
+      sold_qty?: string | null;
+      symbol: string;
+      /** @description "SHORT" | "LONG" for HYBRID only; null otherwise, and never claimed on an open lot. */
+      term?: string | null;
+      unit_cost?: string | null;
+      unmatched_qty?: string | null;
+      unrealized_gain_loss?: string | null;
+      unrealized_roi?: string | null;
+    };
+    /** @description The portfolio rollup: exactly the five per-asset figures, summed across assets. */
+    ReportTotals: {
+      cost_basis: string;
+      market_value: string;
+      realized_cumulative: string;
+      realized_in_window: string;
+      unrealized_at_end: string;
+    };
+    /**
+     * @description Which selection a row is. Exhaustive on purpose: both renderers switch on it, and the
+     * CSV's "this column totals, that one does not" rule is expressed through it.
+     * @enum {string}
+     */
+    RowKind: "SOLD_LOT" | "OPEN_LOT" | "UNMATCHED";
     /**
      * @description Endpoint payload: the breakdown flattened next to the context needed to read
      * it honestly — which strategy produced it, which currency the money is in,
@@ -189,6 +393,12 @@ export interface components {
       /** Format: date-time */
       buy_date: string;
       buy_price: string;
+      /**
+       * Format: int32
+       * @description The buy that opened this lot. Present so a lot can be joined back to the ledger
+       * row a person is reading.
+       */
+      buy_transaction_id: number;
       latent_gain_loss: string;
       latent_roi: string;
       original_qty: string;
@@ -421,21 +631,40 @@ export interface operations {
       };
     };
   };
+  /**
+   * The tax summary, or — with `from` and/or `to` — the dated tax report.
+   * @description Same route, same access level, two shapes. Without a window the response is the
+   * summary object this endpoint has always returned, which carries `assets` with the
+   * open lots the Holdings tab renders; it is not described here, and its shape is
+   * deliberately unchanged (the printable statement and `PortfolioDetail` both read it).
+   * With a window the response is `ReportResponse`.
+   *
+   * No `params(...)` block, deliberately: the parameters come from the handler's own
+   * arguments, which is why `strategy`, `threshold_days`, `from`, `to` and `format` are
+   * all in the committed document without one. `?format=csv` (dated requests only) answers
+   * the same bytes the JSON payload carries, as a server-generated file: the CSV is a
+   * projection of `ReportResponse`, so no number in it is re-derived. It is described here
+   * rather than as a second content type for status 200, which utoipa's response map —
+   * keyed by status — cannot express.
+   */
   get_portfolio_tax_summary: {
     parameters: {
       query?: {
+        format?: string | null;
+        from?: string | null;
         strategy?: string | null;
         threshold_days?: number | null;
+        to?: string | null;
       };
       path: {
         id: number;
       };
     };
     responses: {
-      /** @description Tax summary retrieved */
+      /** @description Dated tax report when a window is given; the legacy summary object otherwise */
       200: {
         content: {
-          "application/json": unknown;
+          "application/json": components["schemas"]["ReportResponse"];
         };
       };
       /** @description Not authenticated */
@@ -444,7 +673,21 @@ export interface operations {
       };
       /** @description Portfolio not found */
       404: {
-        content: never;
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
+      };
+      /** @description Invalid window, or a price or rate does not exist at or before the window end */
+      422: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
+      };
+      /** @description A pricing provider is unreachable, or the report exceeded its elapsed deadline */
+      503: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
       };
     };
   };

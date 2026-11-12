@@ -61,6 +61,11 @@ export const normalizeTaxSummary = (t: unknown): TaxSummary => {
   const assets = Array.isArray(r.assets) ? (r.assets as unknown[]) : [];
   return {
     currency: str(r, 'currency') || 'USD',
+    // Not `str()`/`num()`: those default to '' and 0, and a defaulting `strategy`
+    // would render as "Portfolio · USD · " with a dangling separator. `undefined`
+    // is the correct absence signal here, so these two skip the helpers.
+    strategy: typeof r.strategy === 'string' ? r.strategy : undefined,
+    threshold_days: typeof r.threshold_days === 'number' ? r.threshold_days : undefined,
     total_portfolio_value: num(r, 'total_portfolio_value'),
     total_realized_pnl: num(r, 'total_realized_pnl'),
     total_unrealized_pnl: num(r, 'total_unrealized_pnl'),
@@ -76,6 +81,7 @@ export const normalizeTaxSummary = (t: unknown): TaxSummary => {
         tax_lots: tax_lots.map((l: unknown) => {
           const lr = asRecord(l);
           return {
+            buy_transaction_id: num(lr, 'buy_transaction_id'),
             buy_date: str(lr, 'buy_date'),
             buy_price: num(lr, 'buy_price'), original_qty: num(lr, 'original_qty'),
             remaining_qty: num(lr, 'remaining_qty'), latent_gain_loss: num(lr, 'latent_gain_loss'),

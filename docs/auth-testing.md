@@ -4,8 +4,8 @@ Who this is for: whoever has to convince themselves this is safe to deploy. The
 implementation record says what was built; this says how to check it, in increasing
 order of effort, and is explicit about which checks are automated and which are not.
 
-Two things in here are **not verified by anything in CI**, and they are the reason this
-document exists:
+Two things about the authentication work in here are **not verified by anything in CI**, and
+they are the reason this document exists:
 
 1. Nothing in this repository has ever completed a login against a real identity
    provider. Every OIDC test exercises the failure path.
@@ -25,7 +25,7 @@ Run from the repository root. All of these are expected to pass on
 `feat/oidc-identity-isolation`.
 
 ```fish
-# Backend: 244 tests
+# Backend: 313 tests
 cd backend_rust; and cargo test
 
 # Static access gate: prints "handlers inspected: 15, cleared: 15"
@@ -49,7 +49,7 @@ diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi
 ```
 
 ```fish
-# Frontend: 152 tests, types, lint
+# Frontend: 203 tests, types, lint
 cd ../frontend
 npm test
 npx tsc --noEmit
@@ -211,6 +211,10 @@ that accepted either would pass on a build that got the branch backwards.
 
 ## 5. The browser walkthrough — this is the part that closes the two open items
 
+Everything in this section is about authentication except the last subsection, *Printing the
+statement*, which is the report-export feature's manual check and is listed here because this
+is where the document keeps the checks CI cannot run.
+
 Either bring up the compose harness or run locally.
 
 ### Option A — compose (closest to production shape)
@@ -306,6 +310,131 @@ the unregistered URI. Set `OIDC_REDIRECT_URI=http://localhost:5173/auth/callback
 login, callback and logout all stay on one origin.
 
 Either answer is useful. Neither can be found from here.
+
+### Printing the statement
+
+`npm run dev`, open a portfolio, click **Printable Statement**, then Ctrl-P. Check:
+
+- no sidebar, no nav, no Print button
+- dark text on white, and the table's body rules visible (a half-inverted table means
+  the `.statement-table td` override in `print.css` is missing)
+- one page for a small portfolio
+- the three headline figures equal the payload shown in devtools -- **not** "match the
+  dashboard". `Dashboard.tsx:39-41` falls back to `metrics.*` when a tax-summary figure
+  is falsy, so a coincidental fallback can satisfy an eyeball comparison.
+- an empty portfolio prints a short note and no figures
+- all nine columns are on the page — **and run this check on a wide portfolio, not the smallest one
+  you have**: something carrying a large realized or market value, e.g. `-$123,456.00` or bigger.
+  Shape, not digit count, decides the width. The recorded series measured a seven-digit-realized
+  shape at 635px and an eight-digit-realized one at 608px — the bigger number came out the narrower
+  table, because its other columns were smaller — and the smoke's own fixture carries an eight-figure
+  realized value and fits 608px as it ships. So there is no digit count you can test against; it is
+  the columns moving together that fills the page. On a small stock position the table fits with
+  room to spare and the check proves nothing; that is
+  exactly the blind check the smoke used to perform, and why its fixture was widened. The rightmost
+  three — Realized, Unrealized, Unrealized ROI — are what a too-wide table loses first, and the
+  clip is silent: `.main-content` computes `overflow-x: auto` (because it declares
+  `overflow-y: auto`, `index.css:163`), so an over-wide table is cut at that container and at the
+  page box with no scrollbar and no warning. Three things buy the width, all in `print.css`: the
+  statement table's cells shrink to `4px 6px` at `0.75rem`, the Type column prints a short display
+  label (`Fund`, not the stored `MUTUAL_FUND`), and `.main-content`'s 40px side padding is
+  collapsed **for the statement tab only**. Measured in a browser at the printed page box, that
+  collapse takes the box from 608px to 688px — and it is worth saying plainly that the collapse is
+  **margin, not necessity**: with it deleted the smoke still passes all nine assertions on the
+  shipped fixture, because the shortened Type label already bought the room. Leave the rule alone;
+  just do not be afraid of it, and do not expect a failing check if something else takes that slack
+  away. So what to look for: all nine headers with their figures under them, the rightmost figure
+  sitting inside the paper with about the same gap as the
+  leftmost one (the table now runs the full width of the text above it, because the side padding
+  is gone), and nothing half-cut at either edge. A missing or clipped rightmost column means the
+  table is over the page box — padding alone cannot fix that, so say so before you hand the page
+  to an adviser.
+- **nothing is broken across two lines — not a figure, not an asset-type label.** This is the
+  failure the bullet above cannot see, so check it separately. The Type column prints a
+  human-readable label — `Stock`, `Crypto`, `ETF`, `Fund` — never the database enum, so no cell
+  should read as half a word. Any value split over two lines, a label or a number, means the table
+  has been squeezed below what it needs — with one exception to rule out before you chase it: a value
+  that merely contains a break opportunity, a space or a hyphen, splits there with no squeeze at all.
+  An asset type the label map has never seen falls through to the raw string, and a hyphenated symbol
+  like `BRK-B` breaks on the hyphen; both are content, not layout. Absent that, the columns are
+  interdependent, so whichever column the browser can shrink gives way first. Look at the money
+  columns, then Type. The smoke asserts this
+  directly, by counting the line boxes of every table **body** cell; a header that wraps onto two
+  lines is not itself a defect, because the header row is where that excess width is meant to land.
+  Nothing in `print.css` may break a token mid-word to make a squeezed table fit — that rule used
+  to exist on the Type column and is what turned an over-wide table into quietly unreadable type
+  instead of a failing check.
+
+Letter users change the paper size in the print dialog; `@page` says A4 and cannot be
+scoped, so printing from any other tab now also gets A4 with 14mm margins. The print palette
+cannot be scoped either: the other four tabs now print dark-on-white as well, which is an
+improvement on the near-invisible white-on-white they used to print. Their layout is unchanged —
+the hide rules are `:has()`-scoped, so their sidebar, nav and charts still print. One of those
+backgrounds is a hardcoded dark literal the palette overrides cannot reach, so `print.css` forces
+the sidebar white for print; if you enable background graphics and still get a dark-on-dark
+sidebar on another tab, that rule is what went missing.
+
+### Downloading the tax report
+
+Still signed in through the provider. This is the step no gate can take: the download is a plain
+`<a href>`, so the session cookie is what makes it work, and nothing in CI logs in.
+
+1. Open a portfolio, click **Tax Report**. The window defaults to the current year to date, and
+   the tab fetches as soon as it opens. If it opens on an error instead of a table, read the
+   error panel before going further — the steps below assume a report is on screen.
+2. Click **Download CSV**. The link is only there while a report is on screen: the route's error
+   responses carry no `Content-Disposition`, so a link on a failing window would take the
+   browser to a raw JSON body and throw away the app. If you do not see the button, the report
+   did not load; that is the finding, not a missing control.
+3. The file arrives as `tax-report-<id>-<from>-<to>.csv`, named by the server's
+   `Content-Disposition` and not by the browser's guess at the URL. With `from` absent the name
+   carries the portfolio's first transaction on or before `to`, not the literal `inception` — that
+   appears only when the portfolio has no transaction at or before `to` at all.
+4. Open it in a spreadsheet: row 1 is the header row, there is no `#` row above it, the file
+   starts with a UTF-8 BOM (Excel needs it to pick UTF-8), and `splits_note` is a column. Check
+   `lot_pnl` filtered to `SOLD_LOT` against `asset_realized_in_window` on the same rows — that is
+   the reconciliation the file is for, and it is the **only** summable column. Summing
+   `realized_pnl` instead counts a four-lot sell four times.
+5. Get the request URL from the **link's `href`** (right-click **Download CSV** → Copy Link, or read
+   it in devtools). The address bar will not have it: this app has no router and no deep link to a
+   window, so the tab's URL is the app's, not the report's. Add `&format=csv` if it is not there,
+   then load it in a shell that holds the session. `pp_session` (`auth/session.rs:19`) is HttpOnly,
+   so it is not in `document.cookie` — read it from devtools' Application tab, or from the
+   `Cookie:` header of a request the page already made:
+
+   ```bash
+   # the URL from step 5, not this example's id and dates
+   curl --silent --show-error \
+        --cookie "pp_session=<the value from devtools>" \
+        "http://localhost:8000/api/portfolios/1/tax-summary?from=2024-01-01&to=2024-12-31&strategy=FIFO&threshold_days=30&format=csv" \
+        -o /tmp/report.csv -D /tmp/report.headers
+   ```
+
+   The bytes must match the browser's exactly — compare `/tmp/report.csv` against the downloaded
+   file, and confirm `/tmp/report.headers` carries `Content-Type: text/csv` and the
+   `Content-Disposition` filename. Two runs over unchanged data must also be byte-identical to
+   each other; there is no generated-at column, so a difference is a real difference.
+6. **Now ask for a window that fails** — a `to` in the future, or a `strategy` that is not
+   `FIFO`/`LIFO`/`HYBRID` — with the same `curl` minus the `-o` and `-D` flags, and look at what
+   comes back. It is **not a file**: the status is 422 (or 503), the body is JSON with `error`,
+   `missing_prices`, `missing_rates`, `missing_prices_total`, `missing_rates_total` and
+   `retryable`, and there is **no `Content-Disposition` header at all**. That is why step 2's link
+   is absent in an error state, and it is what a plain link click would have navigated the browser
+   to. On screen the same failure is the error panel: the missing symbols and pairs with their
+   omitted counts, and a **Try again** button only when `retryable` is true.
+7. Print the report tab (Ctrl-P) and confirm it prints like the other four tabs — the whole
+   shell, sidebar and nav included, no print stylesheet applied. The statement's hide rules are
+   `:has()`-scoped (`.main-content:has([data-print="statement"]) > *:not([data-print="statement"])`,
+   `print.css:26`) and match nothing on a page with no statement root, which is the intended
+   behaviour here. If the report tab prints like the *statement* — no sidebar, no controls — a
+   hide rule escaped its `:has()` scope.
+
+Two things this walkthrough cannot check, and no automated check here does either: whether the
+provider's answer for a pair that has no series is an error status or an empty chart, and
+therefore whether a delisted currency pair reports 422 or 503 (see the release note — a 503 every
+time is a possible and correct answer). And whether a genuinely cold multi-currency portfolio
+exceeds the 20 s deadline on its first report; that path is only exercised at a zero deadline in
+the tests.
 
 ---
 

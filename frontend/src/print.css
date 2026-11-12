@@ -1,0 +1,150 @@
+/*
+ * Print palette and hide rules for the printable statement. Imported after index.css
+ * in main.tsx so it wins the cascade at equal specificity.
+ *
+ * The hide rules are scoped with :has() on purpose. Unscoped, `.main-content > *:not(...)`
+ * hides every direct child of the content column on every tab that does not carry the
+ * attribute — four of five tabs would print blank.
+ * :has() is baseline (Chrome 105 / Safari 15.4 / Firefox 121); the repo sets no
+ * browserslist override.
+ */
+
+/* @page cannot take a selector, so this applies to a print started from any tab. */
+@page { size: A4; margin: 14mm; }
+
+@media print {
+  /* 1. Hide the shell, not a list of things inside it. An enumerated hide list drifts
+        every time someone adds chrome; the inclusive form cannot miss a direct child.
+        Rule one removes the sidebar and the auth-failed banner (a position:fixed
+        full-width banner an enumerated list would print on every page). Rule two leaves
+        only the statement in the content column, which is also what hides the Print
+        control — it is a sibling of the statement root, not inside it.
+        Both use `>`, so the statement root must be a DIRECT child of .main-content.
+        Wrap it in a layout div and this prints a blank page from a tab that looks
+        correct on screen. */
+  .app-container:has([data-print="statement"]) > *:not(.main-content) { display: none; }
+  .main-content:has([data-print="statement"]) > *:not([data-print="statement"]) { display: none; }
+
+  /* 2. Collapse the 260px 1fr grid, or the page prints with a 260px gutter of nothing. */
+  .app-container:has([data-print="statement"]) { grid-template-columns: 1fr; }
+
+  /* Give the table the 80px the shell was spending on it. .main-content's 40px side padding
+        (index.css:161-162) is screen chrome; on paper it is 80px of white between the page
+        margin and the only thing left on the sheet, and the table below is content-bound and
+        silently clipped when it runs out of room. This is the widest lever that does not ask
+        an adviser reading the page to decode an abbreviation, and the fit arithmetic in rule 4
+        is written against the box it produces. Scoped with :has() for the same reason the hide
+        rules are: unscoped it would strip the padding from every other tab's print too.
+        Specificity is (0,2,0) — :has() contributes the specificity of its most specific
+        argument, here the [data-print="statement"] attribute selector — against (0,1,0) for
+        .main-content, so it wins with no !important (and print.css is imported after
+        index.css regardless, main.tsx:3-4). 24px stays at the bottom so the last row is not
+        flush against the printed edge.
+        THIS RULE IS MARGIN, NOT NECESSITY — measured, not assumed. With this line deleted, so the
+        box is back to 608px, the smoke ran green on all nine assertions at the shipped fixture:
+        neither width check fires and the worst body cell still rendered on one line. Roughly 80px
+        of slack, bought when the Type column stopped printing the raw enum. So deleting this costs
+        nothing today, and PrintCss.test.ts — which pins this line as text — is the only gate that
+        would notice. Read that as "do not fear deleting it", not as "it is safe to delete": the
+        slack belongs to today's fixture, and rule 4's ceiling argument is untouched by it. */
+  .main-content:has([data-print="statement"]) { padding: 0 0 24px; }
+
+  /* 3. Invert the palette. Legibility comes entirely from the TEXT overrides: text is
+        always painted and does not depend on the "background graphics" setting. The
+        background and border overrides are redundant in that sense and load-bearing in
+        the other one — a reader who HAS enabled background graphics otherwise gets dark
+        text on the dark app background. The two groups are not interchangeable. */
+  :root {
+    --bg-dark: #ffffff;
+    --bg-card: #ffffff;
+    --border-color: #333333;
+    --text-primary: #111111;
+    --text-secondary: #333333;
+    --text-muted: #555555;
+  }
+
+  .glass-card {
+    backdrop-filter: none;
+    box-shadow: none;
+    background: #ffffff;
+  }
+
+  /* The sidebar's own background is a literal rgba(10, 15, 28, 0.95) (index.css:101),
+        not a variable, so the :root overrides above cannot reach it. On the statement tab
+        that is moot, because rule 1 hides the sidebar. On the other tabs the hide rules do
+        not match, the sidebar prints, and its nav text has just become --text-secondary
+        #333333 — with background graphics enabled that is dark-on-dark. This rule is a
+        no-op when they are off (nothing is painted) and removes the case when they are on.
+        It is unscoped like the palette above it, because scoping it to the statement tab
+        would leave the defect exactly where it occurs. */
+  .sidebar { background: #ffffff; }
+
+  /* .data-table td's own border is a literal rgba(255,255,255,0.03) (index.css:247),
+        not a variable, so --border-color never reaches it. Without this the header rule
+        inverts and every body rule stays invisible: a half-inverted table. */
+  .statement-table td { border-bottom: 1px solid #333333; }
+
+  /* 4. Fit the nine columns on the page, or the three rightmost ones never reach the
+        paper. The box: A4 is 210mm wide and `@page` above takes 14mm of it on each side,
+        so the content box is 182mm = 688px at 96dpi, and the padding rule above hands the
+        statement all of it. (Before that rule .main-content kept its 40px each side and the
+        statement was laid out in 608px; every width below is against 688.) A table
+        cannot shrink below min-content, and an over-wide one is clipped silently: at
+        .main-content — whose computed overflow-x is auto, because index.css:163 sets
+        overflow-y:auto and a `visible` paired with a non-visible overflow computes to
+        auto — and again at the page box. Nothing scrolls and nothing warns you; Realized,
+        Unrealized and Unrealized ROI are just not on the sheet. At .data-table's 16px cell
+        padding (index.css:246) the horizontal padding alone costs 32px x 9 columns = 288px,
+        42% of the 688px box before a single glyph, and td inherits the 16px body font (only
+        th drops to 0.875rem, index.css:242), which puts min-content far past what remains.
+        4px 6px is where this lands: 12px x 9 = 108px of padding, leaving ~580px for
+        content — 36px more than 6px 8px left (2px x 2 sides x 9 cells), and 180px more
+        than the on-screen padding. The font stays at 0.75rem on purpose: 12px is ~9pt,
+        ordinary print body size, and going to 11px buys only ~48px while shrinking exactly
+        the digits an adviser reconciles against the full-precision CSV export. 4px vertical
+        keeps a ~24px row (~6.4mm) and every row already carries a 1px rule, so the table
+        does not collapse into a wall of text; 6px horizontal is a 1.6mm gutter, adequate
+        between numeric columns. Specificity ties .data-table th/td at (0,1,1), so source
+        order decides: print.css is imported after index.css (main.tsx:4).
+        What is left was MEASURED, not estimated — chromium, real print media, at the page
+        content box, across portfolio shapes. The widest shape tested peaked at 635px; a shape with
+        a large realized but small values in the other columns came back at 608px, which is the
+        point — it is the columns moving together that decide the width, not any one of them.
+        Against 688px every shape measured fits without overflowing. That is a ceiling with a
+        number on it, not a solution: padding is finite and a holding's column content is not,
+        so a wide enough portfolio still overflows and is still clipped silently.
+        What this rule buys is legibility, not the absence of overflow. That was measured on the
+        smoke's own fixture when the Type column still printed the raw enum: the table's
+        max-content measured 694px — wider than BOTH boxes — so something always gave, and
+        deleting this rule did not overflow the 608px box that remained, something else gave way
+        instead. Two parts of that measurement have since been retired on purpose: the Type column
+        prints a display label (PortfolioStatement.tsx), and the smoke keeps its live-priced
+        columns narrow so its checks are not price-sensitive. So the current max-content is not
+        restated here. The question of WHICH of the smoke's two width checks sees this rule deleted
+        was since measured, and the answer is NEITHER: with rule 2's padding collapse removed the
+        smoke stayed green on all nine assertions, because the table now fits the 608px box too.
+        That is rule 2 being margin, not this rule being unnecessary — the fit arithmetic above is
+        written against the 688px box, and it is why there is slack to lose. What has not changed is
+        the risk: padding is finite, a holding's column content is not,
+        and an over-wide table is still clipped silently. */
+  .statement-table th,
+  .statement-table td {
+    padding: 4px 6px;
+    font-size: 0.75rem;
+  }
+
+  /* No break rule on the Type column, on purpose. One used to sit here: `overflow-wrap: anywhere`
+        on td:nth-child(2), added so MUTUAL_FUND — a valid AssetType (types.ts:9) and what the
+        backend normalises "Mutual Fund" to (lookup.rs:116), unbreakable because `_` is not a
+        line-break opportunity under UAX #14 — could survive a narrow column. It did more harm
+        than good: it is what let the table survive a box it did not fit, so a squeezed table
+        printed a shattered token instead of failing anything. The Type column now prints a
+        display label (PortfolioStatement.tsx) whose widest token is far shorter than the enum,
+        so nothing here needs to break. If a future token is too wide for the page, the smoke's
+        body-cell line-count check or its overflow check has to fail — silently breaking the word
+        in half is exactly the outcome this absence exists to prevent. */
+
+  /* 5. Break rules. */
+  tr { break-inside: avoid; }
+  .statement-headline { break-inside: avoid; }
+}
