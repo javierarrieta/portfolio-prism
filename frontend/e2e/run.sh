@@ -11,12 +11,13 @@
 # (npm install in frontend/), and at least one font available to fontconfig.
 # On NixOS, run it inside:  nix-shell -p chromium -p liberation_ttf --run './e2e/run.sh'
 #
-# Env overrides: CHROMIUM, FONT_DIR, BASE_URL, API_URL, SMOKE_SHOT=<path for a screenshot>
+# Env overrides: CHROMIUM, FONT_DIR, BASE_URL, API_URL, SMOKE_SHOT=<path for a screenshot>,
+# SMOKE_LOG_DIR=<directory to copy backend.log and vite.log into before they are deleted>
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-# ${1:-sell-pnl.smoke.mjs}, not $1: line 16 is `set -uo pipefail`, so a bare $1 aborts the script
-# when it is called with no argument -- which is how npm run e2e:sell-pnl calls it.
+# ${1:-sell-pnl.smoke.mjs}, not $1: this script runs under `set -uo pipefail` above, so a bare $1
+# aborts the script when it is called with no argument -- which is how npm run e2e:sell-pnl calls it.
 TARGET="${1:-sell-pnl.smoke.mjs}"
 REPO_ROOT="$(cd .. && pwd)"
 WORK="$(mktemp -d)"
@@ -36,6 +37,19 @@ cleanup() {
   # name, which would also hit a backend the operator runs in another shell.
   [ -n "$BACKEND_PGID" ] && kill -- -"$BACKEND_PGID" 2>/dev/null
   wait 2>/dev/null
+  # backend.log and vite.log live in $WORK and $WORK is deleted on the next line, so without this
+  # the only trace of a red run is the 20-line tail printed to stdout. SMOKE_LOG_DIR copies them
+  # out first, which is what makes a CI failure debuggable somewhere you cannot reproduce it.
+  # Copied on success too: "it looked like a green run until it wasn't" is exactly the case where
+  # you want the log that was already deleted. Best-effort -- a missing or read-only target must
+  # not turn a passing smoke into a failing one.
+  if [ -n "${SMOKE_LOG_DIR:-}" ]; then
+    if mkdir -p "$SMOKE_LOG_DIR" 2>/dev/null; then
+      cp "$WORK/backend.log" "$SMOKE_LOG_DIR/backend.log" 2>/dev/null
+      cp "$WORK/vite.log" "$SMOKE_LOG_DIR/vite.log" 2>/dev/null
+      echo "logs  $SMOKE_LOG_DIR"
+    fi
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM

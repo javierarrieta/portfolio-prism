@@ -1,7 +1,8 @@
 // Headless browser smoke for the printable statement. Same harness as
 // sell-pnl.smoke.mjs: a real browser, the real Rocket API, a real SQLite file.
 // This is the only layer that sees real print CSS -- jsdom does not apply
-// @media print, and there is no browser job in CI (issue #45).
+// @media print. The `e2e-smoke` job in .github/workflows/ci.yml runs it on every
+// push and pull request.
 //
 // It asserts NO figure. Figures come from a live price provider; when it is
 // unreachable the fallback returns zero, and a smoke that asserted figures

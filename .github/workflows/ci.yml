@@ -142,6 +142,102 @@ jobs:
         run: npm test
         working-directory: frontend
 
+  e2e-smoke:
+    # The only layer in the repo that drives a real browser against the real Rocket API and a
+    # real SQLite file. jsdom mocks the endpoint it would need to get wrong; cargo tests render
+    # nothing. See frontend/e2e/README.md.
+    #
+    # Blocking on purpose. A `continue-on-error` job reads as coverage while checking nothing,
+    # which is worse than no job at all.
+    #
+    # Boots the whole stack twice, once per smoke, because each `run.sh` invocation owns its own
+    # throwaway database, backend and vite. The second boot is cheap: the binary is already
+    # compiled. The statement step is deliberately *not* `if: always()` — if the sell-pnl run
+    # could not even start the backend, the statement run would burn another 420 s proving it
+    # could not either.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        # `run.sh` starts the API with `cargo run`, so this job pays a full debug build of the
+        # crate on a cold cache — measured locally, see the PR. `restore-keys` rather than an
+        # exact key alone: any Cargo.lock change would otherwise throw away a multi-GB target/
+        # and rebuild from nothing. The 10 GB per-repo cache budget is shared across keys, so if
+        # this entry starts evicting the others, drop `backend_rust/target` from `path` and take
+        # the cold build rather than thrash the cache for everyone.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend_rust/target
+          key: cargo-e2e-${{ hashFiles('backend_rust/Cargo.lock') }}
+          restore-keys: |
+            cargo-e2e-
+
+      - name: Setup Node.js
+        # v7 for the action's own runtime, for the reason recorded on `frontend-tests`. The app
+        # stays on Node 20 because frontend/Dockerfile builds on node:20-alpine and this job has
+        # to match the image it is testing.
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Install chromium
+        # `playwright-core` ships the browser downloader but — unlike `playwright` — has no
+        # postinstall that runs it, so the job has to ask for a browser explicitly. No
+        # `--only-shell`: both smokes launch a full browser with `--no-sandbox
+        # --disable-dev-shm-usage`, and the headless shell is not interchangeable for that.
+        # `--with-deps` also pulls the distro font packages, which is what stops currency
+        # symbols rendering as tofu in the statement PDF. It needs sudo; GitHub-hosted runners
+        # have passwordless sudo.
+        working-directory: frontend
+        run: |
+          npx playwright-core install --with-deps chromium
+          # `run.sh` is a separate step and dies with "no chromium binary found" unless it sees
+          # CHROMIUM or a chromium on PATH, so the resolved path goes into $GITHUB_ENV rather
+          # than being exported here.
+          echo "CHROMIUM=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
+
+      - name: Sell P&L smoke
+        working-directory: frontend
+        env:
+          SMOKE_SHOT: /tmp/e2e-sell-pnl.png
+          SMOKE_LOG_DIR: /tmp/e2e-logs/sell-pnl
+        run: npm run e2e:sell-pnl
+
+      - name: Printable statement smoke
+        working-directory: frontend
+        env:
+          SMOKE_SHOT: /tmp/e2e-statement.png
+          SMOKE_LOG_DIR: /tmp/e2e-logs/statement
+        run: npm run e2e:statement
+
+      - name: Upload screenshots and server logs
+        # always(): both smokes write SMOKE_SHOT on the success path too, and a red run is the
+        # one you actually need the logs for. `if-no-files-found: ignore` so a smoke that died
+        # before it could shoot does not fail the upload of everything that did.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-smoke
+          path: |
+            /tmp/e2e-sell-pnl.png
+            /tmp/e2e-statement.png
+            /tmp/e2e-logs
+          if-no-files-found: ignore
+
   docker-build-backend:
     runs-on: ubuntu-latest
     steps:
