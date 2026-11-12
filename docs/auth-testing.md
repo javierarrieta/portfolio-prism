@@ -25,7 +25,7 @@ Run from the repository root. All of these are expected to pass on
 `feat/oidc-identity-isolation`.
 
 ```fish
-# Backend: 272 tests
+# Backend: 311 tests
 cd backend_rust; and cargo test
 
 # Static access gate: prints "handlers inspected: 15, cleared: 15"
@@ -49,7 +49,7 @@ diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi
 ```
 
 ```fish
-# Frontend: 179 tests, types, lint
+# Frontend: 201 tests, types, lint
 cd ../frontend
 npm test
 npx tsc --noEmit
@@ -394,10 +394,12 @@ Still signed in through the provider. This is the step no gate can take: the dow
    `lot_pnl` filtered to `SOLD_LOT` against `asset_realized_in_window` on the same rows — that is
    the reconciliation the file is for, and it is the **only** summable column. Summing
    `realized_pnl` instead counts a four-lot sell four times.
-5. Copy the URL from the address bar of the tab (or the link's `href`), add `&format=csv` if it
-   is not there, and load it in a shell that holds the session. `pp_session` is HttpOnly, so it is
-   not in `document.cookie` — read it from devtools' Application tab, or from the `Cookie:` header
-   of a request the page already made:
+5. Get the request URL from the **link's `href`** (right-click **Download CSV** → Copy Link, or read
+   it in devtools). The address bar will not have it: this app has no router and no deep link to a
+   window, so the tab's URL is the app's, not the report's. Add `&format=csv` if it is not there,
+   then load it in a shell that holds the session. `pp_session` (`auth/session.rs:19`) is HttpOnly,
+   so it is not in `document.cookie` — read it from devtools' Application tab, or from the
+   `Cookie:` header of a request the page already made:
 
    ```bash
    # the URL from step 5, not this example's id and dates
