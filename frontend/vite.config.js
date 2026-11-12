@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // DELIBERATE BREAK -- throwaway branch, proves the e2e-smoke job can fail. vitest cannot
+        // see this: MSW intercepts in-process and never goes through the dev-server proxy.
+        target: 'http://127.0.0.1:8001',
         changeOrigin: true,
       },
       '/api-docs': {
