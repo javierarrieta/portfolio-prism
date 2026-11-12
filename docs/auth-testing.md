@@ -25,7 +25,7 @@ Run from the repository root. All of these are expected to pass on
 `feat/oidc-identity-isolation`.
 
 ```fish
-# Backend: 311 tests
+# Backend: 313 tests
 cd backend_rust; and cargo test
 
 # Static access gate: prints "handlers inspected: 15, cleared: 15"
@@ -387,8 +387,9 @@ Still signed in through the provider. This is the step no gate can take: the dow
    browser to a raw JSON body and throw away the app. If you do not see the button, the report
    did not load; that is the finding, not a missing control.
 3. The file arrives as `tax-report-<id>-<from>-<to>.csv`, named by the server's
-   `Content-Disposition` and not by the browser's guess at the URL. An absent `from` renders as
-   the literal `inception`, so the name describes the window the file actually covers.
+   `Content-Disposition` and not by the browser's guess at the URL. With `from` absent the name
+   carries the portfolio's first transaction on or before `to`, not the literal `inception` — that
+   appears only when the portfolio has no transaction at or before `to` at all.
 4. Open it in a spreadsheet: row 1 is the header row, there is no `#` row above it, the file
    starts with a UTF-8 BOM (Excel needs it to pick UTF-8), and `splits_note` is a column. Check
    `lot_pnl` filtered to `SOLD_LOT` against `asset_realized_in_window` on the same rows — that is

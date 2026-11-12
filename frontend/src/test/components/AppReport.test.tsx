@@ -32,7 +32,9 @@ describe('the tax report tab', () => {
 
     const dated = seen.find((q) => q.includes('from=') || q.includes('to='))
     expect(dated).toBeDefined()
-    expect(dated).toContain(`to=${new Date().getFullYear()}-`)
+    // UTC year, matching how the window is built. A local year here disagrees with the
+    // UTC-built value for a few hours either side of New Year in a non-UTC zone.
+    expect(dated).toContain(`to=${new Date().getUTCFullYear()}-`)
     // The tab's own fetch is dated; the undated summary the rest of the app reads is a
     // separate request and stays undated.
     expect(seen.filter((q) => !q.includes('from=') && !q.includes('to=')).length).toBeGreaterThan(0)

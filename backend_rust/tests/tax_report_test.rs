@@ -511,6 +511,16 @@ async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
     assert_eq!(unmatched.len(), 1, "the June sell's unmatched tail is a row of its own");
     assert!(unmatched[0]["realized_pnl"].is_null());
     assert_eq!(unmatched[0]["unmatched_qty"], "10.0");
+
+    // The half the test's name promised and did not check: a lot bought BEFORE `from` and
+    // still open at `to` must still be in scope. If `from` were ever pushed into `replay_at`,
+    // HELDIT would have no lots, this row would vanish, and cost basis would silently drop
+    // while every other assertion here kept passing.
+    let held_open = report["rows"].as_array().unwrap().iter()
+        .filter(|r| r["row_type"] == "OPEN_LOT" && r["symbol"] == "HELDIT")
+        .collect::<Vec<_>>();
+    assert_eq!(held_open.len(), 1, "HELDIT was bought 2024-02-01, before `from`, and is still open at `to`");
+    assert_eq!(dec_at(held_open[0], "/remaining_qty"), dec("50.0"));
 }
 
 // --------------------------------------------------------------------------------------

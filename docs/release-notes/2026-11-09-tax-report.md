@@ -21,12 +21,16 @@ server. Absent `from` and `to`, the endpoint behaves exactly as it did.
 
 **Either date alone is legal.** `to` alone means "from the portfolio's first transaction
 through that date"; `from` alone means "from that date through today". The window is inclusive
-on both ends and the boundary is UTC, so a sell at any time on `to` is inside it. An
+on both ends and the boundary is UTC, so a sell at any time on `to` is inside it. `?format=json`
+is accepted as an explicit no-op for the default; an unknown format name is a 422 naming the two
+accepted values. An
 unparseable date, a future date, and `from` after `to` are each a 422 naming the parameter.
 
-**The file is named by the server.** `tax-report-<id>-<from>-<to>.csv`, and an absent `from`
-renders as the literal `inception` — the filename names the window the file actually covers,
-not the parameters as typed. Row 1 is the header row; there is no comment row above it, and
+**The file is named by the server.** `tax-report-<id>-<from>-<to>.csv`, and the name carries the
+window **actually applied**, not the parameters as typed. With `from` absent that is the portfolio's
+first transaction on or before `to`, so a `to`-only request for a portfolio whose first trade was
+2024-01-01 is named `...-2024-01-01-<to>.csv`. The literal `inception` appears only when the
+portfolio has no transaction at or before `to` at all — the rare case, not the common one. Row 1 is the header row; there is no comment row above it, and
 the caveats ride as columns. The file opens with a UTF-8 BOM, like every other CSV this app
 produces, because Excel decides the encoding from it.
 
@@ -48,25 +52,33 @@ quantity actually bought was not recoverable from the response at all. It is now
 the lot was opened with, split-adjusted alongside the remaining quantity. A lot that bought 60
 and sold 20 now prints Original Qty 60 / Remaining Qty 40 where it printed 40 / 40.
 `TaxLot` also gains `buy_transaction_id`, so a lot can be joined back to the ledger row a
-person is reading. Nothing else on an existing screen moves.
+person is reading. **One other screen can move, and only for a portfolio stored with a lowercase
+currency**: the single-sell P&L breakdown's FX footnote now hides where it used to show, because
+`fx_applied` was made case-insensitive to match the engine and the pricing layer. That footnote was
+wrong before for such a portfolio; it is right now. Asset and portfolio currency are stored
+verbatim, so the case is reachable, though nothing in the UI creates it.
 
 ## Strategy validation is strict on the dated path only
 
 `?strategy=average_cost&to=2024-06-30` is a 422 naming the accepted values
-(`FIFO`, `LIFO`, `HYBRID`). Without a window the same input still falls back to FIFO — "absent
-parameters reproduce the old behaviour" holds for an unrecognised one too — **and the response
-now echoes `FIFO` rather than the string the client sent**. That echo is new on the undated
-path: the value is normalized once and used for both the engine call and the response, so the
-response can no longer name a matching method the engine did not use.
+(`FIFO`, `LIFO`, `HYBRID`). Without a window the same input still falls back to FIFO, and **the response now echoes `FIFO`
+rather than the string the client sent**. The value is normalized once and used for both the engine
+call and the response, so the response can no longer name a matching method the engine did not use.
+
+**This is the one exception to "absent `from` and `to`, the endpoint behaves exactly as it did",
+and it moves figures, not just labels.** Before, `?strategy=hybrid` (lowercase) fell through the
+engine's catch-all arm, **computed FIFO**, and echoed `hybrid`. Now it computes HYBRID. So a direct
+API caller sending a case-varying token gets different numbers from this release. No shipped screen
+is affected: the UI only ever sends the three uppercase tokens.
 
 ## The columns that may be summed
 
 In the CSV, **`lot_pnl` filtered to `row_type=SOLD_LOT` is the only column whose sum is a
 figure.** It equals that asset's `asset_realized_in_window`, which the file carries on the same
 rows, so the reconciliation is a comparison and not a recomputation. Every other sell-level
-column — `proceeds`, `cost_basis`, `realized_pnl`, `sold_qty`, `matched_qty` — is that **sell's**
-whole figure repeated on each of that sell's lot rows, and summing them counts a four-lot sell
-four times. Every `asset_*` column is already a total. `realized_pnl` is the trap: it is the
+column — `proceeds`, `cost_basis`, `realized_pnl`, `sold_qty`, `matched_qty`,
+`sell_price_in_asset_currency` and `sell_fee_in_asset_currency` — is that **sell's** whole figure
+repeated on each of that sell's lot rows, and summing them counts a four-lot sell four times. Every `asset_*` column is already a total. `realized_pnl` is the trap: it is the
 whole sell's P&L, and it is the column a spreadsheet reaches for first.
 
 This disclosure lives here rather than in the file, because anything above the header row breaks
@@ -153,6 +165,15 @@ the dated report and a **zero** `latent_roi` on the undated summary.
   responses carry no `Content-Disposition`, so an anchor click on a failing window would
   navigate the browser away from the app to a raw JSON body. The link appears when there is a
   report on screen.
+- **The OpenAPI document describes only the dated shape for status 200.** The same operation
+  serves the legacy summary object when no window is given, and that shape is disclosed in the
+  response's prose description but not in its schema — `body = ReportResponse` is wrong for the
+  undated half of the requests. A client generated from the document can parse a report and cannot
+  parse a summary. Fixing it properly needs a `oneOf` over both shapes, or splitting the operation;
+  neither was worth doing to a legacy response this release deliberately leaves alone.
+- **A 500 is reachable and is not in the document.** It was reachable on the old route too, and the
+  statuses are unchanged, but five of the sites now carry the typed error body and some of those
+  bodies contain raw sqlx text. Nothing in the UI reads a 500 body.
 - **A report is one portfolio.** There is no cross-portfolio report and no asset subset.
 - **No PDF, no tax computation, no tax rates.** This answers "what did I sell, at what basis,
   with what gain, and what did I still hold". What to do with that is a tax question, and the app
@@ -163,7 +184,7 @@ the dated report and a **zero** `latent_roi` on the undated summary.
 
 ## What is verified, and what is not
 
-**Covered by `cargo test` (311 tests, green as of this note), from `backend_rust/`:**
+**Covered by `cargo test` (313 tests, green as of this note), from `backend_rust/`:**
 
 - `tests/tax_report_test.rs` (19) — the dated report summing its own rows and agreeing with the
   undated summary, the window selecting the sells but not the lots behind them, a window ending on
@@ -178,12 +199,14 @@ the dated report and a **zero** `latent_roi` on the undated summary.
   conversion rate (two different seeded rates), a split dated after the window end not moving an
   earlier window while one inside it still rescales, the inclusive end boundary, the empty window
   costing no outbound call, and `replay_at` agreeing with `calculate_lots` when both look at today.
-- `tests/report_csv_test.rs` (10) — the header, its order, and that no comment row precedes it;
+- `tests/report_csv_test.rs` (12) — the header, its order, and that no comment row precedes it;
   `lot_pnl` summed over `SOLD_LOT` rows equalling `asset_realized_in_window`; two dispatches over
   unchanged data being byte-identical; a date cell reading exactly the text the JSON field reads,
   including a sub-second timestamp; each RFC 4180 trigger forcing quoting on its own; the
-  server's own filename; `format=csv` without a window being a 422 naming `format`; a window with
-  no rows being a header and nothing else.
+  server's own filename, including both filename branches — a `to`-only request naming the first
+  transaction in scope, and `inception` only when there is no transaction in scope; `format=csv`
+  without a window being a 422 naming `format`, and `format=json` being the accepted no-op it now
+  is; a window with no rows being a header and nothing else.
 - `tests/analytics_test.rs` — that a lot reports the quantity that was bought and the buy it came
   from. `tests/isolation_test.rs` — the dated variant of the access rule, which the grep-based
   gate cannot see on an existing route. `tests/route_coverage_test.rs` — that no route was added.

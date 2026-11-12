@@ -60,9 +60,11 @@ pub async fn get_portfolio_tax_summary(
     to: Option<String>,
     format: Option<String>,
 ) -> Result<TaxSummaryResponse, ReportError> {
-    // First statement in the body on purpose: `check_access_gate.sh`'s Rule B ends a
-    // handler at the first column-0 `}` and requires a `require*` call before any
-    // `WHERE id` query anywhere in it.
+    // First statement in the body on purpose. Note that Rule B of `check_access_gate.sh`
+    // no longer sees this handler's portfolio lookup at all -- it moved into
+    // `load_portfolio`, past the awk block's column-0 `}` terminator -- so the ordering
+    // rule is vacuous here and this call is what actually gates the route. The real check
+    // is `tests/isolation_test.rs`, which exercises the dated variant end to end.
     require(pool.inner(), user.id, id, Access::Viewer)
         .await
         .map_err(ReportError::from_status)?;
@@ -692,11 +694,20 @@ fn parse_window(
 fn parse_format(format: Option<&str>, dated: bool) -> Result<bool, ReportError> {
     match format {
         None => Ok(false),
-        Some("csv") if dated => Ok(true),
-        Some("csv") => Err(ReportError::validation("format", "`csv` needs `from` or `to`")),
+        // Both names are matched case-insensitively, and `json` is a no-op: it is what the
+        // route already returns, so a client that always appends `format=json` must not be
+        // refused for asking for the thing it would have got. The committed document
+        // advertises `format` as a free-form string and there is deliberately no
+        // `params(...)` block to attach an enum to (see this module's header note), so
+        // refusing the default was the only way the mismatch could bite -- and it bit.
+        Some(f) if f.eq_ignore_ascii_case("json") => Ok(false),
+        Some(f) if f.eq_ignore_ascii_case("csv") && dated => Ok(true),
+        Some(f) if f.eq_ignore_ascii_case("csv") => {
+            Err(ReportError::validation("format", "`csv` needs `from` or `to`"))
+        }
         Some(other) => Err(ReportError::validation(
             "format",
-            &format!("`{other}` is not a known format; only `csv` is accepted"),
+            &format!("`{other}` is not a known format; `csv` and `json` are the accepted values"),
         )),
     }
 }

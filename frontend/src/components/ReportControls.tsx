@@ -99,14 +99,22 @@ export default function ReportControls(props: ReportControlsProps) {
             </p>
           )}
           {nothingMissing && <p>{error.error}</p>}
+          {/* Two different 422s land here and only one of them is the window's fault.
+              When the server named missing symbols or pairs, changing the dates or the
+              strategy will not help -- the price or rate simply is not there. */}
           {error.retryable ? (
             <button className="btn btn-secondary" onClick={onRetry}>Try again</button>
-          ) : (
-            <p>
-              The dates or the strategy have to change before this can be answered. The strategy and
-              its threshold are set on the Holdings &amp; Tax lots tab, not here.
-            </p>
-          )}
+          ) : nothingMissing ? (
+              <p>
+                The dates or the strategy have to change before this can be answered. The strategy
+                and its threshold are set on the Holdings &amp; Tax lots tab, not here.
+              </p>
+            ) : (
+              <p>
+                There is no price or rate for what is listed above on or before the window&apos;s
+                end. Changing the dates or the strategy will not produce it.
+              </p>
+            )}
         </div>
       )}
 

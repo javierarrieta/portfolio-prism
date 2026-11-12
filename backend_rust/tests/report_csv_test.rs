@@ -160,6 +160,43 @@ async fn the_headers_are_the_columns_order_and_no_comment_row_precedes_them() {
 }
 
 #[tokio::test]
+async fn a_to_only_filename_names_the_window_applied_not_the_parameters_typed() {
+    // Two documents claimed an absent `from` renders as the literal `inception`. It does not:
+    // `analytics.rs` uses `window.from.or(first_in_scope)`, so the filename carries the
+    // portfolio's first transaction on or before `to`. `inception` is the no-transactions
+    // case only. This pins the common branch; the next test pins the rare one.
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;   // first transaction is 2024-01-01
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?to=2024-06-30&format=csv"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    assert_eq!(
+        resp.headers().get_one("Content-Disposition").unwrap_or(""),
+        format!("attachment; filename=\"tax-report-{port_id}-2024-01-01-2024-06-30.csv\""),
+        "an absent `from` must name the first transaction in scope, not `inception`",
+    );
+}
+
+#[tokio::test]
+async fn a_window_with_no_transaction_in_scope_is_the_only_inception_filename() {
+    let pool = setup_db(&disabled_config()).await;
+    let port_id = csv_fixture(&pool).await;   // nothing on or before 2023-12-31
+    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let resp = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?to=2023-12-31&format=csv"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    assert_eq!(
+        resp.headers().get_one("Content-Disposition").unwrap_or(""),
+        format!("attachment; filename=\"tax-report-{port_id}-inception-2023-12-31.csv\""),
+    );
+}
+
+#[tokio::test]
 async fn the_lot_pnl_column_sums_to_the_assets_realized_in_window() {
     let pool = setup_db(&disabled_config()).await;
     let port_id = csv_fixture(&pool).await;
@@ -268,10 +305,28 @@ async fn format_csv_without_a_window_is_a_422_naming_format() {
     assert!(body["error"].as_str().unwrap().contains("format"));
 
     let unknown = client
-        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&format=json"))
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&to=2024-06-30&format=pdf"))
         .dispatch()
         .await;
     assert_eq!(unknown.status(), Status::UnprocessableEntity);
+
+    // `json` is what the route already returns, so naming it is a no-op, not a 422. It used
+    // to be a 422 -- pinned here -- which meant a client that always appends `format=json`
+    // was refused for asking for the default.
+    // Bounded on both ends: `from` alone runs through today, and today is past the seeded
+    // series, so an open-ended window here would try the provider and answer 503.
+    let named_default = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&to=2024-06-30&format=json"))
+        .dispatch()
+        .await;
+    assert_eq!(named_default.status(), Status::Ok);
+    assert_eq!(named_default.content_type(), Some(ContentType::JSON));
+
+    let upper = client
+        .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&to=2024-06-30&format=CSV"))
+        .dispatch()
+        .await;
+    assert_eq!(upper.status(), Status::Ok, "the two format names are matched case-insensitively");
 }
 
 /// Task 5 review Important #1. The controller's first date fix used
