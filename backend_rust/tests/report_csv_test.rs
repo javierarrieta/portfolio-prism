@@ -58,7 +58,7 @@ async fn csv_fixture(pool: &SqlitePool) -> i32 {
     common::seed_transaction_at(pool, asset_id, "SELL", 140.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
     common::seed_transaction_at(pool, asset_id, "BUY", 30.0, 140.0, 0.0, "2024-06-01T00:00:00Z").await;
     common::seed_daily_prices(pool, "-SYM", "2024-01-01", "2024-06-28", "110.0").await;
-    seed_split_sync(pool, "-SYM").await;
+    seed_split_sync(pool, asset_id).await;
     port_id
 }
 
@@ -348,7 +348,7 @@ async fn a_sub_second_transaction_date_still_projects_exactly() {
     common::seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     common::seed_transaction_at(&pool, asset_id, "SELL", 4.0, 130.0, 0.0, "2024-05-01T00:00:00.123456Z").await;
     common::seed_daily_prices(&pool, "SUBSEC", "2024-01-01", "2024-06-28", "110.0").await;
-    seed_split_sync(&pool, "SUBSEC").await;
+    seed_split_sync(&pool, asset_id).await;
     let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     let q = "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30";
 
@@ -413,7 +413,7 @@ async fn each_rfc4180_trigger_forces_quoting_on_its_own() {
         common::seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
         common::seed_transaction_at(&pool, asset_id, "SELL", 4.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
         common::seed_daily_prices(&pool, symbol, "2024-01-01", "2024-06-28", "110.0").await;
-        seed_split_sync(&pool, symbol).await;
+        seed_split_sync(&pool, asset_id).await;
         let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
 
         let csv = client
@@ -455,7 +455,7 @@ async fn a_window_with_no_rows_is_a_header_and_nothing_else() {
     // Fully sold before the window opens: no sells inside it, and nothing left open.
     common::seed_transaction_at(&pool, asset_id, "SELL", 10.0, 130.0, 0.0, "2024-02-01T00:00:00Z").await;
     common::seed_daily_prices(&pool, "QUIET", "2024-01-01", "2024-06-28", "110.0").await;
-    seed_split_sync(&pool, "QUIET").await;
+    seed_split_sync(&pool, asset_id).await;
     let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     let q = "strategy=FIFO&threshold_days=30&from=2024-03-01&to=2024-06-28";
 

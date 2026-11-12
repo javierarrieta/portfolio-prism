@@ -162,8 +162,16 @@ async fn undated_summary(
 
     for asset in assets {
         // Auto-detect and persist any unrecorded stock splits for this asset before
-        // computing tax lots, so they feed into P&L and value.
-        let _ = currency_service.sync_splits_for_asset(asset, pool).await;
+        // computing tax lots, so they feed into P&L and value. A failure must not stop
+        // the report, but it must not be invisible either: a missed split is a wrong
+        // cost basis, and every failure path in the sync returns Ok or an Err that
+        // used to be discarded here.
+        if let Err(e) = currency_service.sync_splits_for_asset(asset, pool).await {
+            eprintln!(
+                "WARN: split sync failed for asset {} ({}): {}",
+                asset.id, asset.symbol, e
+            );
+        }
 
         let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
             .bind(asset.id)
@@ -251,9 +259,15 @@ pub async fn get_portfolio_performance(
         .map_err(|_| Status::InternalServerError)?;
 
     // Auto-detect and persist any unrecorded stock splits so historical
-    // portfolio value is scaled correctly.
+    // portfolio value is scaled correctly. Logged rather than discarded for the same
+    // reason as the tax-summary path above.
     for asset in &assets {
-        let _ = currency_service.sync_splits_for_asset(asset, pool.inner()).await;
+        if let Err(e) = currency_service.sync_splits_for_asset(asset, pool.inner()).await {
+            eprintln!(
+                "WARN: split sync failed for asset {} ({}): {}",
+                asset.id, asset.symbol, e
+            );
+        }
     }
 
     let transactions = sqlx::query_as::<_, Transaction>(

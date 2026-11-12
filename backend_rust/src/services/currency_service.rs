@@ -883,9 +883,11 @@ impl CurrencyService {
     }
 
     /// Fetch Yahoo Finance split history for an asset and insert any splits not
-    /// already recorded as `SPLIT` transactions. Runs at most once per symbol per
-    /// 30-day window (tracked in the `split_sync` table). Splits dated before the
-    /// asset's first transaction are skipped. Returns the number inserted.
+    /// already recorded as `SPLIT` transactions. Runs at most once per **asset** per
+    /// 30-day window (tracked in the `split_sync` table), and only when that window
+    /// still covers the asset's own history — see the throttle comment below. Splits
+    /// dated before the asset's first transaction are skipped. Returns the number
+    /// inserted.
     pub async fn sync_splits_for_asset(
         &self,
         asset: &Asset,
@@ -893,28 +895,51 @@ impl CurrencyService {
     ) -> Result<usize> {
         let today = Utc::now().date_naive();
 
-        let last_sync: Option<(String,)> = sqlx::query_as(
-            "SELECT last_synced_at FROM split_sync WHERE symbol = ?"
-        )
-        .bind(&asset.symbol)
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some((last,)) = last_sync {
-            if let Ok(last_date) = NaiveDate::parse_from_str(&last, "%Y-%m-%d") {
-                if (today - last_date).num_days() < 30 {
-                    return Ok(0);
-                }
-            }
-        }
-
-        let earliest: Option<(NaiveDate,)> = sqlx::query_as(
+        // The asset's own earliest transaction, read *before* the throttle check
+        // because the throttle now depends on it.
+        let earliest: (Option<NaiveDate>,) = sqlx::query_as(
             "SELECT MIN(date(date)) FROM transactions WHERE asset_id = ?"
+        )
+        .bind(asset.id)
+        .fetch_one(pool)
+        .await?;
+        let earliest_date = earliest.0;
+
+        // Throttle, keyed per asset (#38). Keyed on the symbol, the first asset
+        // holding a symbol suppressed every other asset holding it for 30 days, even
+        // though which splits get inserted is decided by this asset's earliest
+        // transaction. Two conditions, both load-bearing:
+        //
+        //   * the window — a newly announced split still has to be picked up, so a
+        //     coverage date that is old enough must not skip forever;
+        //   * the coverage — if the asset gained a transaction older than the last
+        //     sync evaluated, splits predating the old earliest are still missing and
+        //     a fresh window would not have noticed.
+        let throttle: Option<(String, Option<NaiveDate>)> = sqlx::query_as(
+            "SELECT last_synced_at, covered_from FROM split_sync WHERE asset_id = ?"
         )
         .bind(asset.id)
         .fetch_optional(pool)
         .await?;
-        let earliest_date = earliest.map(|(d,)| d);
+
+        if let Some((last, covered_from)) = throttle {
+            let within_window = NaiveDate::parse_from_str(&last, "%Y-%m-%d")
+                .map(|last_date| (today - last_date).num_days() < 30)
+                .unwrap_or(false);
+            let still_covered = match (earliest_date, covered_from) {
+                // No transactions then and none now: there is nothing to cover.
+                (None, None) => true,
+                // A recorded coverage date reaching at least as far back as the
+                // asset's own history is the only thing that proves no new split is
+                // owed. `covered_from` is NULL when the last sync ran with no
+                // transactions at all, which does not cover a transaction added since.
+                (Some(now), Some(covered)) => now >= covered,
+                _ => false,
+            };
+            if within_window && still_covered {
+                return Ok(0);
+            }
+        }
 
         let end_ts = Utc::now().timestamp();
         let url = format!(
@@ -971,11 +996,14 @@ impl CurrencyService {
 
         let inserted = apply_split_events(asset.id, earliest_date, &events, pool).await?;
 
-        sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
-            .bind(&asset.symbol)
-            .bind(today)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at, covered_from) VALUES (?, ?, ?)",
+        )
+        .bind(asset.id)
+        .bind(today)
+        .bind(earliest_date)
+        .execute(pool)
+        .await?;
 
         Ok(inserted)
     }
@@ -1423,7 +1451,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         make_split_tx_table(&pool).await;
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS split_sync (symbol TEXT PRIMARY KEY, last_synced_at DATE NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS split_sync (asset_id INTEGER PRIMARY KEY, last_synced_at DATE NOT NULL, covered_from DATE)"
         )
         .execute(&pool)
         .await
@@ -1431,9 +1459,12 @@ mod tests {
 
         // A recent sync record must short-circuit before any network call, so the
         // symbol here can be bogus — the function should not try to resolve it.
+        // `covered_from` is left NULL because this asset has no transactions: "synced
+        // while there was nothing to cover" is the one state that needs no coverage
+        // date. Give it a transaction and the same row no longer suppresses a sync.
         let today = Utc::now().date_naive();
-        sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
-            .bind("THROTTLETEST")
+        sqlx::query("INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at) VALUES (?, ?)")
+            .bind(1)
             .bind(today)
             .execute(&pool)
             .await

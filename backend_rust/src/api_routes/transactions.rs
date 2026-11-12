@@ -168,6 +168,16 @@ pub async fn delete_asset(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -
         return Err(Status::NotFound);
     }
 
+    // Drop the asset's split-sync throttle row with it. Not a correctness
+    // requirement — `assets.id` is AUTOINCREMENT, so the id is never handed to a
+    // later asset and a stale row cannot mis-throttle anything. This just stops the
+    // throttle table keeping one permanent row per asset the user ever deleted.
+    sqlx::query("DELETE FROM split_sync WHERE asset_id = ?")
+        .bind(id)
+        .execute(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?;
+
     Ok(Status::NoContent)
 }
 
