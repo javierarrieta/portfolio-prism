@@ -7,7 +7,10 @@
 
 use chrono::{NaiveDate, Utc};
 use sqlx::SqlitePool;
-use crate::backup::{Bundle, BundleAsset, BundlePortfolio, BundlePrice, BundleTransaction, FORMAT_TAG};
+use crate::backup::{
+    Bundle, BundleAsset, BundlePortfolio, BundlePrice, BundleTransaction, CURRENT_SCHEMA_VERSION,
+    FORMAT_TAG, MAX_BUNDLE_ROWS, row_count,
+};
 
 /// A database failure, kept distinct from a client error so the handler can answer
 /// `503` for a lock and `500` for anything else. Collapsing the two is what
@@ -35,7 +38,15 @@ impl DbFailure {
 /// raw code), and Postgres — later — reports `40001` serialisation failure and
 /// `40P01` deadlock detected. The message check is the belt: it is what a bundled
 /// SQLite build actually prints.
+///
+/// Pool exhaustion counts as busy too, and not only by analogy. Under SQLite a reader
+/// rarely lives long enough to meet `SQLITE_BUSY` — the likelier way to be kept out is
+/// every connection in the pool being checked out — and `PoolTimedOut` is exactly as
+/// retryable, so it must not answer a bare `500` where the caller was told to retry.
 pub fn classify(e: sqlx::Error) -> DbFailure {
+    if matches!(e, sqlx::Error::PoolTimedOut) {
+        return DbFailure::Lock;
+    }
     if let sqlx::Error::Database(db) = &e {
         let code = db.code().map(|c| c.to_string()).unwrap_or_default();
         let message = db.message().to_lowercase();
@@ -98,10 +109,32 @@ pub async fn build(
 
     Ok(Bundle {
         format: FORMAT_TAG.to_string(),
-        schema_version: 1,
+        schema_version: CURRENT_SCHEMA_VERSION,
         created_at: Utc::now().to_rfc3339(),
         portfolios,
         prices,
+    })
+}
+
+/// Why a built bundle is too large to hand back, or `None` when it fits.
+///
+/// `MAX_BUNDLE_ROWS` is what restore enforces on the way in, so an export over the
+/// ceiling produces a file its own restore will refuse — discovered by the user, after
+/// the download. Checked here instead, where the caller can still do something about
+/// it. A function rather than an inline `if` so the boundary is testable without
+/// seeding 50k rows.
+///
+/// The **byte** ceiling stays an upload-side limit: nothing at export time knows the
+/// serialised size cheaply, and a price-heavy selection can still produce a bundle
+/// over `MAX_BUNDLE_BYTES`. That is a known limitation, recorded for the spec's
+/// follow-ups.
+pub fn row_cap_error(bundle: &Bundle) -> Option<String> {
+    let rows = row_count(bundle);
+    (rows > MAX_BUNDLE_ROWS).then(|| {
+        format!(
+            "that selection is {rows} rows, over the {MAX_BUNDLE_ROWS} row limit; \
+             export fewer portfolios"
+        )
     })
 }
 
@@ -183,4 +216,81 @@ async fn prices_for(
         }));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::ACCEPTED_VERSIONS;
+    use rocket::http::Status;
+
+    /// A bundle of `1 + assets` counted rows: one portfolio plus that many empty
+    /// assets, which is the cheapest way to sit exactly on either side of the cap.
+    fn bundle_with_assets(assets: usize) -> Bundle {
+        Bundle {
+            format: FORMAT_TAG.to_string(),
+            schema_version: CURRENT_SCHEMA_VERSION,
+            created_at: "2026-11-13T00:00:00Z".to_string(),
+            portfolios: vec![BundlePortfolio {
+                bundle_ref: "p1".into(),
+                name: "P".into(),
+                description: None,
+                currency: "USD".into(),
+                base_currency: "USD".into(),
+                assets: (0..assets)
+                    .map(|i| BundleAsset {
+                        bundle_ref: format!("a{i}"),
+                        symbol: "S".into(),
+                        name: "S".into(),
+                        asset_type: "STOCK".into(),
+                        sector: None,
+                        currency: "USD".into(),
+                        isin: None,
+                        transactions: vec![],
+                    })
+                    .collect(),
+            }],
+            prices: vec![],
+        }
+    }
+
+    /// The two statuses are what keeps a busy database distinguishable from an
+    /// outage for the caller, so they are pinned rather than implied by the handler.
+    #[test]
+    fn a_lock_is_retryable_and_anything_else_is_an_outage() {
+        assert_eq!(DbFailure::Lock.status(), Status::ServiceUnavailable);
+        assert_eq!(DbFailure::Other.status(), Status::InternalServerError);
+    }
+
+    #[test]
+    fn pool_exhaustion_is_busy_and_a_plain_error_is_not() {
+        assert!(matches!(classify(sqlx::Error::PoolTimedOut), DbFailure::Lock));
+        assert!(matches!(classify(sqlx::Error::RowNotFound), DbFailure::Other));
+    }
+
+    /// The writer's version and the accepted set cannot be edited apart: a bundle
+    /// this build writes is a bundle this build can read back.
+    #[test]
+    fn the_written_schema_version_is_the_newest_accepted() {
+        assert_eq!(
+            CURRENT_SCHEMA_VERSION,
+            *ACCEPTED_VERSIONS.last().expect("there is always a newest accepted version"),
+            "export would keep emitting a version the format has moved past"
+        );
+    }
+
+    #[test]
+    fn a_bundle_exactly_at_the_row_ceiling_is_still_exportable() {
+        let b = bundle_with_assets(MAX_BUNDLE_ROWS - 1);
+        assert_eq!(row_count(&b), MAX_BUNDLE_ROWS);
+        assert_eq!(row_cap_error(&b), None);
+    }
+
+    #[test]
+    fn one_row_over_the_ceiling_is_refused_naming_the_cap_and_the_remedy() {
+        let b = bundle_with_assets(MAX_BUNDLE_ROWS);
+        let err = row_cap_error(&b).expect("one row over the cap must be refused");
+        assert!(err.contains(&MAX_BUNDLE_ROWS.to_string()), "{err}");
+        assert!(err.contains("export fewer portfolios"), "{err}");
+    }
 }

@@ -13,7 +13,10 @@
 
 mod common;
 
-use common::{build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction, setup_db};
+use common::{
+    build_rocket, disabled_config, seed_asset, seed_daily_prices, seed_portfolio, seed_transaction,
+    setup_db,
+};
 use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
@@ -22,6 +25,7 @@ use rocket::{get, post, routes};
 use serde_json::{json, Value};
 
 use backend_rust::api_routes::backup::{BackupError, lock_response};
+use backend_rust::backup::export::{self as backup_export, DbFailure};
 use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES};
 
 /// The session header the existing tests use to run as the placeholder user.
@@ -248,6 +252,119 @@ async fn a_duplicate_id_is_exported_once() {
     assert_eq!(body["portfolios"].as_array().unwrap().len(), 1);
 }
 
+/// Price rows for two symbols, only one of which `seed_two_portfolios` puts in the
+/// selection. The unheld one is what makes "prices are for the selection, not for the
+/// whole `historical_prices` table" a checked claim rather than an assumption.
+async fn seed_two_symbols(pool: &sqlx::SqlitePool) {
+    seed_daily_prices(pool, "AAPL", "2024-01-01", "2024-01-03", "150.00").await;
+    seed_daily_prices(pool, "MSFT", "2024-01-01", "2024-01-02", "90.00").await;
+}
+
+#[tokio::test]
+async fn every_on_spelling_includes_only_the_prices_the_selection_holds() {
+    // Rocket's own `bool` form field accepts neither `1` (what the UI sends) nor a
+    // value it would report as an error, so these spellings used to arrive as `None`
+    // and answer a 200 with the requested section missing.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, two) = seed_two_portfolios(&pool).await;
+    seed_two_symbols(&pool).await;
+    let c = client(pool).await;
+
+    for spelling in ["1", "true", "yes", "TRUE"] {
+        let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
+        let res = c.get(&path).header(session()).dispatch().await;
+        assert_eq!(res.status(), Status::Ok, "{spelling}");
+        let body: Value = res.into_json().await.unwrap();
+        let prices = body["prices"]
+            .as_array()
+            .unwrap_or_else(|| panic!("include_prices={spelling} must include prices: {body}"));
+        // Three days of AAPL, and no MSFT: the selection holds AAPL and nothing else.
+        assert_eq!(prices.len(), 3, "include_prices={spelling}: {body}");
+        assert!(prices.iter().all(|p| p["symbol"] == "AAPL"), "{spelling}: {body}");
+        assert_eq!(prices[0]["date"], "2024-01-01", "{spelling}");
+        assert_eq!(prices[0]["close_price"], "150.00", "{spelling}");
+        assert!(
+            !body.to_string().contains("MSFT"),
+            "include_prices={spelling} leaked a symbol the selection does not hold: {body}"
+        );
+    }
+
+    // The empty portfolio asks for prices and gets none: the section follows the
+    // selection's holdings, not the whole `historical_prices` table.
+    let path = format!("/api/backup/export?portfolio_ids={two}&include_prices=1");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(
+        body.get("prices").is_none(),
+        "a portfolio with no assets has no prices to include: {body}"
+    );
+}
+
+#[tokio::test]
+async fn every_off_spelling_omits_the_price_section() {
+    // The mirror half: an explicit no must stay a no, and an omitted section is
+    // skipped rather than serialised as `[]`.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    seed_two_symbols(&pool).await;
+    let c = client(pool).await;
+
+    for spelling in ["0", "false", "no"] {
+        let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
+        let res = c.get(&path).header(session()).dispatch().await;
+        assert_eq!(res.status(), Status::Ok, "{spelling}");
+        let body: Value = res.into_json().await.unwrap();
+        assert!(body.get("prices").is_none(), "include_prices={spelling}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_unrecognised_include_prices_is_a_422_not_a_quiet_omission() {
+    // A value in neither accepted set is the caller's error, said out loud. `on` and
+    // `off` are rocket's spellings, not this flag's: one rule for both flags means the
+    // accepted set is `1/true/yes` and `0/false/no` here and in the environment.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+
+    for spelling in ["maybe", "2", "on", "off", "truest", ""] {
+        let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
+        let res = c.get(&path).header(session()).dispatch().await;
+        assert_eq!(res.status(), Status::UnprocessableEntity, "include_prices={spelling}");
+        let body: Value = res.into_json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("include_prices"),
+            "include_prices={spelling}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_portfolio_ids_parameter_is_refused_not_half_read() {
+    // The same silent-omission class as `include_prices`, from the other direction:
+    // rocket keeps the first value of a repeated field, so `[1] + [2]` reads as a
+    // one-portfolio selection. Refused instead, with a message that says what to do.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, two) = seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+
+    let path = format!("/api/backup/export?portfolio_ids={one}&portfolio_ids={two}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    // Not the "name at least one portfolio" message: the caller named two.
+    assert!(body["error"].as_str().unwrap().contains("only once"), "{body}");
+
+    // The refusal is about the repetition, not about naming several: the documented
+    // comma form still exports both.
+    let path = format!("/api/backup/export?portfolio_ids={one},{two}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["portfolios"].as_array().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn no_global_body_limit_is_raised_for_the_bundle() {
     // The other half of the ruling: because the cap is per route, every other
@@ -301,4 +418,44 @@ async fn a_lock_is_a_503_that_says_when_to_retry() {
     assert!(retry.parse::<u32>().is_ok(), "Retry-After must be a number of seconds: {retry:?}");
     let body: Value = res.into_json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// The database-failure half of the `503`.
+//
+// The handler's `DbFailure::Lock => lock_response()` arm cannot be driven over
+// HTTP from a test: `require` reads the same tables `build` does, so anything that
+// makes the database refuse a read denies the request at `require` (a 500 from
+// `access.rs`) before the arm is reached. Each half is pinned where it can be:
+// `build()` producing `Lock` below, and the response that `Lock` becomes in
+// `a_lock_is_a_503_that_says_when_to_retry` above.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_exhausted_pool_is_a_lock_not_an_outage() {
+    // Under SQLite a reader rarely lives long enough to meet `SQLITE_BUSY`; the
+    // likelier way to be kept out is every connection in the pool being checked out.
+    // That is just as retryable, so it must arrive as the same failure the busy
+    // timeout does rather than a bare 500 with no `Retry-After`.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect(":memory:")
+        .await
+        .unwrap();
+    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
+    let pid = seed_portfolio(&pool, common::DEFAULT_USER, "One", "USD").await;
+
+    // The pool's only connection, held: nothing else can reach the database.
+    let held = pool.acquire().await.unwrap();
+    let err = backup_export::build(&pool, &[pid], false)
+        .await
+        .expect_err("a pool with no free connection cannot answer");
+    assert!(matches!(err, DbFailure::Lock), "expected Lock, got {err:?}");
+    assert_eq!(err.status(), Status::ServiceUnavailable);
+
+    // And it was the exhaustion: with the connection back, the same call answers.
+    drop(held);
+    let bundle = backup_export::build(&pool, &[pid], false).await.unwrap();
+    assert_eq!(bundle.portfolios.len(), 1);
 }

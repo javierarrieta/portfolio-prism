@@ -110,20 +110,25 @@
           {
             "name": "portfolio_ids",
             "in": "query",
-            "description": "Comma-separated portfolio ids to include",
+            "description": "Comma-separated portfolio ids to include; the parameter may appear only once",
             "required": false,
             "schema": {
-              "type": "string",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
               "nullable": true
-            }
+            },
+            "style": "form",
+            "explode": false
           },
           {
             "name": "include_prices",
             "in": "query",
-            "description": "Include the price-history section",
+            "description": "Include the price-history section: 1/true/yes to include, 0/false/no to omit",
             "required": false,
             "schema": {
-              "type": "boolean",
+              "type": "string",
               "nullable": true
             }
           }
@@ -149,7 +154,7 @@
             }
           },
           "422": {
-            "description": "No portfolio selected, or an id did not parse",
+            "description": "No portfolio selected, `portfolio_ids` given more than once, an id that did not parse, or an `include_prices` value that means neither on nor off",
             "content": {
               "application/json": {
                 "schema": {}

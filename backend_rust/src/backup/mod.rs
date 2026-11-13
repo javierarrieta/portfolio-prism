@@ -18,9 +18,14 @@ use serde::{Deserialize, Serialize};
 /// fails here, with a clear message, rather than at the first missing field.
 pub const FORMAT_TAG: &str = "portfolio-prism-backup";
 
+/// The bundle version this build **writes**. The writer uses this rather than a
+/// literal, and `ACCEPTED_VERSIONS` is defined from it, so the version emitted and
+/// the version accepted cannot be edited apart.
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 /// The schema versions this build accepts. `v1.json` is never edited: a format
 /// change adds `v2.json` plus a `v1 -> v2` upgrader and appends `2` here.
-pub const ACCEPTED_VERSIONS: &[i64] = &[1];
+pub const ACCEPTED_VERSIONS: &[i64] = &[CURRENT_SCHEMA_VERSION];
 
 /// Application-level ceiling on an uploaded bundle, enforced **per route**: a
 /// handler opens its own stream with `data.open(MAX_BUNDLE_BYTES.bytes())` rather

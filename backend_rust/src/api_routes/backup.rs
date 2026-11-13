@@ -158,17 +158,36 @@ fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// `?include_prices=` as a boolean, or `None` when the value means neither on nor
+/// off — and `Some(false)` when the parameter is absent, because prices are opt-in.
+///
+/// Parsed as a string against the same accepted sets as the server flag rather than
+/// left to rocket's `bool` form field, because rocket accepts neither `1` nor `0`
+/// there — the spellings the spec and the UI use — and a value it cannot parse on an
+/// `Option` field becomes `None` rather than an error
+/// (`Option<T>::finalize` is `T::finalize(this).ok()`). With `Option<bool>` the
+/// caller would get a 200 with the section they asked for missing, which is the one
+/// failure mode the spec forbids for a flag of this kind: never a silent ignore.
+fn parse_include_prices(raw: Option<&str>) -> Option<bool> {
+    match raw {
+        None => Some(false),
+        Some(raw) if BackupConfig::is_on(raw) => Some(true),
+        Some(raw) if BackupConfig::is_off(raw) => Some(false),
+        Some(_) => None,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/backup/export",
     params(
-        ("portfolio_ids" = String, Query, description = "Comma-separated portfolio ids to include"),
-        ("include_prices" = Option<bool>, Query, description = "Include the price-history section"),
+        ("portfolio_ids" = Vec<String>, Query, style = Form, explode = false, description = "Comma-separated portfolio ids to include; the parameter may appear only once"),
+        ("include_prices" = Option<String>, Query, description = "Include the price-history section: 1/true/yes to include, 0/false/no to omit"),
     ),
     responses(
         (status = 200, description = "The bundle; see docs/backup-schema/v1.json for its shape", body = serde_json::Value),
         (status = 404, description = "A portfolio id is not yours", body = serde_json::Value),
-        (status = 422, description = "No portfolio selected, or an id did not parse", body = serde_json::Value),
+        (status = 422, description = "No portfolio selected, `portfolio_ids` given more than once, an id that did not parse, or an `include_prices` value that means neither on nor off", body = serde_json::Value),
         (status = 503, description = "The database is busy", body = serde_json::Value),
     )
 )]
@@ -176,13 +195,36 @@ fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
 pub async fn export(
     user: AuthedUser,
     pool: &State<SqlitePool>,
-    portfolio_ids: Option<String>,
-    include_prices: Option<bool>,
+    portfolio_ids: Option<Vec<String>>,
+    include_prices: Option<String>,
 ) -> Result<BundleDownload, BackupError> {
-    let ids = match parse_ids(portfolio_ids.as_deref()) {
+    // Read as a sequence so that a repeated `?portfolio_ids=` is something this
+    // handler can see and refuse: rocket collapses a duplicate `Option` field to
+    // `None`, which would have answered "name at least one portfolio" to someone who
+    // named two, and its lenient path would otherwise keep the first value and drop
+    // the rest. One spelling, the comma-separated list the spec documents, is refused
+    // over a half-read selection.
+    let requested = match portfolio_ids.as_deref() {
+        None | Some([]) => None,
+        Some([only]) => Some(only.as_str()),
+        Some(_) => {
+            return Err(fail(
+                Status::UnprocessableEntity,
+                "portfolio_ids may appear only once, as a comma-separated list",
+            ));
+        }
+    };
+
+    let ids = match parse_ids(requested) {
         Some(ids) => ids,
         None => return Err(fail(Status::UnprocessableEntity,
             "portfolio_ids must name at least one portfolio, e.g. ?portfolio_ids=1,2")),
+    };
+
+    let include_prices = match parse_include_prices(include_prices.as_deref()) {
+        Some(v) => v,
+        None => return Err(fail(Status::UnprocessableEntity,
+            "include_prices must be one of 1/true/yes or 0/false/no")),
     };
 
     // Every id, before any data query. The gate script's Rule B does not see
@@ -194,13 +236,27 @@ pub async fn export(
             .map_err(|status| fail(status, "portfolio not found"))?;
     }
 
-    let bundle = backup_export::build(pool.inner(), &ids, include_prices.unwrap_or(false))
+    let bundle = backup_export::build(pool.inner(), &ids, include_prices)
         .await
         .map_err(|e| match e {
+            // Neither arm can be driven from a local request: any database failure a
+            // test could provoke would first deny `require`, which answers 500 from
+            // `access.rs` before this call is reached. Both halves of the `Lock` path
+            // are pinned where they can be — `build()` producing `DbFailure::Lock`
+            // for an exhausted pool
+            // (`tests/backup_test.rs::an_exhausted_pool_is_a_lock_not_an_outage`) and
+            // the response a `Lock` becomes
+            // (`a_lock_is_a_503_that_says_when_to_retry`).
             DbFailure::Lock => lock_response(),
-            DbFailure::Other => fail(Status::InternalServerError,
+            DbFailure::Other => fail(DbFailure::Other.status(),
                 "could not read the portfolio data"),
         })?;
+
+    // A bundle over the row ceiling is one restore will refuse, so it is refused here
+    // too — see `backup_export::row_cap_error`.
+    if let Some(reason) = backup_export::row_cap_error(&bundle) {
+        return Err(fail(Status::UnprocessableEntity, reason));
+    }
 
     Ok(BundleDownload {
         bundle: Json(bundle),
