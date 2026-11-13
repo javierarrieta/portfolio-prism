@@ -49,11 +49,26 @@ pub struct BackupConfig {
 
 impl BackupConfig {
     /// The only spellings that mean on, after trimming and lowercasing. One rule, so
-    /// `from_env_with` and `main`'s "not recognised" warning cannot disagree about
-    /// what the operator wrote. Anything else means off: this flag gates writes to
-    /// shared `historical_prices`, so it fails closed.
+    /// `from_env_with` and `main`'s warning cannot disagree about what the operator
+    /// wrote. Anything outside both accepted sets means off: this flag gates writes
+    /// to shared `historical_prices`, so it fails closed.
     pub fn is_on(raw: &str) -> bool {
         matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    }
+
+    /// The spellings that mean off — the mirror of `is_on`, and just as closed.
+    /// `main` treats a value in either set as a decision and stays quiet about it;
+    /// a WARN that fires on `0` is a WARN operators learn to ignore, including the
+    /// one that matters.
+    pub fn is_off(raw: &str) -> bool {
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no")
+    }
+
+    /// Whether the value means anything to this build, in either direction. This is
+    /// what `main` tests before calling a value unrecognised — `!is_on` alone would
+    /// warn about an intentional `0`.
+    pub fn is_recognised(raw: &str) -> bool {
+        Self::is_on(raw) || Self::is_off(raw)
     }
 
     pub fn from_env() -> Self {
@@ -406,8 +421,9 @@ mod tests {
         for on in ["1", "true", "yes", "TRUE", "Yes", " 1 ", "\ttrue\n"] {
             assert!(with(Some(on)), "{on:?} should mean on");
         }
-        // Plausible spellings that mean nothing to this build. They fail closed, and
-        // `main` warns about them; both halves matter.
+        // Spellings that do not mean on. `0`/`false`/`no` are the accepted way to say
+        // off; the rest mean nothing to this build. Both fail closed, and `main`
+        // warns only about the second group.
         for off in ["0", "false", "no", "on", "y", "enabled", "2", "truest"] {
             assert!(!with(Some(off)), "{off:?} must not mean on");
         }
@@ -419,14 +435,42 @@ mod tests {
 
     #[test]
     fn is_on_and_from_env_with_agree_on_every_spelling() {
-        // `main` warns using `is_on`; if the two diverged, an operator would be told
-        // their value was fine while the flag stayed off.
+        // `from_env_with` decides the flag from `is_on`; if the two diverged, the
+        // config would not mean what the environment says it means.
         for raw in ["1", "true", "yes", " TRUE ", "0", "on", "", "  "] {
             assert_eq!(
                 BackupConfig::is_on(raw),
                 BackupConfig::from_env_with(&|_| Some(raw.to_string())).allow_price_restore,
                 "{raw:?} parsed two ways"
             );
+        }
+    }
+
+    /// `main` warns about a value in neither set and stays silent about a value in
+    /// one of them. `0` is a decision, not a typo: a WARN that fires on it trains
+    /// operators to skim past the warning that the flag is **on**.
+    #[test]
+    fn only_a_value_in_neither_set_is_unrecognised() {
+        for raw in ["1", "true", "yes", " TRUE ", "0", "false", "no", " NO ", " 0 "] {
+            assert!(
+                BackupConfig::is_recognised(raw),
+                "{raw:?} is an accepted spelling and must not be warned about"
+            );
+            assert_ne!(
+                BackupConfig::is_on(raw),
+                BackupConfig::is_off(raw),
+                "{raw:?} must mean exactly one of on or off"
+            );
+        }
+        // Including `off`: it is not the mirror of `yes`, so it means nothing here,
+        // and the operator gets told the accepted spellings rather than believing a
+        // value took effect. Fails closed, and says so.
+        for raw in ["", "  ", "on", "off", "y", "enabled", "2", "truest"] {
+            assert!(
+                !BackupConfig::is_recognised(raw),
+                "{raw:?} means nothing, so main must warn about it"
+            );
+            assert!(!BackupConfig::is_on(raw), "{raw:?} must not mean on");
         }
     }
 

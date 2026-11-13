@@ -126,8 +126,8 @@ fn the_gate_rejects_a_handler_that_checks_after_reading() {
 // Rule A's per-handler marker.
 //
 // Rule A's invariant is per handler — a handler that resolves a caller-supplied id
-// goes through `access` — so the waiver has to be per handler too. These three
-// cases are the difference between a marker and a bypass.
+// goes through `access` — so the waiver has to be per handler too. These cases are
+// the difference between a marker and a bypass.
 // ---------------------------------------------------------------------------
 
 /// One handler that has nothing to send to the chokepoint, marked, and one that
@@ -181,6 +181,34 @@ const CONTRADICTORY_MARKER: &str = r#"use crate::auth::guard::AuthedUser;
 #[get("/export/<portfolio_id>")]
 pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, portfolio_id: i32) -> Json<Value> {
     let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = ?").bind(portfolio_id);
+    Json(json!({}))
+}
+"#;
+
+/// The same defect with a parameter nobody would think to call `id`. The marker's
+/// claim is "no caller-supplied id", not "no id-named id", so a check keyed on the
+/// spelling `id` is a check on one spelling of the bypass rather than on the bypass.
+const ID_LESS_PARAMETER: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get("/backup/export/<portfolio>")]
+pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, portfolio: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = ?").bind(portfolio);
+    Json(json!({}))
+}
+"#;
+
+/// The same route attribute split across lines, which is what `rustfmt` does to a
+/// long one. Testing only the line that opened the attribute would see `#[get(` and
+/// no parameter at all.
+const WRAPPED_ATTRIBUTE: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get(
+    "/export/<id>"
+)]
+pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE id = ?").bind(id);
     Json(json!({}))
 }
 "#;
@@ -240,4 +268,33 @@ fn a_marker_on_a_route_that_takes_an_id_is_refused() {
         "the contradictory marker was honoured anyway:\n{text}"
     );
     assert_eq!(code, 1, "a false marker must fail the gate:\n{text}");
+}
+
+#[test]
+fn a_marker_is_refused_whatever_the_parameter_is_called() {
+    // `<portfolio>`, `<key>`, `<target>`: caller-supplied just as much as `<id>`, and
+    // Rule B cannot see the query either (`WHERE portfolio_id` is its blind spot),
+    // so a name-keyed cross-check would leave nothing standing at all.
+    let (code, text) = run_tree("id-less-param", ID_LESS_PARAMETER);
+    assert!(
+        text.contains("MARKER-CONTRADICTS") && text.contains("export"),
+        "a marker was honoured on a route whose parameter name lacks the letters id:\n{text}"
+    );
+    assert!(
+        !text.contains("waived"),
+        "the contradictory marker was honoured anyway:\n{text}"
+    );
+    assert_eq!(code, 1, "a parameter name must not be a way past the gate:\n{text}");
+}
+
+#[test]
+fn a_marker_is_refused_on_a_wrapped_route_attribute() {
+    // The parameter is on the line after `#[get(`, where rustfmt puts it once the
+    // path is long. Reading only the opening line sees no parameter.
+    let (code, text) = run_tree("wrapped", WRAPPED_ATTRIBUTE);
+    assert!(
+        text.contains("MARKER-CONTRADICTS") && text.contains("export"),
+        "a parameter on a continuation line of the attribute was not seen:\n{text}"
+    );
+    assert_eq!(code, 1, "a wrapped attribute must not hide a contradiction:\n{text}");
 }

@@ -103,11 +103,13 @@ async fn main() -> Result<(), rocket::Error> {
     if backup_cfg.allow_price_restore {
         eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE is on; a restore may write shared historical_prices rows");
     } else if let Some(raw) = std::env::var("BACKUP_ALLOW_PRICE_RESTORE").ok()
-        && !backend_rust::backup::BackupConfig::is_on(&raw)
+        && !backend_rust::backup::BackupConfig::is_recognised(&raw)
     {
         // An operator who wrote `on` or `enabled` believes price restore is enabled.
         // Saying nothing would leave them believing it while restores quietly refuse.
-        eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE={raw:?} is not recognised; price restore stays off (use 1, true, or yes)");
+        // A value in either accepted set is a decision and stays quiet: warning about
+        // `0` would train operators to ignore the warning above this one.
+        eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE={raw:?} is not recognised; price restore stays off (1/true/yes to enable, 0/false/no to disable)");
     }
 
     build_rocket(pool, currency_service, cors, auth, backup_cfg)

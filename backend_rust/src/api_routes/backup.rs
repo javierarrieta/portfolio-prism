@@ -11,8 +11,9 @@
 //! `// access-gate: global-config (no caller-supplied id)` immediately above the
 //! route attribute — below `#[utoipa::path(...)]`, since the gate reads the line
 //! directly above `#[get]`/`#[post]`. That waives Rule A's `require*` half for that
-//! one handler and no other; the gate also refuses the marker if the route path
-//! itself names an id, Rules B and C still apply, and every waiver is printed.
+//! one handler and no other; the gate also refuses the marker if the route itself
+//! takes a path parameter — any one, whatever it is called — Rules B and C still
+//! apply, and every waiver is printed.
 //!
 //! An uploaded bundle is read through a `Data` guard and opened under
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
