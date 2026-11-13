@@ -23,6 +23,22 @@ export interface paths {
   "/api/portfolios/<id>/performance": {
     get: operations["get_portfolio_performance"];
   };
+  "/api/portfolios/<id>/sync-splits": {
+    /**
+     * The explicit split-sync action that replaces the sync these read paths used to do
+     * @description silently (#50).
+     *
+     * A POST, not a GET, because it writes: it fetches from the provider and inserts
+     * `SPLIT` transactions. That is what gives a provider outage somewhere to be reported
+     * — as a 503 with a retry hint, rather than as a 200 whose numbers are quietly
+     * pre-split.
+     *
+     * The per-asset throttle from #38 still applies, so this is cheap to call: an asset
+     * synced within the window and whose history is still covered costs one indexed read,
+     * not a provider round trip.
+     */
+    post: operations["sync_portfolio_splits"];
+  };
   "/api/portfolios/<id>/tax-summary": {
     /**
      * The tax summary, or — with `from` and/or `to` — the dated tax report.
@@ -208,6 +224,14 @@ export interface components {
       /** Format: int32 */
       id: number;
       name: string;
+      /**
+       * @description When the least recently synced asset in this portfolio last synced splits,
+       * or `None` when any asset has never synced. `None` is not "long ago" — it means
+       * no split has ever been looked up for every asset here, which the UI says in
+       * those words rather than as an age. See #50: split sync is an explicit action
+       * now, so a stale portfolio has to be visible rather than silently wrong.
+       */
+      splits_last_synced_at?: string | null;
     };
     PortfolioUpdate: {
       currency: string;
@@ -388,6 +412,25 @@ export interface components {
       /** Format: int32 */
       transaction_id: number;
       unmatched_qty: string;
+    };
+    /** @description One asset whose split sync failed while syncing a whole portfolio. */
+    SyncSplitFailure: {
+      /** Format: int32 */
+      asset_id: number;
+      error: string;
+      symbol: string;
+    };
+    /** @description Outcome of `POST /api/portfolios/<id>/sync-splits`. */
+    SyncSplitsOut: {
+      assets_checked: number;
+      /**
+       * @description Assets that could not be synced. A partial failure is still a 200 — the ones
+       * that worked were written — and the caller shows this list. When *every* asset
+       * fails the route answers 503 instead, because that is a provider outage and
+       * retrying later is the only fix.
+       */
+      failures: components["schemas"]["SyncSplitFailure"][];
+      splits_inserted: number;
     };
     TaxLot: {
       /** Format: date-time */
@@ -628,6 +671,55 @@ export interface operations {
       /** @description Portfolio not found */
       404: {
         content: never;
+      };
+    };
+  };
+  /**
+   * The explicit split-sync action that replaces the sync these read paths used to do
+   * @description silently (#50).
+   *
+   * A POST, not a GET, because it writes: it fetches from the provider and inserts
+   * `SPLIT` transactions. That is what gives a provider outage somewhere to be reported
+   * — as a 503 with a retry hint, rather than as a 200 whose numbers are quietly
+   * pre-split.
+   *
+   * The per-asset throttle from #38 still applies, so this is cheap to call: an asset
+   * synced within the window and whose history is still covered costs one indexed read,
+   * not a provider round trip.
+   */
+  sync_portfolio_splits: {
+    parameters: {
+      path: {
+        id: number;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": unknown;
+      };
+    };
+    responses: {
+      /** @description Synced; per-asset failures listed in the body */
+      200: {
+        content: {
+          "application/json": components["schemas"]["SyncSplitsOut"];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description Portfolio not found */
+      404: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
+      };
+      /** @description Every asset failed to sync — a provider outage */
+      503: {
+        content: {
+          "application/json": components["schemas"]["ErrorBody"];
+        };
       };
     };
   };

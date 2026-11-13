@@ -72,6 +72,32 @@ pub struct PortfolioOut {
     pub description: Option<String>,
     pub currency: String,
     pub assets: Vec<AssetOut>,
+    /// When the least recently synced asset in this portfolio last synced splits,
+    /// or `None` when any asset has never synced. `None` is not "long ago" — it means
+    /// no split has ever been looked up for every asset here, which the UI says in
+    /// those words rather than as an age. See #50: split sync is an explicit action
+    /// now, so a stale portfolio has to be visible rather than silently wrong.
+    pub splits_last_synced_at: Option<String>,
+}
+
+/// One asset whose split sync failed while syncing a whole portfolio.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SyncSplitFailure {
+    pub asset_id: i32,
+    pub symbol: String,
+    pub error: String,
+}
+
+/// Outcome of `POST /api/portfolios/<id>/sync-splits`.
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct SyncSplitsOut {
+    pub assets_checked: usize,
+    pub splits_inserted: usize,
+    /// Assets that could not be synced. A partial failure is still a 200 — the ones
+    /// that worked were written — and the caller shows this list. When *every* asset
+    /// fails the route answers 503 instead, because that is a provider outage and
+    /// retrying later is the only fix.
+    pub failures: Vec<SyncSplitFailure>,
 }
 
 // --- Portfolio Update ---
@@ -725,6 +751,7 @@ mod tests {
             description: Some("A test portfolio".to_string()),
             currency: "EUR".to_string(),
             assets: vec![],
+            splits_last_synced_at: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let deserialized: PortfolioOut = serde_json::from_str(&json).unwrap();

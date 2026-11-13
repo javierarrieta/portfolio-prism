@@ -286,6 +286,73 @@
         }
       }
     },
+    "/api/portfolios/<id>/sync-splits": {
+      "post": {
+        "tags": [
+          "crate::api_routes::analytics"
+        ],
+        "summary": "The explicit split-sync action that replaces the sync these read paths used to do",
+        "description": "silently (#50).\n\nA POST, not a GET, because it writes: it fetches from the provider and inserts\n`SPLIT` transactions. That is what gives a provider outage somewhere to be reported\n— as a 503 with a retry hint, rather than as a 200 whose numbers are quietly\npre-split.\n\nThe per-asset throttle from #38 still applies, so this is cheap to call: an asset\nsynced within the window and whose history is still covered costs one indexed read,\nnot a provider round trip.",
+        "operationId": "sync_portfolio_splits",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "default": null,
+                "nullable": true
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Synced; per-asset failures listed in the body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncSplitsOut"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "Portfolio not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Every asset failed to sync — a provider outage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/portfolios/<id>/tax-summary": {
       "get": {
         "tags": [
@@ -1151,6 +1218,11 @@
           },
           "name": {
             "type": "string"
+          },
+          "splits_last_synced_at": {
+            "type": "string",
+            "description": "When the least recently synced asset in this portfolio last synced splits,\nor `None` when any asset has never synced. `None` is not \"long ago\" — it means\nno split has ever been looked up for every asset here, which the UI says in\nthose words rather than as an age. See #50: split sync is an explicit action\nnow, so a stale portfolio has to be visible rather than silently wrong.",
+            "nullable": true
           }
         }
       },
@@ -1548,6 +1620,53 @@
           },
           "unmatched_qty": {
             "type": "string"
+          }
+        }
+      },
+      "SyncSplitFailure": {
+        "type": "object",
+        "description": "One asset whose split sync failed while syncing a whole portfolio.",
+        "required": [
+          "asset_id",
+          "symbol",
+          "error"
+        ],
+        "properties": {
+          "asset_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "error": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "SyncSplitsOut": {
+        "type": "object",
+        "description": "Outcome of `POST /api/portfolios/<id>/sync-splits`.",
+        "required": [
+          "assets_checked",
+          "splits_inserted",
+          "failures"
+        ],
+        "properties": {
+          "assets_checked": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncSplitFailure"
+            },
+            "description": "Assets that could not be synced. A partial failure is still a 200 — the ones\nthat worked were written — and the caller shows this list. When *every* asset\nfails the route answers 503 instead, because that is a provider outage and\nretrying later is the only fix."
+          },
+          "splits_inserted": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },

@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Plus, Trash2, ChevronDown, ChevronUp, Upload } from 'lucide-react';
+import { Plus, Trash2, ChevronDown, ChevronUp, Upload, RefreshCw } from 'lucide-react';
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import { 
   Portfolio, 
@@ -83,6 +83,39 @@ export default function PortfolioDetail({
   const [txForm, setTxForm] = useState({ asset_id: '', type: 'BUY' as TransactionType, quantity: '', price: '', fee: '0.0', date: new Date().toISOString().slice(0, 16) });
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [isLookingUp, setIsLookingUp] = useState(false);
+  const [syncingSplits, setSyncingSplits] = useState(false);
+  const [splitSyncMsg, setSplitSyncMsg] = useState<string | null>(null);
+
+  // Split sync used to happen as a side effect of loading the portfolio. It is an
+  // explicit POST now, so the outcome has to be said out loud: "no new splits" and
+  // "the provider was unreachable" look identical if you do not say which happened.
+  const syncSplits = async () => {
+    setSyncingSplits(true);
+    setSplitSyncMsg(null);
+    try {
+      const res = await apiFetch(`/api/portfolios/${portfolio.id}/sync-splits`, { method: 'POST' });
+      const body = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (!res.ok) {
+        setSplitSyncMsg(typeof body.error === 'string' ? body.error : `Split sync failed (${res.status})`);
+        return;
+      }
+      const inserted = Number(body.splits_inserted ?? 0);
+      const failed = Array.isArray(body.failures) ? body.failures.length : 0;
+      const tail = failed ? ` ${failed} asset(s) could not be synced.` : '';
+      setSplitSyncMsg(
+        inserted > 0
+          ? `Recorded ${inserted} split${inserted === 1 ? '' : 's'}.${tail}`
+          : `No new splits.${tail}`
+      );
+      // A new split changes cost basis everywhere on the page, so re-read rather than
+      // patching the figures in place.
+      if (inserted > 0) await onFetchPortfolioData();
+    } catch {
+      setSplitSyncMsg('Split sync failed: network error');
+    } finally {
+      setSyncingSplits(false);
+    }
+  };
   const lastLookedUpIsin = useRef('');
   
   const handleAssetSubmit = async (e: React.FormEvent) => {
@@ -211,6 +244,34 @@ export default function PortfolioDetail({
         <button onClick={() => setShowImportModal(true)} className="btn btn-primary">
           <Upload size={16} /> Import CSV
         </button>
+        {assets.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginLeft: 'auto' }}>
+            <span
+              style={{
+                fontSize: '0.75rem',
+                color: portfolio.splits_last_synced_at ? 'var(--text-secondary)' : 'var(--color-warning)',
+              }}
+            >
+              {portfolio.splits_last_synced_at
+                ? `Splits last synced ${portfolio.splits_last_synced_at}`
+                : 'Splits not yet synced for every asset'}
+            </span>
+            <button
+              onClick={syncSplits}
+              disabled={syncingSplits}
+              className="btn btn-secondary"
+              title="Look up stock splits for this portfolio's assets"
+            >
+              <RefreshCw size={16} style={syncingSplits ? { opacity: 0.6 } : undefined} />
+              {syncingSplits ? ' Syncing…' : ' Sync splits'}
+            </button>
+            {splitSyncMsg && (
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }} role="status">
+                {splitSyncMsg}
+              </span>
+            )}
+          </div>
+        )}
         {assets.length === 0 && (
           <>
             <button onClick={() => setShowDeleteConfirm(true)} className="btn btn-secondary" style={{ marginLeft: 'auto', color: 'var(--color-danger)', borderColor: 'var(--color-danger)' }}>

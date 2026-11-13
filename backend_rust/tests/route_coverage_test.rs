@@ -26,6 +26,9 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     ("GET", "/api/portfolios/", Some(Access::Viewer)),
     ("POST", "/api/portfolios/", None),
     ("GET", "/api/portfolios/<id>", Some(Access::Viewer)),
+    // The only write among the portfolio-scoped routes that is not a CRUD edit: it
+    // fetches from the provider and inserts SPLIT rows, so it needs Editor (#50).
+    ("POST", "/api/portfolios/<id>/sync-splits", Some(Access::Editor)),
     ("PATCH", "/api/portfolios/<id>", Some(Access::Owner)),
     ("DELETE", "/api/portfolios/<id>", Some(Access::Owner)),
     (
@@ -137,7 +140,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 15, "the mounted /api surface is 15 operations");
+    assert_eq!(checked, 16, "the mounted /api surface is 16 operations");
 }
 
 #[tokio::test]
@@ -259,7 +262,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 15);
+    assert_eq!(PROTECTED_ROUTES.len(), 16);
 }
 
 #[test]
@@ -273,7 +276,7 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 13,
+        with_level, 14,
         "two routes authenticate without checking an id"
     );
 }

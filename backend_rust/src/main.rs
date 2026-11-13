@@ -1,4 +1,5 @@
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::SqlitePool;
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{get_cors_options, parse_allowed_origins};
 use backend_rust::auth::{finalise_auth, StartupConfig};
@@ -40,7 +41,24 @@ async fn main() -> Result<(), rocket::Error> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite:../portfolio.db?mode=rwc".to_string());
 
-    let pool = SqlitePool::connect(&database_url)
+    // `busy_timeout` rather than WAL. The production volume is `nfs-client` (see
+    // k8s/pv.yaml), and SQLite's own WAL documentation is explicit that WAL does not
+    // work over a network filesystem: it coordinates through a shared-memory `-shm`
+    // file, and on NFS that has produced `SQLITE_CORRUPT` rather than contention. So
+    // the journal mode stays as it is and the only knob turned here is how long a
+    // writer waits for a lock instead of erroring.
+    //
+    // This is a mitigation, not a fix for the underlying exposure: rollback-journal
+    // mode also depends on file locks, and POSIX locks over NFS have their own known
+    // defects. Correctness here does not rest on locking — it rests on the unique
+    // index `enforce_split_uniqueness` installs. Moving the database to block-backed
+    // storage is the real answer and is out of scope for this change.
+    let opts = match database_url.parse::<SqliteConnectOptions>() {
+        Ok(o) => o.busy_timeout(std::time::Duration::from_secs(5)),
+        Err(e) => refuse(anyhow::anyhow!("invalid DATABASE_URL: {e}")),
+    };
+
+    let pool = SqlitePool::connect_with(opts)
         .await
         .expect("Failed to connect to database");
 

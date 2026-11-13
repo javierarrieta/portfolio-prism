@@ -107,13 +107,21 @@ fn f64_to_decimal(v: f64) -> Decimal {
 /// `numerator : denominator` (shares after : shares before). Splits dated before
 /// `earliest_tx_date` are skipped (they would be no-ops since no lots existed).
 /// A split already recorded for the asset on the same calendar day is not
-/// duplicated. Returns the number of transactions inserted.
+/// duplicated — enforced by `uq_split_asset_date`, so a concurrent writer cannot
+/// slip a second row in between a check and this insert. Returns the number of
+/// transactions actually inserted, which is zero when every event was already there.
 pub async fn apply_split_events(
     asset_id: i32,
     earliest_tx_date: Option<NaiveDate>,
     events: &[(NaiveDate, u32, u32)],
     pool: &SqlitePool,
 ) -> Result<usize, sqlx::Error> {
+    // One transaction for the whole set, so a half-applied multi-split event is not
+    // observable. The dedupe itself is the unique index `uq_split_asset_date`, not a
+    // read: a `SELECT COUNT(*)` before the insert let two concurrent callers both see
+    // zero and both write, which doubled the adjustment. `rows_affected` is therefore
+    // the only honest source for the count — a conflict is a no-op, not an error.
+    let mut tx = pool.begin().await?;
     let mut inserted = 0;
     for (split_date, numerator, denominator) in events {
         if *numerator == 0 || *denominator == 0 {
@@ -125,32 +133,21 @@ pub async fn apply_split_events(
             }
         }
 
-        let existing: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM transactions
-             WHERE asset_id = ? AND type = 'SPLIT' AND date(date) = ?"
-        )
-        .bind(asset_id)
-        .bind(*split_date)
-        .fetch_one(pool)
-        .await?;
-
-        if existing.0 > 0 {
-            continue;
-        }
-
         let dt = split_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO transactions (asset_id, type, quantity, price, fee, date)
-             VALUES (?, 'SPLIT', ?, ?, '0', ?)"
+             VALUES (?, 'SPLIT', ?, ?, '0', ?)
+             ON CONFLICT DO NOTHING",
         )
         .bind(asset_id)
         .bind(numerator.to_string())
         .bind(denominator.to_string())
         .bind(dt)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        inserted += 1;
+        inserted += result.rows_affected() as usize;
     }
+    tx.commit().await?;
     Ok(inserted)
 }
 
@@ -1332,6 +1329,12 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+
+        // The real migration, not a hand-written copy of the index. `apply_split_events`
+        // now leans on `uq_split_asset_date` for its dedupe, so a test fixture that
+        // omits it is testing a schema production never runs — which is exactly how
+        // this helper failed once the count-then-insert guard was removed.
+        crate::enforce_split_uniqueness(pool).await.unwrap();
     }
 
     #[tokio::test]

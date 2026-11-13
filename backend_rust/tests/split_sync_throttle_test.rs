@@ -19,7 +19,7 @@ use common::{
     build_rocket_pricing, disabled_config, seed_asset, seed_portfolio, seed_split_sync,
     seed_transaction_at, setup_db, MockYahoo, DEFAULT_USER,
 };
-use rocket::http::Status;
+use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
 use sqlx::SqlitePool;
 
@@ -81,7 +81,8 @@ async fn two_portfolios_holding_the_same_symbol_each_get_their_own_split() {
 
     for port in [port_a, port_b] {
         let resp = client
-            .get(format!("/api/portfolios/{}/tax-summary?strategy=FIFO", port))
+            .post(format!("/api/portfolios/{}/sync-splits", port))
+            .header(ContentType::JSON)
             .dispatch()
             .await;
         assert_eq!(resp.status(), Status::Ok);
@@ -121,9 +122,10 @@ async fn a_portfolio_that_bought_before_the_split_is_not_suppressed_by_one_that_
         .await
         .unwrap();
 
-    // A loads its summary first. This is the step that used to poison the well.
+    // A syncs first. This is the step that used to poison the well.
     let resp = client
-        .get(format!("/api/portfolios/{}/tax-summary?strategy=FIFO", port_a))
+        .post(format!("/api/portfolios/{}/sync-splits", port_a))
+        .header(ContentType::JSON)
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Ok);
@@ -132,9 +134,10 @@ async fn a_portfolio_that_bought_before_the_split_is_not_suppressed_by_one_that_
         "the split predates A's first trade, so A must get nothing"
     );
 
-    // B loads its summary. B must get the split regardless of A having synced first.
+    // B syncs. B must get the split regardless of A having synced first.
     let resp = client
-        .get(format!("/api/portfolios/{}/tax-summary?strategy=FIFO", port_b))
+        .post(format!("/api/portfolios/{}/sync-splits", port_b))
+        .header(ContentType::JSON)
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Ok);
