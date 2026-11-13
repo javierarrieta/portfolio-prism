@@ -271,8 +271,8 @@ async fn fixture(pool: &SqlitePool, through: &str) -> (i32, i32, i32) {
     common::seed_daily_prices(pool, "HELDIT", "2024-02-01", through, "220.0").await;
     // No split is seeded, so this only has to keep `sync_splits_for_asset` on its cache
     // path for the undated call.
-    seed_split_sync(pool, "SOLDIT").await;
-    seed_split_sync(pool, "HELDIT").await;
+    seed_split_sync(pool, sold).await;
+    seed_split_sync(pool, held).await;
 
     (port_id, sold, held)
 }

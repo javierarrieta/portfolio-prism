@@ -190,10 +190,7 @@ pub async fn init_db(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<(
         close_price TEXT NOT NULL
     )").execute(pool).await?;
 
-    sqlx::query("CREATE TABLE IF NOT EXISTS split_sync (
-        symbol TEXT PRIMARY KEY,
-        last_synced_at DATE NOT NULL
-    )").execute(pool).await?;
+    migrate_split_sync_key(pool).await?;
 
     migrate_decimal_columns(pool).await?;
 
@@ -450,6 +447,51 @@ pub async fn enforce_price_uniqueness(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Re-key the split-sync throttle from symbol to asset (#38).
+///
+/// Keyed on the symbol, the throttle let the first asset holding a symbol suppress
+/// every other asset holding it for 30 days — while the set of splits actually
+/// inserted is decided by *the calling asset's* earliest transaction date. So the
+/// first asset to sync could succeed, insert nothing relevant, and record the
+/// throttle anyway, leaving a second portfolio priced pre-split on a tax screen.
+///
+/// The table is a throttle cache: every row is re-derivable by fetching again, and a
+/// row written under the old rule means something the new rule cannot use — a
+/// symbol-level timestamp says nothing about whose history was evaluated. So this
+/// drops and recreates rather than transforming. The whole cost of losing the rows is
+/// one extra provider call per asset, once. Rollback is the same shape swap in the
+/// other direction and equally lossless.
+///
+/// Detection is by column rather than a version number, because `CREATE TABLE IF NOT
+/// EXISTS` will not alter an existing table: an old-shaped table left in place would
+/// keep the bug while the code above it looked fixed. `PRAGMA table_info` returns no
+/// rows when the table does not exist, which is the fresh-database case and falls
+/// straight through to the create.
+pub async fn migrate_split_sync_key(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    use sqlx::Row;
+
+    let columns = sqlx::query("PRAGMA table_info(split_sync)")
+        .fetch_all(pool)
+        .await?;
+    if columns
+        .iter()
+        .any(|row| matches!(row.try_get::<String, _>("name").as_deref(), Ok("symbol")))
+    {
+        sqlx::query("DROP TABLE split_sync").execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS split_sync (
+            asset_id INTEGER PRIMARY KEY,
+            last_synced_at DATE NOT NULL,
+            covered_from DATE
+        )",
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 pub async fn migrate_decimal_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {

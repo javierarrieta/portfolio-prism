@@ -215,12 +215,7 @@ async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
             None => break,
         }
     }
-    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
-        .bind(symbol)
-        .bind(today)
-        .execute(&pool)
-        .await
-        .unwrap();
+    seed_split_sync(&pool, asset_id).await;
 
     (port_id, pool, today)
 }
@@ -273,7 +268,7 @@ async fn a_lot_reports_the_quantity_that_was_bought_and_the_buy_it_came_from() {
     let buy = seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SELL", 20.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
     seed_price(&pool, "LOTQTY", Utc::now().date_naive(), "110.0").await;
-    seed_split_sync(&pool, "LOTQTY").await;
+    seed_split_sync(&pool, asset_id).await;
 
     let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     let resp = client
@@ -305,7 +300,7 @@ async fn a_split_scales_the_original_quantity_alongside_the_remaining_one() {
     seed_transaction_at(&pool, asset_id, "SELL", 20.0, 130.0, 0.0, "2024-06-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, "2024-09-01T00:00:00Z").await;
     seed_price(&pool, "LOTSPLIT", Utc::now().date_naive(), "110.0").await;
-    seed_split_sync(&pool, "LOTSPLIT").await;
+    seed_split_sync(&pool, asset_id).await;
 
     let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
     let resp = client

@@ -292,20 +292,35 @@ pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end
     }
 }
 
-/// Pin split auto-detection for `symbol` so `sync_splits_for_asset` returns on its
-/// 30-day cache check instead of fetching. Same row `analytics_test.rs:218` writes.
+/// Pin split auto-detection for `asset_id` so `sync_splits_for_asset` returns on its
+/// throttle instead of fetching.
 ///
-/// The bound value must be a *bare* date: `sync_splits_for_asset`
-/// (`currency_service.rs:870`) parses this column with `NaiveDate::parse_from_str(..,
-/// "%Y-%m-%d")`, which rejects trailing input, so `datetime('now')` — a datetime string
-/// — fails the parse, falls through the cache check and fetches from Yahoo. Do not
-/// "simplify" the bind back to a SQL datetime function.
+/// Keyed on the **asset**, not the symbol (#38): a symbol-level row let the first
+/// asset holding a symbol suppress every other asset holding it for 30 days, while
+/// which splits get inserted is decided by the calling asset's own history.
+///
+/// `covered_from` is set to [`FULLY_COVERED`] rather than left NULL, because NULL now
+/// means "synced while the asset had no transactions" — which does not suppress a
+/// sync for an asset that has since gained one.
+///
+/// The bound value must be a *bare* date: `sync_splits_for_asset` parses this column
+/// with `NaiveDate::parse_from_str(.., "%Y-%m-%d")`, which rejects trailing input, so
+/// `datetime('now')` — a datetime string — fails the parse, falls through the throttle
+/// and fetches from the provider. Do not "simplify" the bind back to a SQL datetime
+/// function.
 #[allow(dead_code)]
-pub async fn seed_split_sync(pool: &SqlitePool, symbol: &str) {
-    sqlx::query("INSERT OR REPLACE INTO split_sync (symbol, last_synced_at) VALUES (?, ?)")
-        .bind(symbol)
-        .bind(Utc::now().date_naive())
-        .execute(pool)
-        .await
-        .unwrap();
+pub async fn seed_split_sync(pool: &SqlitePool, asset_id: i32) {
+    sqlx::query(
+        "INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at, covered_from) VALUES (?, ?, ?)",
+    )
+    .bind(asset_id)
+    .bind(Utc::now().date_naive())
+    .bind(FULLY_COVERED)
+    .execute(pool)
+    .await
+    .unwrap();
 }
+
+/// Far enough back that no fixture transaction can predate it, so the coverage half
+/// of the throttle condition holds and the seeded row actually suppresses a sync.
+pub const FULLY_COVERED: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
