@@ -2481,20 +2481,29 @@ async fn a_bundle_over_the_row_cap_is_refused_before_any_write() {
     let before = rows(&pool).await;
     let c = client(pool.clone()).await;
 
-    let res = c
-        .post("/api/backup/preview?mode=copy")
-        .header(session())
-        .header(rocket::http::ContentType::JSON)
-        .body(bundle_of_rows(MAX_BUNDLE_ROWS - 2, 0))
-        .dispatch()
-        .await;
-    assert_eq!(res.status(), Status::UnprocessableEntity);
-    let body: Value = res.into_json().await.unwrap();
-    assert!(
-        body["errors"].to_string().contains("row limit"),
-        "{body}"
-    );
-    assert_eq!(rows(&pool).await, before, "the refusal writes nothing");
+    // Both routes that read a bundle, and in particular the one that can write: a cap
+    // enforced only by `preview` would be a suggestion, and the refusal on the write route
+    // is the one that has to leave the database alone.
+    let over_cap = bundle_of_rows(MAX_BUNDLE_ROWS - 2, 0);
+    for (route, path) in [
+        ("preview", "/api/backup/preview?mode=copy"),
+        ("restore", "/api/backup/restore?mode=copy"),
+    ] {
+        let res = c
+            .post(path)
+            .header(session())
+            .header(rocket::http::ContentType::JSON)
+            .body(over_cap.clone())
+            .dispatch()
+            .await;
+        assert_eq!(res.status(), Status::UnprocessableEntity, "{route}");
+        let body: Value = res.into_json().await.unwrap();
+        assert!(
+            body["errors"].to_string().contains("row limit"),
+            "{route}: {body}"
+        );
+        assert_eq!(rows(&pool).await, before, "{route}: the refusal writes nothing");
+    }
 }
 
 #[tokio::test]

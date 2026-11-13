@@ -50,6 +50,15 @@ pub const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 /// prices`. The same number is enforced on the way in (`collect`, so both `preview`
 /// and `restore`) and on the way out (`export::cap_error`), so the two ends cannot
 /// disagree about what this build is willing to write.
+///
+/// **The cap is mode-blind.** Price rows count whether or not `apply_prices` was asked
+/// for, so a bundle whose price section alone exceeds the ceiling is refused even by a
+/// restore that would write none of those rows. Accepted deliberately rather than
+/// overlooked: an app-produced bundle cannot reach that state, because export counts
+/// price rows too and refuses the same selection on the way out — only a hand-authored
+/// file can carry 50k prices over a portfolio of three rows — and one number shared by
+/// export, preview and restore is worth more than a ceiling whose meaning changes with
+/// a query parameter. A caller that hits it is told the row limit and the remedy.
 pub const MAX_BUNDLE_ROWS: usize = 50_000;
 
 /// Server-side switches for the backup feature, read once at startup.

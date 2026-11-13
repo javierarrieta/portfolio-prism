@@ -53,8 +53,19 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
     }
     if let sqlx::Error::Database(db) = &e {
         let code = db.code().map(|c| c.to_string()).unwrap_or_default();
+        // SQLite reports *extended* result codes and `code()` prints the raw value, so a
+        // `SQLITE_BUSY_RECOVERY` (261), `SQLITE_BUSY_SNAPSHOT` (517) or
+        // `SQLITE_LOCKED_SHAREDCACHE` (262) is the primary `SQLITE_BUSY` (5) or
+        // `SQLITE_LOCKED` (6) with an extended bit set. Mask to the primary code before
+        // matching, or an extended lock answers a bare 500 where the caller was told to
+        // retry. Postgres SQLSTATEs ("40001", "40P01") never parse as a number and fall
+        // through unchanged.
+        let primary = code
+            .parse::<i64>()
+            .map(|raw| (raw & 0xff).to_string())
+            .unwrap_or_else(|_| code.clone());
         let message = db.message().to_lowercase();
-        if matches!(code.as_str(), "5" | "6" | "40001" | "40P01")
+        if matches!(primary.as_str(), "5" | "6" | "40001" | "40P01")
             || message.contains("database is locked")
             || message.contains("database table is locked")
         {
@@ -127,6 +138,13 @@ pub async fn build(
 /// here instead, where the caller can still do something about it: export fewer
 /// portfolios. Rows are checked first because it is a counter, while the byte check
 /// has to serialise.
+///
+/// One asymmetry between the two ends, so a surprise here is not a mystery: this byte
+/// ceiling measures `serde_json::to_vec(&bundle)` — the compact form this build writes —
+/// while the upload ceiling measures the **raw request bytes** the caller sent. A bundle
+/// that leaves here just under the cap and is then re-saved pretty-printed by an editor is
+/// over the ceiling on the way back in and comes back `413`. Size is measured at both ends
+/// and the two measurements are not the same measurement.
 ///
 /// The byte ceiling is checked here as well as on the way in because the bundle is
 /// already fully in memory by this point, so its serialised size is knowable — which is
@@ -360,6 +378,13 @@ mod tests {
         for code in ["5", "6"] {
             let err = sqlx::Error::Database(Box::new(FakeCode(code)));
             assert!(matches!(classify(err), DbFailure::Lock), "code {code}");
+        }
+        // The extended forms, which is what the driver actually reports: 5|0x100,
+        // 5|0x200 and 6|0x100. Without the mask these fall through to the message arm and
+        // answer a 500 for a retryable lock.
+        for code in ["261", "517", "262"] {
+            let err = sqlx::Error::Database(Box::new(FakeCode(code)));
+            assert!(matches!(classify(err), DbFailure::Lock), "extended code {code}");
         }
         // And a code that is not one of them is still an outage.
         let err = sqlx::Error::Database(Box::new(FakeCode("1")));

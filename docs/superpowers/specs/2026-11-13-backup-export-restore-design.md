@@ -422,7 +422,17 @@ Recorded here so they are not lost, and deliberately not solved here:
 3. **`historical_prices` ownership.** It has no `owner_id` and is shared across tenants. The
    price-restore flag is a mitigation, not a model. If tenants ever contribute prices at
    all, that table needs an owner or a provenance column.
-4. **Multi-replica pricing rate limits.** `CurrencyService` holds a process-local cache and a
+5. **The row ceiling is one number, and it is mode-blind.** `MAX_BUNDLE_ROWS` counts
+   `portfolios + assets + transactions + prices` at both ends: `export` refuses a selection
+   over it, and `collect` refuses a bundle over it whether or not `apply_prices` was asked
+   for. Two consequences, both accepted: a price-heavy selection that used to export now
+   answers `422` (the message names the row limit and offers omitting the price history as
+   the remedy), and a hand-authored bundle carrying more than the ceiling in prices alone is
+   refused even by a restore that would write none of them. An app-produced bundle cannot
+   reach the second state, because the export side counts the same rows. If a mode-dependent
+   cap is ever wanted, the place it belongs is a separate price ceiling, not a conditional on
+   a query parameter.
+6. **Multi-replica pricing rate limits.** `CurrencyService` holds a process-local cache and a
    `Mutex<Option<Instant>>` rate limiter (`currency_service.rs:205-206`). N replicas means N
    caches and N× the request rate against the pricing provider. Independent of this feature,
    but it is a blocker for the same `replicas: 1` removal.
