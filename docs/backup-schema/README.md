@@ -15,9 +15,13 @@ so a committed file that disagrees with the code fails the build.
   `backend_rust::backup::ACCEPTED_VERSIONS`. A bundle whose `schema_version` is
   outside that set is refused with a `422` naming the accepted versions, and
   nothing is written.
-- A version is deprecated by removing it from `ACCEPTED_VERSIONS` in a release
-  that has shipped the upgrader for at least one prior release. The `vN.json` file
-  stays in this directory forever; it is history.
+- **A released version is never dropped from `ACCEPTED_VERSIONS`.** Removing a
+  version makes every backup already written in that format unrestorable, with no
+  way for its owner to recover it, so the set only ever grows: a new format
+  appends `vN+1` and ships the upgrader, and `vN` keeps being accepted. The
+  `vN.json` file stays in this directory forever either way; it is history.
+  `accepted_versions_are_exactly_v1` in `backend_rust/src/backup/mod.rs` is the
+  tripwire that fails if a released version is removed.
 
 ## Versions
 
