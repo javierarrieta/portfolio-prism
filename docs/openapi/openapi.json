@@ -177,6 +177,76 @@
         }
       }
     },
+    "/api/backup/preview": {
+      "post": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "preview",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "copy or replace; the parameter may appear only once",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plan: mode, delete counts, insert counts, prices, warnings",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "413": {
+            "description": "The upload is over `max_bytes`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/portfolios/": {
       "get": {
         "tags": [

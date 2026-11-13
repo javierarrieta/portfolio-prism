@@ -15,10 +15,11 @@ use std::collections::HashSet;
 
 /// Method, path, and the level required where one exists.
 ///
-/// `None` for the three routes that authenticate but check no resource id:
+/// `None` for the four routes that authenticate but check no resource id:
 /// `POST /api/portfolios/` (the caller becomes the owner),
-/// `GET /api/assets/lookup` (touches none of the three tables), and
-/// `GET /api/backup/capabilities` (reports server limits, no caller data).
+/// `GET /api/assets/lookup` (touches none of the three tables),
+/// `GET /api/backup/capabilities` (reports server limits, no caller data), and
+/// `POST /api/backup/preview` (the only thing it reads is the caller's own upload).
 ///
 /// Routes outside `/api/` — `/`, `/api-docs/openapi.json`, `/auth/*`,
 /// `/_auth/denied` — are deliberately **not** in this inventory: the first two are
@@ -73,6 +74,11 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // them at all; the handler calls `require(.., Viewer)` per id and
     // `tests/isolation_test.rs` is what proves it.
     ("GET", "/api/backup/export", Some(Access::Viewer)),
+    // The caller supplies a file, not an id: every count in the plan is scoped by the
+    // caller's own user id, so there is no resource to authorise against. The static
+    // gate cannot see the bundle either — an upload body is invisible to all three of
+    // its rules — which is what `tests/backup_test.rs`'s preview section is for.
+    ("POST", "/api/backup/preview", None),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -148,7 +154,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 18, "the mounted /api surface is 18 operations");
+    assert_eq!(checked, 19, "the mounted /api surface is 19 operations");
 }
 
 #[tokio::test]
@@ -270,7 +276,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 18);
+    assert_eq!(PROTECTED_ROUTES.len(), 19);
 }
 
 #[test]
@@ -285,6 +291,6 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .count();
     assert_eq!(
         with_level, 15,
-        "three routes authenticate without checking an id"
+        "four routes authenticate without checking an id"
     );
 }

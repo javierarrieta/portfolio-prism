@@ -19,12 +19,14 @@
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
 //! one endpoint — and a read that comes back `is_complete() == false` is this
 //! module's `413`, in the same `{"error": ...}` shape as every other bundle
-//! failure. Rocket does not make that conversion; the handler does. The probes in
-//! `tests/backup_test.rs` pin the read pattern.
+//! failure. Rocket does not make that conversion; the handler does. `preview` is
+//! the first route to make it, and the probes in `tests/backup_test.rs` pin both
+//! halves of the read pattern it uses.
 //!
 //! Route paths carry the full `/backup/...` prefix because they are mounted on the
 //! plain `/api` mount in `lib.rs`, alongside the transaction routes.
 
+use rocket::data::{Data, ToByteUnit};
 use rocket::http::{Header, HeaderMap, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder};
@@ -37,7 +39,11 @@ use sqlx::SqlitePool;
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
 use crate::backup::export::{self as backup_export, DbFailure};
-use crate::backup::{BackupConfig, Bundle, ACCEPTED_VERSIONS, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS};
+use crate::backup::restore::{self as backup_restore, Mode, Plan};
+use crate::backup::{
+    BackupConfig, Bundle, BundleError as BundleErrorKind, ACCEPTED_VERSIONS, MAX_BUNDLE_BYTES,
+    MAX_BUNDLE_ROWS, parse_and_validate,
+};
 
 /// What the server is willing to accept, so the UI can say so before uploading.
 #[derive(Debug, Serialize)]
@@ -281,4 +287,106 @@ pub async fn export(
             format!("attachment; filename=\"portfolio-prism-backup-{}.json\"", Utc::now().format("%Y-%m-%d")),
         ),
     })
+}
+
+/// The one error body shape for a bundle failure, so a client parses validation
+/// failures the same way whichever route produced them.
+///
+/// A struct literal, and a helper in this module, for the same reason as `fail`:
+/// `BackupError`'s fields are private so that nothing outside this module can build
+/// one, and they are visible here. `BundleError::status()` is `422` for every variant
+/// — a bundle names no server-side resource, so nothing in it is a `404`.
+///
+/// The errors inside an `Invalid` stay structured (`path` and `reason` as separate
+/// fields) rather than being joined into one string here: two of them — the byte cap
+/// and the row cap — describe the whole bundle and so carry an empty path, and a
+/// `format!("{path}: {reason}")` would render those two as a message starting with
+/// `": "`. A client that wants one line can join them knowing which half is empty.
+fn bundle_err(e: BundleErrorKind) -> BackupError {
+    BackupError {
+        status: e.status(),
+        headers: HeaderMap::new(),
+        body: Json(e.body()),
+    }
+}
+
+/// An upload over `MAX_BUNDLE_BYTES`.
+///
+/// Rocket does not refuse a `Data` upload of its own accord: the handler opened the
+/// stream under the cap and is handed the truncated body with `is_complete() ==
+/// false`, so converting that into a refusal is entirely this module's business. It
+/// is a `413` rather than a `422` because the file is not too wrong to read, it is too
+/// big to hold — and the caller has to know which of the two to fix.
+fn too_large() -> BackupError {
+    fail(
+        Status::PayloadTooLarge,
+        format!("the upload is over the {MAX_BUNDLE_BYTES} byte limit"),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/backup/preview",
+    params(
+        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; the parameter may appear only once"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "The plan: mode, delete counts, insert counts, prices, warnings", body = serde_json::Value),
+        (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
+        (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),
+        (status = 503, description = "The database is busy", body = serde_json::Value),
+    )
+)]
+#[post("/backup/preview?<mode>", data = "<body>")]
+pub async fn preview(
+    user: AuthedUser,
+    pool: &State<SqlitePool>,
+    mode: Option<Vec<String>>,
+    body: Data<'_>,
+) -> Result<Json<Plan>, BackupError> {
+    // `mode` is read as a sequence and refused when repeated, for the reason
+    // `only_once` documents: a repeated `Option` field reaches the handler as `None`,
+    // which here is indistinguishable from a caller who named no mode at all — and the
+    // two modes differ by "delete everything you own". An absent mode is a 422 too,
+    // because there is no default: neither answer is the safe one to guess.
+    let raw_mode = only_once(
+        mode.as_deref(),
+        "mode may appear only once, as either `copy` or `replace`",
+    )
+    .map_err(|reason| fail(Status::UnprocessableEntity, reason))?;
+    let mode = Mode::from_query(raw_mode)
+        .ok_or_else(|| fail(Status::UnprocessableEntity, "mode must be `copy` or `replace`"))?;
+
+    // The cap is opened here, per route, rather than as a global `Limits` entry: see
+    // the module comment and `no_global_body_limit_is_raised_for_the_bundle`.
+    // A read failure is the body never arriving — rocket's own `Vec<u8>` guard answers
+    // the same io failure with a `400`, and so does this.
+    let uploaded = body
+        .open(MAX_BUNDLE_BYTES.bytes())
+        .into_bytes()
+        .await
+        .map_err(|_| fail(Status::BadRequest, "the upload could not be read"))?;
+    if !uploaded.is_complete() {
+        return Err(too_large());
+    }
+
+    // Everything that can reject a bundle without touching the database happens here,
+    // before the first query: a preview is the user's last look before a write, so it
+    // answers either the plan or the list of what is wrong, and never a partial of
+    // either.
+    let bundle = parse_and_validate(&uploaded.value).map_err(bundle_err)?;
+
+    // Reads only. `plan_for` takes the caller's id, never an id from the bundle, so
+    // what it counts is the caller's own state however the file is addressed.
+    let plan = backup_restore::plan_for(pool.inner(), user.id, &bundle, mode)
+        .await
+        .map_err(|e| match e {
+            DbFailure::Lock => lock_response(),
+            DbFailure::Other => fail(
+                DbFailure::Other.status(),
+                "could not read the current data",
+            ),
+        })?;
+    Ok(Json(plan))
 }

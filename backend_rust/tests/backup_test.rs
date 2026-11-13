@@ -539,3 +539,430 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
     let bundle = backup_export::build(&pool, &[pid], false).await.unwrap();
     assert_eq!(bundle.portfolios.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Preview.
+//
+// Preview is the step a user must pass through before anything is written, so it
+// carries three obligations no other route here has: it must answer every kind of
+// bad input with a status the caller can act on (a bundle is user-authored text, so
+// "not JSON" is a 422 and never a 500), it must describe the caller's own state and
+// nothing else (a bundle names portfolios by bundle-local refs, which are never
+// database ids), and above all it must write nothing — including the previews that
+// end in a refusal, and the one mode whose whole subject is deletion.
+// ---------------------------------------------------------------------------
+
+/// The smallest bundle that passes validation: one portfolio, one asset, one
+/// transaction. `name` is the only string in it a test can point at.
+fn bundle_json(name: &str) -> String {
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": [{
+            "ref": "p1", "name": name, "description": null,
+            "currency": "USD", "base_currency": "USD",
+            "assets": [{
+                "ref": "a1", "symbol": "AAPL", "name": "Apple", "asset_type": "STOCK",
+                "sector": null, "currency": "USD", "isin": null,
+                "transactions": [{ "type": "BUY", "quantity": "10.0", "price": "150.00",
+                                   "fee": "1.00", "date": "2024-01-15T00:00:00Z" }]
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// The same bundle as a mutable `Value`, for a test that needs one field changed.
+///
+/// Parsed rather than wrapped: `json!(bundle_json(..))` turns the *string* into a
+/// `Value::String`, and editing a field on that panics in serde before the request is
+/// ever sent — which is a confusing failure for a test whose subject is the response.
+fn bundle_value(name: &str) -> Value {
+    serde_json::from_str(&bundle_json(name)).expect("the fixture is JSON")
+}
+
+/// A bundle of the same shape carrying a price section: prices are flat, global,
+/// and the one part of a bundle that belongs to no portfolio.
+fn bundle_json_with_prices(name: &str) -> String {
+    let mut b = bundle_value(name);
+    b["prices"] = json!([{ "symbol": "AAPL", "date": "2024-01-01", "close_price": "150.00" }]);
+    b.to_string()
+}
+
+#[tokio::test]
+async fn preview_counts_what_replace_would_delete_and_insert() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+
+    let res = c
+        .post("/api/backup/preview?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Restored"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["mode"], "replace");
+    assert_eq!(body["delete"]["portfolios"], 2, "both owned portfolios go");
+    assert_eq!(body["delete"]["assets"], 1);
+    assert_eq!(body["delete"]["transactions"], 1);
+    assert_eq!(body["insert"]["portfolios"], 1);
+    assert_eq!(body["insert"]["assets"], 1);
+    assert_eq!(body["insert"]["transactions"], 1);
+}
+
+#[tokio::test]
+async fn preview_in_copy_mode_deletes_nothing() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Restored"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["mode"], "copy");
+    assert_eq!(body["delete"]["portfolios"], 0);
+    assert_eq!(body["delete"]["transactions"], 0);
+    // Copy still inserts: "deletes nothing" is not the same as "does nothing".
+    assert_eq!(body["insert"]["portfolios"], 1);
+}
+
+#[tokio::test]
+async fn preview_writes_nothing() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let c = client(pool.clone()).await;
+    c.post("/api/backup/preview?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Restored"))
+        .dispatch()
+        .await;
+    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.0, after.0);
+}
+
+/// Every row a preview could conceivably touch, counted. `historical_prices` is in
+/// the list because a bundle can carry prices and a preview that wrote them would be
+/// one tenant writing the market data every other tenant's dated reports read. The
+/// id sum is there because counts alone would miss a delete-and-reinsert of the same
+/// number of rows.
+async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for table in ["portfolios", "assets", "transactions", "historical_prices"] {
+        let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        out.push((table.to_string(), n));
+    }
+    let (sum,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(id), 0) FROM portfolios")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    out.push(("portfolios.id_sum".to_string(), sum));
+    out
+}
+
+#[tokio::test]
+async fn no_preview_writes_anything_whether_it_succeeds_or_refuses() {
+    // `preview_writes_nothing` is the happy path. This is the whole surface: the
+    // preview that would replace everything, the one whose bundle is invalid, the
+    // one from a newer build, the one that is not JSON, and the one too big to read.
+    // A refusal that wrote is the worst possible failure here, because the user has
+    // been told the answer is "look at the plan first".
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    seed_daily_prices(&pool, "AAPL", "2024-01-01", "2024-01-02", "150.00").await;
+    let before = snapshot(&pool).await;
+    let c = client(pool.clone()).await;
+
+    let mut newer = bundle_value("Restored");
+    newer["schema_version"] = json!(2);
+    let mut invalid = bundle_value("Restored");
+    invalid["portfolios"][0]["assets"][0]["transactions"][0]["price"] = json!("not-a-number");
+
+    let previews: Vec<(&str, &str, String, Status)> = vec![
+        ("a replace of everything", "replace", bundle_json("Restored"), Status::Ok),
+        ("a copy with prices", "copy", bundle_json_with_prices("Restored"), Status::Ok),
+        ("an invalid bundle", "copy", invalid.to_string(), Status::UnprocessableEntity),
+        ("a newer schema_version", "copy", newer.to_string(), Status::UnprocessableEntity),
+        ("not JSON", "copy", "not json".to_string(), Status::UnprocessableEntity),
+        ("over the byte cap", "copy", body_of(MAX_BUNDLE_BYTES + 1), Status::PayloadTooLarge),
+    ];
+    for (what, mode, body, expected) in previews {
+        let path = format!("/api/backup/preview?mode={mode}");
+        let res = c
+            .post(&path)
+            .header(session())
+            .header(rocket::http::ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+        // Each case answers what it is meant to, so a case that silently stopped
+        // exercising its own path (an "invalid" bundle that validated, say) is caught
+        // here rather than by the snapshot below.
+        assert_eq!(res.status(), expected, "{what} via {path}");
+    }
+
+    assert_eq!(snapshot(&pool).await, before, "a preview must write nothing");
+}
+
+#[tokio::test]
+async fn an_unknown_mode_is_a_422() {
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let res = c
+        .post("/api/backup/preview?mode=merge")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("x"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("mode"), "{body}");
+}
+
+#[tokio::test]
+async fn an_absent_mode_is_a_422_naming_the_two_that_exist() {
+    // There is no default mode. Guessing one would answer a question the caller did
+    // not ask, and the two answers differ by "delete everything you own".
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    for path in ["/api/backup/preview", "/api/backup/preview?mode="] {
+        let res = c
+            .post(path)
+            .header(session())
+            .header(rocket::http::ContentType::JSON)
+            .body(bundle_json("x"))
+            .dispatch()
+            .await;
+        assert_eq!(res.status(), Status::UnprocessableEntity, "{path}");
+        let body: Value = res.into_json().await.unwrap();
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("copy") && err.contains("replace"), "{path}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_mode_is_refused_not_half_read() {
+    // The same class `a_repeated_query_parameter_is_refused_not_half_read` pins on
+    // export: rocket collapses a repeated `Option` field into `None`, so
+    // `?mode=copy&mode=replace` would otherwise arrive as "no mode at all" and be
+    // answered as a missing parameter rather than as the contradiction it is.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let res = c
+        .post("/api/backup/preview?mode=copy&mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("x"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("only once"), "{body}");
+}
+
+#[tokio::test]
+async fn a_non_json_upload_is_a_422_not_a_500() {
+    // Review Focus #4.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body("not json")
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("not valid JSON"));
+}
+
+#[tokio::test]
+async fn a_bundle_from_a_newer_build_is_refused_by_preview() {
+    // Review Focus #2: preview is where the user learns it, before anything is written.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let mut b = bundle_value("x");
+    b["schema_version"] = json!(2);
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["accepted"], json!([1]));
+}
+
+#[tokio::test]
+async fn a_bundle_that_fails_validation_names_its_paths() {
+    // The plan is the user's last look before a write, so a refusal has to say which
+    // field is wrong — the same body shape the restore route will produce, so a
+    // client parses validation failures the same way whichever route answered.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let mut b = bundle_value("x");
+    b["portfolios"][0]["assets"][0]["transactions"][0]["price"] = json!("not-a-number");
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["error"], "the bundle failed validation");
+    assert_eq!(
+        body["errors"][0]["path"],
+        "portfolios[0].assets[0].transactions[0].price"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_over_the_byte_cap_is_the_module_s_413() {
+    // Rocket never refuses a `Data` upload of its own accord, so the ceiling is only
+    // real if the route that opens the stream enforces it. The probes above pin the
+    // read; this pins the route doing the conversion.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .body(body_of(MAX_BUNDLE_BYTES + 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::PayloadTooLarge);
+    let body: Value = res.into_json().await.unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains(&MAX_BUNDLE_BYTES.to_string()), "{err}");
+}
+
+#[tokio::test]
+async fn preview_reports_the_price_section_and_warns_about_a_replace() {
+    // The warnings are the two things a user is least likely to have thought of:
+    // that `replace` deletes portfolios the bundle says nothing about, and that a
+    // bundle carrying prices is carrying shared market data rather than their own.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+
+    let res = c
+        .post("/api/backup/preview?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json_with_prices("Restored"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["prices"], 1);
+    let warnings = body["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("replace will delete")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("price history")),
+        "{warnings:?}"
+    );
+
+    // Copy with no prices: nothing to warn about, and an empty list rather than a
+    // missing key, so the UI renders the same component either way.
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Restored"))
+        .dispatch()
+        .await;
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["warnings"], json!([]), "{body}");
+    assert_eq!(body["prices"], 0);
+}
+
+#[tokio::test]
+async fn a_preview_describes_only_the_caller_s_own_rows() {
+    // Cross-tenant: a bundle names portfolios by bundle-local refs, which are labels
+    // and never database ids, so a bundle cannot address another user's rows — and
+    // the counts it is answered with are its own. `replace` describing a foreign
+    // portfolio would be a promise to delete what the caller does not own.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let other = common::seed_user(&pool, "user-b").await;
+    let theirs = seed_portfolio(&pool, other, "Theirs", "USD").await;
+    let their_asset = seed_asset(&pool, theirs, "BBB", "Asset B").await;
+    seed_transaction(&pool, their_asset, "SELL", 1.0, 2.0, 0.0).await;
+
+    // A bundle that names the foreign portfolio's name and reuses its id-shaped label,
+    // which is exactly the thing a hand-edited file would try.
+    let foreign = json!({
+        "format": "portfolio-prism-backup", "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": [{
+            "ref": format!("p{theirs}"), "name": "Theirs", "description": null,
+            "currency": "USD", "base_currency": "USD",
+            "assets": [{
+                "ref": format!("a{their_asset}"), "symbol": "BBB", "name": "Asset B",
+                "asset_type": "STOCK", "sector": null, "currency": "USD", "isin": null,
+                "transactions": []
+            }]
+        }]
+    })
+    .to_string();
+
+    let c = client(pool).await; // runs as DEFAULT_USER, who owns none of B's rows
+    let res = c
+        .post("/api/backup/preview?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(foreign)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    // The caller's own two portfolios, and none of B's: B's one asset and one
+    // transaction are absent from every count.
+    assert_eq!(body["delete"]["portfolios"], 2, "{body}");
+    assert_eq!(body["delete"]["assets"], 1, "{body}");
+    assert_eq!(body["delete"]["transactions"], 1, "{body}");
+    // And the plan is counts, not rows: nothing from either side's data appears.
+    let text = body.to_string();
+    assert!(!text.contains("Asset B") && !text.contains("Theirs"), "{text}");
+}
+
+#[tokio::test]
+async fn preview_requires_a_session() {
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = common::build_rocket_oidc(pool);
+    let c = Client::tracked(rocket).await.unwrap();
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .body(bundle_json("x"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Unauthorized);
+}
