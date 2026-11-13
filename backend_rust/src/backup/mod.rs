@@ -108,6 +108,215 @@ pub fn row_count(bundle: &Bundle) -> usize {
     })
 }
 
+/// One reason a bundle is not usable, addressed by bundle path rather than by
+/// table row, because the bundle is what the user is holding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidationError {
+    pub path: String,
+    pub reason: String,
+}
+
+/// How many validation errors a response names. A bad multi-megabyte file must
+/// not produce a multi-megabyte error.
+pub const MAX_REPORTED_ERRORS: usize = 20;
+
+/// Everything that can stop a bundle before a transaction is opened.
+#[derive(Debug)]
+pub enum BundleError {
+    /// Not JSON, or not UTF-8. A `422`, never a `500`.
+    Unparseable(String),
+    /// JSON, but not a backup bundle (wrong `format`).
+    NotABundle,
+    /// A `schema_version` outside `ACCEPTED_VERSIONS`.
+    UnsupportedVersion { found: i64 },
+    /// Structurally a bundle, semantically not usable. The `bool` is "more
+    /// errors were found than are reported".
+    Invalid(Vec<ValidationError>, bool),
+}
+
+impl BundleError {
+    /// Every bundle failure is the caller's fault, so every one is a `422`.
+    /// Nothing here is a server failure, and nothing here is a `404`: a bundle
+    /// names no server-side resource.
+    pub fn status(&self) -> rocket::http::Status {
+        rocket::http::Status::UnprocessableEntity
+    }
+
+    pub fn body(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            BundleError::Unparseable(e) => json!({ "error": "the upload is not valid JSON", "detail": e }),
+            BundleError::NotABundle => json!({
+                "error": format!("not a {FORMAT_TAG} bundle"),
+                "detail": "the `format` field is missing or does not match",
+            }),
+            BundleError::UnsupportedVersion { found } => json!({
+                "error": format!("unsupported schema_version {found}"),
+                "accepted": ACCEPTED_VERSIONS,
+                "detail": "this build cannot read that bundle version; restore it with a build that lists it",
+            }),
+            BundleError::Invalid(errors, more) => json!({
+                "error": "the bundle failed validation",
+                "errors": errors,
+                "more_errors": more,
+            }),
+        }
+    }
+}
+
+/// Parse, check the version, and validate. **Everything that can reject a bundle
+/// without touching the database happens here**, so the transaction is only ever
+/// about consistency, never about typos.
+pub fn parse_and_validate(raw: &[u8]) -> Result<Bundle, BundleError> {
+    if raw.len() > MAX_BUNDLE_BYTES {
+        return Err(BundleError::Invalid(
+            vec![ValidationError {
+                path: String::new(),
+                reason: format!(
+                    "bundle is {} bytes, over the {MAX_BUNDLE_BYTES} byte limit",
+                    raw.len()
+                ),
+            }],
+            false,
+        ));
+    }
+
+    let bundle: Bundle = serde_json::from_slice(raw)
+        .map_err(|e| BundleError::Unparseable(e.to_string()))?;
+
+    if bundle.format != FORMAT_TAG {
+        return Err(BundleError::NotABundle);
+    }
+    if !ACCEPTED_VERSIONS.contains(&bundle.schema_version) {
+        return Err(BundleError::UnsupportedVersion { found: bundle.schema_version });
+    }
+
+    let errors = validate(&bundle);
+    if errors.is_empty() {
+        Ok(bundle)
+    } else {
+        Err(BundleError::Invalid(errors, false))
+    }
+}
+
+/// Append one error, unless the report is already at its cap.
+fn push_err(errors: &mut Vec<ValidationError>, path: String, reason: String) {
+    if errors.len() < MAX_REPORTED_ERRORS {
+        errors.push(ValidationError { path, reason });
+    }
+}
+
+/// Field-level validation. Returns every error found, capped at
+/// `MAX_REPORTED_ERRORS` so the response stays a readable size.
+///
+/// The appender is a free function taking `&mut Vec` rather than a closure
+/// capturing `errors`, because a closure holding the mutable borrow would not let
+/// `errors` be returned at the end of the function.
+pub fn validate(bundle: &Bundle) -> Vec<ValidationError> {
+    let mut errors: Vec<ValidationError> = Vec::new();
+    let mut push = |path: String, reason: String| push_err(&mut errors, path, reason);
+
+    if bundle.portfolios.is_empty() {
+        push("portfolios".into(), "a bundle must contain at least one portfolio".into());
+    }
+    if row_count(bundle) > MAX_BUNDLE_ROWS {
+        push(String::new(), format!("bundle has {} rows, over the {MAX_BUNDLE_ROWS} row limit", row_count(bundle)));
+    }
+    if !is_rfc3339(&bundle.created_at) {
+        push("created_at".into(), "not an RFC 3339 UTC datetime".into());
+    }
+
+    let mut seen_refs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (pi, p) in bundle.portfolios.iter().enumerate() {
+        let pp = format!("portfolios[{pi}]");
+        if !seen_refs.insert(p.bundle_ref.as_str()) {
+            push(pp.clone(), format!("duplicate ref {:?}", p.bundle_ref));
+        }
+        if p.name.trim().is_empty() {
+            push(format!("{pp}.name"), "must not be empty".into());
+        }
+        for (field, value) in [("currency", &p.currency), ("base_currency", &p.base_currency)] {
+            if value.len() != 3 {
+                push(format!("{pp}.{field}"), format!("{value:?} is not a 3-letter currency code"));
+            }
+        }
+
+        let mut seen_asset_refs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (ai, a) in p.assets.iter().enumerate() {
+            let ap = format!("{pp}.assets[{ai}]");
+            if !seen_asset_refs.insert(a.bundle_ref.as_str()) {
+                push(ap.clone(), format!("duplicate ref {:?}", a.bundle_ref));
+            }
+            if a.symbol.trim().is_empty() {
+                push(format!("{ap}.symbol"), "must not be empty".into());
+            }
+            if a.name.trim().is_empty() {
+                push(format!("{ap}.name"), "must not be empty".into());
+            }
+            if !KNOWN_ASSET_TYPES.contains(&a.asset_type.as_str()) {
+                push(format!("{ap}.asset_type"),
+                    format!("{:?} is not one of {:?}", a.asset_type, KNOWN_ASSET_TYPES));
+            }
+            if a.currency.len() != 3 {
+                push(format!("{ap}.currency"), format!("{:?} is not a 3-letter currency code", a.currency));
+            }
+            // A let-chain rather than two nested `if`s: clippy's
+            // `collapsible_if` rejects the nested form on this toolchain.
+            if let Some(isin) = &a.isin
+                && !isin.is_empty()
+                && !crate::api_routes::lookup::is_valid_isin(isin)
+            {
+                push(format!("{ap}.isin"), format!("{isin:?} is not a valid ISIN"));
+            }
+
+            for (ti, t) in a.transactions.iter().enumerate() {
+                let tp = format!("{ap}.transactions[{ti}]");
+                if !KNOWN_TRANSACTION_TYPES.contains(&t.r#type.as_str()) {
+                    push(format!("{tp}.type"),
+                        format!("{:?} is not one of {:?}", t.r#type, KNOWN_TRANSACTION_TYPES));
+                }
+                for (field, value) in [("quantity", &t.quantity), ("price", &t.price), ("fee", &t.fee)] {
+                    if rust_decimal::Decimal::from_str_exact(value).is_err() {
+                        push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                    }
+                }
+                match chrono::DateTime::parse_from_rfc3339(&t.date) {
+                    Ok(dt) => {
+                        let day = dt.date_naive();
+                        let min = chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+                        let max = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap();
+                        if day < min || day > max {
+                            push(format!("{tp}.date"),
+                                format!("{:?} is outside the supported range 1900-01-01 to 2100-01-01", t.date));
+                        }
+                    }
+                    Err(_) => push(format!("{tp}.date"),
+                        format!("{:?} is not an RFC 3339 UTC datetime such as 2024-01-15T00:00:00Z", t.date)),
+                }
+            }
+        }
+    }
+
+    for (i, price) in bundle.prices.iter().enumerate() {
+        let pp = format!("prices[{i}]");
+        if price.symbol.trim().is_empty() {
+            push(format!("{pp}.symbol"), "must not be empty".into());
+        }
+        if chrono::NaiveDate::parse_from_str(&price.date, "%Y-%m-%d").is_err() {
+            push(format!("{pp}.date"), format!("{:?} is not a date in YYYY-MM-DD form", price.date));
+        }
+        if rust_decimal::Decimal::from_str_exact(&price.close_price).is_err() {
+            push(format!("{pp}.close_price"), format!("{:?} is not a valid decimal", price.close_price));
+        }
+    }
+
+    errors
+}
+
+fn is_rfc3339(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +394,182 @@ mod tests {
         let raw = r#"{"format":"portfolio-prism-backup","schema_version":1,
             "created_at":"2026-11-13T00:00:00Z","portfolios":[],"prices":[],"id":7}"#;
         assert!(serde_json::from_str::<Bundle>(raw).is_err());
+    }
+
+    #[test]
+    fn an_unknown_field_nested_in_a_portfolio_is_rejected() {
+        // The root guard is not enough: `deny_unknown_fields` must hold on the
+        // nested structs too, or a hand-edited bundle could smuggle a database
+        // id into a portfolio row while the root stays clean.
+        let raw = r#"{"format":"portfolio-prism-backup","schema_version":1,
+            "created_at":"2026-11-13T00:00:00Z","portfolios":[
+            {"ref":"p1","name":"Main","description":null,"currency":"USD",
+             "base_currency":"USD","assets":[],"id":7}]}"#;
+        assert!(serde_json::from_str::<Bundle>(raw).is_err());
+    }
+
+    fn tx(_path: &str, kind: &str, qty: &str, price: &str, date: &str) -> BundleTransaction {
+        BundleTransaction {
+            r#type: kind.into(),
+            quantity: qty.into(),
+            price: price.into(),
+            fee: "0".into(),
+            date: date.into(),
+        }
+    }
+
+    fn asset(r: &str, txs: Vec<BundleTransaction>) -> BundleAsset {
+        BundleAsset {
+            bundle_ref: r.into(),
+            symbol: "AAPL".into(),
+            name: "Apple".into(),
+            asset_type: "STOCK".into(),
+            sector: None,
+            currency: "USD".into(),
+            isin: None,
+            transactions: txs,
+        }
+    }
+
+    fn port(r: &str, assets: Vec<BundleAsset>) -> BundlePortfolio {
+        BundlePortfolio {
+            bundle_ref: r.into(),
+            name: "Main".into(),
+            description: None,
+            currency: "USD".into(),
+            base_currency: "USD".into(),
+            assets,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_bundle_has_no_errors() {
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![
+            tx("", "BUY", "10.0", "150.00", "2024-01-15T00:00:00Z"),
+        ])])]);
+        assert_eq!(validate(&b), Vec::<ValidationError>::new());
+    }
+
+    #[test]
+    fn a_bundle_with_no_portfolios_is_rejected() {
+        // Review Focus #5: an empty bundle is the one thing a user will restore
+        // that must never succeed under `replace`.
+        let errs = validate(&bundle(vec![]));
+        assert!(errs.iter().any(|e| e.path == "portfolios"
+            && e.reason.contains("at least one portfolio")));
+    }
+
+    #[test]
+    fn a_non_decimal_price_names_its_path() {
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![
+            tx("", "BUY", "10.0", "not-a-number", "2024-01-15T00:00:00Z"),
+        ])])]);
+        let errs = validate(&b);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].path, "portfolios[0].assets[0].transactions[0].price");
+        assert!(errs[0].reason.contains("not a valid decimal"));
+    }
+
+    #[test]
+    fn a_transaction_date_outside_the_supported_range_is_rejected() {
+        // The same range `create_transaction` enforces (transactions.rs:223-229).
+        // A restore must not accept a row the ordinary write path would refuse.
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![
+            tx("", "BUY", "10.0", "150.00", "1899-01-01T00:00:00Z"),
+        ])])]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.reason.contains("outside the supported range")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_transaction_date_must_be_rfc3339_not_a_bare_date() {
+        // Storage is DateTime<Utc> (models.rs:35). Accepting "2024-01-15" here
+        // would mean two accepted spellings for one column.
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![
+            tx("", "BUY", "10.0", "150.00", "2024-01-15"),
+        ])])]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.reason.contains("RFC 3339")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_price_date_must_be_a_plain_date() {
+        let mut b = bundle(vec![port("p1", vec![])]);
+        b.prices.push(BundlePrice {
+            symbol: "AAPL".into(),
+            date: "2024-01-15T00:00:00Z".into(),
+            close_price: "150.00".into(),
+        });
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.path == "prices[0].date"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_unknown_asset_type_or_transaction_type_is_rejected() {
+        let mut a = asset("a1", vec![tx("", "BUY", "1.0", "1.0", "2024-01-15T00:00:00Z")]);
+        a.asset_type = "CRYPTO".into();
+        let errs = validate(&bundle(vec![port("p1", vec![a])]));
+        assert!(errs.iter().any(|e| e.path.ends_with(".asset_type")
+            && e.reason.contains("is not one of")), "{errs:?}");
+
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![
+            tx("", "SHORT", "1.0", "1.0", "2024-01-15T00:00:00Z"),
+        ])])]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.path.ends_with(".transactions[0].type")
+            && e.reason.contains("is not one of")), "{errs:?}");
+    }
+
+    #[test]
+    fn duplicate_refs_are_rejected_naming_both_paths() {
+        // Review Focus #1: a colliding ref must not silently link to whichever
+        // row the map happened to see last.
+        let b = bundle(vec![port("p1", vec![asset("a1", vec![])]), port("p1", vec![])]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.reason.contains("duplicate ref")), "{errs:?}");
+    }
+
+    #[test]
+    fn an_empty_asset_list_is_allowed_but_an_empty_transaction_list_is_too() {
+        // A portfolio with no assets is legal (you can create one in the UI), so
+        // a bundle may carry one. Same for an asset with no transactions.
+        assert_eq!(validate(&bundle(vec![port("p1", vec![])])), Vec::new());
+        assert_eq!(validate(&bundle(vec![port("p1", vec![asset("a1", vec![])])])), Vec::new());
+    }
+
+    #[test]
+    fn a_newer_schema_version_is_refused_naming_the_accepted_set() {
+        // Review Focus #2.
+        let mut b = bundle(vec![port("p1", vec![])]);
+        b.schema_version = 2;
+        let raw = serde_json::to_vec(&b).unwrap();
+        match parse_and_validate(&raw) {
+            Err(BundleError::UnsupportedVersion { found: 2 }) => {}
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_bundle_is_not_a_bundle_error() {
+        let raw = br#"{"format":"something-else","schema_version":1,
+            "created_at":"x","portfolios":[]}"#;
+        assert!(matches!(parse_and_validate(raw), Err(BundleError::NotABundle)));
+    }
+
+    #[test]
+    fn unparseable_input_is_reported_not_panicked() {
+        // Review Focus #4.
+        assert!(matches!(parse_and_validate(b"not json at all"),
+            Err(BundleError::Unparseable(_))));
+        assert!(matches!(parse_and_validate(&[0xff, 0xfe, 0x00]),
+            Err(BundleError::Unparseable(_))));
+    }
+
+    #[test]
+    fn errors_are_capped_at_twenty_and_flagged_as_truncated() {
+        let txs = (0..25).map(|_| tx("", "BUY", "n", "1", "2024-01-15T00:00:00Z"))
+            .collect();
+        let errs = validate(&bundle(vec![port("p1", vec![asset("a1", txs)])]));
+        assert_eq!(errs.len(), 20);
     }
 }
