@@ -263,12 +263,19 @@ jobs:
           cache-to: type=gha,mode=max
           push: false
 
-  docker-build-frontend:
+  # Split per architecture on native runners (#59). The single multi-platform job this
+  # replaces built arm64 under QEMU user-mode emulation, where every `node`, `npm` and
+  # native-addon binary is interpreted. That leg stalled four times in one day — twice
+  # producing zero log bytes for 30+ minutes, once on a backend-only PR where nothing in
+  # `frontend/` had changed, and once as an `npm ci` ETIMEDOUT that a native build
+  # outruns. `docker-build-backend` above is amd64-only, so this is the first time the
+  # frontend gets the native-ARM runner the release workflow already uses.
+  #
+  # Build-only, like the backend job: PR runs get no registry credentials, so there is no
+  # manifest to push and no manifest job here. The published multi-arch image is
+  # assembled in release.yml.
+  docker-build-frontend-amd64:
     runs-on: ubuntu-latest
-    # Observed 0-7 min on main. This is the emulated-arm64 build that has stalled
-    # twice with no log output at all — once on the v0.0.6-M5 release, once on a
-    # backend-only PR where nothing in `frontend/` had changed. Uncapped, that reads
-    # as a run in progress for six hours.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -276,12 +283,35 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build frontend
+      - name: Build frontend (amd64)
         uses: docker/build-push-action@v7
         with:
           context: frontend
           file: frontend/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          # Scoped per architecture. Two jobs in one workflow sharing the default `gha`
+          # cache scope write to the same cache entry; scoping is how buildx says "this
+          # leg has its own cache". Costs one cold build, then each arch caches properly
+          # instead of contending.
+          cache-from: type=gha,scope=frontend-amd64
+          cache-to: type=gha,mode=max,scope=frontend-amd64
+          push: false
+
+  docker-build-frontend-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build frontend (arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          platforms: linux/arm64
+          cache-from: type=gha,scope=frontend-arm64
+          cache-to: type=gha,mode=max,scope=frontend-arm64
           push: false
