@@ -28,7 +28,7 @@ Run from the repository root. All of these are expected to pass on
 # Backend: 313 tests
 cd backend_rust; and cargo test
 
-# Static access gate: prints "handlers inspected: 15, cleared: 15"
+# Static access gate: prints "handlers inspected: 20, cleared: 20"
 bash scripts/check_access_gate.sh
 
 # The gate's own self-test (it is part of `cargo test`, listed here for clarity)

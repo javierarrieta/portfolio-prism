@@ -13,7 +13,12 @@
 //! directly above `#[get]`/`#[post]`. That waives Rule A's `require*` half for that
 //! one handler and no other; the gate also refuses the marker if the route itself
 //! takes a path parameter — any one, whatever it is called — Rules B and C still
-//! apply, and every waiver is printed.
+//! apply, and every waiver is printed. `restore` resolves no caller-supplied id
+//! either and deliberately carries **no** marker: the marker's cross-check fails
+//! closed on any `<…>` in the route attribute, which includes a query parameter, so
+//! marking it would fail the gate rather than pass it. It clears Rule A the way the
+//! rest of this file does — through the `require` call `export` makes — and Rule C
+//! by taking `AuthedUser`.
 //!
 //! An uploaded bundle is read through a `Data` guard and opened under
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
@@ -39,7 +44,9 @@ use sqlx::SqlitePool;
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
 use crate::backup::export::{self as backup_export, DbFailure};
-use crate::backup::restore::{self as backup_restore, Mode, Plan};
+use crate::backup::restore::{
+    self as backup_restore, ApplyError, Mode, Plan, RestoreOutcome,
+};
 use crate::backup::{
     BackupConfig, Bundle, BundleError as BundleErrorKind, ACCEPTED_VERSIONS, MAX_BUNDLE_BYTES,
     MAX_BUNDLE_ROWS, parse_and_validate,
@@ -181,17 +188,19 @@ fn only_once<'a>(values: Option<&'a [String]>, refusal: &str) -> Result<Option<&
     }
 }
 
-/// `?include_prices=` as a boolean, or `None` when the value means neither on nor
-/// off — and `Some(false)` when the parameter is absent, because prices are opt-in.
+/// A query parameter that means on or off — `?include_prices=`, `?apply_prices=` —
+/// read as a boolean, or `None` when the value means neither on nor off. `Some(false)`
+/// when the parameter is absent: both flags are opt-in.
 ///
 /// Parsed as a string against the same accepted sets as the server flag rather than
 /// left to rocket's `bool` form field, because rocket accepts neither `1` nor `0`
 /// there — the spellings the spec and the UI use — and a value it cannot parse on an
 /// `Option` field becomes `None` rather than an error
 /// (`Option<T>::finalize` is `T::finalize(this).ok()`). With `Option<bool>` the
-/// caller would get a 200 with the section they asked for missing, which is the one
-/// failure mode the spec forbids for a flag of this kind: never a silent ignore.
-fn parse_include_prices(raw: Option<&str>) -> Option<bool> {
+/// caller would get a 200 with the thing they asked for missing, which is the one
+/// failure mode a flag of this kind must never have: never a silent ignore. One
+/// function for both parameters so the two cannot drift apart on what `yes` means.
+fn parse_query_flag(raw: Option<&str>) -> Option<bool> {
     match raw {
         None => Some(false),
         Some(raw) if BackupConfig::is_on(raw) => Some(true),
@@ -242,7 +251,7 @@ pub async fn export(
             "portfolio_ids must name at least one portfolio, e.g. ?portfolio_ids=1,2")),
     };
 
-    let include_prices = match parse_include_prices(prices_requested) {
+    let include_prices = match parse_query_flag(prices_requested) {
         Some(v) => v,
         None => return Err(fail(Status::UnprocessableEntity,
             "include_prices must be one of 1/true/yes or 0/false/no")),
@@ -333,6 +342,7 @@ fn too_large() -> BackupError {
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "The plan: mode, delete counts, insert counts, prices, warnings", body = serde_json::Value),
+        (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),
         (status = 503, description = "The database is busy", body = serde_json::Value),
@@ -389,4 +399,110 @@ pub async fn preview(
             ),
         })?;
     Ok(Json(plan))
+}
+
+// The write. Everything that makes a restore safe lives in `backup_restore::apply`;
+// this handler's job is to refuse a bad request before a transaction is opened and to
+// translate what came back.
+//
+// The order is deliberate: both query parameters, then the upload, then validation,
+// then the transaction. A request that names no mode, or names it twice, or uploads a
+// file that is not a bundle, never reaches the database at all — which is what makes
+// `422` the honest answer for every refusal this route gives. The prose is a `//`
+// comment rather than a `///` doc for the same reason as its siblings here: utoipa
+// turns a doc comment into the operation's summary and description, and every other
+// backup operation in the published document carries prose only.
+#[utoipa::path(
+    post,
+    path = "/api/backup/restore",
+    params(
+        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; the parameter may appear only once"),
+        ("apply_prices" = Vec<String>, Query, style = Form, explode = false, description = "apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; needs the server flag, and may appear only once"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Restored: inserted counts, portfolio_ids, prices_inserted", body = serde_json::Value),
+        (status = 400, description = "The upload could not be read", body = serde_json::Value),
+        (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
+        (status = 422, description = "`mode` or `apply_prices` absent, repeated, or unrecognised; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation; a bundle carrying price history while price restore is disabled", body = serde_json::Value),
+        (status = 500, description = "The write failed; the transaction was rolled back, so nothing was written", body = serde_json::Value),
+        (status = 503, description = "The database is busy; nothing was written", body = serde_json::Value),
+    )
+)]
+#[post("/backup/restore?<mode>&<apply_prices>", data = "<body>")]
+pub async fn restore(
+    user: AuthedUser,
+    pool: &State<SqlitePool>,
+    backup_cfg: &State<BackupConfig>,
+    mode: Option<Vec<String>>,
+    apply_prices: Option<Vec<String>>,
+    body: Data<'_>,
+) -> Result<Json<RestoreOutcome>, BackupError> {
+    // Both parameters go through `only_once` for the reason `only_once` documents: a
+    // repeated `Option` field reaches the handler as `None`, and here `None` means
+    // something specific for each of them — "no mode" and "do not touch prices". The
+    // two modes differ by "delete everything you own", so neither collapse is safe
+    // to answer.
+    let raw_mode = only_once(
+        mode.as_deref(),
+        "mode may appear only once, as either `copy` or `replace`",
+    )
+    .map_err(|reason| fail(Status::UnprocessableEntity, reason))?;
+    let mode = Mode::from_query(raw_mode)
+        .ok_or_else(|| fail(Status::UnprocessableEntity, "mode must be `copy` or `replace`"))?;
+
+    let raw_prices = only_once(
+        apply_prices.as_deref(),
+        "apply_prices may appear only once",
+    )
+    .map_err(|reason| fail(Status::UnprocessableEntity, reason))?;
+    let apply_prices = match parse_query_flag(raw_prices) {
+        Some(v) => v,
+        None => return Err(fail(Status::UnprocessableEntity,
+            "apply_prices must be one of 1/true/yes or 0/false/no")),
+    };
+
+    // The same per-route capped read as `preview`: opened under `MAX_BUNDLE_BYTES`
+    // here rather than by raising a global limit, and a truncated read is this
+    // module's `413` because Rocket hands it over silently and would otherwise be
+    // handed to validation as if it were the whole file.
+    let uploaded = body
+        .open(MAX_BUNDLE_BYTES.bytes())
+        .into_bytes()
+        .await
+        .map_err(|_| fail(Status::BadRequest, "the upload could not be read"))?;
+    if !uploaded.is_complete() {
+        return Err(too_large());
+    }
+
+    // Nothing that can reject a bundle runs after this point's failure: an invalid
+    // file is refused before the transaction opens, which is what makes "nothing was
+    // written" true for every refusal this route can give.
+    let bundle = parse_and_validate(&uploaded.value).map_err(bundle_err)?;
+
+    // `user.id` is the only owner this write can have: every row inserted is scoped
+    // to the caller and nothing in the bundle can name a row to write into, because
+    // nothing in the bundle is read as an id.
+    let outcome = backup_restore::apply(
+        pool.inner(),
+        user.id,
+        &bundle,
+        mode,
+        apply_prices,
+        backup_cfg.inner(),
+    )
+    .await
+    .map_err(|e| match e {
+        ApplyError::PricesDisabled => fail(
+            Status::UnprocessableEntity,
+            "this bundle contains price history and this server has price restore disabled",
+        ),
+        ApplyError::Db(DbFailure::Lock) => lock_response(),
+        ApplyError::Db(DbFailure::Other) => fail(
+            DbFailure::Other.status(),
+            "restore failed; nothing was written",
+        ),
+    })?;
+
+    Ok(Json(outcome))
 }

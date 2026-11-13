@@ -2,16 +2,19 @@
 //!
 //! Two rules hold throughout. **Bundle refs are never database ids** — they are
 //! local labels used only to rewire parent/child links, and nothing here matches
-//! one against a stored row. **The whole restore is one transaction** — a bundle
-//! that fails anywhere writes nothing.
+//! one against a stored row. The write path goes further: it never reads a ref at
+//! all, so a ref cannot reach a column, an empty one cannot reach an insert, and the
+//! links come from the ids the inserts allocated. **The whole restore is one
+//! transaction** — a bundle that fails anywhere writes nothing.
 //!
-//! Task 5 uses only the counting half: [`plan_for`] reads, and writes nothing. It
-//! is what the user is shown before a restore is allowed, so its numbers are the
-//! promise the write has to keep.
+//! [`plan_for`] is the read half: it is what the user is shown before a restore is
+//! allowed, so its numbers are the promise [`apply`] has to keep. [`apply`] is the
+//! write half, and it keeps that promise inside a single `pool.begin()` — every
+//! insert and every delete commits together or not at all.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use crate::backup::Bundle;
+use crate::backup::{BackupConfig, Bundle};
 use crate::backup::export::{classify, DbFailure};
 
 /// What to do with what the caller already owns. Merge is deliberately absent:
@@ -145,6 +148,215 @@ pub async fn plan_for(
         insert: bundle_counts(bundle),
         prices: bundle.prices.len(),
         warnings,
+    })
+}
+
+/// What a restore wrote, and what it cost the caller in new ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreOutcome {
+    pub inserted: Counts,
+    /// The database ids the restore allocated, in bundle order. Returned so the UI
+    /// can link straight to what appeared — and as proof that the ids are new.
+    pub portfolio_ids: Vec<i32>,
+    pub prices_inserted: usize,
+}
+
+/// Why a restore stopped after validation passed.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// `apply_prices` was asked for while the server flag is off. A `422`, never a
+    /// silently ignored request.
+    PricesDisabled,
+    Db(DbFailure),
+}
+
+impl ApplyError {
+    pub fn status(&self) -> rocket::http::Status {
+        match self {
+            ApplyError::PricesDisabled => rocket::http::Status::UnprocessableEntity,
+            ApplyError::Db(d) => d.status(),
+        }
+    }
+}
+
+/// So every database statement in [`apply`] can end in `.map_err(classify)?` rather
+/// than re-wrapping by hand: a `DbFailure` is one of this enum's variants, and the
+/// conversion has exactly one possible shape.
+impl From<DbFailure> for ApplyError {
+    fn from(d: DbFailure) -> Self {
+        ApplyError::Db(d)
+    }
+}
+
+/// Apply a bundle.
+///
+/// **One transaction**: every insert and, for `replace`, every delete happens inside
+/// it, so a bundle that fails on row 201 leaves the database exactly as it was.
+/// Partial application is not a state this feature can produce.
+///
+/// Validation belongs to the caller and the route does it: `parse_and_validate` is
+/// the only path to this function over HTTP, and it refuses an unsupported version,
+/// a duplicate ref, a non-decimal amount and an out-of-range date before a
+/// transaction is opened. `apply` does not re-validate — but it does not trust
+/// either. Every statement is parameterised, every parent id comes from the
+/// `RETURNING id` of the insert that made it, and a value that still cannot be
+/// written fails the whole transaction rather than writing half a bundle.
+pub async fn apply(
+    pool: &SqlitePool,
+    user_id: i32,
+    bundle: &Bundle,
+    mode: Mode,
+    apply_prices: bool,
+    cfg: &BackupConfig,
+) -> Result<RestoreOutcome, ApplyError> {
+    // Checked before anything else, and only when there is a price section to write:
+    // asking for prices the server forbids is a refusal, never a silent ignore, but a
+    // bundle with no prices asks for nothing the flag could forbid.
+    if !bundle.prices.is_empty() && apply_prices && !cfg.allow_price_restore {
+        return Err(ApplyError::PricesDisabled);
+    }
+
+    let mut tx = pool.begin().await.map_err(classify)?;
+
+    if mode == Mode::Replace {
+        // Reverse dependency order, scoped by `owner_id` and by nothing else: no
+        // caller-supplied id is involved, so no bundle value can widen the delete.
+        //
+        // `split_sync` goes first and explicitly. Its `asset_id` is a plain INTEGER
+        // PRIMARY KEY with **no** foreign key to `assets`, so `PRAGMA foreign_keys`
+        // does not reach it: a delete that skipped this statement would strand one
+        // orphan row per deleted asset permanently, and nothing would ever notice.
+        // Then the three real foreign keys, children before parents — `foreign_keys`
+        // is ON in this app and none of these FKs declare `ON DELETE CASCADE`, so
+        // deleting a parent with children still attached is an error, not a cascade.
+        sqlx::query(
+            "DELETE FROM split_sync WHERE asset_id IN \
+             (SELECT id FROM assets WHERE portfolio_id IN \
+              (SELECT id FROM portfolios WHERE owner_id = ?))",
+        )
+        .bind(user_id as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(classify)?;
+
+        sqlx::query(
+            "DELETE FROM transactions WHERE asset_id IN \
+             (SELECT id FROM assets WHERE portfolio_id IN \
+              (SELECT id FROM portfolios WHERE owner_id = ?))",
+        )
+        .bind(user_id as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(classify)?;
+
+        sqlx::query(
+            "DELETE FROM assets WHERE portfolio_id IN \
+             (SELECT id FROM portfolios WHERE owner_id = ?)",
+        )
+        .bind(user_id as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(classify)?;
+
+        sqlx::query("DELETE FROM portfolios WHERE owner_id = ?")
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
+    }
+
+    let mut portfolio_ids = Vec::with_capacity(bundle.portfolios.len());
+    let mut inserted = Counts::default();
+
+    for p in &bundle.portfolios {
+        // `RETURNING id` is the house pattern (see `create_portfolio`) and is one
+        // of the few constructs SQLite and Postgres already agree on.
+        let (new_portfolio,) = sqlx::query_as::<_, (i32,)>(
+            "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) \
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(&p.name)
+        .bind(&p.description)
+        .bind(&p.currency)
+        .bind(&p.base_currency)
+        .bind(user_id as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(classify)?;
+        portfolio_ids.push(new_portfolio);
+        inserted.portfolios += 1;
+
+        for a in &p.assets {
+            let (new_asset,) = sqlx::query_as::<_, (i32,)>(
+                "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            )
+            .bind(new_portfolio)
+            .bind(&a.symbol)
+            .bind(&a.name)
+            .bind(&a.asset_type)
+            .bind(&a.sector)
+            .bind(&a.currency)
+            .bind(&a.isin)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(classify)?;
+            inserted.assets += 1;
+
+            for t in &a.transactions {
+                // Validation already proved this parses; parsing again here is what
+                // keeps a caller that skipped validation from writing a row the
+                // ordinary write path would refuse. It cannot half-write: the `?`
+                // abandons the transaction, and the rollback takes every row above.
+                let when = chrono::DateTime::parse_from_rfc3339(&t.date)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|_| ApplyError::Db(DbFailure::Other))?;
+                sqlx::query(
+                    "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(new_asset)
+                .bind(&t.r#type)
+                .bind(&t.quantity)
+                .bind(&t.price)
+                .bind(&t.fee)
+                .bind(when)
+                .execute(&mut *tx)
+                .await
+                .map_err(classify)?;
+                inserted.transactions += 1;
+            }
+        }
+    }
+
+    let mut prices_inserted = 0usize;
+    if apply_prices && cfg.allow_price_restore {
+        for price in &bundle.prices {
+            let day = chrono::NaiveDate::parse_from_str(&price.date, "%Y-%m-%d")
+                .map_err(|_| ApplyError::Db(DbFailure::Other))?;
+            // DO NOTHING, not DO UPDATE: existing cached prices stay authoritative,
+            // so a bundle can fill gaps but cannot overwrite what is already there.
+            // The unique index `uq_historical_prices_symbol_date` backs this.
+            let res = sqlx::query(
+                "INSERT INTO historical_prices (symbol, date, close_price) \
+                 VALUES (?, ?, ?) ON CONFLICT (symbol, date) DO NOTHING",
+            )
+            .bind(&price.symbol)
+            .bind(day)
+            .bind(&price.close_price)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
+            prices_inserted += res.rows_affected() as usize;
+        }
+    }
+
+    tx.commit().await.map_err(classify)?;
+
+    Ok(RestoreOutcome {
+        inserted,
+        portfolio_ids,
+        prices_inserted,
     })
 }
 

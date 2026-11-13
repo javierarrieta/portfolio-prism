@@ -84,8 +84,8 @@ fn the_real_tree_passes_the_gate() {
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     assert!(
-        text.contains("handlers inspected: 19"),
-        "the gate should account for all 19 handlers, said:\n{text}"
+        text.contains("handlers inspected: 20"),
+        "the gate should account for all 20 handlers, said:\n{text}"
     );
 }
 
