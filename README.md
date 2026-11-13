@@ -125,13 +125,26 @@ Single Pod
 
 Both containers run in the same pod and communicate over `127.0.0.1`. The frontend nginx proxies all API requests (`/api/*`, `/api-docs/*`) to the backend. The browser only talks to the frontend — no cross-service calls are needed.
 
-An init container (`busybox:curl`) waits for the backend to become healthy before the frontend starts, ensuring the API is ready when nginx begins proxying.
+There is **no init container**. An earlier one curled `http://127.0.0.1:8000/` from an
+init phase to wait for the backend, but init runs *before* the backend container exists,
+so it could only ever exhaust its retries and exit 1 — delaying every pod start by 60
+seconds and never succeeding. The frontend's nginx tolerates the backend not being up
+yet; a container proxying to a not-yet-listening upstream returns `502` and the browser
+retries, which is cheaper than a probe that cannot succeed by construction.
 
 ### Storage
 
 The backend uses a SQLite database (`portfolio.db`). A persistent volume and claim are included to retain data across pod restarts. The volume is mounted at `/app/data/`.
 
-For production, replace the included `NFS` StorageClass with a cloud provider StorageClass (e.g., `gp2`, `ssd`, `azure-disk`) or use a managed database.
+For production, use block-backed storage (e.g. `gp2`, `ssd`, `azure-disk`) or a managed database.
+
+> **The manifests in `k8s/` are stale and do not describe the running deployment.** The
+> StorageClass is *named* `nfs-client`, but its provisioner is
+> `k8s.io/minikube-hostpath` — the name is a copied convention, not a description, and
+> nothing here has ever been NFS. The live app runs in the `apps` namespace against a
+> `local-path-retain` PVC on the node filesystem, with `replicas: 1` and `Recreate`.
+> Reconciling or deleting these manifests is tracked in #61. Do not infer the storage
+> backend from a StorageClass name; check `spec.provisioner` and the PV's volume source.
 
 ### Environment Variables
 
@@ -143,10 +156,24 @@ Backend environment variables are configured in the ConfigMap:
 
 ### Scaling
 
-The backend can be horizontally scaled if needed. For SQLite this requires a different storage strategy (e.g., SQLite with WAL mode and NFS, or migration to PostgreSQL). The manifests are designed to be easily adapted for a stateless backend with a managed database.
+The backend is a single replica against one SQLite file, and SQLite is not a
+client/server database — horizontal scaling means changing the storage engine, not
+adding replicas.
+
+> **Do not follow the previous advice in this section**, which suggested "SQLite with WAL
+> mode and NFS". SQLite's own WAL documentation rules that out: *"All processes using a
+> database must be the same host computer; WAL does not work over a network filesystem."*
+> WAL coordinates through a shared-memory `-shm` file, and on NFS that produces
+> `SQLITE_CORRUPT` rather than contention. Scaling SQLite across hosts is not a
+> supported configuration by any route.
+
+The supported path is migration to PostgreSQL (or another managed RDBMS). The manifests
+are written to be adaptable for a stateless backend against a managed database.
 
 ```bash
-kubectl scale deployment backend -n investment-portfolio-manager --replicas=3
+# Not a supported configuration — see above. Kept here only to record that it was tried
+# and why it is wrong.
+# kubectl scale deployment backend -n investment-portfolio-manager --replicas=3
 ```
 
 ### Scaling
