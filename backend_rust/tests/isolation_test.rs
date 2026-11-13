@@ -348,3 +348,57 @@ async fn an_export_never_contains_another_user_s_rows() {
     assert!(text.contains("Asset A"), "A's own bundle must contain A's asset: {text}");
     assert!(!text.contains("Asset B"), "A's bundle must not contain B's asset: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// Restore.
+//
+// The restore routes resolve no caller-supplied id — every row they write takes its
+// owner from the session — so the cross-tenant question here is not export's "can B
+// read A's rows". It is the other direction: a bundle is data that arrived from
+// another user, and carrying it across a tenant boundary must neither hand A's rows
+// to B nor let B write into A's space.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
+    // Restore always writes the caller as owner. A bundle is data, not a grant:
+    // carrying A's rows into B's session must not make them visible to A, and must
+    // not let B write into A's space.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let exported: String = {
+        let a = client_as(pool.clone(), u.a).await;
+        a.get(format!("/api/backup/export?portfolio_ids={}", u.a_portfolio))
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .unwrap()
+    };
+
+    let b = client_as(pool.clone(), u.b).await;
+    let res = b
+        .post("/api/backup/restore?mode=copy")
+        .header(json())
+        .body(exported)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: serde_json::Value = res.into_json().await.unwrap();
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    assert_ne!(new_id, u.a_portfolio, "a restore allocates its own ids");
+
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner.0, Some(u.b as i64), "the restorer owns what they restored");
+
+    // And A cannot see it.
+    let a = client_as(pool.clone(), u.a).await;
+    assert_eq!(
+        a.get(format!("/api/portfolios/{new_id}")).dispatch().await.status(),
+        Status::NotFound
+    );
+}

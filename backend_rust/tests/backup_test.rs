@@ -1116,6 +1116,211 @@ async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
 }
 
 // ---------------------------------------------------------------------------
+// Restore — replace mode.
+//
+// `replace` is the only part of this feature that can destroy data the bundle says
+// nothing about, so the tests here are written to fail rather than to decorate.
+// Three rules hold it together: the delete is scoped by `owner_id` and by nothing
+// else (a restore must never be a cross-tenant wipe, whatever the file contains);
+// it takes everything the caller owns, including portfolios the bundle never
+// mentions; and after it finishes the totals that moved are exactly the bundle's
+// counts, which is what turns "nothing else moved" into a checked claim instead of
+// an assumption. `preview` is the safety mechanism the user has to look at first;
+// none of these tests are that look.
+// ---------------------------------------------------------------------------
+
+/// Every row `user` owns, as one string per row, ordered, plus the `split_sync`
+/// rows hanging off their assets.
+///
+/// The whole row rather than a count, because a count is exactly what a wrong delete
+/// scope can accidentally preserve: this also moves if a foreign `owner_id` is
+/// rewritten, if a row is deleted and re-inserted with a fresh id, or if a
+/// `split_sync` row is stranded on a deleted asset. `split_sync` belongs in here for
+/// that reason — its `asset_id` has no foreign key to `assets`, so nothing in the
+/// schema would notice and nothing else in the suite would either.
+async fn owned_fingerprint(pool: &sqlx::SqlitePool, user: i32) -> Vec<String> {
+    // One `?` each, bound to the caller's id, and nothing else: the same scoping rule
+    // the deletes under test claim to follow.
+    let queries = [
+        "SELECT 'portfolios|' || id || '|' || name || '|' || COALESCE(description, '') || \
+                '|' || currency || '|' || base_currency || '|owner=' || COALESCE(owner_id, -1) \
+         FROM portfolios WHERE owner_id = ? ORDER BY id",
+        "SELECT 'assets|' || id || '|' || portfolio_id || '|' || symbol || '|' || name || '|' \
+                || asset_type || '|' || COALESCE(sector, '') || '|' || currency || '|' \
+                || COALESCE(isin, '') \
+         FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = ?) \
+         ORDER BY id",
+        "SELECT 'transactions|' || id || '|' || asset_id || '|' || type || '|' || quantity || \
+                '|' || price || '|' || fee || '|' || date \
+         FROM transactions WHERE asset_id IN \
+             (SELECT id FROM assets WHERE portfolio_id IN \
+              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+         ORDER BY id",
+        "SELECT 'split_sync|' || asset_id || '|' || last_synced_at || '|' || \
+                COALESCE(covered_from, '') \
+         FROM split_sync WHERE asset_id IN \
+             (SELECT id FROM assets WHERE portfolio_id IN \
+              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+         ORDER BY asset_id",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for sql in queries {
+        let rows: Vec<(String,)> = sqlx::query_as(sql)
+            .bind(user as i64)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        out.extend(rows.into_iter().map(|r| r.0));
+    }
+    out
+}
+
+#[tokio::test]
+async fn replace_removes_everything_the_caller_owns() {
+    // Spec: replace means "make my data equal this bundle", one rule, and the
+    // preview is the safety mechanism. The other two portfolios go too — the bundle
+    // names "Only" and says nothing about "One" or "Two", and both are gone.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let c = client(pool.clone()).await;
+
+    let res = c
+        .post("/api/backup/restore?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Only"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+
+    let (p, a, t) = rows(&pool).await;
+    assert_eq!((p, a, t), (1, 1, 1), "exactly the bundle remains");
+    let name: (String,) = sqlx::query_as("SELECT name FROM portfolios")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name.0, "Only");
+}
+
+#[tokio::test]
+async fn replace_leaves_other_users_data_alone() {
+    // The delete is scoped by `owner_id` and by nothing else. A restore must never be
+    // a cross-tenant wipe, whatever the bundle contains — so the other user's rows
+    // here are deliberately indistinguishable from the caller's by anything but
+    // owner: the same portfolio name the bundle uses, an asset the caller also owns,
+    // and a `split_sync` row that a delete which forgot its filter would happily
+    // sweep up. A `DELETE` missing any one of its four `WHERE owner_id = ?` filters
+    // fails this test.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let other = common::seed_user(&pool, "someone-else").await;
+    let theirs = seed_portfolio(&pool, other, "Only", "USD").await;
+    let their_asset = seed_asset(&pool, theirs, "AAPL", "Apple").await;
+    seed_transaction(&pool, their_asset, "BUY", 3.0, 40.0, 0.0).await;
+    common::seed_split_sync(&pool, their_asset).await;
+
+    let theirs_before = owned_fingerprint(&pool, other).await;
+    assert_eq!(
+        theirs_before.len(),
+        4,
+        "the fixture must own one portfolio, one asset, one transaction and one \
+         split_sync row, or 'unchanged' proves nothing: {theirs_before:?}"
+    );
+    let before = rows(&pool).await;
+
+    let c = client(pool.clone()).await;
+    let res = c
+        .post("/api/backup/restore?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json("Only"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+
+    // (a) the other user's rows, byte for byte: same ids, same columns, same owner,
+    // and their `split_sync` row still attached.
+    assert_eq!(
+        owned_fingerprint(&pool, other).await,
+        theirs_before,
+        "another user's rows must survive a replace untouched"
+    );
+    // (b) the global totals moved by exactly the bundle's counts: the caller's own
+    // 2 portfolios / 1 asset / 1 transaction left, the bundle's 1/1/1 arrived, and
+    // the other user's 1/1/1 is the only other thing inside these numbers. Anything
+    // else that moved — a foreign row, a foreign `split_sync` entry — shows up here
+    // even if (a) somehow did not.
+    assert_eq!(
+        rows(&pool).await,
+        (before.0 - 2 + 1, before.1 - 1 + 1, before.2 - 1 + 1)
+    );
+}
+
+#[tokio::test]
+async fn replacing_twice_in_a_row_is_still_exactly_the_bundle() {
+    // "Make my data equal this bundle" is a rule, not a one-shot: the second call
+    // must delete what the first one wrote and leave the same three rows, rather
+    // than doubling them or stranding a row from the first pass.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let c = client(pool.clone()).await;
+    for round in 1..=2 {
+        let res = c
+            .post("/api/backup/restore?mode=replace")
+            .header(session())
+            .header(rocket::http::ContentType::JSON)
+            .body(bundle_json("Only"))
+            .dispatch()
+            .await;
+        assert_eq!(res.status(), Status::Ok, "round {round}");
+    }
+    assert_eq!(rows(&pool).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn a_replace_that_fails_partway_deletes_nothing_either() {
+    // The worst failure mode this route has: the deletes land and the insert does
+    // not, which is not a failed restore but a wipe. The one transaction is what
+    // prevents it, and the copy-mode rollback test does not cover it — there the
+    // worst case is a stray portfolio, here it is an empty account. So the same
+    // mid-write failure is driven through `Mode::Replace`, over a caller who owns
+    // real rows, and the assertion is their whole fingerprint: a rolled-back delete
+    // has to give back the same ids, not merely the same count.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let mine_before = owned_fingerprint(&pool, common::DEFAULT_USER).await;
+    assert_eq!(
+        mine_before.len(),
+        4,
+        "the caller must own two portfolios, one asset and one transaction to lose: \
+         {mine_before:?}"
+    );
+
+    // Valid apart from the one corrupted field, exactly as the route would have
+    // received it, so the only failure available is the one after the deletes.
+    let mut bundle = parse_and_validate(bundle_json("Only").as_bytes())
+        .expect("the fixture is a valid bundle");
+    bundle.portfolios[0].assets[0].transactions[0].date = "not-a-date".into();
+
+    let err = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &bundle,
+        Mode::Replace,
+        false,
+        &BackupConfig::default(),
+    )
+    .await
+    .expect_err("a date no parser accepts stops the write");
+    assert!(matches!(err, ApplyError::Db(DbFailure::Other)), "{err:?}");
+    assert_eq!(
+        owned_fingerprint(&pool, common::DEFAULT_USER).await,
+        mine_before,
+        "a replace that failed must not have deleted anything either"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The `apply_prices` parameter.
 //
 // The same class of bug `include_prices` on export had twice: rocket's `Option`
@@ -1364,8 +1569,15 @@ async fn a_bundle_whose_second_portfolio_is_invalid_writes_nothing() {
 
 #[tokio::test]
 async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
+    // The baseline is deliberately not empty. From `(0, 0, 0)` "rolled back after
+    // writing the first portfolio" and "never wrote anything" are the same
+    // assertion, and only one of them is the guarantee — so the database starts with
+    // rows to roll back over, and the positive control at the bottom proves this
+    // exact fixture is capable of writing.
     let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
     let before = rows(&pool).await;
+    assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
     // Parsed as a real bundle first, so the only thing wrong with it is the one field
     // corrupted below: everything else is exactly what the route would have written.
     let mut bundle = parse_and_validate(two_portfolio_bundle().as_bytes())
@@ -1389,6 +1601,32 @@ async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
         before,
         "the first portfolio, its asset and its transaction must roll back with the second"
     );
+
+    // Positive control: the same `apply`, the same fixture, the same pool, minus the
+    // corrupted field. Without it the assertion above could be satisfied by an
+    // `apply` that wrote nothing on *any* path.
+    let clean = parse_and_validate(two_portfolio_bundle().as_bytes())
+        .expect("the fixture is a valid bundle");
+    let out = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &clean,
+        Mode::Copy,
+        false,
+        &BackupConfig::default(),
+    )
+    .await
+    .expect("the uncorrupted bundle applies");
+    assert_eq!(
+        (
+            out.inserted.portfolios,
+            out.inserted.assets,
+            out.inserted.transactions
+        ),
+        (2, 2, 2),
+        "this fixture does write through this function: {out:?}"
+    );
+    assert_eq!(rows(&pool).await, (before.0 + 2, before.1 + 2, before.2 + 2));
 }
 
 // ---------------------------------------------------------------------------
