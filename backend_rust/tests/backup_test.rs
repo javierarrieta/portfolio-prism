@@ -34,6 +34,18 @@ async fn client(pool: sqlx::SqlitePool) -> Client {
     Client::tracked(build_rocket(pool, common::DEFAULT_USER)).await.unwrap()
 }
 
+/// The same, with the price-restore flag on — the only thing a test can do about it:
+/// `build_rocket_with_backup_config` documents why the flag is injected, not exported.
+async fn price_restore_client(pool: sqlx::SqlitePool) -> Client {
+    Client::tracked(common::build_rocket_with_backup_config(
+        pool,
+        common::DEFAULT_USER,
+        BackupConfig { allow_price_restore: true },
+    ))
+    .await
+    .unwrap()
+}
+
 fn session() -> Header<'static> {
     let (name, value) = common::session_cookie(1, 0);
     Header::new(name, value)
@@ -1000,6 +1012,17 @@ async fn rows(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
     (p.0, a.0, t.0)
 }
 
+/// Rows in the one table a restore writes that no user owns. Separate from `rows`
+/// because a refusal that writes no portfolios can still have written market data,
+/// and only this count can see it.
+async fn price_rows(pool: &sqlx::SqlitePool) -> i64 {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM historical_prices")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n
+}
+
 #[tokio::test]
 async fn copy_mode_adds_alongside_and_assigns_new_ids() {
     let pool = setup_db(&disabled_config()).await;
@@ -1357,14 +1380,7 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
 #[tokio::test]
 async fn every_apply_prices_on_spelling_applies_the_price_section() {
     let pool = setup_db(&disabled_config()).await;
-    let on = BackupConfig { allow_price_restore: true };
-    let c = Client::tracked(common::build_rocket_with_backup_config(
-        pool.clone(),
-        common::DEFAULT_USER,
-        on,
-    ))
-    .await
-    .unwrap();
+    let c = price_restore_client(pool.clone()).await;
 
     // A distinct symbol per spelling: two rows for one `(symbol, date)` is one row,
     // so a repeated symbol would make three of these four calls answer exactly like
@@ -1395,14 +1411,7 @@ async fn every_apply_prices_off_spelling_and_an_absent_parameter_write_no_prices
     // The mirror half, including the default: an absent parameter means off, because
     // writing shared `historical_prices` is opt-in and never a guess.
     let pool = setup_db(&disabled_config()).await;
-    let on = BackupConfig { allow_price_restore: true };
-    let c = Client::tracked(common::build_rocket_with_backup_config(
-        pool.clone(),
-        common::DEFAULT_USER,
-        on,
-    ))
-    .await
-    .unwrap();
+    let c = price_restore_client(pool.clone()).await;
 
     let mut paths: Vec<String> = ["0", "false", "no"]
         .iter()
@@ -1435,14 +1444,7 @@ async fn every_apply_prices_off_spelling_and_an_absent_parameter_write_no_prices
 #[tokio::test]
 async fn an_unrecognised_apply_prices_is_a_422_not_a_quiet_ignore() {
     let pool = setup_db(&disabled_config()).await;
-    let on = BackupConfig { allow_price_restore: true };
-    let c = Client::tracked(common::build_rocket_with_backup_config(
-        pool,
-        common::DEFAULT_USER,
-        on,
-    ))
-    .await
-    .unwrap();
+    let c = price_restore_client(pool).await;
 
     for spelling in ["maybe", "2", "on", "off", "truest", ""] {
         let path = format!("/api/backup/restore?mode=copy&apply_prices={spelling}");
@@ -1517,6 +1519,11 @@ async fn asking_to_apply_prices_while_the_flag_is_off_is_a_422() {
         "{body}"
     );
     assert_eq!(rows(&pool).await, before, "the refusal writes nothing at all");
+    assert_eq!(
+        price_rows(&pool).await,
+        0,
+        "and that includes the shared historical_prices rows the caller asked for"
+    );
 
     // A bundle with no price section asks for nothing the flag forbids, so the same
     // request is an ordinary 200 rather than a refusal over nothing.
@@ -1529,6 +1536,243 @@ async fn asking_to_apply_prices_while_the_flag_is_off_is_a_422() {
         .await;
     assert_eq!(res.status(), Status::Ok);
     assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
+}
+
+// ---------------------------------------------------------------------------
+// What a price restore actually writes.
+//
+// `historical_prices` has no `owner_id` and hangs off no portfolio: it is market data
+// every tenant's dated reports read. That is the entire reason `BACKUP_ALLOW_PRICE_RESTORE`
+// exists and defaults off, and it is what these tests make visible rather than assume:
+// the spec's rule (design.md:291-295) is `ON CONFLICT (symbol, date) DO NOTHING`, so a
+// bundle fills gaps and cannot overwrite a close the server already has; the date and
+// the decimal string are text and must survive the trip unchanged; and the price inserts
+// sit inside the same transaction as the portfolio rows, so one that cannot be written
+// costs the whole restore.
+// ---------------------------------------------------------------------------
+
+/// `common::seed_price` with the date spelled the way `prices[].date` spells it.
+/// `seed_daily_prices` is the dense-range form, and a gap is the thing under test here.
+async fn seed_price_on(pool: &sqlx::SqlitePool, symbol: &str, day: &str, close: &str) {
+    let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").expect("a YYYY-MM-DD date");
+    common::seed_price(pool, symbol, day, close).await;
+}
+
+#[tokio::test]
+async fn a_price_restore_fills_gaps_and_never_overwrites_an_existing_close() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_price_on(&pool, "AAPL", "2024-01-15", "149.50").await;
+    let c = price_restore_client(pool.clone()).await;
+
+    let mut bundle = bundle_value("Priced");
+    bundle["prices"] = json!([
+        // This date already exists: `DO NOTHING` means this close must not land.
+        { "symbol": "AAPL", "date": "2024-01-15", "close_price": "666.00" },
+        // This one is a gap, so it must.
+        { "symbol": "AAPL", "date": "2024-02-01", "close_price": "180.00" },
+        // The same gap twice inside one bundle: the first write wins and the second
+        // conflicts with it, so a bundle cannot double-insert its own row either.
+        { "symbol": "AAPL", "date": "2024-02-01", "close_price": "999.00" }
+    ]);
+
+    let res = c
+        .post("/api/backup/restore?mode=copy&apply_prices=1")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(
+        body["prices_inserted"],
+        1,
+        "one date was already stored and the third row repeated it inside the bundle: {body}"
+    );
+
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT date, close_price FROM historical_prices ORDER BY date",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            ("2024-01-15".to_string(), "149.50".to_string()),
+            ("2024-02-01".to_string(), "180.00".to_string()),
+        ],
+        "the existing close survives untouched and the gap is filled exactly once"
+    );
+}
+
+#[tokio::test]
+async fn a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it() {
+    // Over HTTP a bad `prices[].date` is refused by validation before a transaction
+    // opens, so the only caller that can put a failure *after* the portfolio rows is
+    // one that skipped validation — the same caller the module's other rollback tests
+    // drive, for the same reason.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
+
+    let mut bundle = parse_and_validate(bundle_priced("Priced", "AAPL").as_bytes())
+        .expect("the fixture is a valid bundle");
+    bundle.prices[0].date = "15-01-2024".into();
+
+    let err = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &bundle,
+        Mode::Copy,
+        true,
+        &BackupConfig { allow_price_restore: true },
+    )
+    .await
+    .expect_err("a date no parser accepts stops the write");
+    assert!(matches!(err, ApplyError::Db(DbFailure::Other)), "{err:?}");
+    assert_eq!(
+        rows(&pool).await,
+        before,
+        "the portfolio the price row cost must have rolled back with it"
+    );
+    assert_eq!(price_rows(&pool).await, 0);
+
+    // Positive control: the same fixture minus the corrupted date writes both halves.
+    // Without it these assertions would be satisfied by an `apply` that never reached
+    // the price branch at all.
+    let clean = parse_and_validate(bundle_priced("Priced", "AAPL").as_bytes())
+        .expect("the fixture is a valid bundle");
+    let out = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &clean,
+        Mode::Copy,
+        true,
+        &BackupConfig { allow_price_restore: true },
+    )
+    .await
+    .expect("the uncorrupted bundle applies");
+    assert_eq!(out.prices_inserted, 1, "{out:?}");
+    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
+}
+
+#[tokio::test]
+async fn a_restored_price_row_is_market_data_every_other_tenant_reads() {
+    // The stakes of the flag, shown from the other side: user B never asked for
+    // anything here, and user A's price restore still lands in B's export.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await; // user A, holding AAPL
+    let other = common::seed_user(&pool, "user-b").await;
+    let theirs = seed_portfolio(&pool, other, "Theirs", "USD").await;
+    seed_asset(&pool, theirs, "AAPL", "Apple").await; // and so does B
+
+    let b = Client::tracked(build_rocket(pool.clone(), other)).await.unwrap();
+    let export = format!("/api/backup/export?portfolio_ids={theirs}&include_prices=1");
+    let res = b.get(&export).header(session()).dispatch().await;
+    let before: Value = res.into_json().await.unwrap();
+    assert!(before.get("prices").is_none(), "nothing is stored yet: {before}");
+
+    let bundle = bundle_priced("Priced", "AAPL");
+    let restore = "/api/backup/restore?mode=copy&apply_prices=1";
+
+    // Flag off: refused out loud, and B's view is untouched — the refusal writes no
+    // shared rows at all, not even the one the caller asked for.
+    let off = client(pool.clone()).await;
+    let res = off
+        .post(restore)
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle.clone())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    assert_eq!(price_rows(&pool).await, 0, "a refusal writes no market data");
+    let res = b.get(&export).header(session()).dispatch().await;
+    let still: Value = res.into_json().await.unwrap();
+    assert!(
+        still.get("prices").is_none(),
+        "B can see nothing of a refused restore: {still}"
+    );
+
+    // Flag on: the row lands, and it lands in B's export too, because there is no
+    // owner column to keep it out of.
+    let on = price_restore_client(pool.clone()).await;
+    let res = on
+        .post(restore)
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["prices_inserted"], 1, "{body}");
+
+    let res = b.get(&export).header(session()).dispatch().await;
+    let seen: Value = res.into_json().await.unwrap();
+    assert_eq!(
+        seen["prices"],
+        json!([{ "symbol": "AAPL", "date": "2024-01-01", "close_price": "150.00" }]),
+        "A's restore is exactly what B now reads"
+    );
+}
+
+#[tokio::test]
+async fn the_price_section_round_trips_byte_for_byte() {
+    // `prices[].date` is `YYYY-MM-DD` text and `close_price` is a decimal string, and
+    // both columns are TEXT, so the bundle carries them verbatim and must write them
+    // back verbatim. A helpful re-scale — `149.5070` to `149.51`, `0.010000` to `0.01`
+    // — is a silently different price, and a re-formatted date is a different day to
+    // every reader that parses this column.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    seed_price_on(&pool, "AAPL", "2024-02-29", "149.5070").await; // a leap day
+    seed_price_on(&pool, "AAPL", "2024-03-01", "0.010000").await; // trailing zeros
+    let c = price_restore_client(pool.clone()).await;
+
+    let path = format!("/api/backup/export?portfolio_ids={one}&include_prices=1");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let exported: Value = res.into_json().await.unwrap();
+    assert_eq!(
+        exported["prices"],
+        json!([
+            { "symbol": "AAPL", "date": "2024-02-29", "close_price": "149.5070" },
+            { "symbol": "AAPL", "date": "2024-03-01", "close_price": "0.010000" }
+        ]),
+        "the export half of the round trip"
+    );
+
+    // The write half: empty the table, restore the file that just came out of the
+    // export, and every character comes back.
+    sqlx::query("DELETE FROM historical_prices").execute(&pool).await.unwrap();
+    let res = c
+        .post("/api/backup/restore?mode=copy&apply_prices=1")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(exported.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["prices_inserted"], 2, "{body}");
+
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT date, close_price FROM historical_prices ORDER BY date",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            ("2024-02-29".to_string(), "149.5070".to_string()),
+            ("2024-03-01".to_string(), "0.010000".to_string()),
+        ],
+        "the restore wrote back exactly what the export read"
+    );
 }
 
 // ---------------------------------------------------------------------------
