@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bundle",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "created_at": {
+      "description": "RFC 3339 UTC, informational. Excluded from the round-trip equality test.",
+      "type": "string"
+    },
+    "portfolios": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BundlePortfolio"
+      }
+    },
+    "prices": {
+      "description": "Absent unless requested at export time. Flat, because price rows are\nglobal and belong to no portfolio.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BundlePrice"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "created_at",
+    "portfolios"
+  ],
+  "$defs": {
+    "BundlePortfolio": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "description": "Bundle-local label (`p1`, `p2`), unique within the bundle, used only to\nrewire parent/child links during restore. Never a database id, never\npersisted. `ref` is a Rust keyword, hence the rename.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currency": {
+          "type": "string"
+        },
+        "base_currency": {
+          "type": "string"
+        },
+        "assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BundleAsset"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "name",
+        "currency",
+        "base_currency",
+        "assets"
+      ]
+    },
+    "BundleAsset": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "asset_type": {
+          "type": "string"
+        },
+        "sector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currency": {
+          "type": "string"
+        },
+        "isin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BundleTransaction"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "symbol",
+        "name",
+        "asset_type",
+        "currency",
+        "transactions"
+      ]
+    },
+    "BundleTransaction": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "quantity": {
+          "description": "Decimal as a string, matching the TEXT column and `models::Transaction`.",
+          "type": "string"
+        },
+        "price": {
+          "type": "string"
+        },
+        "fee": {
+          "type": "string"
+        },
+        "date": {
+          "description": "RFC 3339 UTC datetime, matching `models::Transaction::date`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "quantity",
+        "price",
+        "fee",
+        "date"
+      ]
+    },
+    "BundlePrice": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string"
+        },
+        "date": {
+          "description": "`YYYY-MM-DD`, matching `models::HistoricalPrice::date`.",
+          "type": "string"
+        },
+        "close_price": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "symbol",
+        "date",
+        "close_price"
+      ]
+    }
+  }
+}

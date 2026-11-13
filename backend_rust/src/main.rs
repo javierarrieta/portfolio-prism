@@ -16,6 +16,13 @@ fn print_openapi_requested() -> bool {
     std::env::args().any(|arg| arg == "--print-openapi")
 }
 
+/// Print the backup bundle schema and exit, before touching configuration, the
+/// database, or the network — the same contract `--print-openapi` holds, and for
+/// the same reason: CI runs it with no `OIDC_*` variables and no secret key.
+fn print_backup_schema_requested() -> bool {
+    std::env::args().any(|arg| arg == "--print-backup-schema")
+}
+
 /// Refuse to start, naming the reason.
 ///
 /// `exit(1)` rather than `return Err`: `main`'s error type is `rocket::Error`,
@@ -30,6 +37,11 @@ fn refuse(err: anyhow::Error) -> ! {
 async fn main() -> Result<(), rocket::Error> {
     if print_openapi_requested() {
         println!("{}", backend_rust::openapi::document_json());
+        return Ok(());
+    }
+
+    if print_backup_schema_requested() {
+        println!("{}", backend_rust::backup::schema::document_json());
         return Ok(());
     }
 

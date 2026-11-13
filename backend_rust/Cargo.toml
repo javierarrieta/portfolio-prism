@@ -17,4 +17,5 @@ utoipa = { version = "4.2", features = ["rocket_extras", "decimal", "chrono"] }
 utoipa-swagger-ui = { version = "6.0", features = ["rocket"] }
 rocket_cors = "0.6"
 rust_decimal = { version = "1.35", features = ["serde"] }
+schemars = { version = "1.0", features = ["preserve_order"] }
 openidconnect = "4.1"
