@@ -32,6 +32,16 @@
 #   * Rule A's marker is honoured only as the whole line above the route attribute,
 #     so it cannot be smuggled into a string literal or a doc comment; a marker in
 #     the wrong place fails the gate rather than passing quietly.
+#   * Rule A's pass test is still file-level: one `require*` call anywhere in a file
+#     satisfies it for every handler in that file. The marker is per handler; the
+#     pass branch is not. Rule B is what pins the ordering per handler.
+#   * The marker's claim is cross-checked only against the route path: a parameter
+#     whose name contains `id` contradicts it and fails the gate. A handler that
+#     takes an id from a query string, a form field, or a JSON body is invisible to
+#     this, exactly as it is to Rule B — the isolation matrix is the real gate.
+#   * The `id` test is a substring on the parameter name, so `<sid>` or `<void>`
+#     would also contradict a marker. That fails closed, which is the right way to
+#     be wrong about a security gate.
 #
 # The script prints what it inspected. A gate that silently inspects nothing is worse
 # than no gate.
@@ -61,8 +71,10 @@ is_exempt() {
 }
 
 # One line per route handler in $1: "<attribute line>\t<1 if the marker is
-# honoured>\t<fn name>". The marker is honoured only when it is the whole previous
-# line, so it cannot hide inside a string or a doc comment.
+# honoured>\t<1 if the marker contradicts the route>\t<fn name>". The marker is
+# honoured only when it is the whole previous line, so it cannot hide inside a
+# string or a doc comment, and it is refused outright when the route path itself
+# names a caller-supplied id — the marker's whole claim is that there is none.
 handlers_in() {
   awk -v marker="$MARKER" '
     { line[NR] = $0 }
@@ -72,11 +84,16 @@ handlers_in() {
         prev = (i > 1 ? line[i - 1] : "")
         sub(/^[ \t]+/, "", prev); sub(/[ \t]+$/, "", prev)
         marked = (prev == marker) ? 1 : 0
+        # Any path parameter whose name contains `id` — `<id>`, `<portfolio_id>`,
+        # `<asset_id>` — is a caller-supplied id, so a marker here is a false claim.
+        attr = tolower(line[i])
+        contradict = (marked && attr ~ /<[a-z0-9_]*id[a-z0-9_]*>/) ? 1 : 0
+        if (contradict) marked = 0
         fn = "(unknown)"
         for (j = i; j <= NR && j <= i + 40; j++) {
           if (match(line[j], /fn [A-Za-z_0-9]+/)) { fn = substr(line[j], RSTART + 3, RLENGTH - 3); break }
         }
-        printf "%d\t%d\t%s\n", i, marked, fn
+        printf "%d\t%d\t%d\t%s\n", i, marked, contradict, fn
       }
     }
   ' "$1"
@@ -104,13 +121,21 @@ for file in "${FILES[@]}"; do
   handlers="$(handlers_in "$file")"
   total=0
   unmarked=0
+  contradicted=0
   # Waived handlers are printed whether or not the file also needs the chokepoint,
   # so a marker always shows up in the gate's output and in a diff review.
-  while IFS=$'\t' read -r hline hmarked hfn; do
+  while IFS=$'\t' read -r hline hmarked hcontra hfn; do
     [ -z "$hline" ] && continue
     total=$((total + 1))
     if [ "$hmarked" = "1" ]; then
       echo "  waived   $name:$hline $hfn ($MARKER — no caller-supplied id; Rules B and C still apply)"
+    elif [ "$hcontra" = "1" ]; then
+      # The marker says "no caller-supplied id" and the route path says otherwise.
+      # Refused even in a file that calls the chokepoint elsewhere: a false claim is
+      # the thing to surface, not something a neighbour's `require` can paper over.
+      echo "  MARKER-CONTRADICTS $name:$hline $hfn (the route path names a caller-supplied id, so the marker's claim is false)"
+      contradicted=$((contradicted + 1))
+      fail=1
     else
       unmarked=$((unmarked + 1))
     fi
@@ -118,15 +143,16 @@ for file in "${FILES[@]}"; do
 
   if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(' "$file"; then
     echo "  ok       $name"
-  elif [ "$total" -gt 0 ] && [ "$unmarked" -eq 0 ]; then
+  elif [ "$total" -gt 0 ] && [ "$unmarked" -eq 0 ] && [ "$contradicted" -eq 0 ]; then
     echo "  ok       $name (every handler carries the global-config marker: none resolves a caller-supplied id)"
   else
     # Name each handler that neither calls the chokepoint nor carries the marker.
     # A message that only named the file would hide which handler regressed, and a
     # marker on one handler must never cover an unmarked neighbour.
-    while IFS=$'\t' read -r hline hmarked hfn; do
+    while IFS=$'\t' read -r hline hmarked hcontra hfn; do
       [ -z "$hline" ] && continue
       [ "$hmarked" = "1" ] && continue
+      [ "$hcontra" = "1" ] && continue   # already reported above
       echo "  NO-CHOKEPOINT $name:$hline $hfn calls no require* and carries no access-gate marker"
       fail=1
     done <<< "$handlers"

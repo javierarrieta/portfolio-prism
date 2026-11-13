@@ -79,6 +79,27 @@
         }
       }
     },
+    "/api/backup/capabilities": {
+      "get": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "description": "Server limits and flags: schema_versions, allow_price_restore, max_bytes, max_rows",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
     "/api/portfolios/": {
       "get": {
         "tags": [

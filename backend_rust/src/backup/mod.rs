@@ -48,14 +48,22 @@ pub struct BackupConfig {
 }
 
 impl BackupConfig {
+    /// The only spellings that mean on, after trimming and lowercasing. One rule, so
+    /// `from_env_with` and `main`'s "not recognised" warning cannot disagree about
+    /// what the operator wrote. Anything else means off: this flag gates writes to
+    /// shared `historical_prices`, so it fails closed.
+    pub fn is_on(raw: &str) -> bool {
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    }
+
     pub fn from_env() -> Self {
         Self::from_env_with(&|key| std::env::var(key).ok())
     }
 
     pub fn from_env_with(env: &dyn Fn(&str) -> Option<String>) -> Self {
-        let raw = env("BACKUP_ALLOW_PRICE_RESTORE").map(|v| v.trim().to_ascii_lowercase());
         Self {
-            allow_price_restore: matches!(raw.as_deref(), Some("1") | Some("true") | Some("yes")),
+            allow_price_restore: env("BACKUP_ALLOW_PRICE_RESTORE")
+                .is_some_and(|v| Self::is_on(&v)),
         }
     }
 }
@@ -374,6 +382,51 @@ mod tests {
             created_at: "2026-11-13T00:00:00Z".to_string(),
             portfolios,
             prices: vec![],
+        }
+    }
+
+    /// The flag gates writes to shared `historical_prices`, so the accepted set
+    /// matters: an operator who writes `on` or `enabled` is told off by `main`, and
+    /// the parse itself must stay the single source of that rule.
+    #[test]
+    fn price_restore_is_on_only_for_the_accepted_spellings() {
+        let with = |v: Option<&str>| {
+            BackupConfig::from_env_with(&|key| {
+                if key == "BACKUP_ALLOW_PRICE_RESTORE" {
+                    v.map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .allow_price_restore
+        };
+
+        assert!(!with(None), "unset is off");
+        assert!(!with(Some("")), "empty is off");
+        for on in ["1", "true", "yes", "TRUE", "Yes", " 1 ", "\ttrue\n"] {
+            assert!(with(Some(on)), "{on:?} should mean on");
+        }
+        // Plausible spellings that mean nothing to this build. They fail closed, and
+        // `main` warns about them; both halves matter.
+        for off in ["0", "false", "no", "on", "y", "enabled", "2", "truest"] {
+            assert!(!with(Some(off)), "{off:?} must not mean on");
+        }
+        assert!(
+            !BackupConfig::default().allow_price_restore,
+            "Default is off"
+        );
+    }
+
+    #[test]
+    fn is_on_and_from_env_with_agree_on_every_spelling() {
+        // `main` warns using `is_on`; if the two diverged, an operator would be told
+        // their value was fine while the flag stayed off.
+        for raw in ["1", "true", "yes", " TRUE ", "0", "on", "", "  "] {
+            assert_eq!(
+                BackupConfig::is_on(raw),
+                BackupConfig::from_env_with(&|_| Some(raw.to_string())).allow_price_restore,
+                "{raw:?} parsed two ways"
+            );
         }
     }
 

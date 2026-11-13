@@ -18,7 +18,7 @@ use rocket::local::asynchronous::Client;
 use rocket::{post, routes};
 use serde_json::{json, Value};
 
-use backend_rust::backup::MAX_BUNDLE_BYTES;
+use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES};
 
 /// The session header the existing tests use to run as the placeholder user.
 async fn client(pool: sqlx::SqlitePool) -> Client {
@@ -51,6 +51,34 @@ async fn capabilities_requires_a_session() {
     let c = Client::tracked(rocket).await.unwrap();
     let res = c.get("/api/backup/capabilities").dispatch().await;
     assert_eq!(res.status(), Status::Unauthorized);
+}
+
+#[tokio::test]
+async fn the_managed_backup_config_is_the_one_build_rocket_was_given() {
+    // Rocket 0.5.1's `manage` panics on a type it already holds, so a
+    // `BackupConfig::default()` managed inside `build_rocket` crashed `main` at
+    // startup — and had it not panicked, the default would have won and
+    // `BACKUP_ALLOW_PRICE_RESTORE` could never have taken effect. The config is a
+    // parameter now, and this asserts the value that comes out the other side
+    // through the handler: re-introducing a default-managed config fails a test
+    // here instead of the release binary at boot.
+    let pool = setup_db(&disabled_config()).await;
+    let on = BackupConfig { allow_price_restore: true };
+    let rocket = common::build_rocket_with_backup_config(pool, common::DEFAULT_USER, on);
+    let c = Client::tracked(rocket).await.unwrap();
+
+    assert!(
+        c.rocket().state::<BackupConfig>().unwrap().allow_price_restore,
+        "build_rocket managed something other than the config it was given"
+    );
+
+    let res = c.get("/api/backup/capabilities").header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(
+        body["allow_price_restore"], json!(true),
+        "the handler read a different BackupConfig than the one passed in"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -171,6 +171,20 @@ pub async fn capabilities(user: AuthedUser) -> Json<Value> {
 }
 "#;
 
+/// The copy-paste this gate exists to catch: a handler whose route takes an id and
+/// whose marker claims it does not. Rule B cannot see it — the query is
+/// `WHERE portfolio_id`, not `WHERE id`, which the script admits as a blind spot —
+/// so the marker cross-check is the only thing standing here.
+const CONTRADICTORY_MARKER: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get("/export/<portfolio_id>")]
+pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, portfolio_id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = ?").bind(portfolio_id);
+    Json(json!({}))
+}
+"#;
+
 #[test]
 fn the_marker_waives_the_handler_it_names_and_no_other() {
     let (code, text) = run_tree("marked", PARTIALLY_MARKED);
@@ -209,4 +223,21 @@ fn a_marker_in_the_wrong_place_waives_nothing() {
         "a marker that is not the line above the attribute was honoured:\n{text}"
     );
     assert_eq!(code, 1, "a misplaced marker must fail, not pass quietly:\n{text}");
+}
+
+#[test]
+fn a_marker_on_a_route_that_takes_an_id_is_refused() {
+    // The marker's whole claim is "no caller-supplied id". A route attribute naming
+    // one contradicts it, and honouring the marker here would open Rule A for
+    // exactly the handler that needs it — Tasks 4-6 land in this same file.
+    let (code, text) = run_tree("contradicts", CONTRADICTORY_MARKER);
+    assert!(
+        text.contains("MARKER-CONTRADICTS") && text.contains("export"),
+        "a marker claiming no caller-supplied id was honoured on a route that has one:\n{text}"
+    );
+    assert!(
+        !text.contains("waived"),
+        "the contradictory marker was honoured anyway:\n{text}"
+    );
+    assert_eq!(code, 1, "a false marker must fail the gate:\n{text}");
 }

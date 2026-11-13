@@ -564,6 +564,10 @@ pub fn build_rocket(
     currency_service: CurrencyService,
     cors: Cors,
     auth: AuthMode,
+    // Threaded through rather than managed here: Rocket 0.5.1's `manage` panics on a
+    // type it already holds, so a default managed inside this function would both
+    // crash `main`'s `.manage(...)` and win over the real value.
+    backup_cfg: crate::backup::BackupConfig,
 ) -> Rocket<Build> {
     // The OIDC-only routes are mounted only when there is a provider to talk to;
     // `/auth/me` exists in both modes so the frontend can always ask who it is.
@@ -579,10 +583,7 @@ pub fn build_rocket(
         .manage(pool)
         .manage(currency_service)
         .manage(auth)
-        // The real value is managed over this one by `main`; Rocket replaces
-        // previously-managed state of the same type, so every test rocket has a
-        // `BackupConfig` without one being threaded through `build_rocket`.
-        .manage(crate::backup::BackupConfig::default())
+        .manage(backup_cfg)
         .mount("/", routes![index])
         // The sentinel the fairing rewrites denied requests to. Outside `/api`, so
         // it is neither covered by the prefix rule nor part of the API surface, and

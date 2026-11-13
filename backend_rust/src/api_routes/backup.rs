@@ -8,10 +8,11 @@
 //! resolve no caller-supplied id.
 //!
 //! A handler that resolves no caller-supplied id carries the marker
-//! `// access-gate: global-config (no caller-supplied id)` on the line directly
-//! above its route attribute. That waives Rule A's `require*` half for that one
-//! handler and no other; Rules B and C still apply to it, and the gate prints what
-//! it waived.
+//! `// access-gate: global-config (no caller-supplied id)` immediately above the
+//! route attribute — below `#[utoipa::path(...)]`, since the gate reads the line
+//! directly above `#[get]`/`#[post]`. That waives Rule A's `require*` half for that
+//! one handler and no other; the gate also refuses the marker if the route path
+//! itself names an id, Rules B and C still apply, and every waiver is printed.
 //!
 //! An uploaded bundle is read through a `Data` guard and opened under
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
