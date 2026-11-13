@@ -326,9 +326,15 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
 
         for (ai, a) in p.assets.iter().enumerate() {
             let ap = format!("{pp}.assets[{ai}]");
-            // The same `seen_refs` set as portfolios: Task 6's restore rewires
-            // assets through one shared `ref -> new id` map, so an asset ref must
-            // be unique bundle-wide and must not collide with a portfolio ref.
+            // The same `seen_refs` set as portfolios, deliberately: a ref is a
+            // bundle-local label, and a label that names two rows names neither. So
+            // the labels must be unique bundle-wide, and because portfolio and asset
+            // refs share one namespace, an asset ref may not equal a portfolio ref
+            // either. This is a rule about labels as labels, not a key standing in
+            // for a lookup: `restore::apply` never reads a ref, and every link comes
+            // from the `RETURNING id` of the insert that made the row. There is no
+            // `ref -> new id` map here, and this comment is not a promise that one
+            // should be built.
             if !seen_refs.insert(a.bundle_ref.as_str()) {
                 push(ap.clone(), format!("duplicate ref {:?}", a.bundle_ref));
             }
@@ -697,9 +703,10 @@ mod tests {
 
     #[test]
     fn a_duplicate_asset_ref_across_portfolios_is_rejected() {
-        // Task 6's restore rewires assets through ONE shared `ref -> new id` map,
-        // so asset refs are unique bundle-wide, not per-portfolio. A per-portfolio
-        // set would let the second `a1` silently link to the first row.
+        // Refs are bundle-local labels and the label namespace is bundle-wide, not
+        // per-portfolio: two `a1`s make "the asset labelled a1" name two rows, which
+        // is what a label must never do. A per-portfolio set would accept a bundle
+        // whose labels collide.
         let b = bundle(vec![
             port("p1", vec![asset("a1", vec![])]),
             port("p2", vec![asset("a1", vec![])]),
@@ -711,8 +718,9 @@ mod tests {
 
     #[test]
     fn a_portfolio_ref_colliding_with_an_asset_ref_is_rejected() {
-        // Portfolio and asset refs share one namespace in the restore map, so a
-        // portfolio ref equal to an asset ref is the same collision.
+        // One namespace, one rule: portfolio refs and asset refs are both
+        // bundle-local labels, so a portfolio ref equal to an asset ref is the same
+        // collision as two portfolios sharing one.
         let b = bundle(vec![port("x", vec![asset("x", vec![])])]);
         let errs = validate(&b);
         assert!(errs.iter().any(|e| e.path == "portfolios[0].assets[0]"
