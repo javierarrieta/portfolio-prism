@@ -41,18 +41,27 @@ async fn main() -> Result<(), rocket::Error> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite:../portfolio.db?mode=rwc".to_string());
 
-    // `busy_timeout` rather than WAL. The production volume is `nfs-client` (see
-    // k8s/pv.yaml), and SQLite's own WAL documentation is explicit that WAL does not
-    // work over a network filesystem: it coordinates through a shared-memory `-shm`
-    // file, and on NFS that has produced `SQLITE_CORRUPT` rather than contention. So
-    // the journal mode stays as it is and the only knob turned here is how long a
-    // writer waits for a lock instead of erroring.
+    // `busy_timeout` only; the journal mode is left alone. An earlier version of this
+    // comment justified that by calling the production volume NFS. That was wrong — it
+    // read the StorageClass *name* (`nfs-client`) without checking its provisioner, and
+    // the manifests it cited are not what is deployed. Measured against the live
+    // cluster: the database is on `local-path-retain`, a node filesystem, RWO, with
+    // `replicas: 1` and `Recreate`. WAL would be safe on it.
     //
-    // This is a mitigation, not a fix for the underlying exposure: rollback-journal
-    // mode also depends on file locks, and POSIX locks over NFS have their own known
-    // defects. Correctness here does not rest on locking — it rests on the unique
-    // index `enforce_split_uniqueness` installs. Moving the database to block-backed
-    // storage is the real answer and is out of scope for this change.
+    // WAL is still not enabled, for a different reason (#61): the PVC is opted into
+    // daily restic backups, and the backup Job copies the mounted volume with a plain
+    // `restic backup /volume` — no `sqlite3 .backup`, no checkpoint, nothing that
+    // understands SQLite. On rollback-journal mode a snapshot taken mid-transaction can
+    // restore corrupt, which is at least detectable with `PRAGMA integrity_check`. With
+    // WAL, committed data can sit in `-wal` uncheckpointed, so copying `portfolio.db`
+    // alone restores an older but internally consistent database — silently stale, and
+    // it passes `integrity_check`. Enabling WAL before the backup is SQLite-aware would
+    // turn a detectable failure into an invisible one.
+    //
+    // What is unchanged by all of this: correctness here does not rest on locking or on
+    // journal mode at all. It rests on the unique index `enforce_split_uniqueness`
+    // installs. `busy_timeout` just decides how long a writer waits for a lock instead
+    // of erroring.
     let opts = match database_url.parse::<SqliteConnectOptions>() {
         Ok(o) => o.busy_timeout(std::time::Duration::from_secs(5)),
         Err(e) => refuse(anyhow::anyhow!("invalid DATABASE_URL: {e}")),
