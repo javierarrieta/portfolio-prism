@@ -30,7 +30,6 @@ const emptyTaxSummary: TaxSummary = {
   total_portfolio_value: 0,
   total_realized_pnl: 0,
   total_unrealized_pnl: 0,
-  total_market_value: 0,
 }
 
 const noop = async () => {}
