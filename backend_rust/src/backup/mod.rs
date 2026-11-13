@@ -643,6 +643,26 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_over_the_byte_limit_is_refused_before_it_is_parsed() {
+        // Tasks 4-6 cap the upload per route when they open the `Data` stream, so
+        // this check is unreachable over HTTP — and it stays, because
+        // `parse_and_validate` is not the function that gets to trust its caller.
+        // It runs before parsing, so the bytes need not be JSON.
+        let over = vec![b'x'; MAX_BUNDLE_BYTES + 1];
+        match parse_and_validate(&over) {
+            Err(BundleError::Invalid(errors, false)) => {
+                assert!(errors[0].reason.contains("over the"), "{errors:?}");
+            }
+            other => panic!("expected the byte-limit Invalid, got {other:?}"),
+        }
+
+        // The boundary is `>`, not `>=`: exactly the limit is not over it, so these
+        // bytes fall through to the parser and fail as what they are.
+        let exact = vec![b'x'; MAX_BUNDLE_BYTES];
+        assert!(matches!(parse_and_validate(&exact), Err(BundleError::Unparseable(_))));
+    }
+
+    #[test]
     fn errors_are_capped_at_twenty_and_flagged_as_truncated() {
         let bad = |n: usize| -> Vec<BundleTransaction> {
             (0..n).map(|_| tx("", "BUY", "n", "1", "2024-01-15T00:00:00Z")).collect()
