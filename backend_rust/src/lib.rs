@@ -198,6 +198,8 @@ pub async fn init_db(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<(
     // dedupe that runs before it operates on a schema about to change.
     enforce_price_uniqueness(pool).await?;
 
+    enforce_split_uniqueness(pool).await?;
+
     // --- identity -------------------------------------------------------------
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (
@@ -449,6 +451,46 @@ pub async fn enforce_price_uniqueness(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Make a duplicated split row impossible rather than unlikely (#50).
+///
+/// `apply_split_events` used a `SELECT COUNT(*)` and then an `INSERT`, with no
+/// transaction and no constraint behind it. Two concurrent callers could both see
+/// zero and both insert, doubling a split adjustment and silently corrupting cost
+/// basis for that asset. A check-then-write cannot be made safe by tightening the
+/// check; it is safe when a second writer physically cannot land. So the guard is a
+/// partial unique index, and the count check becomes an optimisation.
+///
+/// The index is on `date(date)` rather than `date` because `transactions.date` is
+/// stored as a full timestamp (`2024-06-01T00:00:00Z`) while the dedupe has always
+/// compared calendar days. The expression has to match the one the queries use or
+/// SQLite will not use the index.
+///
+/// Existing duplicates are removed first, keeping the lowest `id`, because a unique
+/// index cannot be created over data that already violates it. That runs
+/// unconditionally rather than assuming any given database is clean.
+pub async fn enforce_split_uniqueness(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM transactions
+         WHERE type = 'SPLIT'
+           AND id NOT IN (
+               SELECT MIN(id) FROM transactions
+               WHERE type = 'SPLIT'
+               GROUP BY asset_id, date(date)
+           )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_split_asset_date
+             ON transactions(asset_id, date(date)) WHERE type = 'SPLIT'",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Re-key the split-sync throttle from symbol to asset (#38).
 ///
 /// Keyed on the symbol, the throttle let the first asset holding a symbol suppress
@@ -563,6 +605,9 @@ pub fn build_rocket(
             api_routes::portfolios::delete_portfolio,
             api_routes::portfolios::update_portfolio,
             api_routes::analytics::get_portfolio_tax_summary,
+            // Mounted with the portfolio routes because its path is portfolio-scoped.
+            // It is the only write there, and the only split-sync entry point (#50).
+            api_routes::analytics::sync_portfolio_splits,
             api_routes::analytics::get_portfolio_performance,
         ])
         .mount("/api", routes![

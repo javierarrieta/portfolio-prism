@@ -40,6 +40,13 @@ export interface Portfolio {
   description?: string;
   currency: string;
   assets: Asset[];
+  /**
+   * When the least recently synced asset last synced splits, or null when at least one
+   * asset here has never been synced. Null is not "a long time ago" — it means the
+   * portfolio is not fully covered, which is a different message. Split sync is an
+   * explicit action now, so staleness has to be visible rather than silent.
+   */
+  splits_last_synced_at?: string | null;
 }
 
 export interface TaxLot {

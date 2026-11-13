@@ -247,7 +247,7 @@ async fn every_api_route_is_unauthenticated_without_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 15,
+        checked, 16,
         "the sweep must cover the whole mounted surface"
     );
 }
@@ -285,7 +285,7 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
     // equally satisfied by a build that answers 401 *with* one — which is exactly
     // the bug this file now pins: the callback used to mint sessions at
     // `token_version = 0` regardless of the row, so the first `logout-all` locked a
-    // user out of all 15 routes forever and every test still passed.
+    // user out of all 16 routes forever and every test still passed.
     let client = oidc_client().await;
     let mut checked = 0;
     for (method, path) in reachable_api_routes().await {
@@ -302,7 +302,7 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 14,
+        checked, 15,
         "the sweep covers the mounted surface bar the network route"
     );
 }

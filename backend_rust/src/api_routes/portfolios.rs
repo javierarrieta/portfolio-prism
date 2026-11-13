@@ -44,10 +44,63 @@ pub async fn create_portfolio(
                 description: p.description,
                 currency: p.currency,
                 assets,
+                splits_last_synced_at: split_sync_age(pool.inner(), p.id).await
+                    .map_err(|_| Status::InternalServerError)?,
             }))
         },
         Err(_) => Err(Status::InternalServerError),
     }
+}
+
+/// Oldest split-sync timestamp across a portfolio's assets, or `None` when the
+/// portfolio is not fully covered (#50).
+///
+/// `None` means "at least one asset here has never had its splits looked up", which
+/// covers both the never-synced-at-all portfolio and the one where an asset was added
+/// after the last sync. Collapsing those is deliberate: the actionable state is the
+/// same, and the alternative — reporting the age of the assets that *were* synced —
+/// is exactly the silent staleness this field exists to prevent.
+///
+/// `MIN` over the covered assets rather than `MAX`: the portfolio is only as fresh as
+/// its least recently synced holding.
+pub async fn split_sync_age(pool: &sqlx::sqlite::SqlitePool, portfolio_id: i32) -> Result<Option<String>, sqlx::Error> {
+    let (total, synced, oldest): (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM assets WHERE portfolio_id = ?),
+                (SELECT COUNT(*) FROM assets a JOIN split_sync s ON s.asset_id = a.id
+                  WHERE a.portfolio_id = ?),
+                (SELECT MIN(s.last_synced_at) FROM assets a JOIN split_sync s ON s.asset_id = a.id
+                  WHERE a.portfolio_id = ?)"
+    )
+    .bind(portfolio_id)
+    .bind(portfolio_id)
+    .bind(portfolio_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(if total > 0 && synced == total { oldest } else { None })
+}
+
+/// Batch form for `list_portfolios`, so the dashboard does not pay one query per
+/// portfolio. Same semantics as `split_sync_age`.
+pub async fn split_sync_ages(pool: &sqlx::sqlite::SqlitePool) -> Result<HashMap<i32, Option<String>>, sqlx::Error> {
+    let rows: Vec<(i32, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT p.id,
+                (SELECT COUNT(*) FROM assets a WHERE a.portfolio_id = p.id),
+                (SELECT COUNT(*) FROM assets a JOIN split_sync s ON s.asset_id = a.id
+                  WHERE a.portfolio_id = p.id),
+                (SELECT MIN(s.last_synced_at) FROM assets a JOIN split_sync s ON s.asset_id = a.id
+                  WHERE a.portfolio_id = p.id)
+         FROM portfolios p"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, total, synced, oldest)| {
+            (id, if total > 0 && synced == total { oldest } else { None })
+        })
+        .collect())
 }
 
 async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_id: i32) -> Result<Vec<AssetOut>, sqlx::Error> {
@@ -147,12 +200,18 @@ pub async fn list_portfolios(
             map
         });
 
+    // One grouped query for every portfolio, so the dashboard's staleness badges do
+    // not cost a query per row.
+    let ages = split_sync_ages(pool.inner()).await
+        .map_err(|_| Status::InternalServerError)?;
+
     let out = portfolios.into_iter().map(|p| PortfolioOut {
         id: p.id,
         name: p.name,
         description: p.description,
         currency: p.currency,
         assets: by_portfolio.remove(&p.id).unwrap_or_default(),
+        splits_last_synced_at: ages.get(&p.id).cloned().flatten(),
     }).collect();
 
     Ok(Json(out))
@@ -188,6 +247,8 @@ pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) 
                 description: p.description,
                 currency: p.currency,
                 assets,
+                splits_last_synced_at: split_sync_age(pool.inner(), p.id).await
+                    .map_err(|_| Status::InternalServerError)?,
             }))
         },
         None => Err(Status::NotFound),
@@ -237,6 +298,8 @@ pub async fn update_portfolio(
                 description: p.description,
                 currency: p.currency,
                 assets,
+                splits_last_synced_at: split_sync_age(pool.inner(), p.id).await
+                    .map_err(|_| Status::InternalServerError)?,
             }))
         },
         None => Err(Status::NotFound),

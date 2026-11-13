@@ -14,7 +14,7 @@ use crate::engines::tax_engine::TaxLotEngine;
 use crate::report_csv;
 use crate::schemas::{
     AssetTotals, ErrorBody, MissingRate, PriceSource, ReportContext, ReportResponse, ReportRow,
-    ReportTotals, SellPnlResponse,
+    ReportTotals, SellPnlResponse, SyncSplitFailure, SyncSplitsOut,
 };
 use crate::engines::stats_engine::StatsEngine;
 use rust_decimal::Decimal;
@@ -161,17 +161,9 @@ async fn undated_summary(
     let mut total_unrealized = Decimal::ZERO;
 
     for asset in assets {
-        // Auto-detect and persist any unrecorded stock splits for this asset before
-        // computing tax lots, so they feed into P&L and value. A failure must not stop
-        // the report, but it must not be invisible either: a missed split is a wrong
-        // cost basis, and every failure path in the sync returns Ok or an Err that
-        // used to be discarded here.
-        if let Err(e) = currency_service.sync_splits_for_asset(asset, pool).await {
-            eprintln!(
-                "WARN: split sync failed for asset {} ({}): {}",
-                asset.id, asset.symbol, e
-            );
-        }
+        // No split sync here (#50) — see the note in `get_portfolio_performance`. This
+        // path is what `App.tsx` hits on every portfolio open, so leaving the write
+        // here would have kept the whole problem while a new endpoint looked tidy.
 
         let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
             .bind(asset.id)
@@ -225,6 +217,72 @@ async fn undated_summary(
     }))
 }
 
+/// The explicit split-sync action that replaces the sync these read paths used to do
+/// silently (#50).
+///
+/// A POST, not a GET, because it writes: it fetches from the provider and inserts
+/// `SPLIT` transactions. That is what gives a provider outage somewhere to be reported
+/// — as a 503 with a retry hint, rather than as a 200 whose numbers are quietly
+/// pre-split.
+///
+/// The per-asset throttle from #38 still applies, so this is cheap to call: an asset
+/// synced within the window and whose history is still covered costs one indexed read,
+/// not a provider round trip.
+#[utoipa::path(
+    post,
+    path = "/api/portfolios/<id>/sync-splits",
+    request_body = (),
+    responses(
+        (status = 200, description = "Synced; per-asset failures listed in the body", body = SyncSplitsOut),
+        (status = 404, description = "Portfolio not found", body = ErrorBody),
+        (status = 503, description = "Every asset failed to sync — a provider outage", body = ErrorBody)
+    )
+)]
+#[post("/<id>/sync-splits")]
+pub async fn sync_portfolio_splits(
+    user: AuthedUser,
+    id: i32,
+    pool: &State<SqlitePool>,
+    currency_service: &State<CurrencyService>,
+) -> Result<Json<SyncSplitsOut>, ReportError> {
+    // Editor, not Viewer: this writes rows that change cost basis.
+    require(pool.inner(), user.id, id, Access::Editor)
+        .await
+        .map_err(ReportError::from_status)?;
+
+    let pool = pool.inner();
+    let assets = load_assets(pool, id).await?;
+
+    let mut out = SyncSplitsOut {
+        assets_checked: assets.len(),
+        ..Default::default()
+    };
+    for asset in &assets {
+        match currency_service.sync_splits_for_asset(asset, pool).await {
+            Ok(n) => out.splits_inserted += n,
+            Err(e) => out.failures.push(SyncSplitFailure {
+                asset_id: asset.id,
+                symbol: asset.symbol.clone(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    // All-of-them failing is not a partial result, it is an outage, and answering 200
+    // with a list of failures would let a caller treat "nothing happened" as success.
+    // None-of-them-failing-with-zero-assets is a real 200: an empty portfolio has
+    // nothing to sync.
+    if !out.failures.is_empty() && out.failures.len() == out.assets_checked {
+        let first = &out.failures[0].error;
+        return Err(ReportError::provider(format!(
+            "all {} asset(s) failed to sync; first error: {}",
+            out.assets_checked, first
+        )));
+    }
+
+    Ok(Json(out))
+}
+
 #[utoipa::path(
     get,
     path = "/api/portfolios/<id>/performance",
@@ -258,17 +316,11 @@ pub async fn get_portfolio_performance(
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    // Auto-detect and persist any unrecorded stock splits so historical
-    // portfolio value is scaled correctly. Logged rather than discarded for the same
-    // reason as the tax-summary path above.
-    for asset in &assets {
-        if let Err(e) = currency_service.sync_splits_for_asset(asset, pool.inner()).await {
-            eprintln!(
-                "WARN: split sync failed for asset {} ({}): {}",
-                asset.id, asset.symbol, e
-            );
-        }
-    }
+    // No split sync here (#50). This is a GET, and a GET that writes cannot be
+    // reasoned about: it made a page view a mutation, it gave a provider outage no
+    // status code of its own, and its dedupe raced. Splits are synced by
+    // `POST /api/portfolios/<id>/sync-splits`, which the UI calls explicitly and which
+    // reports what it did.
 
     let transactions = sqlx::query_as::<_, Transaction>(
         "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = ?)"
