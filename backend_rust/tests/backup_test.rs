@@ -481,14 +481,13 @@ async fn no_global_body_limit_is_raised_for_the_bundle() {
 // ---------------------------------------------------------------------------
 // The lock responder.
 //
-// `DbFailure::Lock` is the one failure this module cannot provoke over HTTP from a
-// test: it needs the database to answer `SQLITE_BUSY`/`SQLITE_LOCKED`, and a
-// portfolio cannot delete itself between the handler's `require` and its read. So
-// the responder is pinned the way the size cap above is — the module's own value,
-// mounted on a probe route outside `/api`, asserted as what a client receives. The
-// real route reaches this exact code through `lock_response()` in
-// `api_routes::backup::export`, which is the only thing that turns a `DbFailure`
-// into a response.
+// A `503` and its `Retry-After` are only checkable on a real response, so the
+// responder is pinned the way the size cap above is — the module's own value, mounted
+// on a probe route outside `/api`, asserted as what a client receives. The real routes
+// reach this exact code through `lock_response()`, which is the only way to build a
+// `BackupError` with a `503` at all (`BackupError`'s fields are private). The route
+// that writes drives this same code from a real `SQLITE_BUSY` in
+// `a_locked_database_is_a_503_with_retry_after_from_the_restore_route` below.
 // ---------------------------------------------------------------------------
 
 /// The module's lock failure, answered verbatim.
@@ -516,12 +515,19 @@ async fn a_lock_is_a_503_that_says_when_to_retry() {
 // ---------------------------------------------------------------------------
 // The database-failure half of the `503`.
 //
-// The handler's `DbFailure::Lock => lock_response()` arm cannot be driven over
-// HTTP from a test: `require` reads the same tables `build` does, so anything that
-// makes the database refuse a read denies the request at `require` (a 500 from
-// `access.rs`) before the arm is reached. Each half is pinned where it can be:
-// `build()` producing `Lock` below, and the response that `Lock` becomes in
-// `a_lock_is_a_503_that_says_when_to_retry` above.
+// Two arms turn a `DbFailure::Lock` into the response, and they are not equally
+// reachable from a test:
+//
+// * `restore`'s arm is driven for real below, by a second connection holding a write
+//   transaction open against a file-backed database. A write is the one thing SQLite
+//   refuses with `SQLITE_BUSY` here.
+// * `export`'s arm still cannot be driven. `export` only reads, and under the
+//   rollback journal this app uses a writer does not block readers, so the lock that
+//   a test can actually provoke never reaches a read-only route; the one failure that
+//   would (`PoolTimedOut`) is met by `access::require` — or by the auth guard, which
+//   reads `users` on every request — and answered a 500 there before this arm is
+//   reached. Its two halves are pinned where they can be: `build()` producing `Lock`
+//   below, and the response a `Lock` becomes in `a_lock_is_a_503_that_says_when_to_retry`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -551,6 +557,103 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
     drop(held);
     let bundle = backup_export::build(&pool, &[pid], false).await.unwrap();
     assert_eq!(bundle.portfolios.len(), 1);
+}
+
+/// The same options for both halves of the lock test: the app's pool and the
+/// connection that locks it out must describe the same database.
+fn file_opts(path: &std::path::Path) -> sqlx::sqlite::SqliteConnectOptions {
+    sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        // Production waits five seconds for the lock (`main.rs`); this test only needs
+        // the wait to end, and a 5s busy_timeout would cost the suite five seconds.
+        .busy_timeout(std::time::Duration::from_millis(250))
+}
+
+/// A database on disk. `:memory:` cannot host this test: every connection of an
+/// in-memory pool is the *same* shared-cache database, and shared-cache writers
+/// collide at table level (`SQLITE_LOCKED`) rather than the `SQLITE_BUSY` a second
+/// connection — in production, a second process — meets against the file.
+async fn file_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+    // One connection, deliberately: `init_db` runs its migrations statement by statement
+    // against the pool, and a file-backed pool with several connections can hand a later
+    // statement a stale per-connection schema — the same class of bug
+    // `tests/decimal_migration_test.rs` guards. The lock under test comes from a *second*
+    // pool, so a single connection here costs nothing.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(file_opts(path))
+        .await
+        .unwrap();
+    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
+    pool
+}
+
+#[tokio::test]
+async fn a_locked_database_is_a_503_with_retry_after_from_the_restore_route() {
+    // Every other lock test here pins one part: `classify` on a fake error, the
+    // responder on a probe route, `build()` against an exhausted pool. This is the
+    // whole path over HTTP — a real `SQLITE_BUSY` from a real second writer, through
+    // `classify`, through `ApplyError::Db(DbFailure::Lock)`, out of `lock_response()`
+    // — and it is the only one that can fail if a future change routes a lock to a
+    // bare 500.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "portfolio_backup_lock_test_{}_{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let pool = file_pool(&tmp).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+
+    // A second connection holding a write transaction open. Reads still succeed — a
+    // RESERVED writer does not block readers under the rollback journal this app uses,
+    // which is also why the auth guard's read of `users` gets through — but the
+    // restore's first INSERT cannot be granted the write lock and waits out
+    // `busy_timeout`.
+    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp))
+        .await
+        .unwrap();
+    let mut holder = holder_pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let c = client(pool.clone()).await;
+    // Built twice rather than dispatched twice: a `LocalRequest` is consumed by
+    // `dispatch`, and the second request must be identical to the first for "it was
+    // the lock" to mean anything.
+    let restore = || {
+        c.post("/api/backup/restore?mode=copy")
+            .header(session())
+            .header(rocket::http::ContentType::JSON)
+            .body(bundle_json("Locked out"))
+    };
+    let res = restore().dispatch().await;
+    assert_eq!(res.status(), Status::ServiceUnavailable, "a busy database is retryable, not an outage");
+    assert_eq!(
+        res.headers().get_one("Retry-After"),
+        Some("2"),
+        "a 503 that does not say when to retry is a 503 a client will not retry"
+    );
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
+    assert_eq!(rows(&pool).await, before, "the refused restore wrote nothing");
+
+    // And it was the lock rather than something else about the file: release it and
+    // the identical request succeeds.
+    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+    let res = restore().dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
+
+    drop(holder);
+    holder_pool.close().await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,6 +1641,39 @@ async fn asking_to_apply_prices_while_the_flag_is_off_is_a_422() {
     assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
 }
 
+#[tokio::test]
+async fn a_replace_that_asks_for_prices_while_the_flag_is_off_deletes_nothing() {
+    // The copy-mode refusal above cannot see this: `replace` is the mode that destroys
+    // data, and the flag check is the first thing `apply` does, before the transaction
+    // that would delete is even opened. Move that check after the deletes and this
+    // answers the same 422 over an empty portfolio list.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    assert_ne!(before, (0, 0, 0), "a refusal that deletes must have something to delete");
+    let c = client(pool.clone()).await; // the flag is off
+
+    let res = c
+        .post("/api/backup/restore?mode=replace&apply_prices=1")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_json_with_prices("Replaced"))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("price restore disabled"),
+        "{body}"
+    );
+    assert_eq!(rows(&pool).await, before, "a refusal must not delete");
+    assert_eq!(
+        price_rows(&pool).await,
+        0,
+        "and must not write the shared rows it refused to write"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // What a price restore actually writes.
 //
@@ -1546,9 +1682,11 @@ async fn asking_to_apply_prices_while_the_flag_is_off_is_a_422() {
 // exists and defaults off, and it is what these tests make visible rather than assume:
 // the spec's rule (design.md:291-295) is `ON CONFLICT (symbol, date) DO NOTHING`, so a
 // bundle fills gaps and cannot overwrite a close the server already has; the date and
-// the decimal string are text and must survive the trip unchanged; and the price inserts
-// sit inside the same transaction as the portfolio rows, so one that cannot be written
-// costs the whole restore.
+// the decimal string are text and must survive the trip unchanged; and a price row that
+// cannot be written costs the whole restore, because the price inserts sit inside the
+// same transaction as the portfolio rows — which is what
+// `a_price_row_the_database_refuses_rolls_back_the_price_rows_written_before_it` proves,
+// with a trigger, rather than assuming it.
 // ---------------------------------------------------------------------------
 
 /// `common::seed_price` with the date spelled the way `prices[].date` spells it.
@@ -1655,6 +1793,85 @@ async fn a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it() {
     .await
     .expect("the uncorrupted bundle applies");
     assert_eq!(out.prices_inserted, 1, "{out:?}");
+    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
+}
+
+#[tokio::test]
+async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_before_it() {
+    // The claim this exists to pin is narrower than the one above and much easier to
+    // lose: the price inserts run on the restore's **transaction**, not on the pool.
+    // The bad-date test above cannot see it, because a bad `prices[].date` is refused
+    // by validation and then by the Rust parse *before any price SQL runs* — so that
+    // test passes just as happily if the loop executes on the pool, which in production
+    // would commit shared `historical_prices` rows and then roll back the caller's
+    // bundle, leaving market data every other tenant reads from a restore that
+    // reported failure. A trigger is the only way to make SQLite refuse a price row
+    // that the Rust side already approved.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
+
+    sqlx::query(
+        "CREATE TRIGGER refuse_the_second_price BEFORE INSERT ON historical_prices \
+         WHEN NEW.date = '2024-01-02' \
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut bundle = bundle_value("Two prices");
+    bundle["prices"] = json!([
+        // Writes cleanly, and must be undone by the row that does not.
+        { "symbol": "AAPL", "date": "2024-01-01", "close_price": "150.00" },
+        // Trips the trigger.
+        { "symbol": "AAPL", "date": "2024-01-02", "close_price": "151.00" }
+    ]);
+    let bundle = parse_and_validate(bundle.to_string().as_bytes())
+        .expect("the fixture is a valid bundle");
+
+    let err = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &bundle,
+        Mode::Copy,
+        true,
+        &BackupConfig { allow_price_restore: true },
+    )
+    .await
+    .expect_err("a price row the database itself refuses stops the write");
+    assert!(matches!(err, ApplyError::Db(DbFailure::Other)), "{err:?}");
+    assert_eq!(
+        price_rows(&pool).await,
+        0,
+        "the price row that succeeded must roll back with the one that failed"
+    );
+    assert_eq!(
+        rows(&pool).await,
+        before,
+        "and the bundle's own portfolio rows with it"
+    );
+
+    // Positive control: with the trigger gone the same bundle writes both halves, so
+    // the assertions above are a rollback and not a restore that never reached the
+    // price section at all.
+    sqlx::query("DROP TRIGGER refuse_the_second_price")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let out = backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &bundle,
+        Mode::Copy,
+        true,
+        &BackupConfig { allow_price_restore: true },
+    )
+    .await
+    .expect("the untriggered bundle applies");
+    assert_eq!(out.prices_inserted, 2, "{out:?}");
+    assert_eq!(price_rows(&pool).await, 2);
     assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
 }
 
@@ -1832,6 +2049,48 @@ async fn a_bundle_whose_second_portfolio_is_invalid_writes_nothing() {
         "{body}"
     );
     assert_eq!(rows(&pool).await, before, "a half-valid bundle is a half-restored one");
+}
+
+/// Two hundred valid transactions and one unusable one at the end: the shape of a
+/// bundle where everything up to the last row is fine, so a partial application would
+/// be two hundred and one rows of a file the caller has to find by hand.
+fn bundle_with_bad_last_row() -> String {
+    let mut b = bundle_value("Many rows");
+    let txs = b["portfolios"][0]["assets"][0]["transactions"]
+        .as_array_mut()
+        .unwrap();
+    for i in 0..200 {
+        txs.push(json!({ "type": "BUY", "quantity": "1", "price": "1", "fee": "0",
+                         "date": format!("2024-01-{:02}T00:00:00Z", (i % 28) + 1) }));
+    }
+    // Validation catches this before the transaction opens, which is the point: the
+    // write path is never reached at all.
+    txs.push(json!({ "type": "BUY", "quantity": "not-a-number", "price": "1",
+                     "fee": "0", "date": "2024-02-01T00:00:00Z" }));
+    b.to_string()
+}
+
+#[tokio::test]
+async fn a_bundle_that_fails_on_the_last_row_writes_nothing() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
+    let c = client(pool.clone()).await;
+
+    let res = c
+        .post("/api/backup/restore?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_bad_last_row())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    assert_eq!(
+        rows(&pool).await,
+        before,
+        "byte-identical: nothing half-applied"
+    );
 }
 
 #[tokio::test]
@@ -2097,4 +2356,209 @@ async fn restore_refuses_an_upload_it_cannot_read_or_parse() {
     assert_eq!(res.status(), Status::UnprocessableEntity);
 
     assert_eq!(rows(&pool).await, before, "neither refusal writes");
+}
+
+// ---------------------------------------------------------------------------
+// The caps at their exact boundaries.
+//
+// `MAX_BUNDLE_BYTES` and `MAX_BUNDLE_ROWS` are the two ceilings the feature promises,
+// and each is enforced twice: on the way out (an export over either is a file the same
+// build's restore would refuse) and on the way in (an upload over either is refused
+// before a row is written). A test that only checks "enormous is refused" would pass
+// with a ceiling one row too small — which is a user who cannot back up their own
+// portfolio — or one row too large. So every pair here is at the cap and one over.
+// ---------------------------------------------------------------------------
+
+/// The `bundle_value` fixture carries 3 rows (one portfolio, one asset, one
+/// transaction). This pads it with `extra_transactions` more transactions and `prices`
+/// price rows, so a test can sit exactly on `MAX_BUNDLE_ROWS`: the ceiling counts every
+/// row a restore must write, price rows included.
+fn bundle_of_rows(extra_transactions: usize, prices: usize) -> String {
+    let mut b = bundle_value("Cap boundary");
+    {
+        let txs = b["portfolios"][0]["assets"][0]["transactions"]
+            .as_array_mut()
+            .unwrap();
+        for i in 0..extra_transactions {
+            txs.push(json!({ "type": "BUY", "quantity": "1", "price": "1", "fee": "0",
+                             "date": format!("2024-01-{:02}T00:00:00Z", (i % 28) + 1) }));
+        }
+    }
+    b["prices"] = (0..prices)
+        .map(|i| {
+            json!({
+                "symbol": "AAPL",
+                // Every pair here is a real day. Two rows sharing one is legal in a
+                // bundle — the restore's `ON CONFLICT DO NOTHING` settles it.
+                "date": format!("2024-{:02}-{:02}", (i % 12) + 1, (i % 28) + 1),
+                "close_price": "1",
+            })
+        })
+        .collect();
+    b.to_string()
+}
+
+#[tokio::test]
+async fn the_row_cap_is_exact_on_the_export_side() {
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    let asset = seed_asset(&pool, one, "MSFT", "Microsoft").await;
+    // The selection is portfolio `one` alone: itself, the two assets on it, and their
+    // transactions — 4 rows before this seed, so this is the cap exactly.
+    seed_many_transactions(&pool, asset, MAX_BUNDLE_ROWS - 4).await;
+    let c = client(pool.clone()).await;
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok, "exactly at the ceiling must export");
+    let body: Value = res.into_json().await.unwrap();
+    let exported = body["portfolios"][0]["assets"][1]["transactions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(exported, MAX_BUNDLE_ROWS - 4, "the fixture is the ceiling, not less");
+
+    seed_many_transactions(&pool, asset, 1).await;
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity, "one row over is refused");
+    let body: Value = res.into_json().await.unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains(&MAX_BUNDLE_ROWS.to_string()), "{err}");
+    assert!(err.contains("row limit"), "{err}");
+}
+
+#[tokio::test]
+async fn the_byte_cap_is_exact_on_the_upload_side() {
+    // A bundle of exactly `MAX_BUNDLE_BYTES` is read whole and answered with a plan;
+    // one byte more is this module's own `413`, named by the number, before any of it
+    // is parsed. It is a `413` and not a `422` because the cap is opened per route
+    // rather than by raising a global Rocket limit (see
+    // `no_global_body_limit_is_raised_for_the_bundle`), so an oversized body never
+    // reaches validation to be answered as a bad bundle.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    let c = client(pool.clone()).await;
+
+    // The pad is the shortfall against the cap, and `x` needs no JSON escaping, so the
+    // serialised bundle is exactly `MAX_BUNDLE_BYTES` long rather than roughly it.
+    let mut at_cap = bundle_value("Exactly at the cap");
+    at_cap["portfolios"][0]["description"] = json!("");
+    let base = serde_json::to_vec(&at_cap).unwrap().len();
+    at_cap["portfolios"][0]["description"] = json!("x".repeat(MAX_BUNDLE_BYTES - base));
+    let at_cap = at_cap.to_string();
+    assert_eq!(at_cap.len(), MAX_BUNDLE_BYTES, "the fixture is the cap, not less");
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(at_cap)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok, "exactly at the ceiling must be read");
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(body_of(MAX_BUNDLE_BYTES + 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::PayloadTooLarge);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains(&MAX_BUNDLE_BYTES.to_string()),
+        "{body}"
+    );
+    assert_eq!(rows(&pool).await, before, "neither answer writes anything");
+}
+
+#[tokio::test]
+async fn a_bundle_over_the_row_cap_is_refused_before_any_write() {
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    let c = client(pool.clone()).await;
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_of_rows(MAX_BUNDLE_ROWS - 2, 0))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    assert!(
+        body["errors"].to_string().contains("row limit"),
+        "{body}"
+    );
+    assert_eq!(rows(&pool).await, before, "the refusal writes nothing");
+}
+
+#[tokio::test]
+async fn a_bundle_at_exactly_the_row_cap_is_restored() {
+    // The other side of the same boundary, on the route that writes: a bundle the
+    // ceiling allows must actually restore, or the ceiling is a quiet refusal to back
+    // up a legal portfolio.
+    let pool = setup_db(&disabled_config()).await;
+    let before = rows(&pool).await;
+    let c = client(pool.clone()).await;
+
+    let res = c
+        .post("/api/backup/restore?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_of_rows(MAX_BUNDLE_ROWS - 3, 0))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok, "exactly at the ceiling must restore");
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(
+        body["inserted"]["transactions"],
+        json!((MAX_BUNDLE_ROWS - 2) as i64),
+        "every row of the bundle landed: {body}"
+    );
+    assert_eq!(
+        rows(&pool).await,
+        (before.0 + 1, before.1 + 1, before.2 + (MAX_BUNDLE_ROWS - 2) as i64)
+    );
+}
+
+#[tokio::test]
+async fn price_rows_count_toward_the_row_cap_on_the_restore_side() {
+    // The ceiling is a bound on the work one restore does inside one write transaction,
+    // so it counts the rows a restore inserts into `historical_prices` too. A bundle
+    // can carry tens of thousands of them while its caller's own rows are a handful,
+    // and ~120k single-row INSERTs under a cap that only counted portfolios is how a
+    // restore comes to hold the write lock past the 5s `busy_timeout` and answer every
+    // concurrent request with a 503.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool.clone()).await;
+
+    let at_cap = bundle_of_rows(0, MAX_BUNDLE_ROWS - 3);
+    let over_cap = bundle_of_rows(0, MAX_BUNDLE_ROWS - 2);
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(at_cap)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok, "the price rows fit inside the ceiling");
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["prices"], json!((MAX_BUNDLE_ROWS - 3) as i64), "{body}");
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(over_cap)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity, "one price row over is over");
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["errors"].to_string().contains("row limit"), "{body}");
 }

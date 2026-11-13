@@ -440,7 +440,9 @@ mod tests {
         assert_eq!(
             row_count(&bundle),
             c.portfolios + c.assets + c.transactions,
-            "row_count counts a portfolio row for each portfolio; these counts must agree"
+            "row_count counts a portfolio row for each portfolio; these counts must agree \
+             (on a bundle with no price section — the ceiling also counts price rows, which \
+             belong to none of the three tables counted here)"
         );
     }
 }

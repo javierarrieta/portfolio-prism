@@ -46,7 +46,10 @@ pub const ACCEPTED_VERSIONS: &[i64] = &[1];
 /// defense-in-depth behind that, not the first line of defence.
 pub const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Ceiling on `portfolios + assets + transactions` in one bundle.
+/// Ceiling on the rows one bundle carries: `portfolios + assets + transactions +
+/// prices`. The same number is enforced on the way in (`collect`, so both `preview`
+/// and `restore`) and on the way out (`export::cap_error`), so the two ends cannot
+/// disagree about what this build is willing to write.
 pub const MAX_BUNDLE_ROWS: usize = 50_000;
 
 /// Server-side switches for the backup feature, read once at startup.
@@ -175,11 +178,20 @@ pub const KNOWN_ASSET_TYPES: &[&str] = &["STOCK", "FUND", "ETF", "BOND", "CASH"]
 /// The transaction types the tax engine replays.
 pub const KNOWN_TRANSACTION_TYPES: &[&str] = &["BUY", "SELL", "SPLIT", "DIVIDEND"];
 
-/// Total authored rows in a bundle, against `MAX_BUNDLE_ROWS`.
+/// Total rows a restore has to write for this bundle, against `MAX_BUNDLE_ROWS`.
+///
+/// Price rows are included because a restore inserts them too, in the same
+/// transaction as everything else. A cap that counted only the caller's own rows
+/// would let a bundle under it carry ~120k single-row `INSERT`s into
+/// `historical_prices` — enough to hold the SQLite write lock past the 5s
+/// `busy_timeout` in `main.rs` and turn concurrent traffic into 503s. The ceiling is
+/// a promise about how much work one restore may do, so it counts every row the
+/// restore writes.
 pub fn row_count(bundle: &Bundle) -> usize {
-    bundle.portfolios.iter().fold(0usize, |acc, p| {
+    let owned: usize = bundle.portfolios.iter().fold(0usize, |acc, p| {
         acc + 1 + p.assets.iter().fold(0usize, |a, ast| a + 1 + ast.transactions.len())
-    })
+    });
+    owned + bundle.prices.len()
 }
 
 /// One reason a bundle is not usable, addressed by bundle path rather than by
@@ -546,6 +558,64 @@ mod tests {
         }]);
         // 1 portfolio + 2 assets + 1 transaction
         assert_eq!(row_count(&b), 4);
+    }
+
+    /// The rows a restore writes into `historical_prices` count toward the same
+    /// ceiling as the caller's own rows. Excluding them is what let a bundle under the
+    /// cap drive ~120k single-row `INSERT`s inside one write transaction — long
+    /// enough to hold the SQLite write lock past the 5s `busy_timeout` and answer every
+    /// concurrent request with a 503.
+    #[test]
+    fn price_rows_count_toward_the_row_ceiling() {
+        let mut b = bundle(vec![port("p1", vec![asset("a1", vec![])])]);
+        assert_eq!(row_count(&b), 2, "1 portfolio + 1 asset, no prices yet");
+
+        b.prices.push(BundlePrice {
+            symbol: "AAPL".into(),
+            date: "2024-01-01".into(),
+            close_price: "150.00".into(),
+        });
+        assert_eq!(row_count(&b), 3, "the price row is a row the restore must write");
+    }
+
+    /// The ceiling itself, on both sides, filled with the rows that are easiest to
+    /// carry in bulk: prices. Exactly the cap is not over it; one row more is, and the
+    /// error names the number so the UI can say what to trim.
+    #[test]
+    fn the_row_ceiling_is_exact_and_includes_the_price_section() {
+        // 1 portfolio + 1 asset + 1 transaction = 3 owned rows, so the price section
+        // fills the rest of the ceiling exactly.
+        let with_prices = |prices: usize| -> Bundle {
+            let mut b = bundle(vec![port("p1", vec![asset("a1", vec![
+                tx("", "BUY", "1", "1", "2024-01-15T00:00:00Z"),
+            ])])]);
+            b.prices = (0..prices)
+                .map(|i| BundlePrice {
+                    symbol: "AAPL".into(),
+                    // Every combination here is a real day; the cap does not care
+                    // whether two rows share one, and neither does the restore.
+                    date: format!("2024-{:02}-{:02}", (i % 12) + 1, (i % 28) + 1),
+                    close_price: "1".into(),
+                })
+                .collect();
+            b
+        };
+
+        let at = with_prices(MAX_BUNDLE_ROWS - 3);
+        assert_eq!(row_count(&at), MAX_BUNDLE_ROWS);
+        assert_eq!(
+            validate(&at),
+            Vec::<ValidationError>::new(),
+            "exactly at the ceiling is not over it"
+        );
+
+        let over = with_prices(MAX_BUNDLE_ROWS - 2);
+        assert_eq!(row_count(&over), MAX_BUNDLE_ROWS + 1);
+        let errs = validate(&over);
+        assert!(
+            errs.iter().any(|e| e.reason.contains("row limit")),
+            "one row over the ceiling must name it: {errs:?}"
+        );
     }
 
     #[test]

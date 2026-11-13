@@ -269,14 +269,18 @@ pub async fn export(
     let bundle = backup_export::build(pool.inner(), &ids, include_prices)
         .await
         .map_err(|e| match e {
-            // Neither arm can be driven from a local request: any database failure a
-            // test could provoke would first deny `require`, which answers 500 from
-            // `access.rs` before this call is reached. Both halves of the `Lock` path
-            // are pinned where they can be — `build()` producing `DbFailure::Lock`
-            // for an exhausted pool
-            // (`tests/backup_test.rs::an_exhausted_pool_is_a_lock_not_an_outage`) and
-            // the response a `Lock` becomes
-            // (`a_lock_is_a_503_that_says_when_to_retry`).
+            // This `Lock` arm cannot be driven over HTTP from a test, and the reason is
+            // specific: `export` only reads, and under the rollback journal this app
+            // uses a writer does not block readers, so the lock a test can actually
+            // provoke (a second connection holding a write transaction — see
+            // `tests/backup_test.rs::a_locked_database_is_a_503_with_retry_after_from_the_restore_route`,
+            // which drives the *restore* arm for real) never reaches a read-only route.
+            // The failure that would, `PoolTimedOut`, is met earlier — by the auth guard's
+            // read of `users`, or by `require` below — and answered a 500 there before
+            // this arm is reached. So its two halves are pinned where they can be:
+            // `build()` producing `DbFailure::Lock` for an exhausted pool
+            // (`an_exhausted_pool_is_a_lock_not_an_outage`) and the response a `Lock`
+            // becomes (`a_lock_is_a_503_that_says_when_to_retry`).
             DbFailure::Lock => lock_response(),
             DbFailure::Other => fail(DbFailure::Other.status(),
                 "could not read the portfolio data"),

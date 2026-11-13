@@ -130,17 +130,17 @@ pub async fn build(
 ///
 /// The byte ceiling is checked here as well as on the way in because the bundle is
 /// already fully in memory by this point, so its serialised size is knowable — which is
-/// not true of a stream being uploaded. `row_count` counts portfolios, assets and
-/// transactions and **never price rows**, so without this second check a dated export
-/// of a few dozen symbols can pass the row ceiling and still be far too big to
-/// restore. A function rather than an inline `if` so both boundaries are testable
-/// without seeding tens of thousands of rows.
+/// not true of a stream being uploaded. It is a genuinely separate axis from the row
+/// ceiling rather than a restatement of it: `row_count` counts rows, and a single long
+/// text field — a description, an asset name — is megabytes of bundle carried by three
+/// rows. A function rather than an inline `if` so both boundaries are testable without
+/// seeding tens of thousands of rows.
 pub fn cap_error(bundle: &Bundle) -> Option<String> {
     let rows = row_count(bundle);
     if rows > MAX_BUNDLE_ROWS {
         return Some(format!(
             "that selection is {rows} rows, over the {MAX_BUNDLE_ROWS} row limit; \
-             export fewer portfolios"
+             export fewer portfolios, or leave out the price history"
         ));
     }
 
@@ -241,6 +241,130 @@ mod tests {
     use super::*;
     use crate::backup::ACCEPTED_VERSIONS;
     use rocket::http::Status;
+    use sqlx::error::DatabaseError;
+
+    /// A database error that reports itself as a lock, which is how SQLite surfaces
+    /// `SQLITE_BUSY` once the `busy_timeout` in `main.rs` has expired. `code()` keeps
+    /// the trait default of `None`, so this exercises the message half of `classify`;
+    /// the code half is pinned over HTTP by
+    /// `tests/backup_test.rs::a_locked_database_is_a_503_with_retry_after_from_the_restore_route`,
+    /// which drives a real `SQLITE_BUSY` out of a second connection.
+    #[derive(Debug)]
+    struct FakeLock;
+
+    impl std::fmt::Display for FakeLock {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("database is locked")
+        }
+    }
+    impl std::error::Error for FakeLock {}
+
+    impl DatabaseError for FakeLock {
+        fn message(&self) -> &str {
+            "database is locked"
+        }
+        // The trait's other required methods are plumbing: a `DatabaseError` must be
+        // able to hand out `self` as a `dyn Error` because `sqlx::Error::Database`
+        // stores it as a boxed trait object, and `kind()` is this sqlx version's
+        // fourth required method (mapped violations only; a lock has none).
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    #[test]
+    fn a_lock_by_message_is_a_503() {
+        let busy = sqlx::Error::Database(Box::new(FakeLock));
+        assert!(matches!(classify(busy), DbFailure::Lock));
+    }
+
+    #[test]
+    fn anything_else_is_a_500_not_a_503() {
+        // The other half of the rule in `src/access.rs`: an outage must not be
+        // reported as a client error, and a client error must not be reported as an
+        // outage the client should retry. Without this arm, every schema failure in
+        // the application would answer `503` with a `Retry-After`.
+        #[derive(Debug)]
+        struct FakeOther;
+        impl std::fmt::Display for FakeOther {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("no such table")
+            }
+        }
+        impl std::error::Error for FakeOther {}
+        impl DatabaseError for FakeOther {
+            fn message(&self) -> &str {
+                "no such table"
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+        }
+        let other = sqlx::Error::Database(Box::new(FakeOther));
+        assert!(matches!(classify(other), DbFailure::Other));
+        assert_eq!(DbFailure::Other.status(), Status::InternalServerError);
+    }
+
+    /// The SQLite codes `classify` claims to read. A `SQLITE_BUSY` carries `5` and a
+    /// `SQLITE_LOCKED` carries `6`; if the match arm lost them, the message check
+    /// alone would decide, and a driver that words its message differently would
+    /// answer a `500` for a retryable lock.
+    #[test]
+    fn the_busy_and_locked_codes_are_classified_as_locks() {
+        #[derive(Debug)]
+        struct FakeCode(&'static str);
+        impl std::fmt::Display for FakeCode {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "sqlite code {}", self.0)
+            }
+        }
+        impl std::error::Error for FakeCode {}
+        impl DatabaseError for FakeCode {
+            fn message(&self) -> &str {
+                "nothing in the message matches"
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(std::borrow::Cow::Borrowed(self.0))
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+        }
+        for code in ["5", "6"] {
+            let err = sqlx::Error::Database(Box::new(FakeCode(code)));
+            assert!(matches!(classify(err), DbFailure::Lock), "code {code}");
+        }
+        // And a code that is not one of them is still an outage.
+        let err = sqlx::Error::Database(Box::new(FakeCode("1")));
+        assert!(matches!(classify(err), DbFailure::Other));
+    }
 
     /// A bundle of `1 + assets` counted rows: one portfolio plus that many empty
     /// assets, which is the cheapest way to sit exactly on either side of the cap.
@@ -340,9 +464,10 @@ mod tests {
         let pad = MAX_BUNDLE_BYTES - serialised_bytes(&bundle_with_padding(0)) + 1;
         let b = bundle_with_padding(pad);
         assert_eq!(serialised_bytes(&b), MAX_BUNDLE_BYTES + 1);
-        // The point of the byte check: `row_count` never sees price rows, so a bundle
-        // of a few dated symbols is far under the row ceiling and still too big to
-        // restore. Without this arm that bundle is exported and refused later.
+        // The point of the byte check on its own axis: rows say nothing about size, so
+        // three rows carrying one enormous text field are far under the row ceiling and
+        // still too big to restore. Without this arm that bundle is exported and refused
+        // later, by the upload, after the user has downloaded it.
         assert!(row_count(&b) < 10, "the row ceiling was never going to see this");
         let err = cap_error(&b).expect("one byte over the cap must be refused");
         assert!(err.contains("byte"), "{err}");
