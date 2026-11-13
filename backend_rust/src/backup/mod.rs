@@ -191,30 +191,44 @@ pub fn parse_and_validate(raw: &[u8]) -> Result<Bundle, BundleError> {
         return Err(BundleError::UnsupportedVersion { found: bundle.schema_version });
     }
 
-    let errors = validate(&bundle);
+    let (errors, more) = collect(&bundle);
     if errors.is_empty() {
         Ok(bundle)
     } else {
-        Err(BundleError::Invalid(errors, false))
+        Err(BundleError::Invalid(errors, more))
     }
 }
 
-/// Append one error, unless the report is already at its cap.
-fn push_err(errors: &mut Vec<ValidationError>, path: String, reason: String) {
+/// Append one error, unless the report is already at its cap — in which case set
+/// `truncated`, so a caller can tell the user more errors were found than it
+/// lists.
+fn push_err(
+    errors: &mut Vec<ValidationError>,
+    truncated: &mut bool,
+    path: String,
+    reason: String,
+) {
     if errors.len() < MAX_REPORTED_ERRORS {
         errors.push(ValidationError { path, reason });
+    } else {
+        *truncated = true;
     }
+}
+
+/// Field-level validation for callers that only need the list of errors.
+pub fn validate(bundle: &Bundle) -> Vec<ValidationError> {
+    collect(bundle).0
 }
 
 /// Field-level validation. Returns every error found, capped at
-/// `MAX_REPORTED_ERRORS` so the response stays a readable size.
+/// `MAX_REPORTED_ERRORS`, plus whether the cap suppressed any.
 ///
-/// The appender is a free function taking `&mut Vec` rather than a closure
-/// capturing `errors`, because a closure holding the mutable borrow would not let
-/// `errors` be returned at the end of the function.
-pub fn validate(bundle: &Bundle) -> Vec<ValidationError> {
+/// The cap rule lives in the free `push_err` function so it can be exercised on
+/// its own; the closure below only curries the two accumulator borrows.
+fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
     let mut errors: Vec<ValidationError> = Vec::new();
-    let mut push = |path: String, reason: String| push_err(&mut errors, path, reason);
+    let mut truncated = false;
+    let mut push = |path: String, reason: String| push_err(&mut errors, &mut truncated, path, reason);
 
     if bundle.portfolios.is_empty() {
         push("portfolios".into(), "a bundle must contain at least one portfolio".into());
@@ -241,10 +255,12 @@ pub fn validate(bundle: &Bundle) -> Vec<ValidationError> {
             }
         }
 
-        let mut seen_asset_refs: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (ai, a) in p.assets.iter().enumerate() {
             let ap = format!("{pp}.assets[{ai}]");
-            if !seen_asset_refs.insert(a.bundle_ref.as_str()) {
+            // The same `seen_refs` set as portfolios: Task 6's restore rewires
+            // assets through one shared `ref -> new id` map, so an asset ref must
+            // be unique bundle-wide and must not collide with a portfolio ref.
+            if !seen_refs.insert(a.bundle_ref.as_str()) {
                 push(ap.clone(), format!("duplicate ref {:?}", a.bundle_ref));
             }
             if a.symbol.trim().is_empty() {
@@ -310,7 +326,7 @@ pub fn validate(bundle: &Bundle) -> Vec<ValidationError> {
         }
     }
 
-    errors
+    (errors, truncated)
 }
 
 fn is_rfc3339(value: &str) -> bool {
@@ -405,7 +421,14 @@ mod tests {
             "created_at":"2026-11-13T00:00:00Z","portfolios":[
             {"ref":"p1","name":"Main","description":null,"currency":"USD",
              "base_currency":"USD","assets":[],"id":7}]}"#;
-        assert!(serde_json::from_str::<Bundle>(raw).is_err());
+        let err = serde_json::from_str::<Bundle>(raw)
+            .expect_err("an extra `id` on a nested portfolio must be rejected");
+        // Naming the field proves `deny_unknown_fields` fired, not that the
+        // fixture was malformed for some other reason.
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
     }
 
     fn tx(_path: &str, kind: &str, qty: &str, price: &str, date: &str) -> BundleTransaction {
@@ -530,6 +553,30 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_asset_ref_across_portfolios_is_rejected() {
+        // Task 6's restore rewires assets through ONE shared `ref -> new id` map,
+        // so asset refs are unique bundle-wide, not per-portfolio. A per-portfolio
+        // set would let the second `a1` silently link to the first row.
+        let b = bundle(vec![
+            port("p1", vec![asset("a1", vec![])]),
+            port("p2", vec![asset("a1", vec![])]),
+        ]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.path == "portfolios[1].assets[0]"
+            && e.reason.contains("duplicate ref")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_portfolio_ref_colliding_with_an_asset_ref_is_rejected() {
+        // Portfolio and asset refs share one namespace in the restore map, so a
+        // portfolio ref equal to an asset ref is the same collision.
+        let b = bundle(vec![port("x", vec![asset("x", vec![])])]);
+        let errs = validate(&b);
+        assert!(errs.iter().any(|e| e.path == "portfolios[0].assets[0]"
+            && e.reason.contains("duplicate ref")), "{errs:?}");
+    }
+
+    #[test]
     fn an_empty_asset_list_is_allowed_but_an_empty_transaction_list_is_too() {
         // A portfolio with no assets is legal (you can create one in the UI), so
         // a bundle may carry one. Same for an asset with no transactions.
@@ -567,9 +614,25 @@ mod tests {
 
     #[test]
     fn errors_are_capped_at_twenty_and_flagged_as_truncated() {
-        let txs = (0..25).map(|_| tx("", "BUY", "n", "1", "2024-01-15T00:00:00Z"))
-            .collect();
-        let errs = validate(&bundle(vec![port("p1", vec![asset("a1", txs)])]));
-        assert_eq!(errs.len(), 20);
+        let bad = |n: usize| -> Vec<BundleTransaction> {
+            (0..n).map(|_| tx("", "BUY", "n", "1", "2024-01-15T00:00:00Z")).collect()
+        };
+
+        // 25 bad decimals: the report is capped and says it is incomplete.
+        let (errs, truncated) = collect(&bundle(vec![port("p1", vec![asset("a1", bad(25))])]));
+        assert_eq!(errs.len(), MAX_REPORTED_ERRORS);
+        assert!(truncated, "25 errors exceed the cap, so the report must say so");
+
+        // A report under the cap claims no truncation, so the flag is not vacuous.
+        let (errs, truncated) = collect(&bundle(vec![port("p1", vec![asset("a1", bad(2))])]));
+        assert_eq!(errs.len(), 2);
+        assert!(!truncated, "a report under the cap must not claim truncation");
+
+        // `parse_and_validate` must carry the real flag into the error it returns.
+        let raw = serde_json::to_vec(&bundle(vec![port("p1", vec![asset("a1", bad(25))])])).unwrap();
+        match parse_and_validate(&raw) {
+            Err(BundleError::Invalid(errs, true)) => assert_eq!(errs.len(), MAX_REPORTED_ERRORS),
+            other => panic!("expected Invalid(_, true), got {other:?}"),
+        }
     }
 }
