@@ -9,7 +9,7 @@ use chrono::{NaiveDate, Utc};
 use sqlx::SqlitePool;
 use crate::backup::{
     Bundle, BundleAsset, BundlePortfolio, BundlePrice, BundleTransaction, CURRENT_SCHEMA_VERSION,
-    FORMAT_TAG, MAX_BUNDLE_ROWS, row_count,
+    FORMAT_TAG, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS, row_count,
 };
 
 /// A database failure, kept distinct from a client error so the handler can answer
@@ -45,6 +45,10 @@ impl DbFailure {
 /// retryable, so it must not answer a bare `500` where the caller was told to retry.
 pub fn classify(e: sqlx::Error) -> DbFailure {
     if matches!(e, sqlx::Error::PoolTimedOut) {
+        // Said out loud because this branch returns before the `ERROR:` line below, and
+        // an exhausted pool is the one lock an operator can act on: a `SQLITE_BUSY` that
+        // clears in milliseconds is not, but a pool with nothing free stays that way.
+        eprintln!("WARN: backup: no database connection free within the pool timeout; answering 503");
         return DbFailure::Lock;
     }
     if let sqlx::Error::Database(db) = &e {
@@ -118,21 +122,35 @@ pub async fn build(
 
 /// Why a built bundle is too large to hand back, or `None` when it fits.
 ///
-/// `MAX_BUNDLE_ROWS` is what restore enforces on the way in, so an export over the
-/// ceiling produces a file its own restore will refuse — discovered by the user, after
-/// the download. Checked here instead, where the caller can still do something about
-/// it. A function rather than an inline `if` so the boundary is testable without
-/// seeding 50k rows.
+/// Both ceilings are the ones **restore** enforces, so a bundle over either is a file
+/// its own restore will refuse — discovered by the user, after the download. Checked
+/// here instead, where the caller can still do something about it: export fewer
+/// portfolios. Rows are checked first because it is a counter, while the byte check
+/// has to serialise.
 ///
-/// The **byte** ceiling stays an upload-side limit: nothing at export time knows the
-/// serialised size cheaply, and a price-heavy selection can still produce a bundle
-/// over `MAX_BUNDLE_BYTES`. That is a known limitation, recorded for the spec's
-/// follow-ups.
-pub fn row_cap_error(bundle: &Bundle) -> Option<String> {
+/// The byte ceiling is checked here as well as on the way in because the bundle is
+/// already fully in memory by this point, so its serialised size is knowable — which is
+/// not true of a stream being uploaded. `row_count` counts portfolios, assets and
+/// transactions and **never price rows**, so without this second check a dated export
+/// of a few dozen symbols can pass the row ceiling and still be far too big to
+/// restore. A function rather than an inline `if` so both boundaries are testable
+/// without seeding tens of thousands of rows.
+pub fn cap_error(bundle: &Bundle) -> Option<String> {
     let rows = row_count(bundle);
-    (rows > MAX_BUNDLE_ROWS).then(|| {
-        format!(
+    if rows > MAX_BUNDLE_ROWS {
+        return Some(format!(
             "that selection is {rows} rows, over the {MAX_BUNDLE_ROWS} row limit; \
+             export fewer portfolios"
+        ));
+    }
+
+    // A `Bundle` is strings and sequences, so this cannot fail in practice; if it ever
+    // did, the byte ceiling is simply not the thing that stops this response, and the
+    // row ceiling above still stands.
+    let bytes = serde_json::to_vec(bundle).ok()?.len();
+    (bytes > MAX_BUNDLE_BYTES).then(|| {
+        format!(
+            "that selection is {bytes} bytes, over the {MAX_BUNDLE_BYTES} byte limit; \
              export fewer portfolios"
         )
     })
@@ -275,22 +293,60 @@ mod tests {
         assert_eq!(
             CURRENT_SCHEMA_VERSION,
             *ACCEPTED_VERSIONS.last().expect("there is always a newest accepted version"),
-            "export would keep emitting a version the format has moved past"
+            "bumping the version means appending it to ACCEPTED_VERSIONS, never replacing \
+             the version before it: a released version stays restorable forever"
         );
+    }
+
+    /// A bundle whose serialised size is `base + pad` bytes: one portfolio whose
+    /// description is `pad` copies of `x`. That character needs no JSON escaping, so
+    /// every padded byte is exactly one serialised byte, which is what makes both sides
+    /// of the byte ceiling pinnable exactly rather than approximately.
+    fn bundle_with_padding(pad: usize) -> Bundle {
+        let mut b = bundle_with_assets(0);
+        b.portfolios[0].description = Some("x".repeat(pad));
+        b
+    }
+
+    fn serialised_bytes(bundle: &Bundle) -> usize {
+        serde_json::to_vec(bundle).expect("a bundle serialises").len()
     }
 
     #[test]
     fn a_bundle_exactly_at_the_row_ceiling_is_still_exportable() {
         let b = bundle_with_assets(MAX_BUNDLE_ROWS - 1);
         assert_eq!(row_count(&b), MAX_BUNDLE_ROWS);
-        assert_eq!(row_cap_error(&b), None);
+        assert_eq!(cap_error(&b), None);
     }
 
     #[test]
     fn one_row_over_the_ceiling_is_refused_naming_the_cap_and_the_remedy() {
         let b = bundle_with_assets(MAX_BUNDLE_ROWS);
-        let err = row_cap_error(&b).expect("one row over the cap must be refused");
+        let err = cap_error(&b).expect("one row over the cap must be refused");
         assert!(err.contains(&MAX_BUNDLE_ROWS.to_string()), "{err}");
+        assert!(err.contains("export fewer portfolios"), "{err}");
+    }
+
+    #[test]
+    fn a_bundle_exactly_at_the_byte_ceiling_is_still_exportable() {
+        let pad = MAX_BUNDLE_BYTES - serialised_bytes(&bundle_with_padding(0));
+        let b = bundle_with_padding(pad);
+        assert_eq!(serialised_bytes(&b), MAX_BUNDLE_BYTES);
+        assert_eq!(cap_error(&b), None);
+    }
+
+    #[test]
+    fn one_byte_over_the_byte_ceiling_is_refused_naming_the_cap_and_the_remedy() {
+        let pad = MAX_BUNDLE_BYTES - serialised_bytes(&bundle_with_padding(0)) + 1;
+        let b = bundle_with_padding(pad);
+        assert_eq!(serialised_bytes(&b), MAX_BUNDLE_BYTES + 1);
+        // The point of the byte check: `row_count` never sees price rows, so a bundle
+        // of a few dated symbols is far under the row ceiling and still too big to
+        // restore. Without this arm that bundle is exported and refused later.
+        assert!(row_count(&b) < 10, "the row ceiling was never going to see this");
+        let err = cap_error(&b).expect("one byte over the cap must be refused");
+        assert!(err.contains("byte"), "{err}");
+        assert!(err.contains(&MAX_BUNDLE_BYTES.to_string()), "{err}");
         assert!(err.contains("export fewer portfolios"), "{err}");
     }
 }

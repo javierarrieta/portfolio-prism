@@ -158,6 +158,23 @@ fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// A query parameter that may appear **at most once**, or the refusal to answer.
+///
+/// Rocket cannot be trusted to see a duplicate: on an `Option` field two pushes
+/// finalise to `ErrorKind::Duplicate` and `Option::finalize` swallows that into `None`
+/// — so a repeated parameter arrives looking exactly like one that was never sent, or
+/// like its first value. Reading the field as a sequence is what makes the duplicate
+/// visible here; refusing it is what stops the caller being answered a question they did
+/// not ask. Both query parameters on this route use this, because either one being
+/// half-read changes what the caller gets back.
+fn only_once<'a>(values: Option<&'a [String]>, refusal: &str) -> Result<Option<&'a str>, String> {
+    match values {
+        None | Some([]) => Ok(None),
+        Some([only]) => Ok(Some(only)),
+        Some(_) => Err(refusal.to_string()),
+    }
+}
+
 /// `?include_prices=` as a boolean, or `None` when the value means neither on nor
 /// off — and `Some(false)` when the parameter is absent, because prices are opt-in.
 ///
@@ -182,12 +199,12 @@ fn parse_include_prices(raw: Option<&str>) -> Option<bool> {
     path = "/api/backup/export",
     params(
         ("portfolio_ids" = Vec<String>, Query, style = Form, explode = false, description = "Comma-separated portfolio ids to include; the parameter may appear only once"),
-        ("include_prices" = Option<String>, Query, description = "Include the price-history section: 1/true/yes to include, 0/false/no to omit"),
+        ("include_prices" = Vec<String>, Query, style = Form, explode = false, description = "Include the price-history section: 1/true/yes to include, 0/false/no to omit; the parameter may appear only once, with one value"),
     ),
     responses(
         (status = 200, description = "The bundle; see docs/backup-schema/v1.json for its shape", body = serde_json::Value),
         (status = 404, description = "A portfolio id is not yours", body = serde_json::Value),
-        (status = 422, description = "No portfolio selected, `portfolio_ids` given more than once, an id that did not parse, or an `include_prices` value that means neither on nor off", body = serde_json::Value),
+        (status = 422, description = "No portfolio selected; `portfolio_ids` or `include_prices` given more than once; an id that did not parse; an `include_prices` value that means neither on nor off; or a selection over the row or byte ceiling", body = serde_json::Value),
         (status = 503, description = "The database is busy", body = serde_json::Value),
     )
 )]
@@ -196,24 +213,22 @@ pub async fn export(
     user: AuthedUser,
     pool: &State<SqlitePool>,
     portfolio_ids: Option<Vec<String>>,
-    include_prices: Option<String>,
+    include_prices: Option<Vec<String>>,
 ) -> Result<BundleDownload, BackupError> {
-    // Read as a sequence so that a repeated `?portfolio_ids=` is something this
-    // handler can see and refuse: rocket collapses a duplicate `Option` field to
-    // `None`, which would have answered "name at least one portfolio" to someone who
-    // named two, and its lenient path would otherwise keep the first value and drop
-    // the rest. One spelling, the comma-separated list the spec documents, is refused
-    // over a half-read selection.
-    let requested = match portfolio_ids.as_deref() {
-        None | Some([]) => None,
-        Some([only]) => Some(only.as_str()),
-        Some(_) => {
-            return Err(fail(
-                Status::UnprocessableEntity,
-                "portfolio_ids may appear only once, as a comma-separated list",
-            ));
-        }
-    };
+    // Both parameters are read as sequences and both must appear at most once; see
+    // `only_once`. For `portfolio_ids` the alternative is answering "name at least one
+    // portfolio" to someone who named two; for `include_prices` it is handing back a
+    // bundle with no prices to someone who asked for them.
+    let requested = only_once(
+        portfolio_ids.as_deref(),
+        "portfolio_ids may appear only once, as a comma-separated list",
+    )
+    .map_err(|reason| fail(Status::UnprocessableEntity, reason))?;
+    let prices_requested = only_once(
+        include_prices.as_deref(),
+        "include_prices may appear only once",
+    )
+    .map_err(|reason| fail(Status::UnprocessableEntity, reason))?;
 
     let ids = match parse_ids(requested) {
         Some(ids) => ids,
@@ -221,7 +236,7 @@ pub async fn export(
             "portfolio_ids must name at least one portfolio, e.g. ?portfolio_ids=1,2")),
     };
 
-    let include_prices = match parse_include_prices(include_prices.as_deref()) {
+    let include_prices = match parse_include_prices(prices_requested) {
         Some(v) => v,
         None => return Err(fail(Status::UnprocessableEntity,
             "include_prices must be one of 1/true/yes or 0/false/no")),
@@ -252,9 +267,9 @@ pub async fn export(
                 "could not read the portfolio data"),
         })?;
 
-    // A bundle over the row ceiling is one restore will refuse, so it is refused here
-    // too — see `backup_export::row_cap_error`.
-    if let Some(reason) = backup_export::row_cap_error(&bundle) {
+    // A bundle over either ceiling is one restore will refuse, so it is refused here
+    // too — see `backup_export::cap_error`.
+    if let Some(reason) = backup_export::cap_error(&bundle) {
         return Err(fail(Status::UnprocessableEntity, reason));
     }
 

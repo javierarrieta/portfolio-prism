@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use backend_rust::api_routes::backup::{BackupError, lock_response};
 use backend_rust::backup::export::{self as backup_export, DbFailure};
-use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES};
+use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS};
 
 /// The session header the existing tests use to run as the placeholder user.
 async fn client(pool: sqlx::SqlitePool) -> Client {
@@ -341,12 +341,17 @@ async fn an_unrecognised_include_prices_is_a_422_not_a_quiet_omission() {
 }
 
 #[tokio::test]
-async fn a_repeated_portfolio_ids_parameter_is_refused_not_half_read() {
-    // The same silent-omission class as `include_prices`, from the other direction:
-    // rocket keeps the first value of a repeated field, so `[1] + [2]` reads as a
-    // one-portfolio selection. Refused instead, with a message that says what to do.
+async fn a_repeated_query_parameter_is_refused_not_half_read() {
+    // One class, both parameters: rocket collapses a repeated `Option` field to
+    // `None` (`ErrorKind::Duplicate` swallowed by `Option::finalize`), so a duplicate
+    // reaches the handler as if it had not been sent. For `portfolio_ids` that reads as
+    // "no selection"; for `include_prices` it reads as "off", which is the same silent
+    // omission as a value that fails to parse. Both are refused outright.
     let pool = setup_db(&disabled_config()).await;
     let (one, two) = seed_two_portfolios(&pool).await;
+    // Seeded so the duplicate's stakes are real: the failure refused here is a 200 with
+    // a section missing, and there has to be a section that could go missing.
+    seed_two_symbols(&pool).await;
     let c = client(pool).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}&portfolio_ids={two}");
@@ -363,6 +368,81 @@ async fn a_repeated_portfolio_ids_parameter_is_refused_not_half_read() {
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
     assert_eq!(body["portfolios"].as_array().unwrap().len(), 2);
+
+    // `include_prices` twice, whether the two values agree or not: a caller who asked
+    // for prices must never be handed a bundle without them.
+    for second in ["false", "0", "true"] {
+        let path =
+            format!("/api/backup/export?portfolio_ids={one}&include_prices=1&include_prices={second}");
+        let res = c.get(&path).header(session()).dispatch().await;
+        assert_eq!(res.status(), Status::UnprocessableEntity, "second value {second}");
+        let body: Value = res.into_json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("include_prices"),
+            "second value {second}: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("only once"),
+            "second value {second}: {body}"
+        );
+    }
+}
+
+/// `n` transactions on one asset in a single statement. A loop of 50k inserts would
+/// dominate the suite; a recursive CTE is one round trip.
+async fn seed_many_transactions(pool: &sqlx::SqlitePool, asset_id: i32, n: usize) {
+    sqlx::query(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < ?) \
+         SELECT ?, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
+    )
+    .bind(n as i64)
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_selection_over_the_row_ceiling_is_refused_by_the_route() {
+    // The ceiling only protects anyone if the *route* refuses: a function that can
+    // name the cap is not the same as a caller being told, and a bundle over it is one
+    // restore will reject after the download.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    let asset = seed_asset(&pool, one, "AAPL", "Apple").await;
+    seed_many_transactions(&pool, asset, MAX_BUNDLE_ROWS).await;
+    let c = client(pool).await;
+
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains(&MAX_BUNDLE_ROWS.to_string()), "{err}");
+    assert!(err.contains("export fewer portfolios"), "{err}");
+}
+
+#[tokio::test]
+async fn a_bundle_over_the_byte_ceiling_is_refused_by_the_route() {
+    // `row_count` counts portfolios, assets and transactions — never price rows — so
+    // the row ceiling alone lets a dated export through that restore then refuses on
+    // size. The serialised bundle is checked against the same byte ceiling the upload
+    // enforces. A long asset name is the cheapest way to be big on this axis; what is
+    // under test is the check, not which field made the bundle large.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    seed_asset(&pool, one, "BIG", &"x".repeat(MAX_BUNDLE_BYTES + 1)).await;
+    let c = client(pool).await;
+
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+    let body: Value = res.into_json().await.unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("byte"), "{err}");
+    assert!(err.contains(&MAX_BUNDLE_BYTES.to_string()), "{err}");
+    assert!(err.contains("export fewer portfolios"), "{err}");
 }
 
 #[tokio::test]

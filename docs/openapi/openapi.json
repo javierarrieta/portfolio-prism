@@ -125,12 +125,17 @@
           {
             "name": "include_prices",
             "in": "query",
-            "description": "Include the price-history section: 1/true/yes to include, 0/false/no to omit",
+            "description": "Include the price-history section: 1/true/yes to include, 0/false/no to omit; the parameter may appear only once, with one value",
             "required": false,
             "schema": {
-              "type": "string",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
               "nullable": true
-            }
+            },
+            "style": "form",
+            "explode": false
           }
         ],
         "responses": {
@@ -154,7 +159,7 @@
             }
           },
           "422": {
-            "description": "No portfolio selected, `portfolio_ids` given more than once, an id that did not parse, or an `include_prices` value that means neither on nor off",
+            "description": "No portfolio selected; `portfolio_ids` or `include_prices` given more than once; an id that did not parse; an `include_prices` value that means neither on nor off; or a selection over the row or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {}

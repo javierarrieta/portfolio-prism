@@ -19,13 +19,24 @@ use serde::{Deserialize, Serialize};
 pub const FORMAT_TAG: &str = "portfolio-prism-backup";
 
 /// The bundle version this build **writes**. The writer uses this rather than a
-/// literal, and `ACCEPTED_VERSIONS` is defined from it, so the version emitted and
-/// the version accepted cannot be edited apart.
+/// literal, and `export::tests::the_written_schema_version_is_the_newest_accepted`
+/// fails if it is ever bumped on its own: a bundle this build writes must be a bundle
+/// this build can read back.
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
-/// The schema versions this build accepts. `v1.json` is never edited: a format
-/// change adds `v2.json` plus a `v1 -> v2` upgrader and appends `2` here.
-pub const ACCEPTED_VERSIONS: &[i64] = &[CURRENT_SCHEMA_VERSION];
+/// The schema versions this build accepts, oldest first.
+///
+/// **A released version is never dropped from this list.** `v1.json` is not edited: a
+/// format change adds `v2.json`, adds the `v1 -> v2` upgrader, and *appends* `2` here.
+/// Replacing `1` with `2` would make every backup a user already downloaded
+/// unrestorable, and the newest-accepted check would still pass because it only looks
+/// at the newest — `accepted_versions_are_exactly_v1` is what fails if an old version
+/// disappears.
+///
+/// Written out rather than derived from `CURRENT_SCHEMA_VERSION`: `&[1,
+/// CURRENT_SCHEMA_VERSION]` is `[1, 1]` today, and a derived list is precisely how a
+/// bump would silently drop its predecessor.
+pub const ACCEPTED_VERSIONS: &[i64] = &[1];
 
 /// Application-level ceiling on an uploaded bundle, enforced **per route**: a
 /// handler opens its own stream with `data.open(MAX_BUNDLE_BYTES.bytes())` rather
