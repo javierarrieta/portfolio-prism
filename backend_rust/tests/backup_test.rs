@@ -7,17 +7,21 @@
 //! `build_rocket` returns. The bundle cap is **per route** — a handler opens its
 //! `Data` stream under `MAX_BUNDLE_BYTES` rather than a global `Limits` entry being
 //! raised for one endpoint — so the probes pin both halves: the cap is exact, and
-//! no global limit was touched.
+//! no global limit was touched. The lock probe after them uses the same technique
+//! for the module's `503` responder, which no real route can be made to return from
+//! a test.
 
 mod common;
 
-use common::{build_rocket, disabled_config, setup_db};
+use common::{build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction, setup_db};
 use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
-use rocket::{post, routes};
+use rocket::serde::json::Json;
+use rocket::{get, post, routes};
 use serde_json::{json, Value};
 
+use backend_rust::api_routes::backup::{BackupError, lock_response};
 use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES};
 
 /// The session header the existing tests use to run as the placeholder user.
@@ -157,6 +161,93 @@ async fn one_byte_more_arrives_capped_for_the_handler_to_refuse() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Export.
+//
+// The route is the only place a caller can name a portfolio id and get rows back,
+// so these pin the shape of the download and the two rules that make it safe: an
+// empty selection is never a bundle, and only the selected portfolios appear.
+// The cross-user half of that second rule lives in `tests/isolation_test.rs`,
+// because the static access gate cannot see `WHERE portfolio_id = ?`.
+// ---------------------------------------------------------------------------
+
+/// Seed: portfolio "One" with one asset and one buy; portfolio "Two" with nothing.
+async fn seed_two_portfolios(pool: &sqlx::SqlitePool) -> (i32, i32) {
+    let one = seed_portfolio(pool, common::DEFAULT_USER, "One", "USD").await;
+    let two = seed_portfolio(pool, common::DEFAULT_USER, "Two", "EUR").await;
+    let asset = seed_asset(pool, one, "AAPL", "Apple").await;
+    seed_transaction(pool, asset, "BUY", 10.0, 150.0, 1.0).await;
+    (one, two)
+}
+
+#[tokio::test]
+async fn export_contains_only_the_selected_portfolios() {
+    let pool = setup_db(&disabled_config()).await;
+    let (one, two) = seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["portfolios"].as_array().unwrap().len(), 1);
+    assert_eq!(body["portfolios"][0]["name"], "One");
+    assert_eq!(body["portfolios"][0]["assets"][0]["symbol"], "AAPL");
+    assert_eq!(body["portfolios"][0]["assets"][0]["transactions"][0]["quantity"], "10.0");
+    assert!(body.get("prices").is_none(), "prices are opt-in and must be absent");
+    let _ = two;
+}
+
+#[tokio::test]
+async fn export_is_a_download_and_is_never_cached() {
+    // A cached bundle is a silent data-loss bug: the user restores last week's
+    // file believing it is today's.
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    assert_eq!(res.headers().get_one("Cache-Control"), Some("no-store"));
+    let cd = res.headers().get_one("Content-Disposition").unwrap();
+    assert!(cd.starts_with("attachment; filename=\"portfolio-prism-backup-"), "{cd}");
+    assert!(cd.ends_with(".json\""), "{cd}");
+}
+
+#[tokio::test]
+async fn an_empty_selection_is_a_422_not_an_empty_bundle() {
+    // Review Focus #5. An empty bundle must never be produced, because someone
+    // will eventually restore it.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    // The whitespace case is percent-encoded on purpose: a raw space in the request
+    // target is refused by Rocket's URI parser with a `400` before any route runs,
+    // so it would test the parser rather than this rule. `%20` decodes to the same
+    // one-character value the handler sees.
+    for path in ["/api/backup/export", "/api/backup/export?portfolio_ids=", "/api/backup/export?portfolio_ids=%20"] {
+        let res = c.get(path).header(session()).dispatch().await;
+        assert_eq!(res.status(), Status::UnprocessableEntity, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_id_list_is_a_422() {
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool).await;
+    let res = c.get("/api/backup/export?portfolio_ids=1,abc").header(session()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity);
+}
+
+#[tokio::test]
+async fn a_duplicate_id_is_exported_once() {
+    let pool = setup_db(&disabled_config()).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+    let c = client(pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={one},{one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["portfolios"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn no_global_body_limit_is_raised_for_the_bundle() {
     // The other half of the ruling: because the cap is per route, every other
@@ -175,4 +266,39 @@ async fn no_global_body_limit_is_raised_for_the_bundle() {
         None,
         "no global `data` limit: the bundle cap belongs to the route that needs it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The lock responder.
+//
+// `DbFailure::Lock` is the one failure this module cannot provoke over HTTP from a
+// test: it needs the database to answer `SQLITE_BUSY`/`SQLITE_LOCKED`, and a
+// portfolio cannot delete itself between the handler's `require` and its read. So
+// the responder is pinned the way the size cap above is — the module's own value,
+// mounted on a probe route outside `/api`, asserted as what a client receives. The
+// real route reaches this exact code through `lock_response()` in
+// `api_routes::backup::export`, which is the only thing that turns a `DbFailure`
+// into a response.
+// ---------------------------------------------------------------------------
+
+/// The module's lock failure, answered verbatim.
+#[get("/lock")]
+async fn probe_lock() -> Result<Json<Value>, BackupError> {
+    Err(lock_response())
+}
+
+#[tokio::test]
+async fn a_lock_is_a_503_that_says_when_to_retry() {
+    // A `503` without `Retry-After` tells a client nothing about whether the
+    // failure was permanent, and the header can only be checked on a real response.
+    let pool = setup_db(&disabled_config()).await;
+    let rocket = build_rocket(pool, common::DEFAULT_USER).mount("/probe", routes![probe_lock]);
+    let c = Client::tracked(rocket).await.unwrap();
+
+    let res = c.get("/probe/lock").dispatch().await;
+    assert_eq!(res.status(), Status::ServiceUnavailable);
+    let retry = res.headers().get_one("Retry-After").expect("a lock must say when to retry");
+    assert!(retry.parse::<u32>().is_ok(), "Retry-After must be a number of seconds: {retry:?}");
+    let body: Value = res.into_json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
 }

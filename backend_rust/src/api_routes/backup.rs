@@ -26,12 +26,18 @@
 //! plain `/api` mount in `lib.rs`, alongside the transaction routes.
 
 use rocket::http::{Header, HeaderMap, Status};
+use rocket::request::Request;
+use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::State;
 use serde::Serialize;
+use chrono::Utc;
+use sqlx::SqlitePool;
 
+use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
-use crate::backup::{BackupConfig, ACCEPTED_VERSIONS, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS};
+use crate::backup::export::{self as backup_export, DbFailure};
+use crate::backup::{BackupConfig, Bundle, ACCEPTED_VERSIONS, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS};
 
 /// What the server is willing to accept, so the UI can say so before uploading.
 #[derive(Debug, Serialize)]
@@ -46,15 +52,39 @@ pub struct Capabilities {
 /// `{"error": ...}` body. Headers are part of the type because a lock must carry
 /// `Retry-After`, and an error type that cannot hold a header is one where that
 /// gets forgotten. `HeaderMap` is Rocket 0.5's name for the header collection.
-pub type BackupError = (Status, HeaderMap<'static>, Json<serde_json::Value>);
+///
+/// A struct with private fields rather than the `(Status, HeaderMap, Json)` tuple
+/// this started life as: Rocket 0.5.1 implements `Responder` for `(Status, R)` and
+/// `(ContentType, R)` only, so a three-element tuple is not a response, and the
+/// orphan rule forbids adding the impl here. Private fields are the other half —
+/// `fail` and `lock_response` are then the only ways to build one, so no handler
+/// can hand-roll a `503` that forgot `Retry-After`.
+pub struct BackupError {
+    status: Status,
+    headers: HeaderMap<'static>,
+    body: Json<serde_json::Value>,
+}
+
+impl<'r> Responder<'r, 'static> for BackupError {
+    fn respond_to(self, req: &'r Request<'_>) -> response::Result<'static> {
+        let mut response = self.body.respond_to(req)?;
+        response.set_status(self.status);
+        // `HeaderMap` does not implement `IntoIterator` (rocket's own TODO), so
+        // this is the explicit call rather than a `for` over the map.
+        for header in self.headers.into_iter() {
+            response.adjoin_header(header);
+        }
+        Ok(response)
+    }
+}
 
 /// A failure with no extra headers.
 pub fn fail(status: Status, message: impl Into<String>) -> BackupError {
-    (
+    BackupError {
         status,
-        HeaderMap::new(),
-        Json(serde_json::json!({ "error": message.into() })),
-    )
+        headers: HeaderMap::new(),
+        body: Json(serde_json::json!({ "error": message.into() })),
+    }
 }
 
 /// A lock is a `503` the client may retry, and `Retry-After` says so out loud
@@ -62,11 +92,22 @@ pub fn fail(status: Status, message: impl Into<String>) -> BackupError {
 pub fn lock_response() -> BackupError {
     let mut headers = HeaderMap::new();
     headers.add(Header::new("Retry-After", "2"));
-    (
-        Status::ServiceUnavailable,
+    BackupError {
+        status: Status::ServiceUnavailable,
         headers,
-        Json(serde_json::json!({ "error": "the database is busy; try again in a moment" })),
-    )
+        body: Json(serde_json::json!({ "error": "the database is busy; try again in a moment" })),
+    }
+}
+
+/// A bundle on its way out: the JSON body plus the two headers that make it a
+/// download rather than a page. A struct for the same reason as `BackupError` —
+/// Rocket has no `Responder` for a `(HeaderMap, Json)` tuple — and the derive turns
+/// every field after the first into a response header.
+#[derive(rocket::Responder)]
+pub struct BundleDownload {
+    bundle: Json<Bundle>,
+    cache_control: Header<'static>,
+    content_disposition: Header<'static>,
 }
 
 #[utoipa::path(
@@ -95,5 +136,78 @@ pub async fn capabilities(
         allow_price_restore: cfg.allow_price_restore,
         max_bytes: MAX_BUNDLE_BYTES,
         max_rows: MAX_BUNDLE_ROWS,
+    })
+}
+
+/// Parse `?portfolio_ids=1,2` into a de-duplicated, ordered list.
+/// `None` on anything unparseable, so the handler answers 422 rather than
+/// silently exporting a subset of what was asked for.
+fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    let mut ids: Vec<i32> = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id: i32 = part.parse().ok()?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/backup/export",
+    params(
+        ("portfolio_ids" = String, Query, description = "Comma-separated portfolio ids to include"),
+        ("include_prices" = Option<bool>, Query, description = "Include the price-history section"),
+    ),
+    responses(
+        (status = 200, description = "The bundle; see docs/backup-schema/v1.json for its shape", body = serde_json::Value),
+        (status = 404, description = "A portfolio id is not yours", body = serde_json::Value),
+        (status = 422, description = "No portfolio selected, or an id did not parse", body = serde_json::Value),
+        (status = 503, description = "The database is busy", body = serde_json::Value),
+    )
+)]
+#[get("/backup/export?<portfolio_ids>&<include_prices>")]
+pub async fn export(
+    user: AuthedUser,
+    pool: &State<SqlitePool>,
+    portfolio_ids: Option<String>,
+    include_prices: Option<bool>,
+) -> Result<BundleDownload, BackupError> {
+    let ids = match parse_ids(portfolio_ids.as_deref()) {
+        Some(ids) => ids,
+        None => return Err(fail(Status::UnprocessableEntity,
+            "portfolio_ids must name at least one portfolio, e.g. ?portfolio_ids=1,2")),
+    };
+
+    // Every id, before any data query. The gate script's Rule B does not see
+    // `WHERE portfolio_id = ?`, so this loop and tests/isolation_test.rs are what
+    // make the scoping real.
+    for id in &ids {
+        require(pool.inner(), user.id, *id, Access::Viewer)
+            .await
+            .map_err(|status| fail(status, "portfolio not found"))?;
+    }
+
+    let bundle = backup_export::build(pool.inner(), &ids, include_prices.unwrap_or(false))
+        .await
+        .map_err(|e| match e {
+            DbFailure::Lock => lock_response(),
+            DbFailure::Other => fail(Status::InternalServerError,
+                "could not read the portfolio data"),
+        })?;
+
+    Ok(BundleDownload {
+        bundle: Json(bundle),
+        cache_control: Header::new("Cache-Control", "no-store"),
+        content_disposition: Header::new(
+            "Content-Disposition",
+            format!("attachment; filename=\"portfolio-prism-backup-{}.json\"", Utc::now().format("%Y-%m-%d")),
+        ),
     })
 }

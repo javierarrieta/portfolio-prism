@@ -288,3 +288,63 @@ async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
 // resource id, so there is no cross-user case to invent here. The first is covered
 // by the ownership it asserts (every other test depends on that column) and by the
 // F1 sweep in `auth_test.rs`; the second touches none of the three tables.
+
+// ---------------------------------------------------------------------------
+// Export.
+//
+// The static access gate cannot see these: the ids arrive in a query string and
+// the rows are reached by `WHERE portfolio_id = ?`, neither of which Rule B
+// matches. This file is the gate for the export route.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn b_cannot_export_a_s_portfolio_but_a_can() {
+    // The export handler loops `require(.., Viewer)` over every id before it reads
+    // anything. This is what proves that loop exists; the static gate cannot.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={}", u.a_portfolio);
+
+    let b = client_as(pool.clone(), u.b).await;
+    assert_eq!(b.get(&path).dispatch().await.status(), Status::NotFound);
+
+    let a = client_as(pool.clone(), u.a).await;
+    assert_eq!(a.get(&path).dispatch().await.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn one_foreign_id_denies_the_whole_export() {
+    // A request for `[mine, theirs]` must not return mine and quietly drop theirs.
+    // A partial success would look like a bug in the user's own selection.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={},{}", u.a_portfolio, u.b_portfolio);
+
+    let a = client_as(pool, u.a).await;
+    let res = a.get(&path).dispatch().await;
+    assert_eq!(res.status(), Status::NotFound);
+    // And the denial carries no rows at all: a partial bundle would be the leak.
+    let body = res.into_string().await.unwrap();
+    assert!(!body.contains("A portfolio"), "a denied export must not return any rows: {body}");
+}
+
+#[tokio::test]
+async fn an_export_never_contains_another_user_s_rows() {
+    // Positive-side proof: A's bundle of A's portfolio holds A's asset and none of
+    // B's. `seed_two_users` gives B an empty portfolio, so B's asset is seeded
+    // here — and A's own asset is asserted present, or an empty bundle would pass
+    // the negative half for the wrong reason.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    seed_asset(&pool, u.b_portfolio, "BBB", "Asset B").await;
+
+    let a = client_as(pool, u.a).await;
+    let res = a
+        .get(format!("/api/backup/export?portfolio_ids={}", u.a_portfolio))
+        .dispatch()
+        .await;
+    let body: serde_json::Value = res.into_json().await.unwrap();
+    let text = body.to_string();
+    assert!(text.contains("Asset A"), "A's own bundle must contain A's asset: {text}");
+    assert!(!text.contains("Asset B"), "A's bundle must not contain B's asset: {text}");
+}

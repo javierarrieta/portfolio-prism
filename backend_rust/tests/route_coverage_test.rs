@@ -69,6 +69,10 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // Authenticates but resolves no caller-supplied id, so `None` — the same
     // shape as `POST /api/portfolios/`.
     ("GET", "/api/backup/capabilities", None),
+    // The ids arrive in a query string, not a path parameter, so Rule B cannot see
+    // them at all; the handler calls `require(.., Viewer)` per id and
+    // `tests/isolation_test.rs` is what proves it.
+    ("GET", "/api/backup/export", Some(Access::Viewer)),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -144,7 +148,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 17, "the mounted /api surface is 17 operations");
+    assert_eq!(checked, 18, "the mounted /api surface is 18 operations");
 }
 
 #[tokio::test]
@@ -266,7 +270,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 17);
+    assert_eq!(PROTECTED_ROUTES.len(), 18);
 }
 
 #[test]
@@ -280,7 +284,7 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 14,
+        with_level, 15,
         "three routes authenticate without checking an id"
     );
 }

@@ -25,6 +25,7 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::analytics::get_transaction_sell_pnl,
         crate::api_routes::lookup::lookup_isin,
         crate::api_routes::backup::capabilities,
+        crate::api_routes::backup::export,
     ),
     components(schemas(
         models::Portfolio,

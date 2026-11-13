@@ -100,6 +100,73 @@
         }
       }
     },
+    "/api/backup/export": {
+      "get": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "export",
+        "parameters": [
+          {
+            "name": "portfolio_ids",
+            "in": "query",
+            "description": "Comma-separated portfolio ids to include",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "include_prices",
+            "in": "query",
+            "description": "Include the price-history section",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bundle; see docs/backup-schema/v1.json for its shape",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "A portfolio id is not yours",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "No portfolio selected, or an id did not parse",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/portfolios/": {
       "get": {
         "tags": [
