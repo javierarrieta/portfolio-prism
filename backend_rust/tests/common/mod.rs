@@ -42,6 +42,7 @@ pub fn oidc_cfg() -> OidcConfig {
 
 /// A config that asks for OIDC, for the tests that must exercise the authenticated
 /// path rather than the development shortcut.
+#[allow(dead_code)] // not every integration-test binary needs the OIDC path
 pub fn oidc_config() -> StartupConfig {
     StartupConfig {
         requested: backend_rust::auth::AuthRequest::Oidc,
@@ -117,6 +118,7 @@ pub fn session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 }
 
 /// A session cookie that is already expired, with a matching token version.
+#[allow(dead_code)]
 pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
     (
         backend_rust::auth::session::SESSION_COOKIE,
@@ -125,6 +127,7 @@ pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 }
 
 /// Create a user row and return its id.
+#[allow(dead_code)]
 pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
@@ -140,6 +143,7 @@ pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
 }
 
 /// Create a portfolio owned by `owner_id`.
+#[allow(dead_code)]
 pub async fn seed_portfolio(pool: &SqlitePool, owner_id: i32, name: &str, currency: &str) -> i32 {
     let res = sqlx::query_as::<_, (i32,)>(
         "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES (?, ?, ?, ?, ?) RETURNING id"

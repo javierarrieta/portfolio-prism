@@ -22,13 +22,43 @@ pub const FORMAT_TAG: &str = "portfolio-prism-backup";
 /// change adds `v2.json` plus a `v1 -> v2` upgrader and appends `2` here.
 pub const ACCEPTED_VERSIONS: &[i64] = &[1];
 
-/// Application-level ceiling on an uploaded bundle. Exceeding it is a `422` that
-/// names the limit, not a `413` from the framework. Rocket's own `data` limit is
-/// deliberately larger (see `lib.rs`) so this check is the one that answers.
+/// Application-level ceiling on an uploaded bundle, enforced **per route**: a
+/// handler opens its own stream with `data.open(MAX_BUNDLE_BYTES.bytes())` rather
+/// than raising a global Rocket `Limits` entry for one endpoint, and must treat a
+/// capped read (`is_complete() == false`) as the module's `413` — Rocket does not
+/// refuse that request on its own. The byte check in `parse_and_validate` is
+/// defense-in-depth behind that, not the first line of defence.
 pub const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Ceiling on `portfolios + assets + transactions` in one bundle.
 pub const MAX_BUNDLE_ROWS: usize = 50_000;
+
+/// Server-side switches for the backup feature, read once at startup.
+///
+/// Takes the same injected-environment shape as `StartupConfig::from_env_with`,
+/// because `std::env::set_var` is `unsafe` in edition 2024 and the integration
+/// tests run multi-threaded: a test that needs prices restorable must construct
+/// this rather than mutate the process environment.
+#[derive(Debug, Clone, Default)]
+pub struct BackupConfig {
+    /// Whether a restore may write the `prices` section. Off by default:
+    /// `historical_prices` has no `owner_id`, so writing it is a tenant writing
+    /// market data every other tenant's dated reports read.
+    pub allow_price_restore: bool,
+}
+
+impl BackupConfig {
+    pub fn from_env() -> Self {
+        Self::from_env_with(&|key| std::env::var(key).ok())
+    }
+
+    pub fn from_env_with(env: &dyn Fn(&str) -> Option<String>) -> Self {
+        let raw = env("BACKUP_ALLOW_PRICE_RESTORE").map(|v| v.trim().to_ascii_lowercase());
+        Self {
+            allow_price_restore: matches!(raw.as_deref(), Some("1") | Some("true") | Some("yes")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

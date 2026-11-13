@@ -15,9 +15,10 @@ use std::collections::HashSet;
 
 /// Method, path, and the level required where one exists.
 ///
-/// `None` for the two routes that authenticate but check no resource id:
-/// `POST /api/portfolios/` (the caller becomes the owner) and
-/// `GET /api/assets/lookup` (touches none of the three tables).
+/// `None` for the three routes that authenticate but check no resource id:
+/// `POST /api/portfolios/` (the caller becomes the owner),
+/// `GET /api/assets/lookup` (touches none of the three tables), and
+/// `GET /api/backup/capabilities` (reports server limits, no caller data).
 ///
 /// Routes outside `/api/` — `/`, `/api-docs/openapi.json`, `/auth/*`,
 /// `/_auth/denied` — are deliberately **not** in this inventory: the first two are
@@ -65,6 +66,9 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     ("DELETE", "/api/transactions/<id>", Some(Access::Editor)),
     ("GET", "/api/transactions/<id>/pnl", Some(Access::Viewer)),
     ("GET", "/api/assets/lookup", None),
+    // Authenticates but resolves no caller-supplied id, so `None` — the same
+    // shape as `POST /api/portfolios/`.
+    ("GET", "/api/backup/capabilities", None),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -140,7 +144,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 16, "the mounted /api surface is 16 operations");
+    assert_eq!(checked, 17, "the mounted /api surface is 17 operations");
 }
 
 #[tokio::test]
@@ -262,7 +266,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 16);
+    assert_eq!(PROTECTED_ROUTES.len(), 17);
 }
 
 #[test]
@@ -277,6 +281,6 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .count();
     assert_eq!(
         with_level, 14,
-        "two routes authenticate without checking an id"
+        "three routes authenticate without checking an id"
     );
 }

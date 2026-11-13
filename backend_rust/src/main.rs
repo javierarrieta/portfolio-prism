@@ -99,6 +99,14 @@ async fn main() -> Result<(), rocket::Error> {
 
     let cors = get_cors_options(origins);
 
-    build_rocket(pool, currency_service, cors, auth).launch().await?;
+    let backup_cfg = backend_rust::backup::BackupConfig::from_env();
+    if backup_cfg.allow_price_restore {
+        eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE is on; a restore may write shared historical_prices rows");
+    }
+
+    build_rocket(pool, currency_service, cors, auth)
+        .manage(backup_cfg)
+        .launch()
+        .await?;
     Ok(())
 }

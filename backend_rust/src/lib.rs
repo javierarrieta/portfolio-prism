@@ -15,6 +15,7 @@ pub mod api_routes {
     pub mod transactions;
     pub mod analytics;
     pub mod lookup;
+    pub mod backup;
 }
 
 /// Test-only stand-in for the pricing provider, compiled into the library's own
@@ -568,12 +569,20 @@ pub fn build_rocket(
     // `/auth/me` exists in both modes so the frontend can always ask who it is.
     let oidc_routes = matches!(auth, AuthMode::Oidc(_));
 
+    // No `Limits` here on purpose. The bundle upload is capped per route — a
+    // handler opens its own `Data` stream under `backup::MAX_BUNDLE_BYTES` — so no
+    // global body limit is raised to serve one endpoint. See
+    // `api_routes::backup`'s module comment and the probes in `tests/backup_test.rs`.
     let rocket = rocket::build()
         .attach(cors)
         .attach(AuthFairing)
         .manage(pool)
         .manage(currency_service)
         .manage(auth)
+        // The real value is managed over this one by `main`; Rocket replaces
+        // previously-managed state of the same type, so every test rocket has a
+        // `BackupConfig` without one being threaded through `build_rocket`.
+        .manage(crate::backup::BackupConfig::default())
         .mount("/", routes![index])
         // The sentinel the fairing rewrites denied requests to. Outside `/api`, so
         // it is neither covered by the prefix rule nor part of the API surface, and
@@ -620,6 +629,7 @@ pub fn build_rocket(
             api_routes::transactions::list_portfolio_transactions,
             api_routes::transactions::delete_transaction,
             api_routes::analytics::get_transaction_sell_pnl,
+            api_routes::backup::capabilities,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same

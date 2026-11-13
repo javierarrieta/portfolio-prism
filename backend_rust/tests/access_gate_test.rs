@@ -62,14 +62,30 @@ fn run(dir: &Path) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
+/// Build a throwaway tree holding one handler file, run the real script against it,
+/// and report what it said. `label` keeps parallel tests out of each other's
+/// directory.
+fn run_tree(label: &str, handler: &str) -> (i32, String) {
+    let root = std::env::temp_dir().join(format!("access-gate-{}-{label}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("src/api_routes")).unwrap();
+    fs::copy(SCRIPT, root.join("scripts/check_access_gate.sh")).unwrap();
+    fs::write(root.join("src/api_routes/backup.rs"), handler).unwrap();
+
+    let out = run(&root);
+    let _ = fs::remove_dir_all(&root);
+    out
+}
+
 #[test]
 fn the_real_tree_passes_the_gate() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     assert!(
-        text.contains("handlers inspected: 16"),
-        "the gate should account for all 16 handlers, said:\n{text}"
+        text.contains("handlers inspected: 17"),
+        "the gate should account for all 17 handlers, said:\n{text}"
     );
 }
 
@@ -104,4 +120,93 @@ fn the_gate_rejects_a_handler_that_checks_after_reading() {
         text.contains("bad.rs:4") && text.contains("bad.rs:11") && text.contains("bad.rs:18"),
         "reported line numbers do not match the file:\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule A's per-handler marker.
+//
+// Rule A's invariant is per handler — a handler that resolves a caller-supplied id
+// goes through `access` — so the waiver has to be per handler too. These three
+// cases are the difference between a marker and a bypass.
+// ---------------------------------------------------------------------------
+
+/// One handler that has nothing to send to the chokepoint, marked, and one that
+/// resolves an id and is not marked. If the marker waived the *file* rather than
+/// the handler it names, this tree would pass — which is the only reason it exists.
+const PARTIALLY_MARKED: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get("/capabilities")]
+pub async fn capabilities(user: AuthedUser) -> Json<Value> {
+    Json(json!({}))
+}
+
+#[get("/by-id/<id>")]
+pub async fn by_id(user: AuthedUser, pool: &State<SqlitePool>, id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE id = ?").bind(id);
+    Json(json!({}))
+}
+"#;
+
+/// A file whose only handler carries the marker: the shape `api_routes/backup.rs`
+/// has in the real tree, pinned here so the real tree is not the only proof.
+const ONLY_MARKED: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get("/capabilities")]
+pub async fn capabilities(user: AuthedUser) -> Json<Value> {
+    Json(json!({}))
+}
+"#;
+
+/// The same marker with a blank line between it and the attribute. A waiver you can
+/// park anywhere in a file is a waiver you can hide.
+const MISPLACED_MARKER: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+
+#[get("/capabilities")]
+pub async fn capabilities(user: AuthedUser) -> Json<Value> {
+    Json(json!({}))
+}
+"#;
+
+#[test]
+fn the_marker_waives_the_handler_it_names_and_no_other() {
+    let (code, text) = run_tree("marked", PARTIALLY_MARKED);
+    assert!(
+        text.contains("waived") && text.contains("capabilities"),
+        "the marked handler was not reported as waived:\n{text}"
+    );
+    assert!(
+        text.contains("NO-CHOKEPOINT") && text.contains("by_id"),
+        "an unmarked handler slipped through Rule A because a neighbour was marked:\n{text}"
+    );
+    assert_eq!(
+        code, 1,
+        "the unmarked id-resolving handler must still fail the gate:\n{text}"
+    );
+}
+
+#[test]
+fn a_handler_that_resolves_no_id_passes_with_the_marker() {
+    let (code, text) = run_tree("only-marked", ONLY_MARKED);
+    assert_eq!(
+        code, 0,
+        "a marked handler with no caller-supplied id must pass:\n{text}"
+    );
+    assert!(
+        text.contains("waived") && text.contains("capabilities"),
+        "the waiver was honoured silently; the gate must print what it waived:\n{text}"
+    );
+}
+
+#[test]
+fn a_marker_in_the_wrong_place_waives_nothing() {
+    let (code, text) = run_tree("misplaced", MISPLACED_MARKER);
+    assert!(
+        !text.contains("waived"),
+        "a marker that is not the line above the attribute was honoured:\n{text}"
+    );
+    assert_eq!(code, 1, "a misplaced marker must fail, not pass quietly:\n{text}");
 }
