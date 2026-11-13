@@ -47,6 +47,27 @@ jobs:
           cargo run --bin backend_rust -- --print-openapi > /tmp/current_openapi.json
           diff /tmp/current_openapi.json ../docs/openapi/openapi.json || (echo "OpenAPI spec has changed! Please update docs/openapi/openapi.json" && exit 1)
 
+      - name: Backup schema is up to date
+        run: |
+          # Same contract as the OpenAPI diff above: `--print-backup-schema` exits
+          # before reading configuration, the database, or the network, so this
+          # needs no portfolio.db, no OIDC configuration, and no running server.
+          # The artifact had only an in-tree drift guard, so a commit that skipped
+          # `cargo test` could ship a stale v1.json and CI would not notice.
+          cd backend_rust
+          cargo run --bin backend_rust -- --print-backup-schema > /tmp/current_backup_schema.json
+          diff /tmp/current_backup_schema.json ../docs/backup-schema/v1.json \
+            || (echo "Backup schema has changed! Regenerate docs/backup-schema/v1.json" && exit 1)
+
+      - name: Backup module stays engine-portable
+        # Static rules over `src/backup/`, in the style of the access gate above.
+        # This is what the engine-selection spec leans on: it is the reason that
+        # spec's share of the work is a mechanical change to this module rather
+        # than a rewrite. The script prints what it inspected, and
+        # tests/backup_portability_test.rs runs it against throwaway trees that
+        # must fail, so the gate cannot rot into decoration.
+        run: bash backend_rust/scripts/check_backup_portability.sh
+
   release-build:
     # Compiles the release binary with `AuthMode::Disabled` compiled out, and then
     # actually runs it to prove the runtime refusal. The refusal is behind
