@@ -386,7 +386,24 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
     assert_eq!(res.status(), Status::Ok);
     let body: serde_json::Value = res.into_json().await.unwrap();
     let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
-    assert_ne!(new_id, u.a_portfolio, "a restore allocates its own ids");
+    // Deliberately not `assert_ne!(new_id, u.a_portfolio)`: `portfolios.id` is
+    // `INTEGER PRIMARY KEY AUTOINCREMENT` and A's portfolio is the first row the
+    // fixture writes, so that comparison could never fail. The claim underneath it
+    // can fail, and is what "a restore allocates its own ids" is for: the restore
+    // wrote new rows in B's space and left every one of A's rows where it was.
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?), \
+                (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?)",
+    )
+    .bind(u.b as i64)
+    .bind(u.a as i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        counts, (2, 1),
+        "B gained exactly the restored portfolio and A lost none of their own"
+    );
 
     let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
         .bind(new_id)

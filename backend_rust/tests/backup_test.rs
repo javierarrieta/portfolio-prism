@@ -1248,8 +1248,9 @@ async fn replace_leaves_other_users_data_alone() {
     // (b) the global totals moved by exactly the bundle's counts: the caller's own
     // 2 portfolios / 1 asset / 1 transaction left, the bundle's 1/1/1 arrived, and
     // the other user's 1/1/1 is the only other thing inside these numbers. Anything
-    // else that moved — a foreign row, a foreign `split_sync` entry — shows up here
-    // even if (a) somehow did not.
+    // else that moved in those three tables shows up here even if (a) somehow did
+    // not. `rows()` counts no other table, so the foreign `split_sync` entry is (a)'s
+    // job alone: a replace that deleted it would leave (b) exactly as it is.
     assert_eq!(
         rows(&pool).await,
         (before.0 - 2 + 1, before.1 - 1 + 1, before.2 - 1 + 1)
@@ -1317,6 +1318,28 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
         owned_fingerprint(&pool, common::DEFAULT_USER).await,
         mine_before,
         "a replace that failed must not have deleted anything either"
+    );
+
+    // Positive control: the same `apply`, the same fixture, the same pool, minus the
+    // corrupted field, does delete what the caller owned. Without it the assertion
+    // above could be satisfied by an `apply` whose deletes never run on *any* path.
+    let clean = parse_and_validate(bundle_json("Only").as_bytes())
+        .expect("the fixture is a valid bundle");
+    backup_restore::apply(
+        &pool,
+        common::DEFAULT_USER,
+        &clean,
+        Mode::Replace,
+        false,
+        &BackupConfig::default(),
+    )
+    .await
+    .expect("the uncorrupted bundle applies");
+    let mine_after = owned_fingerprint(&pool, common::DEFAULT_USER).await;
+    assert!(
+        mine_after.len() < mine_before.len(),
+        "a replace that succeeds must leave the caller holding fewer rows than before: \
+         {mine_after:?}"
     );
 }
 

@@ -9,8 +9,26 @@ so a committed file that disagrees with the code fails the build.
 
 ## Policy
 
-- **A committed `vN.json` is never edited.** A format change adds `vN+1.json` and a
-  `vN -> vN+1` upgrader in `backend_rust/src/backup/restore.rs`.
+- **A released `vN.json` is never edited in a way that changes what validates.** The
+  rule protects validation semantics and the meaning of `schema_version`, not the
+  bytes of the file: a bundle that validated against `vN` the day it shipped must
+  validate against `vN` for as long as `ACCEPTED_VERSIONS` lists it, because
+  `schema_version` is the only claim a backup that is already written makes about its
+  own shape.
+- **Anything that changes what validates needs `vN+1.json` and a `vN -> vN+1`
+  upgrader** in `backend_rust/src/backup/restore.rs`. The test is whether a bundle
+  that was valid under `vN` would validate differently under the edited artifact: a
+  field added to or removed from the format, a field renamed, a changed type or
+  `required` set, a `pattern`, `format` or `enum` tightened or loosened, or a field
+  whose meaning changes while its name does not.
+- Two things sit outside that rule, and neither loosens it. A JSON Schema
+  `description` is an annotation, so correcting prose in a committed artifact changes
+  no validation outcome — which is why the drift guard in
+  `backend_rust/src/backup/schema.rs` compares the file rather than freezing it. And
+  while a version is unreleased, living only on the branch that introduces it, its
+  artifact is still a working document and editing it is ordinary development. In
+  both cases the invariant that matters is the drift guard's: the committed file is
+  byte-identical to what this build prints.
 - The build declares the versions it accepts in
   `backend_rust::backup::ACCEPTED_VERSIONS`. A bundle whose `schema_version` is
   outside that set is refused with a `422` naming the accepted versions, and
@@ -32,7 +50,8 @@ Introduced 2026-11-13 with the backup feature. Accepted by every build since.
 - Nested structure: `portfolios[]` → `assets[]` → `transactions[]`. Only
   `portfolios` has an `owner_id` in the database, so nesting is what makes
   ownership structural.
-- `ref` labels (`p1`, `a1`) are bundle-local and are never database ids.
+- `ref` labels (`p1`, `a1`) are bundle-local, share one namespace across portfolios
+  and assets, and are never database ids.
 - Decimals (`quantity`, `price`, `fee`, `close_price`) are strings.
 - `transactions[].date` is an RFC 3339 UTC datetime; `prices[].date` is
   `YYYY-MM-DD`. The two differ because the columns differ, and normalising them

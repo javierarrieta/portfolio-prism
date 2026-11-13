@@ -116,9 +116,11 @@ pub struct Bundle {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BundlePortfolio {
-    /// Bundle-local label (`p1`, `p2`), unique within the bundle, used only to
-    /// rewire parent/child links during restore. Never a database id, never
-    /// persisted. `ref` is a Rust keyword, hence the rename.
+    /// Bundle-local label (`p1`, `p2`), unique bundle-wide: portfolio refs and asset
+    /// refs share one namespace, so an asset ref may not equal a portfolio ref
+    /// either. Never a database id, never persisted, and never read during restore —
+    /// the nesting carries the parent/child link. `ref` is a Rust keyword, hence the
+    /// rename.
     #[serde(rename = "ref")]
     pub bundle_ref: String,
     pub name: String,
@@ -131,6 +133,9 @@ pub struct BundlePortfolio {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BundleAsset {
+    /// Bundle-local label (`a1`, `a2`), unique in the same namespace as the portfolio
+    /// refs. Never a database id and never read during restore — the portfolio that
+    /// nests the asset is its parent, so no label has to carry that link.
     #[serde(rename = "ref")]
     pub bundle_ref: String,
     pub symbol: String,
