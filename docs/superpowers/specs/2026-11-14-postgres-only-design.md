@@ -1,0 +1,454 @@
+# Postgres-only backend: design
+
+Status: draft for review.
+Base: `main` after #64 (backup export/restore) merges. Written against `99a95ec`
+plus the backup branch's code, which this spec assumes is merged.
+Author: session of 2026-11-14.
+
+## 1. Problem
+
+The backend is SQLite-only: `sqlx` is built with the `sqlite` feature, `SqlitePool`
+appears 108 times across 13 source files, and the schema is created by a
+hand-written `init_db` (`backend_rust/src/lib.rs:138-560`) that runs `PRAGMA
+table_info` guards, `ALTER TABLE ... ADD COLUMN`, `CAST(... AS TEXT)` column
+migrations and a `PRAGMA legacy_alter_table` dance.
+
+Two things are wanted:
+
+1. **A managed database.** SQLite on a `local-path` PVC with `replicas: 1` and a
+   `Recreate` strategy means the app is down for every deploy and the backup story
+   is "restic copies a raw file, and WAL is deliberately off because that copy
+   would otherwise be silently stale" (`main.rs:57-77`).
+2. **More than one replica.** A multi-tenant SaaS cannot scale horizontally against
+   a single-writer file.
+
+The deployment target already exists and is already run for other workloads:
+CloudNativePG 18.6 in `k8s-titan`, namespace `databases`, cluster `postgres`,
+which hosts coder and authentik today.
+
+## 2. Non-goals
+
+These are not oversights. Each was considered and cut.
+
+- **No live SQLite→Postgres migration.** No dump-and-load code, no dual-write, no
+  shim. The backup feature (#64) *is* the migration path: export a bundle from the
+  SQLite instance, restore it into Postgres. That is why the bundle format was
+  built engine-neutral, and it is the reason this spec can be this size.
+- **No engine selection.** No runtime switch, no dialect abstraction, no
+  `Box<dyn AnyPool>`. SQLite stops being a supported engine. The reason is test
+  fidelity: the operator's words were *"I am concerned of executing tests against a
+  different path than production."* A dual-engine build is exactly that.
+- **No GitOps work in this spec.** The `k8s-titan` half — CNPG `Database`,
+  `DatabaseRole`, credential Secret, deployment env — is §14, named and scoped,
+  deliberately deferred to its own change in that repo.
+- **No decimal type change.** Money stays `TEXT`. See §3.
+- **No ORM.** `sqlx` query strings stay query strings.
+
+## 3. Decisions
+
+| Decision | Chosen | Rejected | Why |
+| --- | --- | --- | --- |
+| Engines | Postgres only | Dual engine behind a flag | Test fidelity. A dual-dialect abstraction is a permanent tax on every query and a second path that production never runs. |
+| Data migration | The backup bundle | `pg_dump`-style converter, dual write | Already built and reviewed. Engine-neutral by construction. One path, exercised by a real feature rather than a one-off script. |
+| Schema management | `sqlx::migrate!` with numbered `.sql` files | Keep `init_db`, or an external migrator | `init_db`'s `PRAGMA table_info` idiom is what produced the `split_sync` bug the code itself documents (`lib.rs:513-519`: *"keep the bug while the code above it looked fixed"*). Numbered migrations compiled into the binary remove the class. An external migrator adds a binary to the image and a step that can be skipped. |
+| Ids | `BIGINT GENERATED ALWAYS AS IDENTITY`, Rust `i64` | Keep `i32`, or `SERIAL` | SQLite `INTEGER` is 64-bit today, so ids already exceed `i32` in principle. `sqlx-postgres` refuses `int8`→`i32` at compile time, so keeping `i32` is not an option once queries are checked. `GENERATED ALWAYS AS IDENTITY` is standard SQL and refuses a supplied id, which matches the bundle rule that ids are never trusted from the file. |
+| Money | Stays `TEXT` | `NUMERIC`/`DECIMAL` | Exact decimal-string round-trip is preserved and no rounding question ever arises. `rust_decimal` already serialises to a string in the API, so the wire format does not change. A later `NUMERIC` migration is a separate, mechanical spec. |
+| Dates | `TIMESTAMPTZ` for timestamps, `DATE` for `historical_prices.date` | Keep `TEXT` | Real date ordering, range scans, and `date_trunc` for the metrics engine. Verified: transaction dates are `DateTime<Utc>` in `schemas.rs:18,32,121,...` and the price date is a `NaiveDate`, so both map cleanly with no parsing rule to invent. |
+| Query safety | `sqlx::query!` macros with a committed `.sqlx` prepare cache | Keep runtime `sqlx::query` | Turns the `i32`-vs-`int8` class of bug — which the whole-branch review of #64 caught by hand — into a compile error. The cache is what makes this possible without a live database at compile time. |
+| Test database | `#[sqlx::test]`, one fresh migrated database per test | Shared database with transaction rollback | Per-test databases remove the interference that made the #64 flake hard to see (shared `:memory:` cache, unlock-notify hangs). Postgres supports it natively; it needs `CREATEDB` on the test role. |
+| Local dev database | `podman run postgres:18` | `nix-shell -p postgresql_16` ephemeral cluster | Same engine and major as production and CI. Podman becomes available in the workspace via coder-workspaces `0.0.12`. **Not yet proven in the pod** — see §9.4; the nix cluster is the named fallback and was proven end to end. |
+| CI database | Service container `postgres:18` | `postgres:16`, SQLite tests | Same major as the production image (`ghcr.io/cloudnative-pg/postgresql:18.6`). |
+| Foreign keys | Enforced, as Postgres does by default | Reproduce SQLite's non-enforcement | See §5.1 — this is a real behaviour change and the largest risk in the spec. |
+
+## 4. Target schema
+
+`backend_rust/migrations/0001_init.sql`. Written from the DDL actually in
+`init_db`, not from memory.
+
+```sql
+CREATE TABLE users (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    issuer        TEXT NOT NULL,
+    subj          TEXT NOT NULL,
+    email         TEXT,
+    name          TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    token_version INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL,
+    last_login_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_users_issuer_subj ON users (issuer, subj);
+
+CREATE TABLE portfolios (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id      BIGINT REFERENCES users(id),
+    name          TEXT NOT NULL,
+    description   TEXT,
+    currency      TEXT NOT NULL DEFAULT 'USD',
+    base_currency TEXT NOT NULL DEFAULT 'USD'
+);
+CREATE INDEX portfolios_owner_idx ON portfolios (owner_id);
+
+CREATE TABLE assets (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    portfolio_id BIGINT NOT NULL REFERENCES portfolios(id),
+    symbol       TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    asset_type   TEXT NOT NULL,
+    sector       TEXT,
+    currency     TEXT NOT NULL DEFAULT 'USD',
+    isin         TEXT
+);
+CREATE INDEX assets_portfolio_idx ON assets (portfolio_id);
+
+CREATE TABLE transactions (
+    id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    asset_id BIGINT NOT NULL REFERENCES assets(id),
+    type     TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    price    TEXT NOT NULL,
+    fee      TEXT NOT NULL,
+    date     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX transactions_asset_date_idx ON transactions (asset_id, date);
+
+-- No owner_id, deliberately: same as today, and the reason price restore stays
+-- flag-gated. Composite PK replaces the unique index SQLite needed.
+CREATE TABLE historical_prices (
+    symbol      TEXT NOT NULL,
+    date        DATE NOT NULL,
+    close_price TEXT NOT NULL,
+    PRIMARY KEY (symbol, date)
+);
+
+CREATE TABLE split_sync (
+    asset_id       BIGINT NOT NULL REFERENCES assets(id),
+    last_synced_at TIMESTAMPTZ NOT NULL,
+    covered_from   DATE,
+    PRIMARY KEY (asset_id)
+);
+```
+
+Notes on what changed and why:
+
+- **`split_sync`'s key.** `init_db` migrated this table's key over the course of
+  several releases (`migrate_split_key`, `enforce_split_uniqueness`,
+  `uq_split_asset_date`). The Postgres schema states the intended end state once.
+  Confirm the live shape against the deployed SQLite database before writing
+  `0001` — the migration file must match what the app's queries assume, and
+  `split_sync` is the table that has been reshaped most.
+- **Three new indexes** (`portfolios_owner_idx`, `assets_portfolio_idx`,
+  `transactions_asset_date_idx`). SQLite has none beyond the three unique indexes,
+  because its rowid tables made some lookups cheap enough. Every authorisation
+  check filters on `owner_id` and every portfolio read filters on `portfolio_id`;
+  on Postgres those are sequential scans without an index.
+- **`is_active` becomes `BOOLEAN`.** Today it is `INTEGER NOT NULL DEFAULT 1`.
+- **No `ON DELETE CASCADE`.** The app deletes explicitly, in a known order, and
+  restore inserts children before parents. Adding cascade would be a behaviour
+  change smuggled into a port.
+
+## 5. Behaviour changes the engine switch forces
+
+These are not rewrites. They are places where Postgres is not SQLite and the
+difference reaches the API.
+
+### 5.1 Foreign keys were never enforced, and now they are
+
+`PRAGMA foreign_keys` is **never set anywhere in the codebase** — the only
+occurrences of the string are in a comment (`backup/restore.rs:255,258`). SQLite
+foreign keys are off unless that pragma is on per connection, so every
+`FOREIGN KEY` clause in `init_db` has been decorative since the day it was
+written. Postgres enforces them always.
+
+Two consequences, and the second is the dangerous one:
+
+1. Writes that today create an orphan row will now fail with a constraint
+   violation. That is an improvement, but it is a new 500/400 path that no test
+   covers yet.
+2. **Existing SQLite data may already contain orphans, and the export will drop
+   them silently.** The bundle is nested — portfolio → assets → transactions — so
+   a transaction whose `asset_id` no longer exists is not under any asset and is
+   therefore never exported. Nothing reports it. Same for an asset whose
+   `portfolio_id` points at a deleted portfolio.
+
+   **Required before cutover:** run the orphan audit (§11 step 2) against the live
+   database and record the counts. If any are non-zero, the cutover does not
+   proceed until they are either repaired or explicitly accepted as loss, in
+   writing, by the operator. This is the one place in the spec where silent data
+   loss is possible.
+
+### 5.2 `i32` → `i64` everywhere an id crosses the boundary
+
+108 `i32` occurrences, of which the id-shaped ones become `i64`: pool row reads
+(`query_as::<_, (i32,)>` on `RETURNING id` — the exact pattern recorded as
+follow-up 8 in #64), `Portfolio.id`, `Asset.id`, `Transaction.id`, `User.id`,
+path parameters, and `HashMap<i32, _>` in `split_sync_ages`.
+
+The JSON wire format does not change: these are numbers either way, and identity
+sequences start at 1, so no JavaScript precision question arises.
+
+### 5.3 `INSERT OR REPLACE` → `ON CONFLICT DO UPDATE`
+
+Four sites, all identified: `stats_engine.rs:433`, `stats_engine.rs:539`
+(`historical_prices`), `currency_service.rs:997`, `currency_service.rs:1469`
+(`split_sync`). Each becomes an explicit `ON CONFLICT (…) DO UPDATE SET …`, which
+is also more honest: `INSERT OR REPLACE` in SQLite is a delete plus an insert, so
+it silently drops columns not named in the statement. The composite PK in §4 gives
+`historical_prices` a real conflict target.
+
+### 5.4 Lock and busy semantics disappear, and the 503 changes meaning
+
+`busy_timeout(5s)`, `SQLITE_BUSY`, and the extended busy-code classification added
+in #64 (`7facddb`) are SQLite concepts. Postgres does not block a reader behind a
+writer, and the restore's `SERIALIZABLE` transaction reports
+`40001 serialization_failure` instead.
+
+The `503 + Retry-After` response shape stays — clients already handle it — but its
+trigger becomes: pool exhaustion (timeout acquiring a connection), statement
+timeout, and serialisation failure after the retry policy is exhausted. The
+backup module's portability gate already forbids engine-specific constructs, so
+this is a mapping change in one place, not a rewrite.
+
+**Recorded as a follow-up in #64 and now in scope:** the restore's serialisation
+behaviour under concurrent writers has never been tested. It gets a test here,
+because Postgres is where it can be written.
+
+### 5.5 `init_db` and its startup migrations are deleted
+
+`lib.rs:138-560` goes away entirely: the `CREATE TABLE IF NOT EXISTS` set,
+`column_exists`, `migrate_decimal_columns`, `migrate_split_key`,
+`enforce_price_uniqueness`, `enforce_split_uniqueness`, `add_owner_id_column`,
+`migrate_split_sync_key`. Their content is §4. Their *history* — the dedupe
+tie-breaks, the `MAX(rowid)` choice documented at `lib.rs:420-428` — is a
+one-time data concern for the live SQLite database, not something Postgres needs
+to re-enact, because the data arrives through the bundle, which is already
+deduped by the unique index it was exported from.
+
+This also closes the recorded pre-existing bug: `main.rs:82-88` boots `init_db` on
+a default multi-connection file-backed pool, which is a stale-schema window. With
+`sqlx::migrate!` the migrator takes a single connection and runs before the pool
+is used for anything else.
+
+### 5.6 SQLite-only connect options go away
+
+`SqliteConnectOptions`, `busy_timeout`, the WAL commentary, and the
+`sqlite:../portfolio.db?mode=rwc` default all go. §10 replaces them.
+
+## 6. Code plan
+
+Mechanical, but wide. Order matters for reviewability.
+
+| Step | Change | Files |
+| --- | --- | --- |
+| 1 | `sqlx` features: `sqlite` → `postgres`, add `migrate`, `macros`, `rust_decimal` if a `NUMERIC` column ever appears (not now) | `Cargo.toml` |
+| 2 | Introduce `pub type DbPool = sqlx::PgPool;` and `pub type DbPoolOptions = sqlx::postgres::PgPoolOptions;` in one module, then replace all 108 `SqlitePool` references with the alias | 13 files |
+| 3 | `?` → `$1..$n` in all 143 query sites. `grep -c '?'` gives the count; the compiler finds every miss once step 4 lands | same 13 files |
+| 4 | Convert `sqlx::query` / `query_as` to `sqlx::query!` / `query_as!` incrementally, file by file, with `cargo sqlx prepare` after each file | same 13 files |
+| 5 | `i32` → `i64` for ids (§5.2) | `schemas.rs`, routes, engines, `backup/` |
+| 6 | `INSERT OR REPLACE` → `ON CONFLICT` (§5.3) | `stats_engine.rs`, `currency_service.rs` |
+| 7 | Delete `init_db` and its helpers; call `sqlx::migrate!("./migrations")` at startup (§5.5) | `lib.rs`, `main.rs` |
+| 8 | Lock/busy remap (§5.4) | `backup/restore.rs`, `api_routes/backup.rs` |
+| 9 | Test harness to `#[sqlx::test]` (§9) | `tests/`, `src/` test modules |
+| 10 | Regenerate `openapi.json` + `api.d.ts` if any schema type changed (`i64` ids do not change the JSON type, so likely no diff — verify, do not assume) | `docs/`, `frontend/src/` |
+
+Step 2 before step 4 is deliberate: the alias makes the type rewrite one commit and
+keeps the macro conversion diff readable, instead of two changes interleaved
+across thirteen files.
+
+## 7. Migration policy
+
+- `backend_rust/migrations/`, numbered `NNNN_name.sql`, compiled in with
+  `sqlx::migrate!`.
+- **`0001_init.sql` is the whole schema.** There is no historical replay: the data
+  arrives as a bundle into a fresh database, so there is nothing to migrate
+  incrementally.
+- Every schema change after this is a new numbered file. Never edit a shipped
+  migration. `_sqlx_migrations` is the ledger; it is created by the migrator.
+- The `--print-backup-schema` and `--print-openapi` flags keep working without a
+  database, which is what makes the CI ordering in §9.3 possible.
+
+## 8. Compile-time checked queries and `.sqlx`
+
+`sqlx::query!` needs a live database at compile time, or a prepared-query cache.
+The cache is the answer for CI and for anyone without Postgres running:
+
+- `.sqlx/` is committed, generated by `cargo sqlx prepare`.
+- `sqlx-data.json`'s successor in 0.8 is the `.sqlx/` directory; confirm the exact
+  layout against the 0.8 docs during implementation rather than assuming the
+  older filename.
+- **Local workflow:** anyone editing SQL runs against the local podman database
+  (§9.1) and re-runs `cargo sqlx prepare` before committing. A stale cache is a CI
+  failure, not a silent drift — that is what `--check` is for.
+- **The failure mode to watch:** `cargo sqlx prepare` against a database whose
+  schema is not at head produces a cache that compiles and lies. The prepare step
+  therefore runs *after* `sqlx migrate run` in every script and workflow, and the
+  CI job fails if `cargo sqlx prepare --check` reports drift.
+
+## 9. Test harness
+
+### 9.1 Local: podman
+
+`backend_rust/scripts/dev-db.sh` — start or reuse a local Postgres for development
+and tests:
+
+```sh
+podman run -d --name prism-pg -e POSTGRES_PASSWORD=prism -e POSTGRES_DB=prism \
+  -p 55432:5432 docker.io/library/postgres:18
+```
+
+`DATABASE_URL=postgres://postgres:prism@127.0.0.1:55432/prism`.
+
+The test role needs `CREATEDB` for `#[sqlx::test]`:
+
+```sh
+psql "$DATABASE_URL" -c 'ALTER ROLE postgres CREATEDB'
+```
+
+### 9.2 Fallback: nix ephemeral cluster
+
+If podman does not work in the pod (§9.4), the fallback is proven: `nix-shell -p
+postgresql_16` with `initdb` into a temp dir, `pg_ctl start`, and the same
+`DATABASE_URL` shape. Measured on this workspace: `initdb` rc=0, server start,
+`CREATE DATABASE`, identity + numeric + `timestamptz` round-trip, clean stop. It
+runs 16.x, not 18.x, which is exactly the fidelity gap this spec exists to close —
+so it is a fallback, documented and not the default.
+
+### 9.3 CI
+
+GitHub Actions, service container `postgres:18`, in this order:
+
+```
+services: postgres:18  →  sqlx migrate run  →  cargo sqlx prepare --check
+                        →  cargo build  →  cargo test  →  clippy
+```
+
+`--check` before build is the point: it fails on a stale cache before anything
+compiles against it. The existing backup schema-freshness and portability gates
+stay where they are.
+
+### 9.4 The unproven part, stated plainly
+
+Podman in the workspace is **not yet proven**. What is measured: podman 6.1.4 runs
+rootless here, `podman info` comes up, `unshare -U -r` succeeds, a docker.io pull
+reached layer application and failed only on the missing `/etc/subuid` range.
+What is not measured: whether `vfs` layer application succeeds once that range
+exists, and whether rootless networking comes up in this pod.
+
+The fix is shipped as coder-workspaces `0.0.12` (subuid range, setuid
+`newuidmap`/`newgidmap`, `/run/user/1000`, `vfs` storage pinned) and the gate is
+two commands inside an updated workspace:
+
+```sh
+podman info --format '{{.Store.GraphDriverName}}'   # expect: vfs
+podman run --rm docker.io/library/postgres:18 postgres --version
+```
+
+**This spec's implementation must not start until those two commands have been
+run.** If they fail, §9.2 becomes the plan and CI remains the authoritative
+environment. If networking is the failure, `--network=host` is the workaround and
+costs nothing for a database.
+
+## 10. Configuration
+
+- `DATABASE_URL` becomes **required**. No default. A missing or malformed value
+  makes the app refuse to start, through the existing `StartupConfig::from_env` →
+  `refuse()` path that already handles missing OIDC config the same way. The
+  current `sqlite:../portfolio.db?mode=rwc` default is deleted — a default that
+  silently creates a file database is the opposite of this spec's purpose.
+- Pool options: `max_connections` (default 5, so two replicas stay well inside
+  CNPG's default `max_connections=100`), `min_connections 0`,
+  `max_connection_lifetime` a few hours, `acquire_timeout` 5 s — which is what the
+  `503` in §5.4 keys off.
+- `statement_timeout` set on the connection (`options=-c statement_timeout=30s` or
+  per-statement), so a runaway analytics query cannot pin a pool connection
+  indefinitely. The #64 review recorded that export holds a pool connection for
+  its whole duration; this is the backstop.
+- `AUTH_MODE=disabled` still works for local development.
+- The SQLite commentary in `main.rs:57-77` about WAL and restic is deleted with
+  the code it describes. It is a good comment about a dead engine.
+
+## 11. Cutover runbook (application side)
+
+The infrastructure half is §14. This is what happens to the data.
+
+1. **Freeze writes.** Scale the SQLite deployment to zero, or put it in read-only
+   mode. The bundle is a point-in-time snapshot per portfolio, but two snapshots
+   taken at different moments are not one consistent backup.
+2. **Audit for orphans** against the live SQLite database, and record the numbers:
+   ```sql
+   SELECT COUNT(*) FROM transactions t LEFT JOIN assets a ON a.id = t.asset_id
+     WHERE a.id IS NULL;
+   SELECT COUNT(*) FROM assets a LEFT JOIN portfolios p ON p.id = a.portfolio_id
+     WHERE p.id IS NULL;
+   SELECT COUNT(*) FROM portfolios p LEFT JOIN users u ON u.id = p.owner_id
+     WHERE p.owner_id IS NOT NULL AND u.id IS NULL;
+   ```
+   Any non-zero count is a stop condition (§5.1).
+3. **Export** a bundle covering every portfolio, with `include_prices=true`.
+   Store the file outside the cluster. It is the only copy that matters.
+4. **Deploy Postgres** (§14) and start the Postgres build against an empty
+   database. `sqlx migrate run` creates the schema.
+5. **Restore** with `apply_prices=true` and `BACKUP_ALLOW_PRICE_RESTORE=1`, then
+   unset the flag. Preview first, as the feature requires.
+6. **Verify counts** — row counts per table against the SQLite source, and the
+   app's own reports for one portfolio against the pre-cutover numbers.
+7. **Keep the SQLite PVC** until the Postgres instance has survived one backup
+   cycle of its own.
+
+Rollback after step 5 is not free: anything written to Postgres after the restore
+is not in any bundle. Re-export from Postgres before declaring the cutover done.
+
+## 12. Verification gates
+
+All from `backend_rust/`, all must pass, all must be warning-free:
+
+- `sqlx migrate run` then `cargo sqlx prepare --check`
+- `cargo test` — including the new serialisation test (§5.4) and the FK-enforcement
+  tests (§5.1)
+- `bash scripts/check_access_gate.sh`
+- `cargo clippy --all-targets`
+- `cargo build --release`
+- `bash scripts/auth_smoke.sh` (unchanged, still must pass)
+- the manual walkthrough in `docs/backup-walkthrough.md`, re-run against Postgres —
+  several of its steps describe SQLite lock behaviour and will need rewriting,
+  not re-running
+
+## 13. Risks
+
+| Risk | Likelihood | Consequence | Mitigation |
+| --- | --- | --- | --- |
+| Orphan rows silently dropped at cutover | Unknown — unmeasured today | Silent data loss | §11 step 2 is a stop condition with recorded numbers |
+| `sqlx prepare` cache drifts from head | High over time | Compiles and lies | `--check` in CI, always after `migrate run` |
+| 143-site rewrite breaks a query the tests do not cover | Medium | Wrong numbers, not a crash | Step 3 is placeholder-only and reviewable as such; the macro conversion in step 4 is where the compiler starts paying |
+| Podman does not work in the pod | Open, unmeasured | Local harness falls back to 16.x | §9.4 gate before implementation starts; CI is authoritative either way |
+| `split_sync` live shape differs from §4 | Medium | Migration creates a table the queries disagree with | Verify against the deployed database before writing `0001` |
+| FK enforcement surfaces a write path that relied on orphans | Medium | New 500s in production | §5.1 tests written before the switch, not after |
+
+## 14. Deferred: the `k8s-titan` half
+
+Deliberately out of this spec, recorded here so it is not rediscovered from
+scratch. It is its own change in that repo, with that repo's own gates
+(`make portfolio-prism-check`, `make check`) and its own PR.
+
+- A CNPG `Database` and `DatabaseRole` for portfolio-prism on the existing
+  `postgres` cluster in `databases` — the cluster already hosts coder and
+  authentik, so the pattern exists to copy.
+- The credential Secret, and how `DATABASE_URL` reaches the deployment.
+- **Deploy ordering is the hard part and it belongs in that spec:** the Postgres
+  build refuses to start without `DATABASE_URL` (§10), so the database and its
+  Secret must exist before the image rolls out, and the cutover (§11) must happen
+  between the two. With `replicas: 1` and `Recreate`, a badly ordered apply is a
+  crash-looping app with no serving replica, not a graceful degradation.
+- Whether the SQLite PVC and its restic backup are retired, and when.
+
+## 15. Explicitly deferred, with source
+
+- `stats_engine.rs:108-110,323-325` returns volatility, Sharpe, beta and
+  correlation as **constants**. Pre-existing, unrelated to the engine, and the
+  metrics engine is the heaviest SQL user in the codebase — rewriting queries
+  against numbers that are hardcoded is wasted work. Fix first or separately.
+- Multi-replica `CurrencyService` in-process cache and rate limiter — the reason
+  more than one replica is not free.
+- Fold the export's N+1 per-asset reads into one join (#64 follow-up 3).
+- No abort/timeout on frontend `apiFetch` (#64 follow-up 6).
+- `create_asset` accepts any uppercased string (#64 follow-up 1).
