@@ -21,6 +21,12 @@ We have successfully built and verified the full-stack **Portfolio Prism**. The 
   - Computes **Beta-Adjusted Net Exposure** (total exposure scaled by portfolio beta).
   - Generates the asset **Correlation Matrix** based on daily returns log covariance.
 
+> **Read this bullet list with §6.** It overstates the current build: annualized
+> volatility, Sharpe ratio and portfolio beta are returned as constants
+> (`stats_engine.rs:323-325`) and the correlation matrix is returned empty. What is
+> actually computed is the daily value series, cumulative **TWR**, portfolio value and
+> beta-adjusted exposure.
+
 ### 2. Frontend Web App (React + Vite)
 - **Design System (`index.css`)**: Premium slate glassmorphic dark theme styled with custom CSS variables, responsive layouts, Google Font 'Outfit', custom badges, and interactive animations.
 - **Dashboard View**: Displays Net Worth, Realized Tax P&L, Latent P&L, and Total Cumulative Return. Displays a historical value timeline (Recharts Area Chart) and asset type allocation (Recharts Pie Chart).
@@ -64,6 +70,10 @@ We executed an integration verification script ([verify_app.py](file:///Users/ja
   - Portfolio Beta: **0.75** (Defensive asset posture relative to S&P 500).
   - Portfolio Volatility: **26.05%**.
   - Sharpe Ratio: **3.38**.
+
+> **Historical transcript.** The beta, volatility and Sharpe figures above were recorded
+> against a build that computed them. The current one returns constants for all three, so
+> do not expect to reproduce them — see §6.
 
 ---
 
@@ -307,16 +317,38 @@ instance to restore into.
 6. Price history is deliberately not restorable from this panel: the card never sends
    `apply_prices`, so a bundle carrying a `prices` section previews
    `N price rows in this bundle will be left alone — this panel does not restore price
-   history.` and restores without them. To apply them at all you need the server flag on
-   and an explicit parameter:
-   ```bash
-   curl -sS -X POST --cookie "pp_session=$PP" \
-        -H 'Content-Type: application/json' --data-binary @/tmp/bundle.json \
-        'http://localhost:8000/api/backup/restore?mode=copy&apply_prices=1'
-   ```
-   Expected with `BACKUP_ALLOW_PRICE_RESTORE=1`: `200` and a `prices_inserted` count above
-   zero. Expected with the flag off: `422` naming price restore as disabled — the bundle
-   is refused before anything is written, not partially applied.
+   history.` and restores without them. Checking the flag itself needs a bundle that
+   **has** a `prices` section, and that needs the server flag on at export time — the panel
+   only offers the *Include price history* tick when `/api/backup/capabilities` reports
+   `allow_price_restore` (`BackupPanel.tsx:589`), and §0 left the flag unset. So this part
+   needs three restarts:
+
+   a. Restart the backend with `export BACKUP_ALLOW_PRICE_RESTORE=1`, tick **Include
+      price history** on the export card, download, and save the file as
+      `/tmp/bundle-prices.json`. Expected: it carries a `prices` array of
+      `{symbol, date, close_price}` rows —
+      `python3 -c 'import json;print(len(json.load(open("/tmp/bundle-prices.json"))["prices"]))'`
+      prints a number above zero. With the flag off the tick is not offered at all and the
+      file has no `prices` key, which is exactly what would make the next two checks
+      unreachable.
+   b. Restart with the flag **off** (unset the variable) and post that file:
+      ```bash
+      curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
+           --data-binary @/tmp/bundle-prices.json -w 'status=%{http_code}\n' \
+           'http://localhost:8000/api/backup/restore?mode=copy&apply_prices=1'
+      ```
+      Expected: `422` naming price restore as disabled, and **nothing written** — the
+      refusal is the first thing `apply` does, before `pool.begin()`
+      (`backend_rust/src/backup/restore.rs:216-222`), so none of the bundle's portfolios
+      appear either.
+   c. Restart with the flag **on** and post the same file. Expected: `200` and a
+      `prices_inserted` count above zero.
+
+   Note what the three of these pin down between them: the guard is the **combination** of
+   a bundle that carries prices, `apply_prices` set, and the flag off. A flag-off restore
+   of a bundle with no price section is a plain `200` whether or not `apply_prices` is
+   set — that is the guard's own design ("a bundle with no prices asks for nothing the flag
+   could forbid") and is pinned by a test, so it is not a hole to report.
 
 If step 2 or 4 disagrees with the preview you were shown, that is a defect in `plan_for`
 versus `apply` — the two must count the same rows by the same rule.
@@ -327,33 +359,31 @@ Single-writer SQLite with `replicas: 1` means `SQLITE_BUSY` is reachable in prod
 the backup module turns it into a `503` with a `Retry-After` rather than a `500`. No test
 can show you what that feels like from the outside.
 
-Open the database in a write transaction and hold it:
+Run this from `backend_rust/`, the directory the backend resolves its relative
+`DATABASE_URL` against — with the dev default, `sqlite3 "$DB"` opens the repository-root
+`portfolio.db` only from there (`main.rs:53-54`). Open the database and take the write
+lock:
 
 ```bash
 export DB="${DATABASE_URL:-sqlite:../portfolio.db?mode=rwc}"
-export DB="${DB#sqlite:}"; export DB="${DB%%\?*}"   # dev default: repo-root portfolio.db
+export DB="${DB#sqlite:}"; export DB="${DB%%\?*}"
 sqlite3 "$DB"
 ```
 ```
 sqlite> .timeout 0
 sqlite> BEGIN IMMEDIATE;
-sqlite> CREATE TABLE walkthrough_lock(x);   -- the write is what makes this bite
 ```
 
-Then, from a second terminal, with that transaction still open:
+`BEGIN IMMEDIATE` is the whole trick: it takes the RESERVED write lock and holds it until
+the transaction ends. Nothing needs to happen inside it, and writing something would not
+change the outcome — under the rollback journal (`main.rs:56-76` deliberately does not
+enable WAL) a write statement still only holds RESERVED, and EXCLUSIVE is taken at COMMIT,
+which this transaction never reaches.
 
-```bash
-curl -sS --cookie "pp_session=$PP" -o /tmp/lock.out -D - -w 'status=%{http_code}\n' \
-     'http://localhost:8000/api/backup/export?portfolio_ids=1'
-cat /tmp/lock.out
-```
-
-Expected: the request **hangs for about five seconds** — that is the `busy_timeout` in
-`main.rs`, and it is the honest experience, not a bug — then
-`HTTP/1.1 503 Service Unavailable`, a `Retry-After: 2` header, and
-`{"error":"the database is busy; try again in a moment"}`.
-
-Then do the same against the write route and prove nothing was written:
+Then, from a second terminal, with that transaction still open, drive the **restore**
+route and prove a refused restore writes nothing. Use a portfolio id you actually own on
+this instance — the one you exported in §3, not a literal `1` — because a foreign id is a
+`404`, and a `404` here reads as the lock test failing:
 
 ```bash
 sqlite3 "$DB" 'select count(*) from portfolios'
@@ -363,19 +393,38 @@ curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
 sqlite3 "$DB" 'select count(*) from portfolios'
 ```
 
-Expected: `503`, and the two counts identical — the restore is one transaction, so a
-refused restore is a restore that never happened. Finish with `ROLLBACK;` in the sqlite3
-prompt and re-run the export: expected `200`.
+Expected: the request **hangs for about five seconds** — that is the `busy_timeout` in
+`main.rs`, and it is the honest experience, not a bug — then
+`HTTP/1.1 503 Service Unavailable`, a `Retry-After: 2` header, and
+`{"error":"the database is busy; try again in a moment"}`. The two counts are identical:
+the restore is one transaction, so a refused restore is a restore that never happened.
+This is the manual version of `a_locked_database_is_a_503_with_retry_after_from_the_restore_route`
+in `backend_rust/tests/backup_test.rs`, which holds a write transaction open the same way.
 
-Two things about that recipe are worth knowing, because both are easy to get wrong and
-leave you concluding the route works when nothing was ever blocked:
+Now the export, with the lock **still held**, and expect the opposite:
 
-- A plain `BEGIN;` will not do it. SQLite lets a deferred transaction stay a reader.
-- A bare `BEGIN IMMEDIATE;` is **not** enough for the export. The database is in
-  rollback-journal mode (`main.rs` deliberately does not enable WAL), and a RESERVED
-  lock still admits readers — and the export route only reads. The dummy `CREATE TABLE`
-  is what upgrades the held lock to EXCLUSIVE, which is what a reader trips over. For
-  the restore route, which writes, `BEGIN IMMEDIATE;` on its own already blocks.
+```bash
+curl -sS --cookie "pp_session=$PP" -o /dev/null -w 'status=%{http_code}\n' \
+     "http://localhost:8000/api/backup/export?portfolio_ids=<the id you own>"
+```
+
+Expected: **`200`, immediately.** Not a `503`, and not the feature failing. A RESERVED
+writer does not block readers under the rollback journal, and `backup_export::build`
+issues no write, so there is nothing for a read-only route to wait on — the auth guard's
+own read of `users` gets through for the same reason. The consequence is written into the
+route at `src/api_routes/backup.rs:270-283`: **the export's `Lock` arm is unreachable
+from a held lock in this journal mode.** The failure that could reach it, pool exhaustion,
+is met earlier by the guard and answered a `500` before that arm. Both halves are pinned by
+tests instead (`an_exhausted_pool_is_a_lock_not_an_outage`, and
+`a_lock_is_a_503_that_says_when_to_retry` for the response shape). So a `200` here is the
+correct answer: the read-only routes are simply not where `SQLITE_BUSY` comes from, and
+this walkthrough must not pretend otherwise.
+
+Finish with `ROLLBACK;` in the sqlite3 prompt and re-run the restore: expected `200` — the
+lock was the only thing refusing it.
+
+The one way to get a false pass: a plain `BEGIN;` will not do it, because SQLite lets a
+deferred transaction stay a reader and nothing blocks. It has to be `BEGIN IMMEDIATE`.
 
 ### 6. Metrics equality before and after a restore — this one is manual
 

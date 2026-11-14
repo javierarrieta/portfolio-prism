@@ -1,5 +1,11 @@
 # Dated tax report: a CSV and a page for a window you choose
 
+> **The test counts in this note are as-of 2026-11-09 and are not maintained.** The backend
+> suite, the access-gate handler count and the frontend suite have all grown since; the
+> live numbers are whatever `cargo test`, `bash scripts/check_access_gate.sh` and
+> `npm test` print today, and `docs/auth-testing.md` §0 carries the current gate set. The
+> figures below are a dated transcript — leave them, do not "fix" them.
+
 Branch `feat/report-export`.
 
 ## What a user will notice

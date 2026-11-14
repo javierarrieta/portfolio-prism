@@ -161,9 +161,12 @@ pub struct Bundle {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BundlePortfolio {
-    /// Bundle-local label (`p1`, `p2`), unique within the bundle, used only to
-    /// rewire parent/child links during restore. Never a database id, never
-    /// persisted. `ref` is a Rust keyword, hence the rename.
+    /// Bundle-local label (`p1`, `p2`), unique within the bundle, so validation can
+    /// refuse two rows that claim the same label. It is never a database id, it is
+    /// never persisted, and the write path never reads one: the parent/child link
+    /// comes from the bundle's nesting, and every stored id comes from the freshly
+    /// allocated `RETURNING id` of the insert that made the row. `ref` is a Rust
+    /// keyword, hence the rename.
     #[serde(rename = "ref")]
     pub bundle_ref: String,
     pub name: String,
@@ -1719,10 +1722,12 @@ Replace `backend_rust/src/backup/restore.rs`:
 ```rust
 //! Counting, planning, and applying a bundle. All restore SQL lives here.
 //!
-//! Two rules hold throughout. **Bundle refs are never database ids** — they are
-//! local labels used only to rewire parent/child links, and nothing here matches
-//! one against a stored row. **The whole restore is one transaction** — a bundle
-//! that fails anywhere writes nothing.
+//! Two rules hold throughout. **A bundle ref is a bundle-local label and nothing
+//! else** — it names a row inside one bundle so validation can refuse two rows that
+//! claim the same label, it is never a database id, and the write path never reads
+//! one: the nesting carries the parent/child link and `RETURNING id` supplies every
+//! stored id. **The whole restore is one transaction** — a bundle that fails anywhere
+//! writes nothing.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
