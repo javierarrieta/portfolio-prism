@@ -1,11 +1,15 @@
 //! Counting, planning, and applying a bundle. All restore SQL lives here.
 //!
-//! Two rules hold throughout. **Bundle refs are never database ids** — they are
-//! local labels used only to rewire parent/child links, and nothing here matches
-//! one against a stored row. The write path goes further: it never reads a ref at
-//! all, so a ref cannot reach a column, an empty one cannot reach an insert, and the
-//! links come from the ids the inserts allocated. **The whole restore is one
-//! transaction** — a bundle that fails anywhere writes nothing.
+//! Two rules hold throughout. **A bundle ref is a bundle-local label and nothing
+//! else.** It names a row inside one bundle, so validation can refuse two rows that
+//! claim the same label; it is never a database id, it is never persisted, and nothing
+//! here matches one against a stored row. It does not even carry the parent/child
+//! link — the bundle's nesting does, by putting an asset inside its portfolio. The
+//! write path goes further and never reads a ref at all: a ref cannot reach a column
+//! and an empty one cannot reach an insert. Every link comes from the freshly
+//! allocated id (`RETURNING id`) of the insert that made the row, so a restore always
+//! mints new ids rather than reusing anything the bundle names. **The whole restore is
+//! one transaction** — a bundle that fails anywhere writes nothing.
 //!
 //! [`plan_for`] is the read half: it is what the user is shown before a restore is
 //! allowed, so its numbers are the promise [`apply`] has to keep. [`apply`] is the

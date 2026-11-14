@@ -25,11 +25,15 @@ Run from the repository root. All of these are expected to pass on
 `feat/oidc-identity-isolation`.
 
 ```fish
-# Backend: 313 tests
+# Backend: 460 tests
 cd backend_rust; and cargo test
 
-# Static access gate: prints "handlers inspected: 20, cleared: 20"
+# Static access gate: prints "handlers inspected: 20, cleared: 20, files checked: 4"
 bash scripts/check_access_gate.sh
+
+# Pricing seam and engine portability: both print what they inspected
+bash scripts/check_pricing_seam.sh
+bash scripts/check_backup_portability.sh
 
 # The gate's own self-test (it is part of `cargo test`, listed here for clarity)
 cargo test --test access_gate_test
@@ -43,15 +47,20 @@ set -x AUTH_MODE disabled
 ./target/release/backend_rust; echo "exit=$status"   # expect exit 1, names AUTH_MODE
 set -e AUTH_MODE
 
-# OpenAPI document must match the code
+# OpenAPI document must match the code — a raw diff, exactly as CI does it
 cargo run --quiet -- --print-openapi > /tmp/oa.json
-diff <(python3 -m json.tool /tmp/oa.json) <(python3 -m json.tool ../docs/openapi/openapi.json)
+diff /tmp/oa.json ../docs/openapi/openapi.json
+
+# Backup bundle schema must match the code (same early-exit contract)
+cargo run --quiet -- --print-backup-schema > /tmp/schema.json
+diff /tmp/schema.json ../docs/backup-schema/v1.json
 ```
 
 ```fish
-# Frontend: 203 tests, types, lint
+# Frontend: 256 tests, types, lint
 cd ../frontend
 npm test
+npm run generate-types; and git diff --exit-code src/types/api.d.ts
 npx tsc --noEmit
 npm run lint        # 0 errors; one pre-existing react-hooks warning is expected
 ```
