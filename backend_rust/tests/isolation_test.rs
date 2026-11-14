@@ -288,3 +288,134 @@ async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
 // resource id, so there is no cross-user case to invent here. The first is covered
 // by the ownership it asserts (every other test depends on that column) and by the
 // F1 sweep in `auth_test.rs`; the second touches none of the three tables.
+
+// ---------------------------------------------------------------------------
+// Export.
+//
+// The static access gate cannot see these: the ids arrive in a query string and
+// the rows are reached by `WHERE portfolio_id = ?`, neither of which Rule B
+// matches. This file is the gate for the export route.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn b_cannot_export_a_s_portfolio_but_a_can() {
+    // The export handler loops `require(.., Viewer)` over every id before it reads
+    // anything. This is what proves that loop exists; the static gate cannot.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={}", u.a_portfolio);
+
+    let b = client_as(pool.clone(), u.b).await;
+    assert_eq!(b.get(&path).dispatch().await.status(), Status::NotFound);
+
+    let a = client_as(pool.clone(), u.a).await;
+    assert_eq!(a.get(&path).dispatch().await.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn one_foreign_id_denies_the_whole_export() {
+    // A request for `[mine, theirs]` must not return mine and quietly drop theirs.
+    // A partial success would look like a bug in the user's own selection.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let path = format!("/api/backup/export?portfolio_ids={},{}", u.a_portfolio, u.b_portfolio);
+
+    let a = client_as(pool, u.a).await;
+    let res = a.get(&path).dispatch().await;
+    assert_eq!(res.status(), Status::NotFound);
+    // And the denial carries no rows at all: a partial bundle would be the leak.
+    let body = res.into_string().await.unwrap();
+    assert!(!body.contains("A portfolio"), "a denied export must not return any rows: {body}");
+}
+
+#[tokio::test]
+async fn an_export_never_contains_another_user_s_rows() {
+    // Positive-side proof: A's bundle of A's portfolio holds A's asset and none of
+    // B's. `seed_two_users` gives B an empty portfolio, so B's asset is seeded
+    // here — and A's own asset is asserted present, or an empty bundle would pass
+    // the negative half for the wrong reason.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    seed_asset(&pool, u.b_portfolio, "BBB", "Asset B").await;
+
+    let a = client_as(pool, u.a).await;
+    let res = a
+        .get(format!("/api/backup/export?portfolio_ids={}", u.a_portfolio))
+        .dispatch()
+        .await;
+    let body: serde_json::Value = res.into_json().await.unwrap();
+    let text = body.to_string();
+    assert!(text.contains("Asset A"), "A's own bundle must contain A's asset: {text}");
+    assert!(!text.contains("Asset B"), "A's bundle must not contain B's asset: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// Restore.
+//
+// The restore routes resolve no caller-supplied id — every row they write takes its
+// owner from the session — so the cross-tenant question here is not export's "can B
+// read A's rows". It is the other direction: a bundle is data that arrived from
+// another user, and carrying it across a tenant boundary must neither hand A's rows
+// to B nor let B write into A's space.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
+    // Restore always writes the caller as owner. A bundle is data, not a grant:
+    // carrying A's rows into B's session must not make them visible to A, and must
+    // not let B write into A's space.
+    let pool = setup_db(&disabled_config()).await;
+    let u = seed_two_users(&pool).await;
+    let exported: String = {
+        let a = client_as(pool.clone(), u.a).await;
+        a.get(format!("/api/backup/export?portfolio_ids={}", u.a_portfolio))
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .unwrap()
+    };
+
+    let b = client_as(pool.clone(), u.b).await;
+    let res = b
+        .post("/api/backup/restore?mode=copy")
+        .header(json())
+        .body(exported)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: serde_json::Value = res.into_json().await.unwrap();
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    // Deliberately not `assert_ne!(new_id, u.a_portfolio)`: `portfolios.id` is
+    // `INTEGER PRIMARY KEY AUTOINCREMENT` and A's portfolio is the first row the
+    // fixture writes, so that comparison could never fail. The claim underneath it
+    // can fail, and is what "a restore allocates its own ids" is for: the restore
+    // wrote new rows in B's space and left every one of A's rows where it was.
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?), \
+                (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?)",
+    )
+    .bind(u.b as i64)
+    .bind(u.a as i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        counts, (2, 1),
+        "B gained exactly the restored portfolio and A lost none of their own"
+    );
+
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner.0, Some(u.b as i64), "the restorer owns what they restored");
+
+    // And A cannot see it.
+    let a = client_as(pool.clone(), u.a).await;
+    assert_eq!(
+        a.get(format!("/api/portfolios/{new_id}")).dispatch().await.status(),
+        Status::NotFound
+    );
+}

@@ -16,6 +16,13 @@ fn print_openapi_requested() -> bool {
     std::env::args().any(|arg| arg == "--print-openapi")
 }
 
+/// Print the backup bundle schema and exit, before touching configuration, the
+/// database, or the network — the same contract `--print-openapi` holds, and for
+/// the same reason: CI runs it with no `OIDC_*` variables and no secret key.
+fn print_backup_schema_requested() -> bool {
+    std::env::args().any(|arg| arg == "--print-backup-schema")
+}
+
 /// Refuse to start, naming the reason.
 ///
 /// `exit(1)` rather than `return Err`: `main`'s error type is `rocket::Error`,
@@ -30,6 +37,11 @@ fn refuse(err: anyhow::Error) -> ! {
 async fn main() -> Result<(), rocket::Error> {
     if print_openapi_requested() {
         println!("{}", backend_rust::openapi::document_json());
+        return Ok(());
+    }
+
+    if print_backup_schema_requested() {
+        println!("{}", backend_rust::backup::schema::document_json());
         return Ok(());
     }
 
@@ -87,6 +99,21 @@ async fn main() -> Result<(), rocket::Error> {
 
     let cors = get_cors_options(origins);
 
-    build_rocket(pool, currency_service, cors, auth).launch().await?;
+    let backup_cfg = backend_rust::backup::BackupConfig::from_env();
+    if backup_cfg.allow_price_restore {
+        eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE is on; a restore may write shared historical_prices rows");
+    } else if let Some(raw) = std::env::var("BACKUP_ALLOW_PRICE_RESTORE").ok()
+        && !backend_rust::backup::BackupConfig::is_recognised(&raw)
+    {
+        // An operator who wrote `on` or `enabled` believes price restore is enabled.
+        // Saying nothing would leave them believing it while restores quietly refuse.
+        // A value in either accepted set is a decision and stays quiet: warning about
+        // `0` would train operators to ignore the warning above this one.
+        eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE={raw:?} is not recognised; price restore stays off (1/true/yes to enable, 0/false/no to disable)");
+    }
+
+    build_rocket(pool, currency_service, cors, auth, backup_cfg)
+        .launch()
+        .await?;
     Ok(())
 }

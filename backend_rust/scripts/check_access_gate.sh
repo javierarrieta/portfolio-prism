@@ -5,8 +5,14 @@
 # on correct code gets weakened or deleted in the next PR that lands, which is the
 # failure mode this script is written to avoid.
 #
-#   Rule A — every handler file goes through the chokepoint: it imports from
-#            `crate::access` and calls one of the require functions.
+#   Rule A — every handler goes through the chokepoint: its file imports from
+#            `crate::access` and calls one of the require functions. One handler
+#            that genuinely resolves no caller-supplied id may carry the marker
+#            `// access-gate: global-config (no caller-supplied id)` on the line
+#            directly above its route attribute. That waives the require half for
+#            that handler alone — never for an unmarked neighbour — and it still
+#            owes Rule C an `AuthedUser` and Rule B its ordering. The marker is
+#            printed whenever it is honoured, so it cannot be added quietly.
 #   Rule B — every handler whose body resolves a row by `WHERE id` calls
 #            `require*` *before* that query, not merely somewhere inside itself.
 #   Rule C — every route handler takes the caller (`AuthedUser`).
@@ -23,6 +29,38 @@
 #     patterns match the bare call name as well as the qualified path.
 #   * Rule C inspects the signature only (up to the first `->`), so a body comment
 #     naming `AuthedUser` no longer satisfies it.
+#   * Rule A's marker is honoured only as the whole line above the route attribute,
+#     so it cannot be smuggled into a string literal or a doc comment; a marker in
+#     the wrong place fails the gate rather than passing quietly.
+#   * Rule A's pass test is still file-level: one `require*` call anywhere in a file
+#     satisfies it for every handler in that file. The marker is per handler; the
+#     pass branch is not. Rule B is what pins the ordering per handler.
+#   * The three rules compose into a hole no single rule has: a handler that takes an id
+#     from a query string, a form field or a JSON body and never calls `require*` passes
+#     Rule A (a sibling in the same file calls it), Rule B (no `WHERE id` text to order)
+#     and Rule C (it takes `AuthedUser`). `api_routes/backup.rs` is the live example —
+#     `preview` and `restore` carry no marker and call no `require`, and clear Rule A
+#     through `export`'s call. A fifth route in that file that forgot the chokepoint
+#     would pass all three. The isolation matrix (`tests/isolation_test.rs`) is the
+#     gate for that shape, not this script.
+#   * All three rules anchor on a route attribute in column 0 (`^#\[(get|post|...)`), so
+#     an **indented** route attribute is invisible to every rule: not flagged, not
+#     counted, not printed. No handler is indented today (all 20 in `src/api_routes` are
+#     at column 0); a new one that is would be silently ungatechecked rather than
+#     failing. Fixing the anchor is a one-character change to each awk pattern; it is
+#     listed here so the gap is the script's known limit and not a discovery.
+#   * The marker's claim is cross-checked against the route path only, and by shape
+#     rather than spelling: any path parameter at all contradicts it, because the
+#     claim is "no caller-supplied id", not "no id-named id". A handler that takes an
+#     id from a query string, a form field, or a JSON body is invisible to this,
+#     exactly as it is to Rule B — the isolation matrix is the real gate.
+#   * That check reads the attribute's text, so it fails closed on shape, not
+#     meaning: a marked handler with a harmless parameter such as `<tab>` fails, and
+#     `#[route(..., data = "<body>")]` fails because the data generic also uses angle
+#     brackets. Failing closed is the right way to be wrong about a security gate.
+#   * The attribute is read to its closing `)]`, at most nine lines, so a wrapped
+#     attribute is still seen. An attribute wrapping further than that hides its
+#     parameters, which is the same limit Rule B accepts with per-line SQL matching.
 #
 # The script prints what it inspected. A gate that silently inspects nothing is worse
 # than no gate.
@@ -35,6 +73,11 @@ HANDLER_DIR="src/api_routes"
 # Files that legitimately never touch portfolios/assets/transactions.
 EXEMPT=( "lookup.rs" )
 
+# The whole-line comment a handler carries when it resolves no caller-supplied id
+# and so has nothing to send to the chokepoint. Honoured per handler, never per
+# file. Kept as one string so the script has a single spelling of it.
+MARKER='// access-gate: global-config (no caller-supplied id)'
+
 fail=0
 rules_b_hits=0
 
@@ -46,6 +89,41 @@ is_exempt() {
   return 1
 }
 
+# One line per route handler in $1: "<attribute line>\t<1 if the marker is
+# honoured>\t<1 if the marker contradicts the route>\t<fn name>". The marker is
+# honoured only when it is the whole previous line, so it cannot hide inside a
+# string or a doc comment, and it is refused outright when the route takes any path
+# parameter — the marker's whole claim is that the caller supplied nothing to check.
+handlers_in() {
+  awk -v marker="$MARKER" '
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (line[i] !~ /^#\[(get|post|put|delete|patch|head|options|route)\(/) continue
+        prev = (i > 1 ? line[i - 1] : "")
+        sub(/^[ \t]+/, "", prev); sub(/[ \t]+$/, "", prev)
+        marked = (prev == marker) ? 1 : 0
+        # Any path parameter contradicts the claim: `<portfolio>` is as much
+        # caller-supplied as `<portfolio_id>`, and matching the spelling `id` is what
+        # let `<key>` and `<target>` through. The attribute may wrap, so read on to
+        # its closing `)]` instead of testing only the line that opened it.
+        attr = ""
+        for (k = i; k <= NR && k <= i + 8; k++) {
+          attr = attr " " tolower(line[k])
+          if (line[k] ~ /\)\]/) break
+        }
+        contradict = (marked && attr ~ /</) ? 1 : 0
+        if (contradict) marked = 0
+        fn = "(unknown)"
+        for (j = i; j <= NR && j <= i + 40; j++) {
+          if (match(line[j], /fn [A-Za-z_0-9]+/)) { fn = substr(line[j], RSTART + 3, RLENGTH - 3); break }
+        }
+        printf "%d\t%d\t%d\t%s\n", i, marked, contradict, fn
+      }
+    }
+  ' "$1"
+}
+
 mapfile -t FILES < <(find "$HANDLER_DIR" -name '*.rs' | sort)
 if [ "${#FILES[@]}" -eq 0 ]; then
   echo "GATE FAILED: no handler files found under $HANDLER_DIR"
@@ -53,9 +131,9 @@ if [ "${#FILES[@]}" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Rule A — every handler file goes through the chokepoint
+# Rule A — every handler goes through the chokepoint, or names why it has none
 # ---------------------------------------------------------------------------
-echo "Rule A: every handler file calls the access chokepoint"
+echo "Rule A: every handler goes through the access chokepoint, or carries the marker saying why it has nothing to check"
 files_checked=0
 for file in "${FILES[@]}"; do
   name="$(basename "$file")"
@@ -64,11 +142,49 @@ for file in "${FILES[@]}"; do
     continue
   fi
   files_checked=$((files_checked + 1))
+
+  handlers="$(handlers_in "$file")"
+  total=0
+  unmarked=0
+  contradicted=0
+  # Waived handlers are printed whether or not the file also needs the chokepoint,
+  # so a marker always shows up in the gate's output and in a diff review.
+  while IFS=$'\t' read -r hline hmarked hcontra hfn; do
+    [ -z "$hline" ] && continue
+    total=$((total + 1))
+    if [ "$hmarked" = "1" ]; then
+      echo "  waived   $name:$hline $hfn ($MARKER — no caller-supplied id; Rules B and C still apply)"
+    elif [ "$hcontra" = "1" ]; then
+      # The marker says "no caller-supplied id" and the route path says otherwise.
+      # Refused even in a file that calls the chokepoint elsewhere: a false claim is
+      # the thing to surface, not something a neighbour's `require` can paper over.
+      echo "  MARKER-CONTRADICTS $name:$hline $hfn (the route takes a path parameter, so the marker's claim is false)"
+      contradicted=$((contradicted + 1))
+      fail=1
+    else
+      unmarked=$((unmarked + 1))
+    fi
+  done <<< "$handlers"
+
   if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(' "$file"; then
     echo "  ok       $name"
+  elif [ "$total" -gt 0 ] && [ "$unmarked" -eq 0 ] && [ "$contradicted" -eq 0 ]; then
+    echo "  ok       $name (every handler carries the global-config marker: none resolves a caller-supplied id)"
   else
-    echo "  MISSING  $name neither imports crate::access nor calls a require function"
-    fail=1
+    # Name each handler that neither calls the chokepoint nor carries the marker.
+    # A message that only named the file would hide which handler regressed, and a
+    # marker on one handler must never cover an unmarked neighbour.
+    while IFS=$'\t' read -r hline hmarked hcontra hfn; do
+      [ -z "$hline" ] && continue
+      [ "$hmarked" = "1" ] && continue
+      [ "$hcontra" = "1" ] && continue   # already reported above
+      echo "  NO-CHOKEPOINT $name:$hline $hfn calls no require* and carries no access-gate marker"
+      fail=1
+    done <<< "$handlers"
+    if [ "$total" -eq 0 ]; then
+      echo "  MISSING  $name neither imports crate::access nor calls a require function, and holds no route handler to inspect"
+      fail=1
+    fi
   fi
 done
 

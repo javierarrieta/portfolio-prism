@@ -79,6 +79,299 @@
         }
       }
     },
+    "/api/backup/capabilities": {
+      "get": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "description": "Server limits and flags: schema_versions, allow_price_restore, max_bytes, max_rows",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/backup/export": {
+      "get": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "export",
+        "parameters": [
+          {
+            "name": "portfolio_ids",
+            "in": "query",
+            "description": "Comma-separated portfolio ids to include; required, and the parameter may appear only once",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "include_prices",
+            "in": "query",
+            "description": "Include the price-history section: 1/true/yes to include, 0/false/no to omit; optional, absent means omit; the parameter may appear only once, with one value",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bundle; see docs/backup-schema/v1.json for its shape",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "A portfolio id is not yours",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "No portfolio selected; `portfolio_ids` or `include_prices` given more than once; an id that did not parse; an `include_prices` value that means neither on nor off; or a selection over the row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed for a reason that is not a lock",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/backup/preview": {
+      "post": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "preview",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "copy or replace; required, and the parameter may appear only once",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plan: mode, delete counts, insert counts, prices, warnings",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "The upload could not be read",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "413": {
+            "description": "The upload is over `max_bytes`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "The read of the caller's current data failed for a reason that is not a lock",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/backup/restore": {
+      "post": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "operationId": "restore",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "copy or replace; required, and the parameter may appear only once",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "apply_prices",
+            "in": "query",
+            "description": "apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; optional, absent means leave it alone; needs the server flag, and may appear only once",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true
+            },
+            "style": "form",
+            "explode": false
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Restored: inserted counts, portfolio_ids, prices_inserted",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "The upload could not be read",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "413": {
+            "description": "The upload is over `max_bytes`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "`mode` or `apply_prices` absent, repeated, or unrecognised; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation; a bundle carrying price history while price restore is disabled",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "The write failed; the transaction was rolled back, so nothing was written",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy; nothing was written",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/portfolios/": {
       "get": {
         "tags": [

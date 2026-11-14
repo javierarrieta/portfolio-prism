@@ -11,6 +11,18 @@ export interface paths {
   "/api/assets/lookup": {
     get: operations["lookup_isin"];
   };
+  "/api/backup/capabilities": {
+    get: operations["capabilities"];
+  };
+  "/api/backup/export": {
+    get: operations["export"];
+  };
+  "/api/backup/preview": {
+    post: operations["preview"];
+  };
+  "/api/backup/restore": {
+    post: operations["restore"];
+  };
   "/api/portfolios/": {
     get: operations["list_portfolios"];
     post: operations["create_portfolio"];
@@ -539,6 +551,178 @@ export interface operations {
       /** @description ISIN not found */
       404: {
         content: never;
+      };
+    };
+  };
+  capabilities: {
+    responses: {
+      /** @description Server limits and flags: schema_versions, allow_price_restore, max_bytes, max_rows */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  export: {
+    parameters: {
+      query: {
+        /** @description Comma-separated portfolio ids to include; required, and the parameter may appear only once */
+        portfolio_ids: string[] | null;
+        /** @description Include the price-history section: 1/true/yes to include, 0/false/no to omit; optional, absent means omit; the parameter may appear only once, with one value */
+        include_prices?: string[] | null;
+      };
+    };
+    responses: {
+      /** @description The bundle; see docs/backup-schema/v1.json for its shape */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description A portfolio id is not yours */
+      404: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description No portfolio selected; `portfolio_ids` or `include_prices` given more than once; an id that did not parse; an `include_prices` value that means neither on nor off; or a selection over the row or byte ceiling */
+      422: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The read failed for a reason that is not a lock */
+      500: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The database is busy */
+      503: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+    };
+  };
+  preview: {
+    parameters: {
+      query: {
+        /** @description copy or replace; required, and the parameter may appear only once */
+        mode: string[] | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": unknown;
+      };
+    };
+    responses: {
+      /** @description The plan: mode, delete counts, insert counts, prices, warnings */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The upload could not be read */
+      400: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description The upload is over `max_bytes` */
+      413: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description `mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation */
+      422: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The read of the caller's current data failed for a reason that is not a lock */
+      500: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The database is busy */
+      503: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+    };
+  };
+  restore: {
+    parameters: {
+      query: {
+        /** @description copy or replace; required, and the parameter may appear only once */
+        mode: string[] | null;
+        /** @description apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; optional, absent means leave it alone; needs the server flag, and may appear only once */
+        apply_prices?: string[] | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": unknown;
+      };
+    };
+    responses: {
+      /** @description Restored: inserted counts, portfolio_ids, prices_inserted */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The upload could not be read */
+      400: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description The upload is over `max_bytes` */
+      413: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description `mode` or `apply_prices` absent, repeated, or unrecognised; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation; a bundle carrying price history while price restore is disabled */
+      422: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The write failed; the transaction was rolled back, so nothing was written */
+      500: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The database is busy; nothing was written */
+      503: {
+        content: {
+          "application/json": unknown;
+        };
       };
     };
   };

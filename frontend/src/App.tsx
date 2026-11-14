@@ -12,6 +12,7 @@ import {
   LogOut,
   Printer,
   Receipt,
+  FolderSync,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
@@ -19,6 +20,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
+import BackupPanel from './components/BackupPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
 import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
@@ -555,6 +557,9 @@ export default function App() {
           <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
             <Receipt size={18} /> Tax Report
           </li>
+          <li className={`nav-item ${activeTab === 'backup' ? 'active' : ''}`} onClick={() => selectTab('backup')}>
+            <FolderSync size={18} /> Backup
+          </li>
         </ul>
 
         {/* Portfolio Switcher */}
@@ -631,7 +636,20 @@ export default function App() {
         </div>
 
         {/* Tab View Selection */}
-        {currentPortfolio ? (
+        {/*
+          Backup is asked first, and is the only tab that sits outside the
+          `currentPortfolio` guard below it. Every tab under that guard renders the
+          selected portfolio, so with nothing selected they have nothing to say and
+          `No Portfolio Active` is the honest answer. Backup is account-level: it
+          exports whichever portfolios the signed-in user owns, and the restore half
+          that follows it is exactly what a user with no portfolio needs -- a fresh
+          account, or someone whose replace went wrong. Guarding it produced a dead
+          end: the sidebar item highlighted and the pane answered `No Portfolio
+          Active`.
+        */}
+        {activeTab === 'backup' ? (
+          <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (
               <Dashboard 

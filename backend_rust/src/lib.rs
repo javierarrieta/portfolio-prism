@@ -9,11 +9,13 @@ pub mod openapi;
 pub mod access;
 pub mod report_csv;
 pub mod auth;
+pub mod backup;
 pub mod api_routes {
     pub mod portfolios;
     pub mod transactions;
     pub mod analytics;
     pub mod lookup;
+    pub mod backup;
 }
 
 /// Test-only stand-in for the pricing provider, compiled into the library's own
@@ -562,17 +564,26 @@ pub fn build_rocket(
     currency_service: CurrencyService,
     cors: Cors,
     auth: AuthMode,
+    // Threaded through rather than managed here: Rocket 0.5.1's `manage` panics on a
+    // type it already holds, so a default managed inside this function would both
+    // crash `main`'s `.manage(...)` and win over the real value.
+    backup_cfg: crate::backup::BackupConfig,
 ) -> Rocket<Build> {
     // The OIDC-only routes are mounted only when there is a provider to talk to;
     // `/auth/me` exists in both modes so the frontend can always ask who it is.
     let oidc_routes = matches!(auth, AuthMode::Oidc(_));
 
+    // No `Limits` here on purpose. The bundle upload is capped per route — a
+    // handler opens its own `Data` stream under `backup::MAX_BUNDLE_BYTES` — so no
+    // global body limit is raised to serve one endpoint. See
+    // `api_routes::backup`'s module comment and the probes in `tests/backup_test.rs`.
     let rocket = rocket::build()
         .attach(cors)
         .attach(AuthFairing)
         .manage(pool)
         .manage(currency_service)
         .manage(auth)
+        .manage(backup_cfg)
         .mount("/", routes![index])
         // The sentinel the fairing rewrites denied requests to. Outside `/api`, so
         // it is neither covered by the prefix rule nor part of the API surface, and
@@ -619,6 +630,10 @@ pub fn build_rocket(
             api_routes::transactions::list_portfolio_transactions,
             api_routes::transactions::delete_transaction,
             api_routes::analytics::get_transaction_sell_pnl,
+            api_routes::backup::capabilities,
+            api_routes::backup::export,
+            api_routes::backup::preview,
+            api_routes::backup::restore,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same

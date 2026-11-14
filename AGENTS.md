@@ -4,7 +4,7 @@
 Portfolio Prism: Full-stack app for portfolio management and tax lot (FIFO/LIFO/Hybrid) calculations.
 
 ## Architecture
-- **Backend**: Rust (Rocket) in `backend_rust/`. Uses SQLite (`backend/portfolio.db`) via SQLx.
+- **Backend**: Rust (Rocket) in `backend_rust/`. Uses SQLite (see *Database* below) via SQLx.
 - **Frontend**: React + Vite in `frontend/`.
 
 ## Commands
@@ -43,8 +43,18 @@ From root:
   the release image refuses to start without OIDC configuration.
 - **API Prefix**: All routes are under `/api`.
 - **Tax Logic**: `backend_rust/src/engines/tax_engine.rs` contains the core `TaxLotEngine` supporting `FIFO`, `LIFO`, and `HYBRID` (using `hybrid_threshold_days`) strategies.
-- **Database**: Persistent storage is in `backend/portfolio.db`.
-- **Metrics Engine**: `backend_rust/src/engines/stats_engine.rs` computes TWR, Volatility, Sharpe Ratio, and Portfolio Beta (vs SPY).
+- **Database**: The default `DATABASE_URL` is `sqlite:../portfolio.db?mode=rwc`, resolved
+  against the process cwd — so in development that is **`portfolio.db` in the repository
+  root** when the backend is run from `backend_rust/` (`main.rs:53-54`). There is no
+  `backend/` directory. Production sets `DATABASE_URL` to `/app/data/portfolio.db`
+  (`k8s/configmap.yaml`).
+- **Metrics Engine**: `backend_rust/src/engines/stats_engine.rs` computes the daily value
+  series, cumulative **TWR**, portfolio value and beta-adjusted exposure. Volatility,
+  Sharpe Ratio and Portfolio Beta are **not** computed — the response carries them as the
+  constants `"0.0"`, `"0.0"` and `"1.0"` (`stats_engine.rs:108-110` and `:323-325`), and
+  `stats_engine.rs:383` asserts the Sharpe is `"0.0"`. The correlation matrix is returned
+  empty for the same reason. Do not write a test or a doc that treats those four as real
+  measurements without changing the engine first.
 - **macOS Tip**: Use `127.0.0.1` instead of `localhost` for the API to avoid IPv6 resolution issues.
 
 ## Branching Workflow
@@ -63,7 +73,11 @@ From root:
   entry point for verifying the auth work, including the two things CI cannot check
   (a real login, and whether the provider ends its own session on logout).
 - **Backend gates**: `cargo test`, `bash scripts/check_access_gate.sh`,
+  `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`,
   `cargo clippy --all-targets`, `cargo build --release` — all from `backend_rust/`.
+  Each gate script has its own test (`tests/access_gate_test.rs`,
+  `tests/backup_portability_test.rs`) that runs the real script against a throwaway
+  tree; a gate is only as good as the mutation that proves it can fail.
 - **Provider smoke (no browser)**: `bash scripts/auth_smoke.sh` from `backend_rust/`,
   with `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` set.
 - **Local OIDC harness**: `docker-compose.auth-test.yml` with `.auth-test.env`

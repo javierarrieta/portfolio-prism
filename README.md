@@ -39,6 +39,13 @@ Full-stack portfolio management application with tax lot tracking (FIFO/LIFO/Hyb
 | `DELETE` | `/api/transactions/:id` | Delete transaction |
 | `GET` | `/api/portfolios/:id/tax-summary` | Tax summary |
 | `GET` | `/api/portfolios/:id/performance` | Performance analytics |
+| `GET` | `/api/backup/capabilities` | Bundle limits and flags (`allow_price_restore`, `max_bytes`, `max_rows`) |
+| `GET` | `/api/backup/export` | Export a bundle; `?portfolio_ids=1,2` (required), `?include_prices=1` |
+| `POST` | `/api/backup/preview` | Preview a restore; `?mode=copy\|replace` (required), body is the bundle |
+| `POST` | `/api/backup/restore` | Restore a bundle; `?mode=copy\|replace` (required), `?apply_prices=1` (needs the flag below) |
+
+The four backup routes are authenticated like every other `/api` route. Their bundle format is
+`docs/backup-schema/v1.json` and the manual walkthrough is `docs/walkthrough.md`.
 
 ---
 
@@ -153,6 +160,7 @@ Backend environment variables are configured in the ConfigMap:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `sqlite:///app/data/portfolio.db?mode=rwc` | SQLite connection string |
+| `BACKUP_ALLOW_PRICE_RESTORE` | `false` | Let `POST /api/backup/restore` write the bundle's `prices` section. **Security-relevant:** `historical_prices` has no `owner_id`, so a restore that writes it is one tenant writing market data every other tenant's dated reports read. `1/true/yes` enable, `0/false/no` disable, anything else stays off and logs a warning, and the backend prints a `WARN` on every start with it on. Deliberately **absent** from `k8s/configmap.yaml`, so the deployed app has it off. See `docs/backup-schema/README.md` and `docs/walkthrough.md` §4 step 6. |
 
 ### Scaling
 

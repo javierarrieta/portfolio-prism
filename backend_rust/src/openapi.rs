@@ -2,6 +2,8 @@ use crate::api_routes::lookup::AssetLookupResult;
 use crate::models;
 use crate::schemas;
 use utoipa::OpenApi;
+use utoipa::openapi::Required;
+use utoipa::openapi::path::PathItemType;
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{Components, RefOr, Response};
 
@@ -24,6 +26,10 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::analytics::get_portfolio_performance,
         crate::api_routes::analytics::get_transaction_sell_pnl,
         crate::api_routes::lookup::lookup_isin,
+        crate::api_routes::backup::capabilities,
+        crate::api_routes::backup::export,
+        crate::api_routes::backup::preview,
+        crate::api_routes::backup::restore,
     ),
     components(schemas(
         models::Portfolio,
@@ -102,7 +108,62 @@ pub fn document() -> utoipa::openapi::OpenApi {
         }
     }
 
+    mark_required_query_params(&mut doc);
+
     doc
+}
+
+/// The query parameters a route answers `422` without, published as `required`.
+///
+/// utoipa infers a parameter's `required` from the handler's argument type, and
+/// `api_routes::backup` takes `Option<Vec<String>>` for every query parameter it
+/// reads, on purpose: a parameter repeated in the URL finalises to `None` on an
+/// `Option` field, and reading the field as a sequence is the only way `only_once`
+/// can see the duplicate and refuse it. The inference therefore calls all of them
+/// optional, and `#[utoipa::path]` 4.x has no attribute to overrule it — `required`
+/// is not an accepted inline-parameter attribute, and the inferred schema replaces
+/// the declared one whatever is written there. Corrected here instead, in the one
+/// function every published document is built from, beside the `401` responses
+/// added the same way.
+///
+/// Only the parameters whose absence is a `422` are listed. `include_prices` and
+/// `apply_prices` stay as the derive has them: absent genuinely means off for those
+/// two (`parse_query_flag`), and calling them required would publish a contract the
+/// panel itself breaks on every plain restore.
+///
+/// The list is checked rather than trusted: a route or parameter renamed away from it
+/// fails the build instead of quietly publishing a required parameter as optional —
+/// the exact defect this function exists to remove.
+fn mark_required_query_params(doc: &mut utoipa::openapi::OpenApi) {
+    const REQUIRED: [(&str, PathItemType, &str); 3] = [
+        ("/api/backup/export", PathItemType::Get, "portfolio_ids"),
+        ("/api/backup/preview", PathItemType::Post, "mode"),
+        ("/api/backup/restore", PathItemType::Post, "mode"),
+    ];
+
+    let mut marked = 0;
+    for (path, item) in doc.paths.paths.iter_mut() {
+        for (kind, operation) in item.operations.iter_mut() {
+            for parameter in operation.parameters.iter_mut().flatten() {
+                let named = REQUIRED.iter().any(|(p, k, n)| {
+                    *p == path.as_str() && k == kind && *n == parameter.name.as_str()
+                });
+                if named {
+                    parameter.required = Required::True;
+                    marked += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        marked,
+        REQUIRED.len(),
+        "mark_required_query_params named {} parameter(s) and found {marked}; a backup route \
+         or query parameter was renamed and the published document now calls a required \
+         parameter optional",
+        REQUIRED.len()
+    );
 }
 
 /// Serialise [`document`] the one way the committed file is produced. Both the

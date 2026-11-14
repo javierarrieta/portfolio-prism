@@ -1,4 +1,5 @@
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
+use backend_rust::backup::BackupConfig;
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{build_rocket as lib_build_rocket, get_cors_options, init_db};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -42,6 +43,7 @@ pub fn oidc_cfg() -> OidcConfig {
 
 /// A config that asks for OIDC, for the tests that must exercise the authenticated
 /// path rather than the development shortcut.
+#[allow(dead_code)] // not every integration-test binary needs the OIDC path
 pub fn oidc_config() -> StartupConfig {
     StartupConfig {
         requested: backend_rust::auth::AuthRequest::Oidc,
@@ -81,7 +83,24 @@ fn rocket_with_service(
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
     let mode = AuthMode::Disabled { as_user };
-    lib_build_rocket(pool, currency_service, cors, mode)
+    lib_build_rocket(pool, currency_service, cors, mode, BackupConfig::default())
+}
+
+/// `build_rocket` with a specific `BackupConfig`. There is no other way to set the
+/// flag in a test: `std::env::set_var` is `unsafe` in edition 2024 and racy across
+/// parallel tests, and Rocket refuses a second `.manage` of a type it already
+/// holds — so the value has to enter through `build_rocket`, which is exactly what
+/// this exercises.
+#[allow(dead_code)]
+pub fn build_rocket_with_backup_config(
+    pool: SqlitePool,
+    as_user: i32,
+    backup_cfg: BackupConfig,
+) -> Rocket<Build> {
+    let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
+    #[cfg(debug_assertions)]
+    let mode = AuthMode::Disabled { as_user };
+    lib_build_rocket(pool, offline_pricing_service(), cors, mode, backup_cfg)
 }
 
 /// Build the app in OIDC mode — the mode production runs in, and the only one in
@@ -89,7 +108,13 @@ fn rocket_with_service(
 pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
     let currency_service = offline_pricing_service();
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
-    lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
+    lib_build_rocket(
+        pool,
+        currency_service,
+        cors,
+        AuthMode::Oidc(oidc_cfg()),
+        BackupConfig::default(),
+    )
 }
 
 /// Build in OIDC mode with an explicit origin allowlist, for the tests that care
@@ -98,7 +123,13 @@ pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
 pub fn build_rocket_oidc_with_cors(pool: SqlitePool, origins: Vec<String>) -> Rocket<Build> {
     let currency_service = offline_pricing_service();
     let cors = get_cors_options(origins);
-    lib_build_rocket(pool, currency_service, cors, AuthMode::Oidc(oidc_cfg()))
+    lib_build_rocket(
+        pool,
+        currency_service,
+        cors,
+        AuthMode::Oidc(oidc_cfg()),
+        BackupConfig::default(),
+    )
 }
 
 /// Migrate a fresh in-memory database under `cfg`, exactly as `main` does.
@@ -117,6 +148,7 @@ pub fn session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 }
 
 /// A session cookie that is already expired, with a matching token version.
+#[allow(dead_code)]
 pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
     (
         backend_rust::auth::session::SESSION_COOKIE,
@@ -125,6 +157,7 @@ pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 }
 
 /// Create a user row and return its id.
+#[allow(dead_code)]
 pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
@@ -140,6 +173,7 @@ pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
 }
 
 /// Create a portfolio owned by `owner_id`.
+#[allow(dead_code)]
 pub async fn seed_portfolio(pool: &SqlitePool, owner_id: i32, name: &str, currency: &str) -> i32 {
     let res = sqlx::query_as::<_, (i32,)>(
         "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES (?, ?, ?, ?, ?) RETURNING id"

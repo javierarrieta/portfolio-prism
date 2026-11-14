@@ -15,9 +15,13 @@ use std::collections::HashSet;
 
 /// Method, path, and the level required where one exists.
 ///
-/// `None` for the two routes that authenticate but check no resource id:
-/// `POST /api/portfolios/` (the caller becomes the owner) and
-/// `GET /api/assets/lookup` (touches none of the three tables).
+/// `None` for the five routes that authenticate but check no resource id:
+/// `POST /api/portfolios/` (the caller becomes the owner),
+/// `GET /api/assets/lookup` (touches none of the three tables),
+/// `GET /api/backup/capabilities` (reports server limits, no caller data),
+/// `POST /api/backup/preview` (the only thing it reads is the caller's own upload),
+/// and `POST /api/backup/restore` (the same, and every row it writes is owned by the
+/// caller because the caller's own id is the only owner it is given).
 ///
 /// Routes outside `/api/` — `/`, `/api-docs/openapi.json`, `/auth/*`,
 /// `/_auth/denied` — are deliberately **not** in this inventory: the first two are
@@ -65,6 +69,23 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     ("DELETE", "/api/transactions/<id>", Some(Access::Editor)),
     ("GET", "/api/transactions/<id>/pnl", Some(Access::Viewer)),
     ("GET", "/api/assets/lookup", None),
+    // Authenticates but resolves no caller-supplied id, so `None` — the same
+    // shape as `POST /api/portfolios/`.
+    ("GET", "/api/backup/capabilities", None),
+    // The ids arrive in a query string, not a path parameter, so Rule B cannot see
+    // them at all; the handler calls `require(.., Viewer)` per id and
+    // `tests/isolation_test.rs` is what proves it.
+    ("GET", "/api/backup/export", Some(Access::Viewer)),
+    // The caller supplies a file, not an id: every count in the plan is scoped by the
+    // caller's own user id, so there is no resource to authorise against. The static
+    // gate cannot see the bundle either — an upload body is invisible to all three of
+    // its rules — which is what `tests/backup_test.rs`'s preview section is for.
+    ("POST", "/api/backup/preview", None),
+    // The same shape as preview: the caller supplies a file rather than an id, and
+    // the rows it writes take their owner from the session, never from the bundle.
+    // Nothing here is authorisable against a resource, which is why the write path is
+    // pinned by `tests/backup_test.rs` instead of by an `Access` level.
+    ("POST", "/api/backup/restore", None),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -140,7 +161,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 16, "the mounted /api surface is 16 operations");
+    assert_eq!(checked, 20, "the mounted /api surface is 20 operations");
 }
 
 #[tokio::test]
@@ -262,7 +283,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 16);
+    assert_eq!(PROTECTED_ROUTES.len(), 20);
 }
 
 #[test]
@@ -276,7 +297,62 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 14,
-        "two routes authenticate without checking an id"
+        with_level, 15,
+        "five routes authenticate without checking an id"
+    );
+}
+
+/// The query parameters a route answers `422` without are published `required`, and the
+/// two whose absence means "off" are not.
+///
+/// utoipa infers `required` from the handler's argument type, and every backup query
+/// parameter is `Option<Vec<String>>` there — reading the field as a sequence is the only
+/// way `only_once` can see a repeated parameter — so the derive calls all of them optional
+/// and `#[utoipa::path]` has no attribute to overrule it. The correction lives in
+/// `openapi::mark_required_query_params`, and this is the mutation that proves it holds:
+/// delete that call and the first three assertions fail, because the published contract
+/// would tell a generated client to omit a parameter the route refuses without. Widen the
+/// list to `include_prices` or `apply_prices` and the last two fail — absent means off for
+/// those two, and the panel relies on that on every plain restore.
+#[test]
+fn required_query_parameters_are_published_required() {
+    use utoipa::openapi::path::PathItemType;
+    let document = backend_rust::openapi::document();
+    let is_required = |path: &str, method: PathItemType, name: &str| {
+        document
+            .paths
+            .paths
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} is not in the document"))
+            .operations
+            .get(&method)
+            .unwrap_or_else(|| panic!("{path} has no such operation in the document"))
+            .parameters
+            .as_ref()
+            .and_then(|params| params.iter().find(|p| p.name == name))
+            .unwrap_or_else(|| panic!("{name} is not a parameter of {path}"))
+            .required
+            == utoipa::openapi::Required::True
+    };
+
+    assert!(
+        is_required("/api/backup/export", PathItemType::Get, "portfolio_ids"),
+        "an absent portfolio_ids is a 422, never an empty bundle"
+    );
+    assert!(
+        is_required("/api/backup/preview", PathItemType::Post, "mode"),
+        "an absent mode is a 422: neither mode is the safe one to guess"
+    );
+    assert!(
+        is_required("/api/backup/restore", PathItemType::Post, "mode"),
+        "the write must not guess a mode either"
+    );
+    assert!(
+        !is_required("/api/backup/export", PathItemType::Get, "include_prices"),
+        "absent include_prices means omit, so it really is optional"
+    );
+    assert!(
+        !is_required("/api/backup/restore", PathItemType::Post, "apply_prices"),
+        "absent apply_prices means leave the price section alone, so it really is optional"
     );
 }
