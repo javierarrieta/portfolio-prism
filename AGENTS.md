@@ -16,6 +16,10 @@ From root:
 ```
 
 ### Backend
+- **Local database**: `nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'`
+  (from `backend_rust/`). Prints the `DATABASE_URL` to export. Stop with
+  `scripts/dev-db-stop.sh`. There is no SQLite fallback: the engine is Postgres
+  only, and the tests run against the same engine as production.
 - **Start API**: `cargo run` (run from `backend_rust/`). In development this needs
   `AUTH_MODE=disabled` in the environment — `./start.sh` exports it. Without it the
   backend refuses to start, naming what is missing.
