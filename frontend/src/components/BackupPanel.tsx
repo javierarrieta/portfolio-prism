@@ -16,7 +16,11 @@ import { apiFetch, API_BASE } from '../utils/apiFetch';
  * selection was refused — and a refusal carries no `Content-Disposition`, so a link
  * the browser navigates leaves the user standing on a JSON error body instead of
  * leaving the reason in the panel. The href stays the real route, so ctrl+click and
- * "save link as" still work the browser's way.
+ * "save link as" still work the browser's way. That is a deliberate hole rather than
+ * an oversight: a modified click is the browser's own save-as, so it is left alone,
+ * and a modified click on a refused selection therefore does land the user on the raw
+ * JSON body this paragraph cites. Plain clicks — the ones carrying the intent to
+ * download — are the ones kept inside the panel.
  *
  * The half that writes cannot be a link for the same reason in reverse: a destructive
  * write has to say what it will do before it offers to do it, and an href cannot
@@ -64,10 +68,15 @@ interface Capabilities {
 }
 
 /** The two shapes a backup refusal arrives in: one `error` sentence, and — for a
- * bundle that failed validation — the list of what is wrong with it. */
+ * bundle that failed validation — the list of what is wrong with it, plus the server's
+ * own flag saying that list arrived already truncated. */
 interface FailureBody {
   error?: string;
   errors?: { path: string; reason: string }[];
+  /** Set when the server stopped listing errors at its cap, so the array in hand is not
+   * the whole answer. `collect()` in `backend_rust/src/backup/mod.rs` truncates and
+   * sets it; nothing here can observe that truncation from the array alone. */
+  more_errors?: boolean;
 }
 
 /** One sentence out of a refusal. Naming the first few validation failures is what
@@ -77,7 +86,18 @@ function describeFailure(body: FailureBody): string {
   const head = body.error ?? 'The server refused the request.';
   if (!body.errors?.length) return head;
   const named = body.errors.slice(0, 5).map((e) => (e.path ? `${e.path}: ${e.reason}` : e.reason));
-  const more = body.errors.length > named.length ? ` (and ${body.errors.length - named.length} more)` : '';
+  // What was left off is counted two different ways, and only one of them is arithmetic
+  // this file may do. `errors.length - named.length` is what *this renderer* dropped;
+  // `more_errors` is the server saying it dropped some before this body was ever built,
+  // and how many it dropped is not knowable from here. So the flag turns the count into
+  // a floor — "at least" — rather than letting the arithmetic state a total the server
+  // never sent, which is how a 25-error bundle used to be reported as "(and 5 more)".
+  const heldBack = body.errors.length - named.length;
+  const more = body.more_errors
+    ? ` (and at least ${heldBack + 1} more)`
+    : heldBack > 0
+      ? ` (and ${heldBack} more)`
+      : '';
   return `${head} ${named.join('; ')}${more}`;
 }
 
@@ -295,10 +315,27 @@ export default function BackupPanel({ portfolios }: Props) {
     if (file) void runPreview(file, next);
   };
 
+  // A write retires every preview that has not answered yet, at both ends of the write:
+  // before it starts, and again when it finishes. Bumping the sequence is what makes an
+  // in-flight answer fail the guard in `runPreview` instead of being displayed; the flag
+  // has to come down here too, because that answer's `finally` clears it only for the
+  // sequence number that is current, and this has just made it not current.
+  const retireInFlightPreview = () => {
+    previewSeq.current += 1;
+    setPreviewing(false);
+  };
+
   // Take the card apart at the end of a write: no plan and no words, so there is
   // nothing left to press. Both callers are the end of a restore — one that wrote, and
   // one whose outcome cannot be read.
   const disarmRestore = () => {
+    // A preview still on its way when the write finished is retired with the plan it
+    // was drawn against. Left alone, it lands after `disarmRestore` has cleared the
+    // card, passes its own sequence guard, and puts a plan back — re-arming a second
+    // write that nobody asked for. This is the half the guard at the top of `runRestore`
+    // cannot reach: a preview asked for *during* the write carries a newer sequence
+    // number than that one, so it is this bump that retires it.
+    retireInFlightPreview();
     setPlan(null);
     setConfirm('');
     setConfirmFor(null);
@@ -308,6 +345,7 @@ export default function BackupPanel({ portfolios }: Props) {
     // No plan, no restore: the gate is that the user has seen this file's counts, and
     // there is nothing to have seen until a preview has answered.
     if (!file || !plan) return;
+    retireInFlightPreview();
     setRestoring(true);
     setRestoreError(null);
     setRestoreResult(null);
@@ -462,7 +500,7 @@ export default function BackupPanel({ portfolios }: Props) {
         <button
           className="btn btn-primary"
           data-testid="restore-button"
-          disabled={!plan || (mode === 'replace' && !replaceConfirmed) || restoring}
+          disabled={!plan || (mode === 'replace' && !replaceConfirmed) || restoring || previewing}
           onClick={() => void runRestore()}
         >
           {restoring ? 'Restoring…' : 'Restore'}
@@ -581,12 +619,22 @@ function ExportCard({ portfolios, caps }: { portfolios: PortfolioOption[]; caps:
       </ul>
       {/* Gated on `allow_price_restore`, which is the server's *restore* permission and
           is never consulted by the export route — so this is deliberately stricter than
-          the backend, and not a bug to fix. A bundle carrying a price section is a
-          bundle that cannot be applied while the flag is off: `restore::apply` refuses
-          it (`PricesDisabled`, backend_rust/src/backup/restore.rs) before it opens a
-          transaction. Offering the toggle would sell the user a file they can never
-          restore, which is worse than not offering it. Do not "correct" this to match
-          what the export route checks. */}
+          the backend, and not a bug to fix.
+
+          The reason is this panel, not the backend. The restore half never sends
+          `apply_prices`, so a price section in a bundle this panel restores is written
+          by nobody: `restore::apply` writes prices only when the bundle carries them
+          *and* `apply_prices` is set — the `PricesDisabled` guard in
+          backend_rust/src/backup/restore.rs is reached on that same conjunction — and a
+          bundle with a price section and no `apply_prices` restores with a plain `200`
+          and the prices skipped, which is what the plan above says out loud. So the
+          toggle would offer rows the user carries around in a file this panel can never
+          apply, in the one format whose whole promise is that a bundle restores.
+
+          Do not "correct" this to match what the export route checks: the export route
+          answers `include_prices` whether or not the flag is on, and matching it would
+          put a price section in a bundle this panel cannot apply. The gate opens when
+          this panel grows an `apply_prices` control, not before. */}
       {caps?.allow_price_restore && (
         <label style={{ display: 'block', marginTop: '12px' }}>
           <input

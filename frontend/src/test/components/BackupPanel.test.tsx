@@ -651,6 +651,53 @@ describe('restore card', () => {
     expect(screen.getByTestId('restore-button')).toBeEnabled()
   })
 
+  it('counts held-back validation errors as a floor when the server says it truncated', async () => {
+    // `collect()` in `backend_rust/src/backup/mod.rs` stops listing at its own cap and
+    // sets `more_errors` to say so. The array that arrives is therefore not the whole
+    // answer, and how far short of it the array is cannot be worked out from here -- so
+    // the count has to be a floor. Without the flag being read this renders "(and 2
+    // more)", which states a total the server never sent.
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      path: `portfolios[${i}].name`,
+      reason: `must not be empty (${i})`,
+    }))
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse(
+          { error: 'the bundle failed validation', errors: many, more_errors: true },
+          422,
+        )
+      }
+      return jsonResponse({}, 404)
+    })
+
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error')).toBeInTheDocument())
+    expect(screen.getByTestId('restore-error')).toHaveTextContent('portfolios[4].name')
+    expect(screen.getByTestId('restore-error')).toHaveTextContent('(and at least 3 more)')
+    expect(screen.getByTestId('restore-error')).not.toHaveTextContent('(and 2 more)')
+  })
+
+  it('counts held-back validation errors exactly when the server says the list is whole', async () => {
+    // The other side of the same rule: no flag means the array is everything the server
+    // found, and saying "at least" about a known total would understate an answer the
+    // user could check for themselves.
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      path: `portfolios[${i}].name`,
+      reason: `must not be empty (${i})`,
+    }))
+    previewRefusedWith(many)
+
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error')).toBeInTheDocument())
+    expect(screen.getByTestId('restore-error')).toHaveTextContent('(and 2 more)')
+    expect(screen.getByTestId('restore-error')).not.toHaveTextContent('at least')
+  })
+
   it('restores with the mode whose plan is on screen, and reports what was written', async () => {
     render(<BackupPanel portfolios={portfolios} />)
     await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
@@ -797,6 +844,74 @@ describe('restore card', () => {
 
     // A fresh preview re-arms it, so this is friction and not a dead end.
     await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+  })
+
+  it('keeps the card disarmed when a preview answers after the write it crossed', async () => {
+    // The reviewer's ordering. The Preview button is read-only, so a write leaves it
+    // clickable, and a preview asked for during a write is answered by a database the
+    // write is changing -- the counts it carries are about a state that is already
+    // gone. If it is allowed to display, the card is armed again for a second write
+    // that nobody asked for, which is the whole reason a finished write clears the plan.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+
+    const previews: Array<(res: Response) => void> = []
+    let releaseRestore: ((res: Response) => void) | null = null
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return new Promise<Response>((resolve) => {
+          previews.push(resolve)
+        })
+      }
+      if (url.includes('/backup/restore')) {
+        return new Promise<Response>((resolve) => {
+          releaseRestore = resolve
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(releaseRestore).not.toBeNull())
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(previews).toHaveLength(1))
+
+    // The write lands first, and takes the card apart.
+    const held = releaseRestore as unknown as (res: Response) => void
+    await answer(
+      [held],
+      0,
+      jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 }, portfolio_ids: [7], prices_inserted: 0 }),
+    )
+    expect(screen.queryByTestId('preview-summary')).not.toBeInTheDocument()
+
+    // The preview lands afterwards, and is stale by a whole write, so it is dropped
+    // rather than displayed. Without the bump in `disarmRestore` this is the line that
+    // fails: the plan reappears and the button with it.
+    await answer(previews, 0, planResponse({ portfolios: 1, assets: 2, transactions: 3 }))
+    expect(screen.queryByTestId('preview-summary')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('keeps restore out of reach while a preview for the file on screen is running', async () => {
+    // The other half of the same hazard, from the other direction: the plan on screen
+    // is the one this preview may replace, and a write fired now would go against
+    // whichever of the two the server happens to answer with.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+
+    const pending = gatedPreviews()
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(pending).toHaveLength(1))
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+
+    // And it comes back when the answer arrives, so this is a wait and not a dead end.
+    await answer(pending, 0, planResponse({ portfolios: 1, assets: 2, transactions: 3 }))
     await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
   })
 
