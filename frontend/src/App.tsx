@@ -12,6 +12,7 @@ import {
   LogOut,
   Printer,
   Receipt,
+  FolderSync,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
@@ -19,6 +20,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
+import BackupPanel from './components/BackupPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
 import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
@@ -555,6 +557,9 @@ export default function App() {
           <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
             <Receipt size={18} /> Tax Report
           </li>
+          <li className={`nav-item ${activeTab === 'backup' ? 'active' : ''}`} onClick={() => selectTab('backup')}>
+            <FolderSync size={18} /> Backup
+          </li>
         </ul>
 
         {/* Portfolio Switcher */}
@@ -715,6 +720,10 @@ export default function App() {
                 />
                 {currentReport !== null && <TaxReportTable report={currentReport} />}
               </>
+            )}
+
+            {activeTab === 'backup' && (
+              <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
             )}
 
             {sellPnl !== null && sellPnl.portfolioId === selectedId && (
