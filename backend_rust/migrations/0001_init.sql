@@ -118,6 +118,11 @@ CREATE TABLE split_sync (
     -- schemas.rs:80). Spec §4 had it as TIMESTAMPTZ; that is a spec defect, corrected
     -- separately — a day stored as an instant invites a session-timezone shift into a
     -- throttle window, which is exactly the bug class #38 was about.
+    --
+    -- The type also forces a Rust change: `String` is not a decodable target for a
+    -- Postgres DATE, so currency_service.rs:916 and api_routes/portfolios.rs:71,91 must
+    -- decode `chrono::NaiveDate` and format `%Y-%m-%d` themselves to keep
+    -- `splits_last_synced_at` the string the API already returns.
     last_synced_at DATE NOT NULL,
     covered_from   DATE,
     PRIMARY KEY (asset_id)

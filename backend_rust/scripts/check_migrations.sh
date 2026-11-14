@@ -2,17 +2,20 @@
 # The migration is the schema. This checks a Postgres database against it, and it pins
 # four things, because each one has a different way of going wrong silently:
 #
-#   1. every column's type and NOT NULL-ness (all 38 columns of the six tables, not a
-#      sample — sqlx-postgres type-checks at run time, so a wrong column type is a
-#      request failing in production rather than a compile error, and a column made
-#      nullable is a `None` the Rust structs have no field for),
+#   1. every column's type and NOT NULL-ness (all 36 columns of the six tables, 28 of
+#      them NOT NULL, not a sample — sqlx-postgres type-checks at run time, so a wrong
+#      column type is a request failing in production rather than a compile error, and a
+#      column made nullable is a `None` the Rust structs have no field for),
 #   2. ids being GENERATED *ALWAYS* identity, so a supplied id is refused: the SQL form
 #      of the bundle rule that ids are never trusted from the file,
-#   3. the two primary keys and the split-dedupe index that queries are written against
-#      rather than inferred — `ON CONFLICT` targets and the #50 dedupe,
-#   4. that the database being inspected is the one this migration built, by comparing
-#      `_sqlx_migrations` against the migrations directory. Without it the gate can go
-#      green against a stale schema, which is the failure mode it exists to catch.
+#   3. every `ON CONFLICT` target the code uses — `split_sync.asset_id`,
+#      `historical_prices (symbol, date)` and `uq_users_issuer_subj` — plus the
+#      split-dedupe index, which is the #50 dedupe and is not a key at all,
+#   4. that the database being inspected was built from *these* files: the ledger must
+#      hold one successful row per `*.sql` on disk (at least one) and each row's stored
+#      checksum must equal the sha384 of its file. A bare count match would still
+#      certify a database migrated from an older copy of 0001_init.sql — 1 = 1 — which
+#      is the staleness this check exists to catch.
 #
 # Shell rather than a Rust test because it has to run during the engine switch, before
 # sqlx's postgres feature exists.
@@ -28,6 +31,8 @@ set -euo pipefail
 
 command -v psql >/dev/null \
   || { echo "FAIL psql is not installed — run inside: nix-shell -p postgresql_18 --run '...'"; exit 1; }
+command -v sha384sum >/dev/null \
+  || { echo "FAIL sha384sum is not installed (GNU coreutils); the ledger check cannot tie the database to the files"; exit 1; }
 
 # -w so a password prompt cannot hang a non-tty job; ON_ERROR_STOP so a broken query is
 # an error here rather than an empty string that looks like a missing column.
@@ -78,17 +83,65 @@ want_pk() { # table expected-primary-key
   echo "ok   $1 primary key = $2"
 }
 
-# The gate inspects a database; this is what ties that database to these files.
+# A named unique index, keyed on exactly the given columns. Every ON CONFLICT target in
+# the code needs one: with no matching index the statement is rejected when the plan is
+# built, so the request that first reaches that line fails.
+want_unique() { # table index-name "(col, ...)"
+  local row uniq cols
+  row=$(q "select concat_ws('|', i.indisunique,
+                 (select string_agg(a.attname, ', ' order by k.ord)
+                    from unnest(i.indkey) with ordinality as k(attnum, ord)
+                    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum))
+            from pg_class t
+            join pg_namespace n on n.oid = t.relnamespace
+            join pg_index i on i.indrelid = t.oid
+            join pg_class x on x.oid = i.indexrelid
+            where n.nspname = 'public' and t.relname = '$1' and x.relname = '$2'") \
+    || { echo "FAIL could not read index $2 from $DATABASE_URL"; exit 1; }
+  [ -n "$row" ] \
+    || { echo "FAIL $1.$2 does not exist, and an ON CONFLICT target needs a matching unique index"; exit 1; }
+  IFS='|' read -r uniq cols <<<"$row"
+  [ "$uniq" = "t" ] || { echo "FAIL $1.$2 must be UNIQUE, it is not"; exit 1; }
+  [ "($cols)" = "$3" ] || { echo "FAIL $1.$2 keys on ($cols), expected $3"; exit 1; }
+  echo "ok   $1.$2 = unique, keyed on $3"
+}
+
+# The gate inspects a database; this is what ties that database to these exact files.
+# sqlx stores sha384(file contents) as the checksum (sqlx-core-0.8.6
+# src/migrate/migration.rs:25), so a database migrated from an older copy of a file
+# fails on content rather than passing a bare count comparison.
 want_migration_ledger() {
-  local files applied
-  [ -d "$MIGRATIONS_DIR" ] \
-    || { echo "FAIL migrations directory '$MIGRATIONS_DIR' not found; set MIGRATIONS_DIR"; exit 1; }
-  files=$(find "$MIGRATIONS_DIR" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d '[:space:]')
+  local dir="$MIGRATIONS_DIR" files n applied f base v d sum stored
+  [ -d "$dir" ] \
+    || { echo "FAIL migrations directory '$dir' not found; set MIGRATIONS_DIR"; exit 1; }
+  files=$(find "$dir" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort)
+  n=$(printf '%s\n' "$files" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+  [ "$n" -gt 0 ] \
+    || { echo "FAIL no *.sql file found in '$dir': there is nothing to tie $DATABASE_URL to"; exit 1; }
   applied=$(q "select count(*) from _sqlx_migrations where success") \
     || { echo "FAIL cannot read _sqlx_migrations from $DATABASE_URL — has 'sqlx migrate run' been applied to it?"; exit 1; }
-  [ "$applied" = "$files" ] \
-    || { echo "FAIL $DATABASE_URL holds $applied applied migration(s) but $MIGRATIONS_DIR holds $files .sql file(s): this database is not at the schema the gate is checking"; exit 1; }
-  echo "ok   _sqlx_migrations = $applied applied, matching $files file(s) in $MIGRATIONS_DIR"
+  [ "$applied" = "$n" ] \
+    || { echo "FAIL $DATABASE_URL holds $applied applied migration(s) but $dir holds $n .sql file(s): this database is not at the schema the gate is checking"; exit 1; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base=$(basename "$f")
+    v=${base%%_*}
+    case "$v" in
+      ''|*[!0-9]*) echo "FAIL '$base' is not named <version>_<description>.sql"; exit 1 ;;
+    esac
+    v=$((10#$v))
+    d=${base#*_}
+    d=${d%.sql}
+    sum=$(sha384sum "$f" | cut -d' ' -f1)
+    stored=$(q "select encode(checksum, 'hex') from _sqlx_migrations
+                  where version = $v and description = '$d' and success") \
+      || { echo "FAIL cannot read the stored checksum of $base from $DATABASE_URL"; exit 1; }
+    [ -n "$stored" ] \
+      || { echo "FAIL $base is on disk but not applied in $DATABASE_URL (version $v, description '$d')"; exit 1; }
+    [ "$stored" = "$sum" ] \
+      || { echo "FAIL $base on disk is sha384 $sum but $DATABASE_URL applied it as $stored: this database was migrated from a different copy of this file"; exit 1; }
+  done <<<"$files"
+  echo "ok   _sqlx_migrations = $applied applied, each stored checksum matching its file in $dir"
 }
 
 # The split dedupe is an index, not a query. `apply_split_events` inserts with
@@ -224,6 +277,11 @@ want_identity transactions id
 # and deleted by asset_id alone, and price restore upserts on (symbol, date).
 want_pk split_sync        "PRIMARY KEY (asset_id)"
 want_pk historical_prices "PRIMARY KEY (symbol, date)"
+
+# The third ON CONFLICT target: provision_or_update inserts the user row with
+# `ON CONFLICT (issuer, subj) DO NOTHING` (auth/oidc.rs:304), so without this index every
+# first login fails when the plan is built rather than writing a duplicate identity.
+want_unique users uq_users_issuer_subj "(issuer, subj)"
 
 want_split_dedupe_index
 want_migration_ledger
