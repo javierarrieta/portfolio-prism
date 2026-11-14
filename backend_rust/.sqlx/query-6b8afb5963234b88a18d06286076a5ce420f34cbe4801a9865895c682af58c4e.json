@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Date",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6b8afb5963234b88a18d06286076a5ce420f34cbe4801a9865895c682af58c4e"
+}

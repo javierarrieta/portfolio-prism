@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, covered_from   = EXCLUDED.covered_from",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5aa4a2d2a85df6ffd3fb01d769a3d247dde3aa4082a61fc5cc25e8511ae733df"
+}

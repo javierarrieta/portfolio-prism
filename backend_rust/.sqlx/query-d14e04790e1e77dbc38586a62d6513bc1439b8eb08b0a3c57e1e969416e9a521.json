@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "portfolio_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "symbol",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "asset_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "sector",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "currency",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "isin",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "d14e04790e1e77dbc38586a62d6513bc1439b8eb08b0a3c57e1e969416e9a521"
+}

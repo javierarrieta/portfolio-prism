@@ -429,16 +429,16 @@ mod tests {
         let sjson = "50.0";
         let mut curr = start_date;
         while curr <= today {
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) \
                  ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+                symbol,
+                curr,
+                sjson
             )
-                .bind(symbol)
-                .bind(curr)
-                .bind(sjson)
-                .execute(&pool)
-                .await
-                .unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
             match curr.succ_opt() {
                 Some(next) => curr = next,
                 None => break,
@@ -534,16 +534,16 @@ mod tests {
         // Split-adjusted close: constant 1.0.
         let mut curr = start_date;
         while curr <= today {
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) \
                  ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+                symbol,
+                curr,
+                "1.0"
             )
-                .bind(symbol)
-                .bind(curr)
-                .bind("1.0")
-                .execute(&pool)
-                .await
-                .unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
             match curr.succ_opt() {
                 Some(next) => curr = next,
                 None => break,

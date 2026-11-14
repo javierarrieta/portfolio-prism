@@ -44,13 +44,15 @@ mod tests {
 
     async fn seed_fx(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
         for (date, price) in rows {
-            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)")
-                .bind(symbol)
-                .bind(day(date))
-                .bind(*price)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query!(
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)",
+                symbol,
+                day(date),
+                *price
+            )
+            .execute(pool)
+            .await
+            .unwrap();
         }
     }
 

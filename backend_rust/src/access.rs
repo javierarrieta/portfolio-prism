@@ -48,13 +48,12 @@ async fn resolve(
     user_id: i64,
     portfolio_id: i64,
 ) -> Result<Option<Access>, sqlx::Error> {
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
-            .bind(portfolio_id)
+    let owner: Option<Option<i64>> =
+        sqlx::query_scalar!("SELECT owner_id FROM portfolios WHERE id = $1", portfolio_id)
             .fetch_optional(pool)
             .await?;
 
-    let Some((Some(owner_id),)) = row else {
+    let Some(Some(owner_id)) = owner else {
         return Ok(None);
     };
 
@@ -123,9 +122,8 @@ pub async fn require_asset(
     asset_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
-    let portfolio_id: Option<(i64,)> =
-        sqlx::query_as("SELECT portfolio_id FROM assets WHERE id = $1")
-            .bind(asset_id)
+    let portfolio_id: Option<i64> =
+        sqlx::query_scalar!("SELECT portfolio_id FROM assets WHERE id = $1", asset_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| {
@@ -133,7 +131,7 @@ pub async fn require_asset(
                 Status::InternalServerError
             })?;
 
-    let Some((portfolio_id,)) = portfolio_id else {
+    let Some(portfolio_id) = portfolio_id else {
         return Err(deny("asset", asset_id, user_id));
     };
 
@@ -159,16 +157,16 @@ pub async fn require_asset_in(
     asset_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT portfolio_id FROM assets WHERE id = $1")
-        .bind(asset_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            eprintln!("ERROR: could not look up asset {asset_id} for user {user_id}: {e}");
-            Status::InternalServerError
-        })?;
+    let real_portfolio: Option<i64> =
+        sqlx::query_scalar!("SELECT portfolio_id FROM assets WHERE id = $1", asset_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                eprintln!("ERROR: could not look up asset {asset_id} for user {user_id}: {e}");
+                Status::InternalServerError
+            })?;
 
-    let Some((real_portfolio,)) = row else {
+    let Some(real_portfolio) = real_portfolio else {
         return Err(deny("asset", asset_id, user_id));
     };
 
@@ -188,16 +186,16 @@ pub async fn require_transaction(
     tx_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
-    let asset: Option<(i64,)> = sqlx::query_as("SELECT asset_id FROM transactions WHERE id = $1")
-        .bind(tx_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            eprintln!("ERROR: could not look up transaction {tx_id} for user {user_id}: {e}");
-            Status::InternalServerError
-        })?;
+    let asset: Option<i64> =
+        sqlx::query_scalar!("SELECT asset_id FROM transactions WHERE id = $1", tx_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                eprintln!("ERROR: could not look up transaction {tx_id} for user {user_id}: {e}");
+                Status::InternalServerError
+            })?;
 
-    let Some((asset_id,)) = asset else {
+    let Some(asset_id) = asset else {
         return Err(deny("transaction", tx_id, user_id));
     };
 
@@ -229,44 +227,43 @@ mod tests {
     /// A real `users` row, because `portfolios.owner_id` is a foreign key here and
     /// will not hold an id that does not exist.
     async fn seed_user(pool: &DbPool, subj: &str) -> i64 {
-        sqlx::query_as::<_, (i64,)>(
+        sqlx::query_scalar!(
             "INSERT INTO users (issuer, subj, created_at) \
              VALUES ('https://auth.test', $1, now()) RETURNING id",
+            subj
         )
-        .bind(subj)
         .fetch_one(pool)
         .await
         .unwrap()
-        .0
     }
 
     /// `owner` is a user id from [`seed_user`], or `None` for an unowned portfolio.
     async fn seed(pool: &DbPool, owner: Option<i64>) -> (i64, i64, i64) {
-        let pid: (i64,) = sqlx::query_as(
+        let pid: i64 = sqlx::query_scalar!(
             "INSERT INTO portfolios (name, currency, base_currency, owner_id) \
              VALUES ('p', 'USD', 'USD', $1) RETURNING id",
+            owner
         )
-        .bind(owner)
         .fetch_one(pool)
         .await
         .unwrap();
-        let aid: (i64,) = sqlx::query_as(
+        let aid: i64 = sqlx::query_scalar!(
             "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
              VALUES ($1, 'A', 'A', 'stock', 'USD') RETURNING id",
+            pid
         )
-        .bind(pid.0)
         .fetch_one(pool)
         .await
         .unwrap();
-        let tid: (i64,) = sqlx::query_as(
+        let tid: i64 = sqlx::query_scalar!(
             "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
              VALUES ($1, 'buy', '1', '1', '0', '2024-01-01T00:00:00Z') RETURNING id",
+            aid
         )
-        .bind(aid.0)
         .fetch_one(pool)
         .await
         .unwrap();
-        (pid.0, aid.0, tid.0)
+        (pid, aid, tid)
     }
 
     #[tokio::test]
@@ -370,11 +367,13 @@ mod tests {
         // missing asset. Dropping the constraint is the hand-edited database that
         // `require_transaction`'s last branch exists for, and it is now stated as
         // such instead of being a property of a hand-written test schema.
+        // macro-exempt: DDL. `PREPARE` accepts only SELECT/INSERT/UPDATE/DELETE/
+        // MERGE/VALUES, so no sqlx macro can describe an ALTER TABLE.
         sqlx::query("ALTER TABLE transactions DROP CONSTRAINT transactions_asset_id_fkey")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM assets").execute(&pool).await.unwrap();
+        sqlx::query!("DELETE FROM assets").execute(&pool).await.unwrap();
         assert_eq!(
             require_transaction(&pool, owner, tid, Access::Viewer).await.unwrap_err(),
             Status::NotFound

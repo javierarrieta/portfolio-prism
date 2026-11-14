@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE portfolios SET owner_id = $1 WHERE owner_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2ef0dafc03352fa896051d9417720024dd88e2f2dc27ded3df33be02274b9210"
+}

@@ -199,13 +199,13 @@ pub async fn finalise_auth(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result
         },
         #[cfg(debug_assertions)]
         AuthRequest::Disabled => {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'",
+            let row: Option<i64> = sqlx::query_scalar!(
+                "SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'"
             )
             .fetch_optional(pool)
             .await?;
             match row {
-                Some((id,)) => {
+                Some(id) => {
                     eprintln!(
                         "AUTH_MODE=disabled: every request runs as user id {id} \
                          (local/bootstrap). Do not use this configuration in production."

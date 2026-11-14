@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT date, close_price FROM historical_prices\n                 WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 1,
+        "name": "close_price",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5015c0343f2e46d4cafe5df08878f85febf48151346c55cb4fbeddd8210b2573"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, 'buy', '1', '1', '0', '2024-01-01T00:00:00Z') RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "82e1a177928a2671619aef0a4c5663f8505f9dd4846cfe0e2d06f9cba3ee6ccf"
+}

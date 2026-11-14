@@ -186,14 +186,14 @@ pub const PLACEHOLDER_SUBJ: &str = "bootstrap";
 /// Returns `Err` rather than exiting, so "startup refuses" is testable; `main`
 /// turns an error into `exit(1)`.
 pub async fn ensure_bootstrap_owner(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result<()> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
          VALUES ($1, $2, NULL, \'Placeholder owner\', $3) \
          ON CONFLICT (issuer, subj) DO NOTHING",
+        PLACEHOLDER_ISSUER,
+        PLACEHOLDER_SUBJ,
+        chrono::Utc::now()
     )
-    .bind(PLACEHOLDER_ISSUER)
-    .bind(PLACEHOLDER_SUBJ)
-    .bind(chrono::Utc::now())
     .execute(pool)
     .await?;
 
@@ -207,20 +207,21 @@ pub async fn ensure_bootstrap_owner(pool: &DbPool, cfg: &StartupConfig) -> anyho
 /// stops the process. See [`ensure_bootstrap_owner`] for why this is a startup step
 /// rather than a migration.
 async fn backfill_ownership(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result<()> {
-    let (orphans,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id IS NULL")
-            .fetch_one(pool)
-            .await?;
+    let orphans: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id IS NULL"#
+    )
+    .fetch_one(pool)
+    .await?;
 
     if orphans == 0 {
         return Ok(());
     }
 
-    let placeholder: (i64,) = sqlx::query_as(
+    let placeholder: i64 = sqlx::query_scalar!(
         "SELECT id FROM users WHERE issuer = $1 AND subj = $2",
+        PLACEHOLDER_ISSUER,
+        PLACEHOLDER_SUBJ
     )
-    .bind(PLACEHOLDER_ISSUER)
-    .bind(PLACEHOLDER_SUBJ)
     .fetch_one(pool)
     .await?;
 
@@ -241,13 +242,15 @@ async fn backfill_ownership(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Resul
         );
     }
 
-    sqlx::query("UPDATE portfolios SET owner_id = $1 WHERE owner_id IS NULL")
-        .bind(placeholder.0)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "UPDATE portfolios SET owner_id = $1 WHERE owner_id IS NULL",
+        placeholder
+    )
+    .execute(pool)
+    .await?;
     eprintln!(
         "WARN: assigned {orphans} pre-existing portfolio(s) to the placeholder owner \
-         (user {}); they transfer on bootstrap handover", placeholder.0
+         (user {placeholder}); they transfer on bootstrap handover"
     );
     Ok(())
 }

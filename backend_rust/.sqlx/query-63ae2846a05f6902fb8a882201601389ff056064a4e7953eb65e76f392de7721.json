@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM transactions WHERE asset_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "asset_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "price",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "fee",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "date",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "63ae2846a05f6902fb8a882201601389ff056064a4e7953eb65e76f392de7721"
+}

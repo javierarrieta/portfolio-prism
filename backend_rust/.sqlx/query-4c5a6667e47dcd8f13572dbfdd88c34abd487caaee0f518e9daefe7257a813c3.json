@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"count!\" FROM transactions WHERE asset_id IN\n          (SELECT id FROM assets WHERE portfolio_id IN\n           (SELECT id FROM portfolios WHERE owner_id = $1))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4c5a6667e47dcd8f13572dbfdd88c34abd487caaee0f518e9daefe7257a813c3"
+}

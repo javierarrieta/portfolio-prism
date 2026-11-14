@@ -72,35 +72,37 @@ pub struct Plan {
 /// provoke is a count of the caller's own rows, because the caller's id is the
 /// only filter any of these three queries has.
 pub async fn owned_counts(pool: &DbPool, user_id: i64) -> Result<Counts, DbFailure> {
-    let portfolios: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id = $1")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(classify)?;
-
-    let assets: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM assets WHERE portfolio_id IN \
-         (SELECT id FROM portfolios WHERE owner_id = $1)",
+    let portfolios: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id = $1"#,
+        user_id
     )
-    .bind(user_id)
     .fetch_one(pool)
     .await
     .map_err(classify)?;
 
-    let transactions: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id IN \
-          (SELECT id FROM portfolios WHERE owner_id = $1))",
+    let assets: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM assets WHERE portfolio_id IN
+          (SELECT id FROM portfolios WHERE owner_id = $1)"#,
+        user_id
     )
-    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(classify)?;
+
+    let transactions: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id IN
+          (SELECT id FROM assets WHERE portfolio_id IN
+           (SELECT id FROM portfolios WHERE owner_id = $1))"#,
+        user_id
+    )
     .fetch_one(pool)
     .await
     .map_err(classify)?;
 
     Ok(Counts {
-        portfolios: portfolios.0 as usize,
-        assets: assets.0 as usize,
-        transactions: transactions.0 as usize,
+        portfolios: portfolios as usize,
+        assets: assets as usize,
+        transactions: transactions as usize,
     })
 }
 
@@ -285,37 +287,36 @@ pub async fn apply(
         // and `split_sync.asset_id` to `assets` — and none of them declares
         // `ON DELETE CASCADE`, so deleting a parent with children still attached is an
         // error, not a cascade.
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
+            user_id
         )
-        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
+            user_id
         )
-        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM assets WHERE portfolio_id IN \
              (SELECT id FROM portfolios WHERE owner_id = $1)",
+            user_id
         )
-        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query("DELETE FROM portfolios WHERE owner_id = $1")
-            .bind(user_id)
+        sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
@@ -327,15 +328,15 @@ pub async fn apply(
     for p in &bundle.portfolios {
         // `RETURNING id` is the house pattern (see `create_portfolio`) and is one
         // of the few constructs SQLite and Postgres already agree on.
-        let (new_portfolio,) = sqlx::query_as::<_, (i64,)>(
+        let new_portfolio: i64 = sqlx::query_scalar!(
             "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) \
              VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &p.name,
+            p.description.as_deref(),
+            &p.currency,
+            &p.base_currency,
+            user_id
         )
-        .bind(&p.name)
-        .bind(&p.description)
-        .bind(&p.currency)
-        .bind(&p.base_currency)
-        .bind(user_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(classify)?;
@@ -347,24 +348,24 @@ pub async fn apply(
         inserted.portfolios += 1;
 
         for a in &p.assets {
-            let (new_asset,) = sqlx::query_as::<_, (i64,)>(
+            let new_asset: i64 = sqlx::query_scalar!(
                 "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+                new_portfolio,
+                &a.symbol,
+                &a.name,
+                &a.asset_type,
+                a.sector.as_deref(),
+                &a.currency,
+                // Upper-cased, because `create_asset` upper-cases (`transactions.rs:78`)
+                // and a hand-authored bundle must not be able to store a spelling the
+                // ordinary write path never produces: a lowercase ISIN would sail past the
+                // uniqueness check at `transactions.rs:50-56` and store a second row for
+                // one security. Validation already proved it is a valid ISIN, and
+                // `is_valid_isin` upper-cases internally, so this only normalises what is
+                // stored.
+                a.isin.as_ref().map(|isin| isin.to_uppercase())
             )
-            .bind(new_portfolio)
-            .bind(&a.symbol)
-            .bind(&a.name)
-            .bind(&a.asset_type)
-            .bind(&a.sector)
-            .bind(&a.currency)
-            // Upper-cased, because `create_asset` upper-cases (`transactions.rs:78`)
-            // and a hand-authored bundle must not be able to store a spelling the
-            // ordinary write path never produces: a lowercase ISIN would sail past the
-            // uniqueness check at `transactions.rs:50-56` and store a second row for
-            // one security. Validation already proved it is a valid ISIN, and
-            // `is_valid_isin` upper-cases internally, so this only normalises what is
-            // stored.
-            .bind(a.isin.as_ref().map(|isin| isin.to_uppercase()))
             .fetch_one(&mut *tx)
             .await
             .map_err(classify)?;
@@ -389,16 +390,16 @@ pub async fn apply(
                 } else {
                     t.fee.as_str()
                 };
-                sqlx::query(
+                sqlx::query!(
                     "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
                      VALUES ($1, $2, $3, $4, $5, $6)",
+                    new_asset,
+                    &t.r#type,
+                    &t.quantity,
+                    &t.price,
+                    fee,
+                    when
                 )
-                .bind(new_asset)
-                .bind(&t.r#type)
-                .bind(&t.quantity)
-                .bind(&t.price)
-                .bind(fee)
-                .bind(when)
                 .execute(&mut *tx)
                 .await
                 .map_err(classify)?;
@@ -416,13 +417,13 @@ pub async fn apply(
             // so a bundle can fill gaps but cannot overwrite what is already there.
             // The `PRIMARY KEY (symbol, date)` backs this; it is the constraint that
             // `enforce_price_uniqueness` used to install on a live SQLite table.
-            let res = sqlx::query(
+            let res = sqlx::query!(
                 "INSERT INTO historical_prices (symbol, date, close_price) \
                  VALUES ($1, $2, $3) ON CONFLICT (symbol, date) DO NOTHING",
+                &price.symbol,
+                day,
+                &price.close_price
             )
-            .bind(&price.symbol)
-            .bind(day)
-            .bind(&price.close_price)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;

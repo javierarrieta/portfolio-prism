@@ -231,31 +231,35 @@ pub async fn provision_or_update(
 ) -> anyhow::Result<AuthedUser> {
     let now = chrono::Utc::now();
 
-    // 1. Known identity. `UserRow` decodes `is_active` as `bool`; it is unused
-    // here, so the pattern keeps the `_` in position 5 rather than naming it.
-    let existing: Option<crate::auth::guard::UserRow> = sqlx::query_as(
+    // 1. Known identity. `query!` infers `is_active` as `bool` (it is `BOOLEAN`, and
+    // `sqlx-postgres` will not decode `BOOL` into an integer) and `token_version` as
+    // `i64` (`BIGINT`, deliberately: `migrations/0001_init.sql`). `is_active` is not
+    // read here, so the block below simply does not name it.
+    let existing = sqlx::query!(
         "SELECT id, email, name, subj, is_active, token_version FROM users \
          WHERE issuer = $1 AND subj = $2",
+        issuer,
+        sub
     )
-    .bind(issuer)
-    .bind(sub)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, _, _, _, _, token_version)) = existing {
-        sqlx::query("UPDATE users SET email = $1, name = $2, last_login_at = $3 WHERE id = $4")
-            .bind(email)
-            .bind(name)
-            .bind(now)
-            .bind(id)
-            .execute(pool)
-            .await?;
+    if let Some(row) = existing {
+        sqlx::query!(
+            "UPDATE users SET email = $1, name = $2, last_login_at = $3 WHERE id = $4",
+            email,
+            name,
+            now,
+            row.id
+        )
+        .execute(pool)
+        .await?;
         return Ok(AuthedUser {
-            id,
+            id: row.id,
             email: email.map(str::to_string),
             name: name.map(str::to_string),
             sub: sub.to_string(),
-            token_version,
+            token_version: row.token_version,
         });
     }
 
@@ -265,22 +269,23 @@ pub async fn provision_or_update(
     // A blank configured subject counts as unset, matching the backfill rule.
     let bootstrap = bootstrap_subj.map(str::trim).filter(|s| !s.is_empty());
     if bootstrap == Some(sub) {
-        let placeholder: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'")
-                .fetch_optional(pool)
-                .await?;
+        let placeholder: Option<i64> = sqlx::query_scalar!(
+            "SELECT id FROM users WHERE issuer = 'local' AND subj = 'bootstrap'"
+        )
+        .fetch_optional(pool)
+        .await?;
 
-        if let Some((placeholder_id,)) = placeholder {
-            let handed: (i64,) = sqlx::query_as(
+        if let Some(placeholder_id) = placeholder {
+            let handed: i64 = sqlx::query_scalar!(
                 "UPDATE users SET issuer = $1, subj = $2, email = $3, name = $4, last_login_at = $5 \
                  WHERE id = $6 RETURNING token_version",
+                issuer,
+                sub,
+                email,
+                name,
+                now,
+                placeholder_id
             )
-            .bind(issuer)
-            .bind(sub)
-            .bind(email)
-            .bind(name)
-            .bind(now)
-            .bind(placeholder_id)
             .fetch_one(pool)
             .await?;
             eprintln!(
@@ -292,7 +297,7 @@ pub async fn provision_or_update(
                 email: email.map(str::to_string),
                 name: name.map(str::to_string),
                 sub: sub.to_string(),
-                token_version: handed.0,
+                token_version: handed,
             });
         }
     }
@@ -300,44 +305,46 @@ pub async fn provision_or_update(
     // 3. New identity. ON CONFLICT DO NOTHING plus a re-select makes two concurrent
     // first logins for the same subject safe: one of them loses the insert and
     // still gets the row, instead of failing a whole login on the unique index.
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO users (issuer, subj, email, name, created_at, last_login_at) \
          VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (issuer, subj) DO NOTHING",
+        issuer,
+        sub,
+        email,
+        name,
+        now,
+        now
     )
-    .bind(issuer)
-    .bind(sub)
-    .bind(email)
-    .bind(name)
-    .bind(now)
-    .bind(now)
     .execute(pool)
     .await?;
 
-    let row: (i64, Option<String>, Option<String>, i64) = sqlx::query_as(
+    let row = sqlx::query!(
         "SELECT id, email, name, token_version FROM users WHERE issuer = $1 AND subj = $2",
+        issuer,
+        sub
     )
-    .bind(issuer)
-    .bind(sub)
     .fetch_one(pool)
     .await?;
 
-    let (id, email, name, token_version) = row;
+    let id = row.id;
     eprintln!("INFO: provisioned user id={id} issuer={issuer} sub={sub}");
     Ok(AuthedUser {
         id,
-        email,
-        name,
+        email: row.email,
+        name: row.name,
         sub: sub.to_string(),
-        token_version,
+        token_version: row.token_version,
     })
 }
 
 /// Bump the caller's `token_version`, invalidating every session issued to them.
 pub async fn bump_token_version(pool: &DbPool, user_id: i64) -> anyhow::Result<()> {
-    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
-        .bind(user_id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "UPDATE users SET token_version = token_version + 1 WHERE id = $1",
+        user_id
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"count!\" FROM portfolios WHERE owner_id IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d0a09fed0ccdb26629c9ffdb15ec62e3ca6c1f33523ad74d1a397fb2e1bc2b52"
+}

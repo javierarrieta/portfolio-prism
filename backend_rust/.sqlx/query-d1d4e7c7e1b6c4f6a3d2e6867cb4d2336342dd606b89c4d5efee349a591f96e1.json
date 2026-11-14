@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM assets",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d1d4e7c7e1b6c4f6a3d2e6867cb4d2336342dd606b89c4d5efee349a591f96e1"
+}

@@ -210,6 +210,8 @@ async fn a_bogus_column_is_an_error_and_not_a_quiet_no_backends() {
     let base = std::env::var("DATABASE_URL").expect("DATABASE_URL for tests");
     let mut admin = sqlx::postgres::PgConnection::connect(&base).await.unwrap();
     let bogus: Result<(i64,), sqlx::Error> =
+        // macro-exempt: the assertion is that a wrong column name fails at *runtime*;
+        // a macro would reject it at compile time and the test would test nothing.
         sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE database = $1")
             .bind("prism")
             .fetch_one(&mut admin)

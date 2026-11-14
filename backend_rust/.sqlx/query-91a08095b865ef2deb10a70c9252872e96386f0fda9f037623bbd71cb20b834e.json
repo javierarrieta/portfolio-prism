@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET issuer = $1, subj = $2, email = $3, name = $4, last_login_at = $5 WHERE id = $6 RETURNING token_version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "91a08095b865ef2deb10a70c9252872e96386f0fda9f037623bbd71cb20b834e"
+}

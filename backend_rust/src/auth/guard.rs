@@ -86,14 +86,6 @@ impl Responder<'_, 'static> for Unauthenticated {
     }
 }
 
-/// The columns `resolve_caller` reads, in select order.
-///
-/// Position 5 is `bool`, not `i64`: `users.is_active` is `BOOLEAN` in Postgres and
-/// was `INTEGER` in SQLite, and `sqlx-postgres` will not decode `BOOL` into an
-/// integer. Position 1 and position 6 are `i64` because both columns are `BIGINT`
-/// — `token_version` deliberately so, see `migrations/0001_init.sql`.
-pub(crate) type UserRow = (i64, Option<String>, Option<String>, String, bool, i64);
-
 /// Resolve the caller, or explain why there is none.
 ///
 /// `Ok(None)` means "no valid session" — deny. `Err(db)` means the database
@@ -127,36 +119,40 @@ pub async fn resolve_caller(
         AuthMode::Disabled { as_user } => (*as_user, None),
     };
 
-    // (id, email, name, subj, is_active, token_version)
-    let row: Option<UserRow> = sqlx::query_as(
+    // `query!` infers the row, which is what the hand-written tuple alias here used to
+    // pin by hand: `is_active` is `BOOLEAN` (`sqlx-postgres` will not decode it into an
+    // integer, and `users.is_active` was `INTEGER` under SQLite), and `id` and
+    // `token_version` are `BIGINT` — `token_version` deliberately so, see
+    // `migrations/0001_init.sql`.
+    let row = sqlx::query!(
         "SELECT id, email, name, subj, is_active, token_version FROM users WHERE id = $1",
+        uid
     )
-    .bind(uid)
     .fetch_optional(pool)
     .await?;
 
-    let Some((id, email, name, sub, is_active, token_version)) = row else {
+    let Some(row) = row else {
         return Ok(None);
     };
 
     // A deactivated account, or a session minted before a `logout-all`, is
     // denied the same way a missing cookie is.
-    if !is_active {
+    if !row.is_active {
         return Ok(None);
     }
     if let Some(tv) = expected_tv {
         // A session minted before a `logout-all` carries the old version.
-        if tv != token_version {
+        if tv != row.token_version {
             return Ok(None);
         }
     }
 
     Ok(Some(AuthedUser {
-        id,
-        email,
-        name,
-        sub,
-        token_version,
+        id: row.id,
+        email: row.email,
+        name: row.name,
+        sub: row.subj,
+        token_version: row.token_version,
     }))
 }
 

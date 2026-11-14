@@ -5,7 +5,7 @@
 //! caller's ids are checked by `access::require` in the handler *before* anything
 //! here runs; nothing in this file decides who may see a row.
 
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use crate::db::DbPool;
 use crate::backup::{
     Bundle, BundleAsset, BundlePortfolio, BundlePrice, BundleTransaction, CURRENT_SCHEMA_VERSION,
@@ -161,15 +161,15 @@ async fn build_in(
     let mut symbols = std::collections::BTreeSet::new();
 
     for id in portfolio_ids {
-        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+        let row = sqlx::query!(
             "SELECT name, description, currency, base_currency FROM portfolios WHERE id = $1",
+            *id
         )
-        .bind(*id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(classify)?;
 
-        let Some((name, description, currency, base_currency)) = row else {
+        let Some(row) = row else {
             // `require` already cleared this id; a row vanishing underneath us is a
             // concurrent delete, not a denial, and not something a retry fixes.
             return Err(DbFailure::Missing);
@@ -181,10 +181,10 @@ async fn build_in(
         }
         portfolios.push(BundlePortfolio {
             bundle_ref: format!("p{id}"),
-            name,
-            description,
-            currency,
-            base_currency,
+            name: row.name,
+            description: row.description,
+            currency: row.currency,
+            base_currency: row.base_currency,
             assets,
         });
     }
@@ -247,58 +247,51 @@ pub fn cap_error(bundle: &Bundle) -> Option<String> {
     })
 }
 
-/// One `assets` row, in the order `assets_for` names its columns. A named type
-/// rather than the inline tuple: seven positional columns is past what a reader can
-/// hold in their head at the `for` that destructures it, and clippy's
-/// `type_complexity` says so too.
-// The leading `i64` is `assets.id`, which is `BIGINT`. Reading it as `i32` is a
-// runtime mismatched-types error under sqlx-postgres, so the alias is where the row
-// shape has to be right.
-type AssetRow = (i64, String, String, String, Option<String>, String, Option<String>);
-
-/// One `transactions` row, in the order `assets_for` names its columns.
-type TransactionRow = (String, String, String, String, chrono::DateTime<Utc>);
-
+// `assets.id` is `BIGINT`. The hand-written tuple aliases this function used to read
+// into were the only place that said so, and getting it wrong was a runtime
+// mismatched-types error under sqlx-postgres, not a compile error. `query!` now infers
+// both row shapes from the named columns, so the column list is the row type.
 async fn assets_for(
     conn: &mut sqlx::PgConnection,
     portfolio_id: i64,
 ) -> Result<Vec<BundleAsset>, DbFailure> {
-    let rows: Vec<AssetRow> = sqlx::query_as(
+    let rows = sqlx::query!(
         "SELECT id, symbol, name, asset_type, sector, currency, isin \
          FROM assets WHERE portfolio_id = $1 ORDER BY id",
+        portfolio_id
     )
-    .bind(portfolio_id)
     .fetch_all(&mut *conn)
     .await
     .map_err(classify)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, symbol, name, asset_type, sector, currency, isin) in rows {
-        let txs: Vec<TransactionRow> = sqlx::query_as(
+    for row in rows {
+        let id = row.id;
+        let txs = sqlx::query!(
             "SELECT type, quantity, price, fee, date FROM transactions \
              WHERE asset_id = $1 ORDER BY date, id",
+            id
         )
-        .bind(id)
         .fetch_all(&mut *conn)
         .await
         .map_err(classify)?;
 
         out.push(BundleAsset {
             bundle_ref: format!("a{id}"),
-            symbol,
-            name,
-            asset_type,
-            sector,
-            currency,
-            isin,
+            symbol: row.symbol,
+            name: row.name,
+            asset_type: row.asset_type,
+            sector: row.sector,
+            currency: row.currency,
+            isin: row.isin,
             transactions: txs
                 .into_iter()
-                .map(|(r#type, quantity, price, fee, date)| BundleTransaction {
-                    r#type,
-                    quantity,
-                    price,
-                    fee,
-                    date: date.to_rfc3339(),
+                .map(|tx| BundleTransaction {
+                    r#type: tx.r#type,
+                    quantity: tx.quantity,
+                    price: tx.price,
+                    fee: tx.fee,
+                    date: tx.date.to_rfc3339(),
                 })
                 .collect(),
         });
@@ -315,19 +308,19 @@ async fn prices_for(
     // bounded by the portfolio's holdings, and a placeholder built by `format!`
     // is invisible to the access gate and to a reader alike.
     for symbol in symbols {
-        let rows: Vec<(String, NaiveDate, String)> = sqlx::query_as(
+        let rows = sqlx::query!(
             "SELECT symbol, date, close_price FROM historical_prices \
              WHERE symbol = $1 ORDER BY date",
+            symbol
         )
-        .bind(symbol)
         .fetch_all(&mut *conn)
         .await
         .map_err(classify)?;
 
-        out.extend(rows.into_iter().map(|(symbol, date, close_price)| BundlePrice {
-            symbol,
-            date: date.format("%Y-%m-%d").to_string(),
-            close_price,
+        out.extend(rows.into_iter().map(|row| BundlePrice {
+            symbol: row.symbol,
+            date: row.date.format("%Y-%m-%d").to_string(),
+            close_price: row.close_price,
         }));
     }
     Ok(out)
@@ -456,6 +449,8 @@ mod tests {
         // arm reads. A missing table is `42P01 undefined_table` — permanent, so a retry
         // would be an outage with a `Retry-After` header on it.
         let pool = crate::test_db::test_pool(&crate::test_db::next_caller("classify")).await;
+        // macro-exempt: the whole point is a table that does not exist, so no macro can
+        // describe it — `query!` would fail at compile time, not produce 42P01.
         let err = sqlx::query("SELECT * FROM a_table_no_test_created")
             .fetch_one(&pool)
             .await

@@ -44,6 +44,9 @@ pub fn pool_options() -> PgPoolOptions {
         // `tests/statement_timeout_test.rs` reads it back and shows which scope it bounds.
         .after_connect(|conn, _meta| {
             Box::pin(async move {
+                // macro-exempt: `SET` is a utility statement. Postgres `PREPARE` accepts
+                // only SELECT/WITH/INSERT/UPDATE/DELETE/MERGE/VALUES, so no sqlx macro can
+                // describe it — and there are no parameters to check anyway.
                 sqlx::query("SET statement_timeout = '30s'")
                     .execute(&mut *conn)
                     .await

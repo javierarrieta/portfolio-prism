@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, name, description, currency, base_currency FROM portfolios WHERE owner_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "currency",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "base_currency",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "942ba6298f135dc1d675e27dcacfa93aa666081af51d49313588c64a79361044"
+}

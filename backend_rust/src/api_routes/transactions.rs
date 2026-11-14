@@ -30,11 +30,12 @@ pub async fn create_asset(
     // exist. A nonexistent portfolio is now 404 instead of 201-with-a-dangling-row.
     require(pool.inner(), user.id, portfolio_id, Access::Editor).await?;
 
-    let existing = sqlx::query_as::<_, Asset>(
-        "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2"
+    let existing = sqlx::query_as!(
+        Asset,
+        "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2",
+        portfolio_id,
+        asset.symbol.to_uppercase()
     )
-    .bind(portfolio_id)
-    .bind(asset.symbol.to_uppercase())
     .fetch_optional(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -51,12 +52,14 @@ pub async fn create_asset(
         // `assets.id` is BIGINT; reading it as `i32` is a runtime mismatched-types
         // error under sqlx-postgres, not a compile error. The value is only tested for
         // presence, but the row still has to decode.
-        let isin_exists = sqlx::query_as::<_, (i64,)>("SELECT id FROM assets WHERE portfolio_id = $1 AND isin = $2")
-            .bind(portfolio_id)
-            .bind(&isin_upper)
-            .fetch_optional(pool.inner())
-            .await
-            .map_err(|_| Status::InternalServerError)?;
+        let isin_exists: Option<i64> = sqlx::query_scalar!(
+            "SELECT id FROM assets WHERE portfolio_id = $1 AND isin = $2",
+            portfolio_id,
+            &isin_upper
+        )
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?;
         if isin_exists.is_some() {
             return Err(Status::Conflict);
         }
@@ -68,17 +71,18 @@ pub async fn create_asset(
         asset.currency.clone()
     };
 
-    let res = sqlx::query_as::<_, Asset>(
-        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *"
+    let res = sqlx::query_as!(
+        Asset,
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+        portfolio_id,
+        asset.symbol.to_uppercase(),
+        &asset.name,
+        asset.asset_type.to_uppercase(),
+        asset.sector.as_deref(),
+        &resolved_currency,
+        if asset.isin.is_empty() { None } else { Some(asset.isin.to_uppercase()) }
     )
-    .bind(portfolio_id)
-    .bind(asset.symbol.to_uppercase())
-    .bind(&asset.name)
-    .bind(asset.asset_type.to_uppercase())
-    .bind(&asset.sector)
-    .bind(&resolved_currency)
-    .bind(if asset.isin.is_empty() { None } else { Some(asset.isin.to_uppercase()) })
     .fetch_one(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -117,19 +121,22 @@ pub async fn update_asset(
     // The `AND portfolio_id = ?` predicate below stays on purpose. The guard and the
     // write are two statements; the predicate is what makes the write itself
     // incapable of crossing portfolios if the guard is ever refactored away.
-    sqlx::query("UPDATE assets SET currency = $1 WHERE id = $2 AND portfolio_id = $3")
-        .bind(&update.currency)
-        .bind(asset_id)
-        .bind(portfolio_id)
-        .execute(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let asset = sqlx::query_as::<_, Asset>(
-        "SELECT * FROM assets WHERE id = $1 AND portfolio_id = $2"
+    sqlx::query!(
+        "UPDATE assets SET currency = $1 WHERE id = $2 AND portfolio_id = $3",
+        &update.currency,
+        asset_id,
+        portfolio_id
     )
-    .bind(asset_id)
-    .bind(portfolio_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|_| Status::InternalServerError)?;
+
+    let asset = sqlx::query_as!(
+        Asset,
+        "SELECT * FROM assets WHERE id = $1 AND portfolio_id = $2",
+        asset_id,
+        portfolio_id
+    )
     .fetch_optional(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -177,14 +184,12 @@ pub async fn delete_asset(user: AuthedUser, id: i64, pool: &State<DbPool>) -> Re
     // requirement — `assets.id` is an identity column, so the id is never handed to a
     // later asset and a stale row cannot mis-throttle anything. This just stops the
     // throttle table keeping one permanent row per asset the user ever deleted.
-    sqlx::query("DELETE FROM split_sync WHERE asset_id = $1")
-        .bind(id)
+    sqlx::query!("DELETE FROM split_sync WHERE asset_id = $1", id)
         .execute(&mut *tx)
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    let res = sqlx::query("DELETE FROM assets WHERE id = $1")
-        .bind(id)
+    let res = sqlx::query!("DELETE FROM assets WHERE id = $1", id)
         .execute(&mut *tx)
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -217,12 +222,15 @@ pub async fn create_transaction(
 
     // Kept: this row is the data the handler validates against (asset type, symbol),
     // not the authorization decision.
-    let asset = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = $1 AND portfolio_id = $2")
-        .bind(asset_id)
-        .bind(portfolio_id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
+    let asset = sqlx::query_as!(
+        Asset,
+        "SELECT * FROM assets WHERE id = $1 AND portfolio_id = $2",
+        asset_id,
+        portfolio_id
+    )
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|_| Status::InternalServerError)?;
 
     if asset.is_none() {
         return Err(Status::NotFound);
@@ -244,16 +252,17 @@ pub async fn create_transaction(
         return Err(Status::BadRequest);
     }
 
-    let res = sqlx::query_as::<_, Transaction>(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) 
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"
+    let res = sqlx::query_as!(
+        Transaction,
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        asset_id,
+        &tx_type,
+        tx.quantity.to_string(),
+        tx.price.to_string(),
+        tx_fee.to_string(),
+        tx.date
     )
-    .bind(asset_id)
-    .bind(&tx_type)
-    .bind(tx.quantity.to_string())
-    .bind(tx.price.to_string())
-    .bind(tx_fee.to_string())
-    .bind(tx.date)
     .fetch_one(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -280,13 +289,10 @@ pub async fn create_transaction(
 #[get("/portfolios/<portfolio_id>/transactions")]
 pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i64, pool: &State<DbPool>) -> Result<Json<Vec<TransactionOut>>, Status> {
     require(pool.inner(), user.id, portfolio_id, Access::Viewer).await?;
-    let assets = sqlx::query_as::<_, (i64,)>("SELECT id FROM assets WHERE portfolio_id = $1")
-        .bind(portfolio_id)
+    let asset_ids = sqlx::query_scalar!("SELECT id FROM assets WHERE portfolio_id = $1", portfolio_id)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
-
-    let asset_ids: Vec<i64> = assets.into_iter().map(|a| a.0).collect();
 
     if asset_ids.is_empty() {
         return Ok(Json(vec![]));
@@ -294,11 +300,14 @@ pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i64, po
 
     let mut all_txs = Vec::new();
     for id in asset_ids {
-        let txs = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = $1")
-            .bind(id)
-            .fetch_all(pool.inner())
-            .await
-            .map_err(|_| Status::InternalServerError)?;
+        let txs = sqlx::query_as!(
+            Transaction,
+            "SELECT * FROM transactions WHERE asset_id = $1",
+            id
+        )
+        .fetch_all(pool.inner())
+        .await
+        .map_err(|_| Status::InternalServerError)?;
         all_txs.extend(txs);
     }
     all_txs.sort_by(|a, b| b.date.cmp(&a.date));
@@ -328,8 +337,7 @@ pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i64, po
 #[delete("/transactions/<id>")]
 pub async fn delete_transaction(user: AuthedUser, id: i64, pool: &State<DbPool>) -> Result<Status, Status> {
     require_transaction(pool.inner(), user.id, id, Access::Editor).await?;
-    let res = sqlx::query("DELETE FROM transactions WHERE id = $1")
-        .bind(id)
+    let res = sqlx::query!("DELETE FROM transactions WHERE id = $1", id)
         .execute(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;

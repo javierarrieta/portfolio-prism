@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT owner_id FROM portfolios WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "994a7b0f08fa7ebae538a158b148bbe9a5c8ff7f92065d694d6ad3b7eee52b6b"
+}

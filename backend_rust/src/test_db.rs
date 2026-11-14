@@ -33,6 +33,15 @@
 //! * **Nothing here decides a deletion from a failed query.** `has_backends` returns
 //!   `Result`, and a reaper that could not read `pg_stat_activity` reports up instead
 //!   of assuming "no backends" — see the comment on [`has_backends`].
+//! * **Every query in this file stays runtime SQL, for two different reasons.** Two of
+//!   them cannot be macros: `CREATE DATABASE` and `DROP DATABASE` name a database, and a
+//!   name cannot be a bind parameter in DDL. The other three — the `pg_database` count,
+//!   the `pg_database` list, the `pg_stat_activity` count — are ordinary preparable
+//!   `SELECT`s that *could* be `sqlx::query!`; they stay runtime SQL only because the
+//!   module was ruled exempt as a unit rather than statement by statement. Read those
+//!   three as "convertible, exempt by ruling", not "impossible". Each site carries its
+//!   own `// macro-exempt:` line and `scripts/check_sqlx_cache.sh` counts those markers,
+//!   so this file is 5 of the residue it reports and only 2 of that is forced.
 //!
 //! This file is compiled twice by design, from `src/lib.rs` (`#[cfg(test)]`) and
 //! from `tests/common/mod.rs`, exactly like `test_provider.rs`, so the unit suite
@@ -162,6 +171,9 @@ async fn create_database(caller: &str) -> (String, String) {
     // Dropped only when it exists. `DROP DATABASE IF EXISTS` on a missing database is
     // a *notice*, and sqlx forwards notices to stderr — so the polite form would print
     // one line per test in a clean run, and a clean run has to be silent to be readable.
+    // macro-exempt: convertible — an ordinary preparable SELECT, runtime only because
+    // the module is exempt as a unit (see the module comment). The count decides whether
+    // `CREATE DATABASE` below has to be a `DROP` first.
     let exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_database WHERE datname = $1")
         .bind(&name)
         .fetch_one(&mut admin)
@@ -174,6 +186,7 @@ async fn create_database(caller: &str) -> (String, String) {
             .await
             .unwrap_or_else(|e| panic!("could not drop stale {name}: {e}"));
     }
+    // macro-exempt: `CREATE DATABASE` takes a database name, not a bind parameter.
     sqlx::query(&format!("CREATE DATABASE {name}"))
         .execute(&mut admin)
         .await
@@ -296,6 +309,9 @@ async fn reap_crash_leftovers(base: &str) -> Vec<String> {
     // single-character wildcard, so the narrower-looking pattern also matches
     // `prism_testdb`. Ownership is decided by [`harness_pid`] in Rust, which is the
     // only place the name shape is specified.
+    // macro-exempt: convertible — an ordinary preparable SELECT, runtime only because
+    // the module is exempt as a unit (see the module comment). This is the list the crash
+    // sweep feeds to `DROP DATABASE`.
     let rows: Vec<(String,)> =
         match sqlx::query_as("SELECT datname FROM pg_database WHERE datname LIKE 'prism%'")
             .fetch_all(&mut admin)
@@ -360,6 +376,9 @@ pub(crate) async fn has_backends(
     admin: &mut sqlx::postgres::PgConnection,
     name: &str,
 ) -> Result<bool, sqlx::Error> {
+    // macro-exempt: convertible — an ordinary preparable SELECT, runtime only because
+    // the module is exempt as a unit (see the module comment). Its answer gates a
+    // `DROP DATABASE`.
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE pg_stat_activity.datname = $1")
             .bind(name)
@@ -395,6 +414,8 @@ async fn drop_with_retries(
     assert_harness_database(name);
     let mut last = None;
     for attempt in 0..3 {
+        // macro-exempt: `DROP DATABASE` takes a database name, not a bind parameter,
+        // which is also why `assert_harness_database` has to vouch for the shape.
         match sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
             .execute(&mut *admin)
             .await
