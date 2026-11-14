@@ -10,6 +10,12 @@
 -- native so the engine orders and compares them instead of the app. Ids are identity,
 -- which refuses a supplied id: the SQL form of the bundle rule that ids are never
 -- trusted from the file.
+--
+-- Two columns are typed by what reads them rather than by what looks natural, and both
+-- are pinned by scripts/check_migrations.sh because the mismatch is a runtime error
+-- under sqlx-postgres, not a compile error: `users.token_version` is BIGINT (the guard
+-- decodes it into an `i64`, and sqlx will not decode INT4 into `i64`), and
+-- `split_sync.last_synced_at` is DATE (it is a calendar day, not an instant).
 
 CREATE TABLE users (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -18,7 +24,13 @@ CREATE TABLE users (
     email         TEXT,
     name          TEXT,
     is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-    token_version INTEGER NOT NULL DEFAULT 0,
+    -- BIGINT, not INTEGER: `AuthedUser.token_version` is `i64` (auth/guard.rs:31) and
+    -- `UserRow` reads column 6 straight into an `i64` (auth/guard.rs:82,119; also
+    -- auth/oidc.rs:236,275,316). sqlx-postgres declares `i64` as INT8 and will not
+    -- decode INT4 into it, so an INTEGER here fails *every authenticated request*
+    -- with a mismatched-types error. SQLite's INTEGER is 8 bytes, which is why the
+    -- original column definition (lib.rs:214) never showed this.
+    token_version BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL,
     last_login_at TIMESTAMPTZ
 );
@@ -99,7 +111,14 @@ CREATE TABLE historical_prices (
 -- looks like it belongs here is on `transactions`, above.
 CREATE TABLE split_sync (
     asset_id       BIGINT NOT NULL REFERENCES assets(id),
-    last_synced_at TIMESTAMPTZ NOT NULL,
+    -- DATE, not TIMESTAMPTZ: this is a calendar day, not an instant. It is written as
+    -- `Utc::now().date_naive()` (currency_service.rs:894, bound at :999), compared
+    -- against a `%Y-%m-%d` parse for the 30-day window (:916, :924), and surfaced
+    -- verbatim as `splits_last_synced_at` (api_routes/portfolios.rs:71,91;
+    -- schemas.rs:80). Spec §4 had it as TIMESTAMPTZ; that is a spec defect, corrected
+    -- separately — a day stored as an instant invites a session-timezone shift into a
+    -- throttle window, which is exactly the bug class #38 was about.
+    last_synced_at DATE NOT NULL,
     covered_from   DATE,
     PRIMARY KEY (asset_id)
 );
