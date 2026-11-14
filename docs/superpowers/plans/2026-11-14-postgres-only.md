@@ -557,7 +557,7 @@ way."
 
 **Interfaces:**
 - Consumes: Task 3's `DbPool`.
-- Produces: `i64` ids in every public struct in `schemas.rs`. JSON is unchanged — these are numbers either way — so `openapi.json` and `api.d.ts` should show no diff; Step 6 proves that rather than assuming it.
+- Produces: `i64` ids in every public struct in `schemas.rs`. **The JSON is unchanged but the OpenAPI is not** — `format: int32` becomes `format: int64` for every field that moves, exactly as Task 3 discovered when five fields flipped without anyone regenerating the artifacts. Regenerate `docs/openapi/openapi.json` and `frontend/src/types/api.d.ts` in the same commit and show the diff; Step 6 proves the *JSON* is unchanged, not the spec file.
 
 - [ ] **Step 1: Write the failing date test**
 
@@ -1115,6 +1115,7 @@ git commit -m "ci(db): postgres service container, migrate, prepare --check, the
 **Files:**
 - Create: `docs/postgres-cutover.md`
 - Modify: `docs/backup-walkthrough.md` (SQLite lock and `PRAGMA` steps rewritten)
+- Modify: `docs/walkthrough.md` — referenced twice from `README.md` (`:48`, `:170`), and still tells the reader to `export DATABASE_URL='sqlite:/tmp/second.db?mode=rwc'` and to query the store with `sqlite3` (`:305`, `:367-405`). Every command in it now fails. Decide deliberately whether to rewrite it or delete it and drop the README references; do not leave a README pointing at instructions that cannot run. (`docs/migration_python_to_rust.md` and `docs/implementation_plan.md` also mention SQLite, but they are dated historical records and should stay as they are.)
 - Modify: `AGENTS.md` (Roadmap: the GitOps follow-up named)
 - Create: `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`
 
