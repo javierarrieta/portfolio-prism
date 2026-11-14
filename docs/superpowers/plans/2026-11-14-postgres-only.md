@@ -73,6 +73,10 @@ else
 fi
 
 URI="postgres://postgres@127.0.0.1:$PORT/postgres"
+
+# `command -v initdb` cannot tell the two toolchains apart: the image's 18.6 is on
+# PATH and its server will open a cluster built by 18.7 (spec §9.1). Ask what is
+# actually answering instead.
 V=$(psql "$URI" -tAc 'show server_version')
 case "$V" in
   18.*) ;;
@@ -94,8 +98,6 @@ echo "DATABASE_URL=postgres://postgres@127.0.0.1:$PORT/prism"
 #!/usr/bin/env bash
 set -euo pipefail
 DATA="${PRISM_PG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/prism-pg}"
-# Idempotent: stopping an already-stopped cluster is not an error, because the
-# gate sequences in Task 9 stop unconditionally under `set -e`.
 pg_ctl -D "$DATA" status >/dev/null 2>&1 || exit 0
 pg_ctl -D "$DATA" -m fast -w stop
 ```
