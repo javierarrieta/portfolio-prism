@@ -658,43 +658,20 @@ git commit -m "refactor(db): ids are i64 to match int8, and the date boundary is
 
 **Files:**
 - Modify: `backend_rust/tests/common/mod.rs` (`test_pool`, `seed_*`)
-- Modify: every `tests/*.rs` that assumed a shared database
+- Modify: every `tests/*.rs` that still calls `setup_db` or reads `DEFAULT_USER`
+- Possibly modify: `backend_rust/src/test_db.rs`, if the `seed_*` helpers move there so `src/` unit tests and `tests/` share one copy
 
 **Interfaces:**
 - Consumes: `DATABASE_URL` with a role that has `CREATEDB` (Task 1 grants it).
 - Produces: `pub async fn test_pool(caller: &str) -> DbPool` returning a **private, freshly migrated** database per test, named `prism_t_<pid>_<caller>` and dropped at the end of the test.
 
-- [ ] **Step 1: Replace `test_pool`**
+- [ ] **Step 1: Consolidate onto the shipped harness**
 
-```rust
-/// One database per test, migrated from zero, dropped on drop.
-///
-/// The SQLite suite shared one `:memory:` database through a process-wide cache,
-/// which is how a stale-schema flake and a mutant that hung instead of failing
-/// both got as far as a review. Per-test databases remove the class rather than
-/// papering over it.
-pub async fn test_pool(caller: &str) -> DbPool {
-    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-    // Unique per test process AND per test fn: the caller passes its own name,
-    // because two tests in one binary would otherwise collide on the pid alone.
-    let name = format!("prism_t_{}_{}", std::process::id(), caller);
-    let admin = sqlx::PgConnection::connect(&base).await.unwrap();
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin).await.unwrap();
-    let mut url = base.clone();
-    url.push('/');
-    url.push_str(&name);
-    let pool = backend_rust::db::connect(&url).await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    pool
-}
-```
-
-Name each database after the test — `env!("CARGO_PKG_NAME")` plus a counter, or the `#[test]` function name passed in — and drop it at the end of the test with `sqlx::query("DROP DATABASE ... ")` outside a transaction (Postgres refuses `DROP DATABASE` inside one). If a test fails and leaves its database behind, that is a feature: the leftover is the evidence.
+Task 3 shipped the real harness in `src/test_db.rs` (`test_pool(caller)`, the duplicate-`caller` panic, the crash sweep) and already converted the `src/` unit tests. What is left is deletion, not invention: fold `tests/common/mod.rs` onto it, retire `setup_db(&cfg)` and `DEFAULT_USER`, and move the `seed_*` helpers so they take the per-test pool. The `CREATE DATABASE` sketch that was here is gone — it predated Task 3 and would have replaced a working harness with a worse one.
 
 - [ ] **Step 2: Convert the suite file by file**
 
-For each file in `tests/`: replace the shared-pool call with `test_pool("<file>")`, and replace `DEFAULT_USER` (which was `id = 1` because SQLite's placeholder user was always the first row) with the id returned by `seed_user`. Run that file alone before moving on:
+Task 3 already converted most of `tests/`; finish the job. For each file still using `setup_db` or `DEFAULT_USER`: switch to `test_pool("<file>")` and the id returned by `seed_user`. Run each file alone before moving on:
 
 ```bash
 DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test --test portfolios_test
@@ -716,6 +693,8 @@ async fn two_tests_do_not_see_each_others_rows() {
     assert_eq!(n.0, 0, "test databases are not isolated");
 }
 ```
+
+The literal `1` is the `DEFAULT_USER` this task is retiring — use the id `seed_user` returns, or the bootstrap owner id from `ensure_bootstrap_owner`, and say which.
 
 - [ ] **Step 4: Full suite, twice**
 
