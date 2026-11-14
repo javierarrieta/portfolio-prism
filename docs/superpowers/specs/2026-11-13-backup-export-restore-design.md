@@ -397,23 +397,38 @@ on any of the banned constructs in a statement under `src/backup/`, and on any
 string literal wraps. Prose is not a statement: comment lines
 are skipped, since the rule is about SQL the module sends to the engine, and
 `restore.rs` names `PRAGMA foreign_keys` in a comment to explain a schema fact. The
-expected diff when the engine spec lands is the pool type in this module's signatures and
-nothing else.
+The expected diff when the engine spec lands is the pool type in this module's signatures
+plus the row-decoding types — `query_as::<_, (i32,)>()` on a `RETURNING id` will not decode
+an `int8` under `sqlx-postgres`, and the gate cannot see that because it is not a lexical
+construct. The gate certifies the ban list, not the whole port.
 
 ## Frontend changes
 
-A **Backup** tab in the nav (`App.tsx:540-555`), one new component `BackupPanel.tsx`, two
-cards.
+A **Backup** tab in the nav, one component `BackupPanel.tsx`, two cards. The tab renders
+outside the `currentPortfolio` guard on purpose: the panel is about everything the caller
+owns, so a user with no portfolios must still be able to reach restore.
 
 **Export card.** Checkbox list of the caller's portfolios. An "include price history"
-checkbox, disabled with an explanation when the capability is off. A download anchor built
-the way `ReportControls.tsx:81` builds its CSV href. Export is disabled with no selection.
+control, **hidden** (not disabled-with-explanation) unless the server reports
+`allow_price_restore`. The download is `fetch` → `blob` → object URL, **not** the plain
+`href` pattern `ReportControls.tsx` uses for CSV: a refused selection must render the
+server's own message in the panel instead of navigating the tab to a raw JSON body. The
+filename comes from the response's `Content-Disposition`. Export is disabled, with a
+title, when nothing is selected.
 
 **Restore card.** File input, following the upload shape of `CsvImportModal.tsx`. A mode
-radio defaulting to **New copy**. A Preview button rendering the plan counts. The Restore
-button stays disabled until a preview has returned for the current file, and `replace`
-additionally requires typing `REPLACE`. The prices checkbox appears only when the capability
-allows it. After a restore, the summary states what was written and links each new portfolio.
+radio defaulting to **New copy**. Preview runs automatically when a file is chosen and
+when the mode changes; the Preview button is an explicit retry. The Restore button stays
+disabled while no plan is on screen, while a preview is in flight, and — for `replace` —
+until the user has typed `REPLACE`. There is **no** restore-side prices control: the panel
+never sends `apply_prices`, so a bundle's price section is reported as "left alone" rather
+than restored. After a successful write the card **disarms** — the plan and the typed
+words are cleared and only a fresh preview re-arms it — and the summary states the row
+counts written. It does not link the new portfolios; the response carries counts, not ids.
+
+Two things this section originally promised and were not built, recorded here rather than
+silently dropped: a client-side pre-flight of the file size against `caps.max_bytes`
+before uploading, and a link from the post-restore summary to each new portfolio.
 
 ## Testing
 
@@ -479,8 +494,10 @@ Recorded here so they are not lost, and deliberately not solved here:
    request may be touching. On SQLite today this is moot — one writer, `replicas: 1`
    (`k8s/app-deployment.yaml:9`). Under Postgres with several replicas the right answer is
    probably a `SERIALIZABLE` restore transaction. This spec does not guess at it.
-2. **Pool type in `src/backup/`.** The module must be rewired to whatever pool the engine
-   spec chooses. Per *Portability discipline* that is the only expected change.
+2. **Pool type in `src/backup/`, and the row types that go with it.** The module must be
+   rewired to whatever pool the engine spec chooses, and the `query_as::<_, (i32,)>()` calls
+   reading `RETURNING id` must become `i64` — `sqlx-postgres` refuses to decode `int8` into
+   `i32`, and the portability gate cannot see it because the construct is not lexical.
 3. **`historical_prices` ownership.** It has no `owner_id` and is shared across tenants. The
    price-restore flag is a mitigation, not a model. If tenants ever contribute prices at
    all, that table needs an owner or a provenance column.
