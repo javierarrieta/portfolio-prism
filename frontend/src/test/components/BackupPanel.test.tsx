@@ -236,8 +236,21 @@ describe('export download', () => {
     vi.restoreAllMocks()
   })
 
-  /** jsdom's `Blob` has no `text()`; its `FileReader` does the same job. */
-  function readBlob(blob: Blob): Promise<string> {
+  /** Read the blob back as text.
+   *
+   * Two implementations because the two Node versions that run this suite hand back
+   * different classes. `Response.blob()` on Node 20 — the version `frontend/Dockerfile`
+   * builds on, and the one `frontend-tests` pins to match it — returns Node's own
+   * `Blob`, which jsdom's `FileReader` rejects outright:
+   * `parameter 1 is not of type 'Blob'`. Node 24 (local dev, and the runner's own
+   * runtime) produces one jsdom accepts. Node's `Blob` has `text()`, jsdom's does
+   * not, so try `text()` first and fall back to `FileReader`. Either way the
+   * assertion below still compares the exact bytes; only the reading mechanism
+   * varies.
+   */
+  async function readBlob(blob: Blob): Promise<string> {
+    const withText = blob as Blob & { text?: () => Promise<string> }
+    if (typeof withText.text === 'function') return withText.text()
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(String(reader.result))
