@@ -111,9 +111,13 @@ async fn b_cannot_delete_a_s_asset_but_a_can() {
 #[tokio::test]
 async fn deleting_an_asset_that_has_transactions_fails_today() {
     // Pre-existing, and deliberately left as-is: `delete_asset` issues a bare
-    // `DELETE FROM assets` while sqlx enables `PRAGMA foreign_keys` by default, so
-    // the delete is rejected and the handler reports 500. Recorded here so the
-    // behaviour is visible rather than mistaken for an access-control regression.
+    // `DELETE FROM assets`, `transactions.asset_id` is a foreign key with no cascade,
+    // and nothing maps the resulting `23503` to a 409 the way `delete_portfolio` does,
+    // so the handler reports 500. Deferred on purpose — the fix is an error mapping,
+    // not a schema change. The database half is pinned by
+    // `tests/foreign_keys_test.rs::an_asset_with_a_transaction_cannot_be_deleted_underneath_it`;
+    // this is the route half. Recorded here so the behaviour is visible rather than
+    // mistaken for an access-control regression.
     let (pool, _) = db_with_user("deleting_an_asset_that_has_transactions_fails_today").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/assets/{}", u.a_asset);

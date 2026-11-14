@@ -2521,11 +2521,14 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
 
 #[tokio::test]
 async fn replace_leaves_no_orphan_split_sync_rows() {
-    // `split_sync.asset_id` is a plain INTEGER PRIMARY KEY with **no** foreign key to
-    // `assets`, so `PRAGMA foreign_keys` does not reach it: a delete that forgot it
-    // would leave one row per deleted asset forever, and the next asset handed that id
-    // would inherit a stranger's split-sync throttle. The delete order is the other
-    // half — `foreign_keys` is ON and no FK here cascades, so children go first.
+    // `split_sync.asset_id` is a foreign key to `assets` in `0001_init.sql` with no
+    // cascade — it was a plain INTEGER PRIMARY KEY with no foreign key in the SQLite
+    // table, which is why this delete used to be merely tidy rather than required.
+    // A replace that forgot it could not even delete the asset now; the row is dropped
+    // first so it does not outlive the asset, and so the next asset handed that id
+    // cannot inherit a stranger's split-sync throttle. The delete order is the other
+    // half — no FK here cascades, so children go first.
+    // `tests/foreign_keys_test.rs` pins the constraint itself.
     let (pool, user) = db_with_user("replace_leaves_no_orphan_split_sync_rows").await;
     let (one, _) = seed_two_portfolios(&pool, user).await;
     let asset = seed_asset(&pool, one, "MSFT", "Microsoft").await;

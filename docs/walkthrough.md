@@ -233,6 +233,30 @@ Sign back in before §3, and re-export `PP` — a new login mints a new cookie.
 
 ### 3. The file is really yours and really complete
 
+**Before the export, audit the source for orphans.** The bundle is nested: `export` reads
+portfolios by id, then `assets WHERE portfolio_id = …`, then `transactions WHERE
+asset_id = …` (`backend_rust/src/backup/export.rs`). A row whose parent is gone is under
+no parent, so it is never read, never mentioned, and never rejected — the export cannot
+report what it cannot reach. After the cutover Postgres will refuse such a row outright,
+so the loss is invisible at both ends: not exported, not restored, and nothing in
+between says a word about it.
+
+`backend_rust/scripts/pre_cutover_audit.sh` runs the four parent checks against the
+**SQLite** file — the source, which is where the orphans still are; there is no Postgres
+query that can find rows Postgres will not accept:
+
+```bash
+bash backend_rust/scripts/pre_cutover_audit.sh /path/to/portfolio.db
+```
+
+It exits **0** with no orphans, **1** with orphans, and **2** when it could not run at all
+(no `sqlite3`, the wrong file, a file that is not this app's schema). The exit code is
+the contract: a non-zero count is the stop condition, and the script enforces that so
+nobody has to read the report line by line to find out whether it is safe to continue.
+
+Run it *before* step 1 below, not after. Once a bundle has been accepted as the complete
+record of a portfolio, an orphan found later has no baseline left to compare against.
+
 1. Sign in and note your portfolios, their assets, and a transaction count you recognise:
    ```bash
    curl -sS --cookie "pp_session=$PP" http://localhost:8000/api/portfolios/ \

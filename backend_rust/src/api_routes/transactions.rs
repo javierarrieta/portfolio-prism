@@ -163,11 +163,14 @@ pub async fn delete_asset(user: AuthedUser, id: i64, pool: &State<DbPool>) -> Re
     require_asset(pool.inner(), user.id, id, Access::Owner).await?;
 
     // Both deletes are one transaction. `split_sync.asset_id` references `assets(id)`
-    // with no `ON DELETE CASCADE`, and SQLite never enforced a foreign key here —
-    // `PRAGMA foreign_keys` was never enabled — so the old order (asset first, throttle
-    // row second) only ever worked by accident. Postgres enforces it, so the dependent
-    // row has to go first, and if it went first *outside* a transaction a failed asset
-    // delete would still have destroyed the throttle row.
+    // and `0001_init.sql` gives it no `ON DELETE CASCADE`, so the throttle row has to
+    // go first. The SQLite table had no foreign key here at all
+    // (`migrate_split_sync_key`, lib.rs:530 at the merge base), so the old order —
+    // asset first, throttle row second — did work, and worked reliably; it was simply
+    // unchecked. The constraint arrived with the Postgres schema and the ordering
+    // became load-bearing, which is what `tests/foreign_keys_test.rs` pins. And the
+    // throttle row has to go first *inside* this transaction: if it went first outside
+    // one, a failed asset delete would still have destroyed it.
     let mut tx = pool.begin().await.map_err(|_| Status::InternalServerError)?;
 
     // Drop the asset's split-sync throttle row with it. Not a correctness

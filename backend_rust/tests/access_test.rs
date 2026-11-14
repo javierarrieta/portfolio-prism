@@ -75,12 +75,14 @@ async fn a_transaction_that_does_not_exist_is_not_found() {
 
 #[tokio::test]
 async fn foreign_keys_are_enforced_so_an_orphan_transaction_cannot_be_written() {
-    // The spec assumed foreign keys are off. They are not: sqlx enables
-    // `PRAGMA foreign_keys` by default, which is why `require_transaction`'s
-    // "asset is gone" branch is defensive rather than reachable. This test pins
-    // that assumption; if it ever fails, the dangling-asset path becomes live and
-    // needs its own end-to-end coverage (the branch itself is unit-tested in
-    // `src/access.rs`, where the schema is built without constraints).
+    // The spec assumed foreign keys were off. They were not: sqlx-sqlite sets
+    // `foreign_keys=ON` per connection by default, and Postgres enforces the same
+    // clause — which is why `require_transaction`'s "asset is gone" branch is
+    // defensive rather than reachable. This test pins that reachability claim from the
+    // access-control side; the constraint itself is pinned by name, with its SQLSTATE,
+    // in `tests/foreign_keys_test.rs`. If this ever fails, the dangling-asset path
+    // becomes live and needs its own end-to-end coverage (the branch itself is
+    // unit-tested in `src/access.rs`, on the real migrated schema).
     let (pool, _) = db_with_user("foreign_keys_are_enforced_so_an_orphan_transaction_cannot_be_written").await;
     let err = sqlx::query(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
