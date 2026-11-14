@@ -56,7 +56,7 @@ These are not oversights. Each was considered and cut.
 | Dates | `TIMESTAMPTZ` for timestamps, `DATE` for `historical_prices.date` | Keep `TEXT` | Real date ordering, range scans, and `date_trunc` for the metrics engine. Verified: transaction dates are `DateTime<Utc>` in `schemas.rs:18,32,121,...` and the price date is a `NaiveDate`, so both map cleanly with no parsing rule to invent. |
 | Query safety | `sqlx::query!` macros with a committed `.sqlx` prepare cache | Keep runtime `sqlx::query` | Turns the `i32`-vs-`int8` class of bug — which the whole-branch review of #64 caught by hand — into a compile error. The cache is what makes this possible without a live database at compile time. |
 | Test database | `#[sqlx::test]`, one fresh migrated database per test | Shared database with transaction rollback | Per-test databases remove the interference that made the #64 flake hard to see (shared `:memory:` cache, unlock-notify hangs). Postgres supports it natively; it needs `CREATEDB` on the test role. |
-| Local dev database | `podman run postgres:18` | `nix-shell -p postgresql_16` ephemeral cluster | Same engine and major as production and CI. Podman becomes available in the workspace via coder-workspaces `0.0.12`. **Not yet proven in the pod** — see §9.4; the nix cluster is the named fallback and was proven end to end. |
+| Local dev database | `nix-shell -p postgresql_18` ephemeral cluster (18.7, same major as production) | Rootless podman running `postgres:18` | Podman was the first choice and was tried: it cannot create a usable user namespace in this pod, even after the `0.0.12` image fix. Measured in §9.2. The nix cluster was then proven end to end (§9.1). |
 | CI database | Service container `postgres:18` | `postgres:16`, SQLite tests | Same major as the production image (`ghcr.io/cloudnative-pg/postgresql:18.6`). |
 | Foreign keys | Enforced, as Postgres does by default | Reproduce SQLite's non-enforcement | See §5.1 — this is a real behaviour change and the largest risk in the spec. |
 
@@ -276,7 +276,7 @@ The cache is the answer for CI and for anyone without Postgres running:
 - `sqlx-data.json`'s successor in 0.8 is the `.sqlx/` directory; confirm the exact
   layout against the 0.8 docs during implementation rather than assuming the
   older filename.
-- **Local workflow:** anyone editing SQL runs against the local podman database
+- **Local workflow:** anyone editing SQL runs against the local ephemeral cluster
   (§9.1) and re-runs `cargo sqlx prepare` before committing. A stale cache is a CI
   failure, not a silent drift — that is what `--check` is for.
 - **The failure mode to watch:** `cargo sqlx prepare` against a database whose
@@ -286,32 +286,86 @@ The cache is the answer for CI and for anyone without Postgres running:
 
 ## 9. Test harness
 
-### 9.1 Local: podman
+### 9.1 Local: `nix-shell -p postgresql_18` ephemeral cluster
 
-`backend_rust/scripts/dev-db.sh` — start or reuse a local Postgres for development
-and tests:
+This is the plan, not the fallback. Measured end to end in this workspace on
+2026-11-14, after the podman route was tried and failed (§9.2):
 
-```sh
-podman run -d --name prism-pg -e POSTGRES_PASSWORD=prism -e POSTGRES_DB=prism \
-  -p 55432:5432 docker.io/library/postgres:18
+```
+initdb ok, version: initdb (PostgreSQL) 18.7
+server up
+PostgreSQL 18.7 on x86_64-pc-linux-gnu, compiled by clang version 21.1.8, 64-bit
+1
+1|12345678901234567890.123456789|2026-11-14 13:40:00.123456+00|2026-11-14
+createdb works, db visible: 1
+stopped cleanly
 ```
 
-`DATABASE_URL=postgres://postgres:prism@127.0.0.1:55432/prism`.
+That run covers the four things this spec actually depends on: `GENERATED ALWAYS
+AS IDENTITY`, `TIMESTAMPTZ` with microsecond precision, `DATE`, exact `TEXT`
+decimal round-trip, and `CREATEDB` for `#[sqlx::test]`.
 
-The test role needs `CREATEDB` for `#[sqlx::test]`:
+`backend_rust/scripts/dev-db.sh` wraps it: `initdb` into a directory under
+`$XDG_RUNTIME_DIR` or `/tmp`, `pg_ctl -o "-p 55432 -k <sockdir> -c
+listen_addresses=127.0.0.1"`, `create database prism_test`,
+`alter role postgres createdb`, and a matching `stop`. `DATABASE_URL` is
+`postgres://postgres@127.0.0.1:55432/prism_test`.
 
-```sh
-psql "$DATABASE_URL" -c 'ALTER ROLE postgres CREATEDB'
+**Version note.** nixpkgs' `postgresql_18` is **18.7**; production is **18.6**
+(`ghcr.io/cloudnative-pg/postgresql:18.6`) and CI's `postgres:18` will resolve to
+whatever 18.x is current. Same major, patch drift. That is acceptable and it is
+stated rather than hidden: nothing in §4 or §5 depends on a 18.6-vs-18.7
+difference, and the alternative — pinning 18.6 locally — buys fidelity nobody has
+asked for at the cost of a nix overlay.
+
+**Do not use the `postgresql` already in the workspace image.** It is 18.6 and it
+is broken for this purpose: `initdb` dies with
+
+```
+FATAL:  could not access file "dict_snowball": No such file or directory
+STATEMENT:  CREATE FUNCTION dsnowball_init(INTERNAL) ... AS '$libdir/dict_snowball'
 ```
 
-### 9.2 Fallback: nix ephemeral cluster
+even though `/nix/store/9i3rafrdlicmvn7bnnzafwq715y9ap23-postgresql-18.6/lib/dict_snowball.so`
+exists and `ldd` on it reports nothing missing. The nix-shell build of the same
+major works, so the fault is in the image's closure, not in PostgreSQL. Worth
+reporting upstream in `coder-workspaces`; not worth blocking on.
 
-If podman does not work in the pod (§9.4), the fallback is proven: `nix-shell -p
-postgresql_16` with `initdb` into a temp dir, `pg_ctl start`, and the same
-`DATABASE_URL` shape. Measured on this workspace: `initdb` rc=0, server start,
-`CREATE DATABASE`, identity + numeric + `timestamptz` round-trip, clean stop. It
-runs 16.x, not 18.x, which is exactly the fidelity gap this spec exists to close —
-so it is a fallback, documented and not the default.
+### 9.2 Podman: attempted, and it does not work in this pod
+
+Recorded in full because the conclusion reverses what this spec said on first
+draft, and because the evidence is specific enough to act on.
+
+The image fix shipped in coder-workspaces `0.0.12` and is present in the running
+workspace: `/etc/subuid` and `/etc/subgid` carry `coder:100000:65536`,
+`/run/user/1000` exists, `XDG_RUNTIME_DIR` is set, and `/etc/containers/` pins
+`vfs` and `cgroupfs`. Podman 5.8.7 starts and reports itself rootless.
+
+It still cannot run a container. Two distinct faults:
+
+1. **`/bin/newuidmap` shadows the setuid copy.** The image's `PATH` is
+   `...:/bin:/usr/bin:...`, and `buildEnv` puts a plain non-setuid *symlink* at
+   `/bin/newuidmap`, ahead of the setuid copy at `/usr/bin/newuidmap`
+   (`-rwsr-xr-x root root`). Podman picks `/bin/newuidmap` and reports
+   `should have setuid or have filecaps setuid`. Fixable in `image.nix` with
+   `cp --remove-destination` into `/bin` as well.
+2. **Even with the setuid helper found, the kernel refuses the mapping.** With
+   `PATH` forced so `/usr/bin/newuidmap` wins, podman still fails:
+   `newuidmap: write to uid_map failed: Operation not permitted`. Reproduced
+   directly, outside podman: `unshare -U sleep 30` then
+   `newuidmap <pid> 0 1000 1 1 100000 65536` → `EPERM`, while
+   `unshare -U -r` (single self-mapping) succeeds. So single-identity user
+   namespaces are allowed and multi-range `uid_map` writes are not.
+
+`NoNewPrivs: 0`, `Seccomp: 0`, no AppArmor, `CapBnd: 00000000a80425fb` (the
+default Docker bounding set, which does include `CAP_SETUID`), `/proc/self/uid_map`
+is `0 0 4294967295` so this is the initial user namespace, and
+`user.max_user_namespaces` is 514686. Nothing inside the container explains the
+refusal, which puts the fix outside this workspace — in the pod spec or the node.
+
+**Consequence for this spec:** rootless podman is not the local harness. If it is
+ever fixed at the pod level, §9.1's script is a one-line swap and the CI
+configuration does not change at all.
 
 ### 9.3 CI
 
@@ -324,29 +378,8 @@ services: postgres:18  →  sqlx migrate run  →  cargo sqlx prepare --check
 
 `--check` before build is the point: it fails on a stale cache before anything
 compiles against it. The existing backup schema-freshness and portability gates
-stay where they are.
-
-### 9.4 The unproven part, stated plainly
-
-Podman in the workspace is **not yet proven**. What is measured: podman 6.1.4 runs
-rootless here, `podman info` comes up, `unshare -U -r` succeeds, a docker.io pull
-reached layer application and failed only on the missing `/etc/subuid` range.
-What is not measured: whether `vfs` layer application succeeds once that range
-exists, and whether rootless networking comes up in this pod.
-
-The fix is shipped as coder-workspaces `0.0.12` (subuid range, setuid
-`newuidmap`/`newgidmap`, `/run/user/1000`, `vfs` storage pinned) and the gate is
-two commands inside an updated workspace:
-
-```sh
-podman info --format '{{.Store.GraphDriverName}}'   # expect: vfs
-podman run --rm docker.io/library/postgres:18 postgres --version
-```
-
-**This spec's implementation must not start until those two commands have been
-run.** If they fail, §9.2 becomes the plan and CI remains the authoritative
-environment. If networking is the failure, `--network=host` is the workaround and
-costs nothing for a database.
+stay where they are. CI is the authoritative environment; the local harness exists
+for iteration speed.
 
 ## 10. Configuration
 
@@ -420,7 +453,7 @@ All from `backend_rust/`, all must pass, all must be warning-free:
 | Orphan rows silently dropped at cutover | Unknown — unmeasured today | Silent data loss | §11 step 2 is a stop condition with recorded numbers |
 | `sqlx prepare` cache drifts from head | High over time | Compiles and lies | `--check` in CI, always after `migrate run` |
 | 143-site rewrite breaks a query the tests do not cover | Medium | Wrong numbers, not a crash | Step 3 is placeholder-only and reviewable as such; the macro conversion in step 4 is where the compiler starts paying |
-| Podman does not work in the pod | Open, unmeasured | Local harness falls back to 16.x | §9.4 gate before implementation starts; CI is authoritative either way |
+| Podman cannot run containers in this pod | **Confirmed, not a risk any more** | No local container engine; local harness is the nix cluster instead | §9.1 is the plan and is proven. The pod-level cause is outside this workspace (§9.2). CI is authoritative either way. |
 | `split_sync` live shape differs from §4 | Medium | Migration creates a table the queries disagree with | Verify against the deployed database before writing `0001` |
 | FK enforcement surfaces a write path that relied on orphans | Medium | New 500s in production | §5.1 tests written before the switch, not after |
 
