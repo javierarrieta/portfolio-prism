@@ -277,15 +277,14 @@ pub async fn export(
         .await
         .map_err(|e| match e {
             // This `Lock` arm cannot be driven over HTTP from a test, and the reason is
-            // specific: `export` only reads, and under the rollback journal this app
-            // uses a writer does not block readers, so the lock a test can actually
-            // provoke (a second connection holding a write transaction — see
-            // `tests/backup_test.rs::a_locked_database_is_a_503_with_retry_after_from_the_restore_route`,
-            // which drives the *restore* arm for real) never reaches a read-only route.
-            // The failure that would, `PoolTimedOut`, is met earlier — by the auth guard's
-            // read of `users`, or by `require` below — and answered a 500 there before
-            // this arm is reached. So its two halves are pinned where they can be:
-            // `build()` producing `DbFailure::Lock` for an exhausted pool
+            // specific: `export` only reads, and a Postgres read transaction takes no row
+            // lock, so there is no lock for a test to provoke on a read-only route. The
+            // restore arm is driven for real, by a genuine serialisation failure, in
+            // `tests/restore_concurrency_test.rs::a_concurrent_replace_restore_is_a_503_with_retry_after`.
+            // The failure that would reach this arm, `PoolTimedOut`, is met earlier — by
+            // the auth guard's read of `users`, or by `require` below — and answered a
+            // 500 there before this arm is reached. So its two halves are pinned where
+            // they can be: `build()` producing `DbFailure::Lock` for an exhausted pool
             // (`an_exhausted_pool_is_a_lock_not_an_outage`) and the response a `Lock`
             // becomes (`a_lock_is_a_503_that_says_when_to_retry`).
             DbFailure::Lock => lock_response(),

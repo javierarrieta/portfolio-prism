@@ -257,14 +257,22 @@ An empty or absent `portfolio_ids` is `422`, never an empty bundle. A user will 
 an empty bundle, and "restore succeeded, everything vanished" is the worst outcome this
 feature could produce.
 
-**Export is one deferred read transaction** (`pool.begin()`), because the product is a
+**Export is one `REPEATABLE READ` read transaction**, because the product is a
 point-in-time copy: on the pool, each of its queries is its own implicit transaction and a
 commit landing between the portfolio read and the per-asset transaction reads yields a bundle
-straddling two database states. Deferred rather than `BEGIN IMMEDIATE` on purpose — under this
-app's rollback journal a deferred read transaction takes a `SHARED` lock, a concurrent writer
-still gets `RESERVED` and keeps working, and only its final `EXCLUSIVE` upgrade waits for the
-export to finish. `BEGIN IMMEDIATE` would queue a read-only route behind every writer and
-answer a busy database with a `503`.
+straddling two database states.
+
+*Corrected by Task 7 of the Postgres migration, which found this paragraph's promise and its
+mechanism both wrong.* It originally read "one deferred read transaction (`pool.begin()`)",
+justified by SQLite's rollback journal: a deferred read transaction takes a `SHARED` lock, a
+writer still gets `RESERVED`, and only its final `EXCLUSIVE` upgrade waits. That justification
+died with the engine, and the guarantee it was offered for was never real — at Postgres' READ
+COMMITTED default a transaction takes a fresh snapshot **per statement**, so a plain `BEGIN`
+made the straddle less likely without preventing it. The export now opens
+`BEGIN ISOLATION LEVEL REPEATABLE READ`: one snapshot per transaction, and still no row lock,
+so a concurrent writer is not kept out and a read-only route cannot be the cause of a `503`
+that a write lock would have caused. `tests/export_snapshot_test.rs` pins the snapshot and
+`a_read_only_export_does_not_queue_behind_a_writer` pins the no-lock half.
 
 **`GET /api/backup/capabilities`**
 `{ "schema_versions": [1], "allow_price_restore": false, "max_bytes": 8388608,
@@ -322,7 +330,10 @@ re-derive it. The transaction exists for consistency, not to catch typos.
 
 ### The restore transaction
 
-Inside one `pool.begin()`, in this order:
+Inside one `SERIALIZABLE` transaction — Task 7 of the Postgres migration made it
+`BEGIN ISOLATION LEVEL SERIALIZABLE` rather than the plain `pool.begin()` this line named,
+because at the READ COMMITTED default two restores for one caller interleave (Postgres spec
+§5.4) — in this order:
 
 1. If `mode=replace`: delete `transactions` → `assets` → `portfolios`, each scoped by a nested
    subquery on `owner_id`. Never a bare `DELETE`, and no caller-supplied id is involved.

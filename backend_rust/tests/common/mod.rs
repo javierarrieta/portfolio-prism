@@ -20,7 +20,10 @@ use backend_rust::db::DbPool;
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{build_rocket as lib_build_rocket, ensure_bootstrap_owner, get_cors_options};
 use chrono::{DateTime, NaiveDate, Utc};
+use rocket::http::{Header, HeaderMap, Status};
+use rocket::local::asynchronous::Client;
 use rocket::{Build, Rocket};
+use serde_json::json;
 
 // The mock lives in `src/test_provider.rs` so the library's own unit tests can use
 // it too; this include compiles the same file into the integration-test binary.
@@ -157,6 +160,121 @@ pub fn build_rocket_oidc_with_cors(pool: DbPool, origins: Vec<String>) -> Rocket
         AuthMode::Oidc(oidc_cfg()),
         BackupConfig::default(),
     )
+}
+
+/// The session header a test sends to be taken as authenticated.
+///
+/// In `disabled` mode the id inside the cookie is ignored — `build_rocket` names the
+/// caller — but the auth fairing still refuses a request that carries no session at all
+/// (`tests/backup_test.rs::capabilities_requires_a_session`), so every request needs one.
+#[allow(dead_code)]
+pub fn session_header() -> Header<'static> {
+    let (name, value) = session_cookie(1, 0);
+    Header::new(name, value)
+}
+
+/// `POST /api/backup/restore?mode=<mode>` with `bundle` as the body, answered with the
+/// two halves of the retry contract kept apart: the status and the headers.
+///
+/// The body is dropped on purpose. What a concurrency test has to assert is that a
+/// `503` came with `Retry-After`, and the only way to hold a header after the status has
+/// been read is to copy it out of the response before it is consumed. The body shape is
+/// pinned by `tests/backup_test.rs::a_lock_is_a_503_that_says_when_to_retry`.
+///
+/// `mode` is a parameter rather than baked in because the two modes race differently:
+/// `replace` deletes the caller's rows and so is the one that can abort, and `copy`
+/// writes disjoint rows and so is the one that must not.
+#[allow(dead_code)]
+pub async fn post_restore(
+    client: &Client,
+    mode: &str,
+    bundle: &str,
+) -> (Status, HeaderMap<'static>) {
+    let res = client
+        .post(format!("/api/backup/restore?mode={mode}"))
+        .header(session_header())
+        .header(rocket::http::ContentType::JSON)
+        // `LocalRequest::body` takes `Into<Vec<u8>>`, which `&str` satisfies directly.
+        .body(bundle)
+        .dispatch()
+        .await;
+    let status = res.status();
+    // A response borrows its own headers, so the map is rebuilt with owned strings —
+    // that is the only way the caller can still hold it after the response is gone.
+    let mut headers: HeaderMap<'static> = HeaderMap::new();
+    for header in res.headers().iter() {
+        headers.add(Header::new(
+            header.name().to_string(),
+            header.value().to_string(),
+        ));
+    }
+    (status, headers)
+}
+
+/// The smallest bundle that passes validation: one portfolio, one asset, one
+/// transaction. `name` is the only string in it a test can point at.
+///
+/// Moved here from `tests/backup_test.rs` when `tests/restore_concurrency_test.rs`
+/// needed the same fixture: two copies of a bundle shape is how one test starts
+/// restoring a file the other one never sends.
+#[allow(dead_code)]
+pub fn bundle_json(name: &str) -> String {
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": [{
+            "ref": "p1", "name": name, "description": null,
+            "currency": "USD", "base_currency": "USD",
+            "assets": [{
+                "ref": "a1", "symbol": "AAPL", "name": "Apple", "asset_type": "STOCK",
+                "sector": null, "currency": "USD", "isin": null,
+                "transactions": [{ "type": "BUY", "quantity": "10.0", "price": "150.00",
+                                   "fee": "1.00", "date": "2024-01-15T00:00:00Z" }]
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// A bundle with `portfolios` portfolios, each carrying `assets` assets of
+/// `transactions` transactions each — the shape a real account has, and the only way to
+/// make two restores overlap long enough for a race to be more than a coincidence.
+///
+/// Refs are unique across the whole bundle (`p{i}`, `a{i}_{j}`) because validation
+/// refuses a repeated ref anywhere in a file, not just within one portfolio.
+#[allow(dead_code)]
+pub fn bundle_with_size(portfolios: usize, assets: usize, transactions: usize) -> String {
+    let portfolios_json: Vec<serde_json::Value> = (0..portfolios)
+        .map(|i| {
+            let assets_json: Vec<serde_json::Value> = (0..assets)
+                .map(|j| {
+                    let txs: Vec<serde_json::Value> = (0..transactions)
+                        .map(|_| {
+                            json!({ "type": "BUY", "quantity": "1.0", "price": "10.00",
+                                    "fee": "0.00", "date": "2024-01-15T00:00:00Z" })
+                        })
+                        .collect();
+                    json!({
+                        "ref": format!("a{i}_{j}"), "symbol": format!("S{i}_{j}"),
+                        "name": "A", "asset_type": "STOCK", "sector": null,
+                        "currency": "USD", "isin": null, "transactions": txs,
+                    })
+                })
+                .collect();
+            json!({
+                "ref": format!("p{i}"), "name": format!("P{i}"), "description": null,
+                "currency": "USD", "base_currency": "USD", "assets": assets_json,
+            })
+        })
+        .collect();
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": portfolios_json,
+    })
+    .to_string()
 }
 
 /// A private, freshly migrated database for one test, and the id of a user in it.

@@ -251,15 +251,67 @@ in #64 (`7facddb`) are SQLite concepts. Postgres does not block a reader behind 
 writer, and the restore's `SERIALIZABLE` transaction reports
 `40001 serialization_failure` instead.
 
+*Corrected when Task 7 landed:* that sentence described an intention, not the code.
+`restore::apply` was opening `pool.begin()`, which is the server default — READ
+COMMITTED — and at READ COMMITTED two restores for one caller interleave: the loser
+either finishes anyway, so the caller silently owns both restores' rows, or its
+`DELETE FROM assets` hits rows the winner already replaced and fails `23503`. Which
+outcome was seen where, because they did not all reproduce the same way: over HTTP, only
+the silent both-`200` outcome reproduced (6 runs in 6 of the Task 7 mutation); the
+`23503` form was measured directly against the server with two concurrent READ COMMITTED
+transactions in `psql`, and the same concurrent-delete conflict does show up over HTTP as
+a `500` if `40001` is removed from the classifier. `apply` now opens
+`BEGIN ISOLATION LEVEL SERIALIZABLE`, which is what this section had always assumed.
+
 The `503 + Retry-After` response shape stays — clients already handle it — but its
 trigger becomes: pool exhaustion (timeout acquiring a connection), statement
-timeout, and serialisation failure after the retry policy is exhausted. The
-backup module's portability gate already forbids engine-specific constructs, so
-this is a mapping change in one place, not a rewrite.
+timeout, and a transaction asked to give up — `40001` serialisation failure, `40P01`
+deadlock detected, `55P03` lock wait. Nothing else maps to `503`: anything else is a
+bug, and a retry will not help. `55P03` is named rather than left to the `500` catch-all,
+and it is worth saying plainly that nothing in this repository can raise it today: no
+`lock_timeout` is set at any level the app controls, so that arm fires only if an
+operator sets one at role, database or server level. There is no unbounded wait either
+way, because the statement timeout below cancels a lock-blocked statement at 30 s and
+that is `57014`, which is already on the list. The statement timeout raises `57014 query_canceled`,
+not a code of its own; the plan's first draft of the match arm omitted it, which made
+this very trigger unreachable, and the pool sets the limit per connection in
+`db::pool_options` (`30s` per *statement*, not per transaction). The backup module's
+portability gate bans SQLite-only SQL spellings; it never claimed to forbid
+engine-specific constructs in general, and `src/backup/` now deliberately sends
+Postgres-only transaction control (`BEGIN ISOLATION LEVEL …`). What the gate does for
+this section is keep the mapping in one place, and its Rule 3 — added by Task 7 — requires
+every transaction start in `src/backup/` to name its isolation level, which is what stops
+the export's read drifting back to a bare `BEGIN`.
+
+**Export reads at `REPEATABLE READ`, and that is a Task 7 correction of the same kind.**
+The export's transaction was documented as the thing that made a bundle a point-in-time
+copy while running at the server default, which does not do it: READ COMMITTED takes a
+fresh snapshot per statement, so a commit landing between the portfolio read and the
+per-asset reads is visible to the later statement — the exact straddle the transaction
+was said to prevent. `export::build` now opens `BEGIN ISOLATION LEVEL REPEATABLE READ`,
+which is one snapshot per transaction and still takes no row lock, so a writer is not
+kept out and `a_read_only_export_does_not_queue_behind_a_writer` still passes. It is not
+`SERIALIZABLE`: a read-only route has nothing to serialise against, and at
+REPEATABLE READ a plain read cannot be aborted with `40001` in the first place, so the
+export gains a snapshot without gaining a new source of `503`s.
+`tests/export_snapshot_test.rs` reads the isolation level back from the server and shows
+a commit landing between two reads staying invisible.
+
+**There is no server-side retry policy, and an earlier draft of this section's
+"serialisation failure after the retry policy is exhausted" was written as though there
+were one.**
+`apply` attempts the transaction once and answers `503` with `Retry-After`. A retry
+loop inside `apply` would add a second failure mode and buy nothing the client cannot
+already do, because the response says when to come back. Task 7 recorded this as a
+deliberate scope call, not an oversight.
 
 **Recorded as a follow-up in #64 and now in scope:** the restore's serialisation
 behaviour under concurrent writers has never been tested. It gets a test here,
-because Postgres is where it can be written.
+because Postgres is where it can be written — `tests/restore_concurrency_test.rs`,
+which races two `replace` restores and requires the loser to be a `503` with
+`Retry-After`. `copy` is pinned in the other direction: two concurrent copies both
+commit, because they write disjoint rows and the serialiser has no read-write
+dependency to order. That is the contract, not an untested gap.
 
 ### 5.5 `init_db` and its startup migrations are deleted
 
@@ -442,8 +494,16 @@ for iteration speed.
   `503` in §5.4 keys off.
 - `statement_timeout` set on the connection (`options=-c statement_timeout=30s` or
   per-statement), so a runaway analytics query cannot pin a pool connection
-  indefinitely. The #64 review recorded that export holds a pool connection for
-  its whole duration; this is the backstop.
+  indefinitely. It is **per statement, not per transaction** — `tests/statement_timeout_test.rs`
+  proves it — so it is not a bound on how long export holds a connection, which is a
+  sequence of fast statements and would sail through any per-statement limit. Nothing
+  else bounds that hold either, and the spec says so rather than pointing at a cap that
+  does not apply: the bundle row cap (`MAX_BUNDLE_ROWS`, counted by `backup::row_count`)
+  and the byte cap (`MAX_BUNDLE_BYTES`) are checked on the **built** bundle by
+  `export::cap_error`, so an over-cap selection performs every read and only then gets
+  a 422. The hold is as long as the tenant's row volume makes it, with each statement
+  under 30 s. On the restore side the caps do bound the work up front, because
+  `parse_and_validate` checks both before `apply` opens its transaction.
 - `AUTH_MODE=disabled` still works for local development. That mode resolves the
   caller against a placeholder user row (`issuer='local'`, `subj='bootstrap'`) that
   `init_db` used to create, so **the row and the ownership backfill survive the

@@ -37,45 +37,52 @@ impl DbFailure {
     }
 }
 
-/// Classify a sqlx error as a lock or not.
+/// Classify a sqlx error as retryable or not.
 ///
-/// sqlx has no `is_locked()` on `DatabaseError`, so this matches on what the
-/// drivers actually surface: SQLite reports `SQLITE_BUSY` as code `5` and
-/// `SQLITE_LOCKED` as code `6` (`sqlx-sqlite`'s `DatabaseError::code()` formats the
-/// raw code), and Postgres — later — reports `40001` serialisation failure and
-/// `40P01` deadlock detected. The message check is the belt: it is what a bundled
-/// SQLite build actually prints.
+/// Postgres has no `SQLITE_BUSY`. Three conditions mean "try later", and they are the
+/// only things that produce a `503` here (spec §5.4):
 ///
-/// Pool exhaustion counts as busy too, and not only by analogy. Under SQLite a reader
-/// rarely lives long enough to meet `SQLITE_BUSY` — the likelier way to be kept out is
-/// every connection in the pool being checked out — and `PoolTimedOut` is exactly as
-/// retryable, so it must not answer a bare `500` where the caller was told to retry.
+/// * the pool had no connection within `acquire_timeout` (`db::pool_options`) —
+///   [`sqlx::Error::PoolTimedOut`], which carries no SQLSTATE and so is matched by
+///   variant, not by code;
+/// * `statement_timeout` fired: `57014 query_canceled`. It is the code Postgres
+///   reports for *any* cancelled statement, and `db::pool_options`' 30 s limit is the
+///   only thing in this application that cancels one of its own accord — an operator
+///   calling `pg_cancel_backend()` produces the same SQLSTATE and the same answer;
+/// * the transaction was asked to give up: `40001` serialisation failure, `40P01`
+///   deadlock detected, or `55P03` lock_not_available.
+///
+/// `55P03` is named rather than swallowed by the `500` catch-all, and it is worth saying
+/// plainly that nothing here can currently raise it: no `lock_timeout` is set at any
+/// level this app controls, so that arm only fires if an operator sets one at role,
+/// database or server level. There is no unbounded wait either way, because the statement
+/// timeout cancels a lock-blocked statement at 30 s as `57014` above.
+///
+/// Everything else is a `500`, because it is a bug and a retry will not help. The
+/// SQLite version of this function also matched `SQLITE_BUSY`/`SQLITE_LOCKED` — the
+/// primary codes and their extended forms — and grepped the message for "database is
+/// locked"; all of that is gone, because a message match would keep answering `503`
+/// for text the Postgres driver has no reason to produce, and because SQLSTATEs are
+/// the engine's contract while prose in an error message is not.
 pub fn classify(e: sqlx::Error) -> DbFailure {
     if matches!(e, sqlx::Error::PoolTimedOut) {
         // Said out loud because this branch returns before the `ERROR:` line below, and
-        // an exhausted pool is the one lock an operator can act on: a `SQLITE_BUSY` that
-        // clears in milliseconds is not, but a pool with nothing free stays that way.
+        // an exhausted pool is the one retryable condition an operator can act on: a
+        // serialisation failure that clears in milliseconds is not, but a pool with
+        // nothing free stays that way.
         eprintln!("WARN: backup: no database connection free within the pool timeout; answering 503");
         return DbFailure::Lock;
     }
     if let sqlx::Error::Database(db) = &e {
-        let code = db.code().map(|c| c.to_string()).unwrap_or_default();
-        // SQLite reports *extended* result codes and `code()` prints the raw value, so a
-        // `SQLITE_BUSY_RECOVERY` (261), `SQLITE_BUSY_SNAPSHOT` (517) or
-        // `SQLITE_LOCKED_SHAREDCACHE` (262) is the primary `SQLITE_BUSY` (5) or
-        // `SQLITE_LOCKED` (6) with an extended bit set. Mask to the primary code before
-        // matching, or an extended lock answers a bare 500 where the caller was told to
-        // retry. Postgres SQLSTATEs ("40001", "40P01") never parse as a number and fall
-        // through unchanged.
-        let primary = code
-            .parse::<i64>()
-            .map(|raw| (raw & 0xff).to_string())
-            .unwrap_or_else(|_| code.clone());
-        let message = db.message().to_lowercase();
-        if matches!(primary.as_str(), "5" | "6" | "40001" | "40P01")
-            || message.contains("database is locked")
-            || message.contains("database table is locked")
-        {
+        // `code()` is the SQLSTATE for `sqlx::postgres::PgDatabaseError`, and it is the
+        // only thing here worth matching: `db.message()` is English prose Postgres is
+        // free to reword, and `db.kind()` has no variant for any of the four codes above
+        // (they all map to `ErrorKind::Other`), so the code is the whole signal.
+        if matches!(
+            db.code().as_deref(),
+            Some("40001") | Some("40P01") | Some("55P03") | Some("57014")
+        ) {
+            eprintln!("WARN: backup: retryable database failure ({e}); answering 503");
             return DbFailure::Lock;
         }
     }
@@ -87,34 +94,61 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 /// authorised for. Order follows the order requested, so the file matches what the
 /// user ticked.
 ///
-/// **Every read runs inside one deferred read transaction**, because the product is a
-/// point-in-time copy. On the pool each query is its own implicit transaction, so a
-/// commit landing between the portfolio read and the per-asset transaction reads
-/// yields a bundle that straddles two database states — a portfolio row from one
-/// moment and its transactions from a later one. `restore::apply` has always been one
-/// transaction; export being one too is the same promise seen from the other side.
+/// **Every read `build` itself issues runs inside one `REPEATABLE READ` transaction**
+/// ([`begin_read_tx`]), because the product is a point-in-time copy. Scope matters
+/// here: the route does other reads before this function is reached — the auth guard's
+/// read of `users`, and `require`'s per-id authorisation check in `api_routes::backup` —
+/// and those run outside it, at the server default. What is one snapshot is the bundle's
+/// own data, which is the thing that must not straddle two states. On the pool each query
+/// is its own implicit transaction, so a commit landing between the portfolio read and
+/// the per-asset transaction reads yields a bundle that straddles two database states —
+/// a portfolio row from one moment and its transactions from a later one.
+/// `restore::apply` has always been one transaction; export being one too is the same
+/// promise seen from the other side.
 ///
-/// Deferred, not `BEGIN IMMEDIATE`, and that is load-bearing rather than incidental:
-/// this app runs SQLite on the rollback journal with a 5 s `busy_timeout`
-/// (`main.rs`), where a deferred read transaction takes a `SHARED` lock on its first
-/// read. A concurrent writer still gets `RESERVED` and keeps working; only its final
-/// `EXCLUSIVE` upgrade waits for the export to finish, and the export is a handful of
-/// indexed reads. `BEGIN IMMEDIATE` would instead queue the export behind every
-/// writer and answer a busy database with a `503` on a route that only reads —
-/// `a_read_only_export_does_not_queue_behind_a_writer` is what fails if someone
-/// "hardens" it that way.
+/// `REPEATABLE READ` and not the server default, and that is the whole point of the
+/// transaction: at READ COMMITTED Postgres takes a **fresh snapshot per statement**, so
+/// merely wrapping the reads in a transaction would not prevent the straddle above — it
+/// would only make it less likely. `REPEATABLE READ` takes one snapshot per transaction,
+/// which is the guarantee the previous paragraph claims.
+/// `tests/export_snapshot_test.rs` reads the isolation level back from the server on the
+/// transaction [`begin_read_tx`] opens, and shows a commit landing between two reads
+/// staying invisible to the second one.
+///
+/// Not `SERIALIZABLE`, which the write path needs and a read does not: predicate locking
+/// on an export that writes nothing would make a read-only route pay for a serialiser it
+/// has nothing to serialise against. Not `BEGIN READ ONLY FOR UPDATE` either, because a
+/// read transaction that takes no row lock is what lets a writer keep working while an
+/// export runs — `a_read_only_export_does_not_queue_behind_a_writer` is what fails if
+/// someone "hardens" it into a lock.
 pub async fn build(
     pool: &DbPool,
     portfolio_ids: &[i64],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
-    let mut tx = pool.begin().await.map_err(classify)?;
+    let mut tx = begin_read_tx(pool).await?;
     let bundle = build_in(&mut tx, portfolio_ids, include_prices).await?;
     // A read-only commit: nothing was written, and ending the transaction is what
-    // releases the `SHARED` lock the reads above are holding.
+    // releases the one snapshot every read above shared.
     tx.commit().await.map_err(classify)?;
     Ok(bundle)
 }
+
+/// The transaction [`build`] reads inside, opened in one place so that every test of the
+/// isolation level goes through the same call `build` makes, and so that the portability
+/// gate has one spelling to look for. `build` is its only caller, and the gate rule is
+/// what keeps a second caller from appearing with a bare `pool.begin()` instead — see
+/// Rule 3 of `scripts/check_backup_portability.sh`.
+pub async fn begin_read_tx(
+    pool: &DbPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DbFailure> {
+    pool.begin_with(EXPORT_ISOLATION).await.map_err(classify)
+}
+
+/// The statement [`begin_read_tx`] sends, verbatim, through `Pool::begin_with`. Named so
+/// the isolation level is stated once, where it takes effect, and so that grepping
+/// `REPEATABLE READ` finds the code rather than only the docs.
+pub const EXPORT_ISOLATION: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
 
 /// The reads themselves, on a transaction [`build`] opened. Separate from `build` so
 /// the transaction's scope is three lines and impossible to widen by accident.
@@ -306,30 +340,63 @@ mod tests {
     use rocket::http::Status;
     use sqlx::error::DatabaseError;
 
-    /// A database error that reports itself as a lock, which is how SQLite surfaces
-    /// `SQLITE_BUSY` once the `busy_timeout` in `main.rs` has expired. `code()` keeps
-    /// the trait default of `None`, so this exercises the message half of `classify`;
-    /// the code half is pinned over HTTP by
-    /// `tests/backup_test.rs::a_locked_database_is_a_503_with_retry_after_from_the_restore_route`,
-    /// which drives a real `SQLITE_BUSY` out of a second connection.
+    /// A database error carrying exactly the SQLSTATE `code` — or no code at all, when
+    /// `code` is `None` — and a message that matches nothing.
+    ///
+    /// `sqlx::postgres::PgDatabaseError` cannot be constructed from outside the driver,
+    /// so the four codes `classify` matches are exercised through this instead. The
+    /// three near-identical fakes this replaces (`FakeLock`, `FakeOther`, `FakeCode`)
+    /// existed because the old classifier read the message *and* the code; only the
+    /// code is read now, so one fake with a field for it is enough.
     #[derive(Debug)]
-    struct FakeLock;
+    struct FakeDb {
+        message: &'static str,
+        code: Option<&'static str>,
+    }
 
-    impl std::fmt::Display for FakeLock {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("database is locked")
+    impl FakeDb {
+        fn error(self) -> sqlx::Error {
+            sqlx::Error::Database(Box::new(self))
         }
     }
-    impl std::error::Error for FakeLock {}
 
-    impl DatabaseError for FakeLock {
-        fn message(&self) -> &str {
-            "database is locked"
+    /// A database error whose only interesting property is its SQLSTATE.
+    fn error_with_code(code: Option<&'static str>) -> sqlx::Error {
+        FakeDb {
+            message: "nothing in this message matches anything classify reads",
+            code,
         }
-        // The trait's other required methods are plumbing: a `DatabaseError` must be
-        // able to hand out `self` as a `dyn Error` because `sqlx::Error::Database`
-        // stores it as a boxed trait object, and `kind()` is this sqlx version's
-        // fourth required method (mapped violations only; a lock has none).
+        .error()
+    }
+
+    /// A database error carrying `message` and no SQLSTATE at all, which is the shape
+    /// the deleted message-matching used to accept.
+    fn error_with_message(message: &'static str) -> sqlx::Error {
+        FakeDb {
+            message,
+            code: None,
+        }
+        .error()
+    }
+
+    impl std::fmt::Display for FakeDb {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+    impl std::error::Error for FakeDb {}
+
+    impl DatabaseError for FakeDb {
+        fn message(&self) -> &str {
+            self.message
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+        // The rest is plumbing: a `DatabaseError` must be able to hand out `self` as a
+        // `dyn Error` because `sqlx::Error::Database` stores it as a boxed trait object,
+        // and `kind()` is this sqlx version's fourth required method (mapped violations
+        // only; none of the codes under test map to one).
         fn kind(&self) -> sqlx::error::ErrorKind {
             sqlx::error::ErrorKind::Other
         }
@@ -344,10 +411,64 @@ mod tests {
         }
     }
 
+    /// The four conditions spec §5.4 allows to be a `503`, by the SQLSTATE each one
+    /// arrives as: serialisation failure, deadlock, `lock_timeout`, `statement_timeout`.
     #[test]
-    fn a_lock_by_message_is_a_503() {
-        let busy = sqlx::Error::Database(Box::new(FakeLock));
-        assert!(matches!(classify(busy), DbFailure::Lock));
+    fn the_retryable_sqlstates_are_locks() {
+        for code in ["40001", "40P01", "55P03", "57014"] {
+            assert!(
+                matches!(classify(error_with_code(Some(code))), DbFailure::Lock),
+                "code {code}"
+            );
+        }
+    }
+
+    /// The SQLite result codes the deleted classifier matched — `SQLITE_BUSY` (5),
+    /// `SQLITE_LOCKED` (6) and the extended forms 261, 517, 262 — must now be outages.
+    /// Without this the old arms could come back as "harmless" belt-and-braces matching
+    /// and a `500` that should be a `500` would quietly become a retryable `503`.
+    #[test]
+    fn the_sqlite_busy_codes_are_no_longer_retryable() {
+        for code in ["5", "6", "261", "517", "262"] {
+            assert!(
+                matches!(classify(error_with_code(Some(code))), DbFailure::Other),
+                "code {code}"
+            );
+        }
+    }
+
+    /// The message half of the old classifier is gone, and this is what it would still
+    /// match: SQLite's wording with no SQLSTATE behind it. Prose is not the engine's
+    /// contract, so a message no longer buys a `Retry-After`.
+    #[test]
+    fn a_lock_shaped_message_without_a_sqlstate_is_an_outage() {
+        assert!(matches!(
+            classify(error_with_message("database is locked")),
+            DbFailure::Other
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_real_database_error_is_not_retryable() {
+        // The false case driven through the driver rather than a fake, because a fake
+        // proves the match arm and this proves the *shape*: a real Postgres failure
+        // really does arrive as `Error::Database` with a SQLSTATE, which is what the
+        // arm reads. A missing table is `42P01 undefined_table` — permanent, so a retry
+        // would be an outage with a `Retry-After` header on it.
+        let pool = crate::test_db::test_pool(&crate::test_db::next_caller("classify")).await;
+        let err = sqlx::query("SELECT * FROM a_table_no_test_created")
+            .fetch_one(&pool)
+            .await
+            .expect_err("the table does not exist");
+        let sqlx::Error::Database(db) = &err else {
+            panic!("a missing table must arrive as a database error, got {err:?}");
+        };
+        assert_eq!(
+            db.code().as_deref(),
+            Some("42P01"),
+            "the arm reads the SQLSTATE, so the fixture has to carry one"
+        );
+        assert!(matches!(classify(err), DbFailure::Other));
     }
 
     #[test]
@@ -356,84 +477,11 @@ mod tests {
         // reported as a client error, and a client error must not be reported as an
         // outage the client should retry. Without this arm, every schema failure in
         // the application would answer `503` with a `Retry-After`.
-        #[derive(Debug)]
-        struct FakeOther;
-        impl std::fmt::Display for FakeOther {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("no such table")
-            }
-        }
-        impl std::error::Error for FakeOther {}
-        impl DatabaseError for FakeOther {
-            fn message(&self) -> &str {
-                "no such table"
-            }
-            fn kind(&self) -> sqlx::error::ErrorKind {
-                sqlx::error::ErrorKind::Other
-            }
-            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-                self
-            }
-        }
-        let other = sqlx::Error::Database(Box::new(FakeOther));
+        // `42601 syntax_error`: retried forever that is an outage with a `Retry-After`
+        // on it, and it is the code the plan named for this exact case.
+        let other = error_with_code(Some("42601"));
         assert!(matches!(classify(other), DbFailure::Other));
         assert_eq!(DbFailure::Other.status(), Status::InternalServerError);
-    }
-
-    /// The SQLite codes `classify` claims to read. A `SQLITE_BUSY` carries `5` and a
-    /// `SQLITE_LOCKED` carries `6`; if the match arm lost them, the message check
-    /// alone would decide, and a driver that words its message differently would
-    /// answer a `500` for a retryable lock.
-    #[test]
-    fn the_busy_and_locked_codes_are_classified_as_locks() {
-        #[derive(Debug)]
-        struct FakeCode(&'static str);
-        impl std::fmt::Display for FakeCode {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "sqlite code {}", self.0)
-            }
-        }
-        impl std::error::Error for FakeCode {}
-        impl DatabaseError for FakeCode {
-            fn message(&self) -> &str {
-                "nothing in the message matches"
-            }
-            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-                Some(std::borrow::Cow::Borrowed(self.0))
-            }
-            fn kind(&self) -> sqlx::error::ErrorKind {
-                sqlx::error::ErrorKind::Other
-            }
-            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-                self
-            }
-        }
-        for code in ["5", "6"] {
-            let err = sqlx::Error::Database(Box::new(FakeCode(code)));
-            assert!(matches!(classify(err), DbFailure::Lock), "code {code}");
-        }
-        // The extended forms, which is what the driver actually reports: 5|0x100,
-        // 5|0x200 and 6|0x100. Without the mask these fall through to the message arm and
-        // answer a 500 for a retryable lock.
-        for code in ["261", "517", "262"] {
-            let err = sqlx::Error::Database(Box::new(FakeCode(code)));
-            assert!(matches!(classify(err), DbFailure::Lock), "extended code {code}");
-        }
-        // And a code that is not one of them is still an outage.
-        let err = sqlx::Error::Database(Box::new(FakeCode("1")));
-        assert!(matches!(classify(err), DbFailure::Other));
     }
 
     /// A bundle of `1 + assets` counted rows: one portfolio plus that many empty

@@ -16,6 +16,7 @@ mod common;
 use backend_rust::ensure_bootstrap_owner;
 use common::{
     build_rocket,
+    bundle_json,
     db_with_user,
     disabled_config,
     placeholder_id,
@@ -58,8 +59,7 @@ async fn price_restore_client(pool: DbPool, user: i64) -> Client {
 }
 
 fn session() -> Header<'static> {
-    let (name, value) = common::session_cookie(1, 0);
-    Header::new(name, value)
+    common::session_header()
 }
 
 #[tokio::test]
@@ -496,9 +496,9 @@ async fn no_global_body_limit_is_raised_for_the_bundle() {
 // responder is pinned the way the size cap above is — the module's own value, mounted
 // on a probe route outside `/api`, asserted as what a client receives. The real routes
 // reach this exact code through `lock_response()`, which is the only way to build a
-// `BackupError` with a `503` at all (`BackupError`'s fields are private). The route
-// that writes drives this same code from a real `SQLITE_BUSY` in
-// `a_locked_database_is_a_503_with_retry_after_from_the_restore_route` below.
+// `BackupError` with a `503` at all (`BackupError`'s fields are private). The route that
+// writes reaches it from a real serialisation failure, proven end to end in
+// `tests/restore_concurrency_test.rs::a_concurrent_replace_restore_is_a_503_with_retry_after`.
 // ---------------------------------------------------------------------------
 
 /// The module's lock failure, answered verbatim.
@@ -535,24 +535,28 @@ async fn a_lock_is_a_503_that_says_when_to_retry() {
 // * The response a `Lock` becomes is pinned by `a_lock_is_a_503_that_says_when_to_retry`
 //   on a probe route.
 //
-// What is *not* pinned here, and deliberately so: the SQLite version of this section
-// drove `restore`'s arm over HTTP by holding a write transaction open against a
-// file-backed database, which is how SQLite answers a second writer. Postgres does not
-// work that way — MVCC means a writer blocks no reader, and two restores writing
-// *different* rows do not block each other at all. The Postgres condition that means
-// "try later" is a serialisation failure (`40001`) from two restores writing the *same*
-// rows under `SERIALIZABLE`, and that is Task 7's test to write, together with the
-// `classify` arm that recognises it. Proving a 503 here by locking a table outright
-// would hang the request instead — the pool sets `acquire_timeout`, not `lock_timeout` —
-// so it would be a test of the harness, not of the code.
+// What *is* now pinned, and what is not, about `restore`'s arm:
 //
-// TODO(Task 7): `restore`'s `ApplyError::Db(DbFailure::Lock) => lock_response()` arm
-// (`src/api_routes/backup.rs:524`) has had no end-to-end proof since the engine switch.
-// The SQLite test that proved it —
-// `a_locked_database_is_a_503_with_retry_after_from_the_restore_route` — was removed
-// with the SQLite lock section, and the tests below only reach `DbFailure::Lock`
-// through `build()`/`export`, never through `restore`. Write the Postgres version
-// alongside the `classify` arm that recognises `40001`/`40P01`.
+// * `restore`'s `ApplyError::Db(DbFailure::Lock) => lock_response()` arm is driven over
+//   HTTP for real by `tests/restore_concurrency_test.rs`, which races two `replace`
+//   restores and requires the loser to answer `503` with `Retry-After`. That is the
+//   Postgres replacement for the SQLite test the engine switch deleted: two writers on
+//   the same rows abort with `40001`, because `restore::apply` runs `SERIALIZABLE`.
+// * The pool-timeout half of the same arm is **not** reachable over HTTP, and the reason
+//   is specific rather than incidental: the auth guard reads `users` before the handler
+//   runs, so a pool with nothing free is answered a `500` by the guard and never reaches
+//   `apply`. Proving it would mean holding a connection at an instant *between* the
+//   guard and the handler, which no test can observe. A `40P01` deadlock cannot be
+//   provoked on purpose either: the victim is whichever transaction's wait completes the
+//   cycle, and a restore that blocks on its first statement holds nothing yet.
+//
+// TODO(Task 7, accepted gap): the two bullets above are the whole of what is proven.
+// `restore`'s `Lock` arm is proven for a serialisation failure and permanently unproven
+// for `PoolTimedOut`, for the reason in the previous paragraph — do not re-derive it, and
+// do not "fix" it by softening the guard, which answers a database failure as a `500`
+// exactly as `src/access.rs` requires. The `PoolTimedOut` half of the rule is pinned
+// where it can be: `classify` maps it (unit test `pool_exhaustion_is_busy_and_a_plain_
+// error_is_not`), and `build()` produces the `Lock` (below).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -587,19 +591,19 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
 
 #[tokio::test]
 async fn a_read_only_export_does_not_queue_behind_a_writer() {
-    // `export::build` wraps its reads in a transaction, and under Postgres this is the
-    // stronger claim SQLite could only make weakly: an open writer blocks nothing. A
-    // reader does not wait for the lock *or* see the uncommitted write — it reads the
-    // snapshot its transaction started on.
+    // `export::build` wraps its reads in a `REPEATABLE READ` transaction, and the claim
+    // this test makes is the one about locking rather than visibility: an open writer
+    // blocks nothing. A reader neither waits for the lock nor sees the uncommitted write.
     //
-    // Changing `pool.begin()` to `pool.begin_with("BEGIN READ ONLY FOR UPDATE")`, or
-    // to anything that takes a write lock no read needs, fails here.
+    // Changing `backup_export::EXPORT_ISOLATION`, or `begin_read_tx`, to anything
+    // that takes a write lock no read needs — `BEGIN READ ONLY FOR UPDATE`, or a `BEGIN`
+    // that acquires one — fails here.
     //
-    // What this test cannot pin, said plainly rather than glossed: that the reads are in
-    // a transaction at all. Uncommitted data is invisible to a reader either way, and no
-    // test can commit at a chosen moment *between* two of `build`'s queries. The
-    // snapshot is a property of the transaction `build` opens, and it is the transaction
-    // that carries it, not anything observable from outside.
+    // What this test cannot pin, said plainly rather than glossed: that every read in
+    // `build` shares one snapshot. Uncommitted data is invisible to a reader at any
+    // isolation level, and no test can commit at a chosen moment *between* two of
+    // `build`'s own queries. That half is pinned from inside the transaction instead, in
+    // `tests/export_snapshot_test.rs`.
     let url = test_pool_url("a_read_only_export_does_not_queue").await;
     let pool = pool_options().connect(&url).await.unwrap();
     ensure_bootstrap_owner(&pool, &disabled_config()).await.unwrap();
@@ -646,28 +650,8 @@ async fn a_read_only_export_does_not_queue_behind_a_writer() {
 // end in a refusal, and the one mode whose whole subject is deletion.
 // ---------------------------------------------------------------------------
 
-/// The smallest bundle that passes validation: one portfolio, one asset, one
-/// transaction. `name` is the only string in it a test can point at.
-fn bundle_json(name: &str) -> String {
-    json!({
-        "format": "portfolio-prism-backup",
-        "schema_version": 1,
-        "created_at": "2026-11-13T00:00:00Z",
-        "portfolios": [{
-            "ref": "p1", "name": name, "description": null,
-            "currency": "USD", "base_currency": "USD",
-            "assets": [{
-                "ref": "a1", "symbol": "AAPL", "name": "Apple", "asset_type": "STOCK",
-                "sector": null, "currency": "USD", "isin": null,
-                "transactions": [{ "type": "BUY", "quantity": "10.0", "price": "150.00",
-                                   "fee": "1.00", "date": "2024-01-15T00:00:00Z" }]
-            }]
-        }]
-    })
-    .to_string()
-}
-
-/// The same bundle as a mutable `Value`, for a test that needs one field changed.
+/// The smallest bundle that passes validation, as a mutable `Value`, for a test that
+/// needs one field changed.
 ///
 /// Parsed rather than wrapped: `json!(bundle_json(..))` turns the *string* into a
 /// `Value::String`, and editing a field on that panics in serde before the request is

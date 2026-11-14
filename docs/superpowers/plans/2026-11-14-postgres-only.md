@@ -31,7 +31,7 @@ The spec's own tests will not cover these; each line gets a test in the task tha
 2. **Two restores running at once under `SERIALIZABLE`.** Postgres answers `40001`, SQLite answered `SQLITE_BUSY`; the client must still see `503` with `Retry-After`, never a 500 (§5.4) — Task 7.
 3. **A stale `.sqlx` prepare cache.** It compiles and lies: the query is checked against the schema as it was when the cache was generated (§8). Expected behavior: CI fails before compilation, naming the drifted query — Task 8, Task 9.
 4. **A transaction date that is not a full RFC 3339 timestamp.** `TIMESTAMPTZ` will reject what `TEXT` accepted, and the CSV import path is where that arrives. Expected behavior: a `422` naming the row, not a 500 — Task 4.
-5. **Pool exhaustion during a long export.** Export holds a connection for its whole duration (#64 follow-up 3) and `statement_timeout` is the only backstop (§10). Expected behavior: `503` with `Retry-After` after `acquire_timeout`, not a hung request — Task 7.
+5. **Pool exhaustion during a long export.** Export holds a connection for its whole duration (#64 follow-up 3); `statement_timeout` bounds any single statement inside that hold but cannot bound the hold itself, which is a sequence of fast statements — and the bundle caps do not bound it either, since `export::cap_error` checks them on the already-built bundle (§10). Expected behavior: `503` with `Retry-After` after `acquire_timeout`, not a hung request — Task 7.
 
 ---
 

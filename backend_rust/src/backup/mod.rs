@@ -249,10 +249,10 @@ fn transaction_type_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sc
 /// Price rows are included because a restore inserts them too, in the same
 /// transaction as everything else. A cap that counted only the caller's own rows
 /// would let a bundle under it carry ~120k single-row `INSERT`s into
-/// `historical_prices` — enough to hold the SQLite write lock past the 5s
-/// `busy_timeout` in `main.rs` and turn concurrent traffic into 503s. The ceiling is
-/// a promise about how much work one restore may do, so it counts every row the
-/// restore writes.
+/// `historical_prices` — enough to hold one pool connection, and the row locks those
+/// inserts take, for the whole of one long transaction while every other request waits
+/// for a connection. The ceiling is a promise about how much work one restore may do,
+/// so it counts every row the restore writes.
 pub fn row_count(bundle: &Bundle) -> usize {
     let owned: usize = bundle.portfolios.iter().fold(0usize, |acc, p| {
         acc + 1 + p.assets.iter().fold(0usize, |a, ast| a + 1 + ast.transactions.len())
@@ -649,9 +649,9 @@ mod tests {
 
     /// The rows a restore writes into `historical_prices` count toward the same
     /// ceiling as the caller's own rows. Excluding them is what let a bundle under the
-    /// cap drive ~120k single-row `INSERT`s inside one write transaction — long
-    /// enough to hold the SQLite write lock past the 5s `busy_timeout` and answer every
-    /// concurrent request with a 503.
+    /// cap drive ~120k single-row `INSERT`s inside one transaction — long enough to
+    /// hold that connection and the locks those rows take while every concurrent
+    /// request waited for a connection.
     #[test]
     fn price_rows_count_toward_the_row_ceiling() {
         let mut b = bundle(vec![port("p1", vec![asset("a1", vec![])])]);

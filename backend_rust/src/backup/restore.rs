@@ -13,8 +13,8 @@
 //!
 //! [`plan_for`] is the read half: it is what the user is shown before a restore is
 //! allowed, so its numbers are the promise [`apply`] has to keep. [`apply`] is the
-//! write half, and it keeps that promise inside a single `pool.begin()` — every
-//! insert and every delete commits together or not at all.
+//! write half, and it keeps that promise inside a single `SERIALIZABLE` transaction —
+//! every insert and every delete commits together or not at all.
 
 use crate::backup::export::{DbFailure, classify};
 use crate::backup::{BackupConfig, Bundle};
@@ -205,9 +205,25 @@ impl From<DbFailure> for ApplyError {
 
 /// Apply a bundle.
 ///
-/// **One transaction**: every insert and, for `replace`, every delete happens inside
-/// it, so a bundle that fails on row 201 leaves the database exactly as it was.
-/// Partial application is not a state this feature can produce.
+/// **One `SERIALIZABLE` transaction**: every insert and, for `replace`, every delete
+/// happens inside it, so a bundle that fails on row 201 leaves the database exactly as
+/// it was. Partial application is not a state this feature can produce.
+///
+/// `SERIALIZABLE` and not the server default, and that is load-bearing: `replace` reads
+/// the caller's rows to delete them, and under READ COMMITTED two restores for the same
+/// caller interleave. Measured at the server default, the loser either finishes anyway
+/// — the caller silently ends up with both restores' rows — or its `DELETE FROM assets`
+/// runs against a set the winner already replaced and fails `23503` on
+/// `transactions_asset_id_fkey`, which is a `500` for a race the caller cannot see.
+/// Neither is a defensible answer to "two people pressed restore". At `SERIALIZABLE` the
+/// loser instead aborts with `40001`, which `classify` answers as a retryable `503` with
+/// `Retry-After`. `tests/restore_concurrency_test.rs` proves both halves, including the
+/// mutation that shows the default isolation level fails there.
+///
+/// The server does **not** retry the aborted transaction (spec §5.4): the caller is told
+/// when to come back instead, which is the contract #64 shipped. Predicate locking is
+/// the cost, paid by every restore and not only concurrent ones; see the measurement in
+/// the Task 7 report.
 ///
 /// Validation belongs to the caller and the route does it: `parse_and_validate` is
 /// the only path to this function over HTTP, and it refuses an unsupported version,
@@ -244,7 +260,13 @@ pub async fn apply(
         bundle.prices.len(),
     );
 
-    let mut tx = pool.begin().await.map_err(classify)?;
+    // `SERIALIZABLE`, not the server default — see the module-level note on [`apply`].
+    // `begin_with` sends the statement verbatim, so the isolation level is stated where
+    // it takes effect rather than in a `SET` that a later `pool.begin()` could undo.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .map_err(classify)?;
 
     if mode == Mode::Replace {
         // Reverse dependency order, scoped by `owner_id` and by nothing else: no
