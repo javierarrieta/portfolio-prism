@@ -152,6 +152,9 @@ pub struct BundleAsset {
     pub bundle_ref: String,
     pub symbol: String,
     pub name: String,
+    /// One of the asset types the application produces. The `enum` in the generated
+    /// artifact comes from the same constant the server validates against.
+    #[schemars(schema_with = "asset_type_schema")]
     pub asset_type: String,
     pub sector: Option<String>,
     pub currency: String,
@@ -162,6 +165,9 @@ pub struct BundleAsset {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BundleTransaction {
+    /// One of the transaction types the engines replay. The `enum` in the generated
+    /// artifact comes from the same constant the server validates against.
+    #[schemars(schema_with = "transaction_type_schema")]
     pub r#type: String,
     /// Decimal as a string, matching the TEXT column and `models::Transaction`.
     pub quantity: String,
@@ -180,12 +186,63 @@ pub struct BundlePrice {
     pub close_price: String,
 }
 
-/// The asset types the tax engine recognises. An unknown value is a validation
-/// error, not a row that silently never matches.
-pub const KNOWN_ASSET_TYPES: &[&str] = &["STOCK", "FUND", "ETF", "BOND", "CASH"];
+/// The asset types the application produces, and the only ones a bundle may carry.
+///
+/// This is the app's vocabulary, not a guess at one: `AssetType` in
+/// `frontend/src/types.ts`, offered verbatim by the create-asset dropdown
+/// (`frontend/src/components/PortfolioDetail.tsx`) and returned by the backend's own
+/// ISIN lookup (`api_routes::lookup`).
+///
+/// Deliberately **not** a permissive superset. It used to read
+/// `["STOCK", "FUND", "ETF", "BOND", "CASH"]`: three of those five are unreachable
+/// from the app, while `CRYPTO` and `MUTUAL_FUND` — which the app produces from the
+/// dropdown, from the ISIN lookup, and from its own demonstration portfolio
+/// (`frontend/src/App.tsx`) — were missing. Export copies `asset_type` verbatim and
+/// never validates it, so a portfolio holding either type exported cleanly and then
+/// 422s on restore: after the user is already holding the file. A set that does not
+/// describe the app is worse than no set, because it fails at the worst moment.
+///
+/// The residual gap, stated rather than hidden: `create_asset` stores any uppercased
+/// string with no membership check (`api_routes::transactions.rs:75`), so a caller
+/// who posts `asset_type: "BOND"` directly can still write a row whose bundle will
+/// not restore. That is the spec's chosen rule — "an unknown value is a validation
+/// error, not a row that silently never matches" — and closing it means constraining
+/// `create_asset`, which is a different feature's decision.
+pub const KNOWN_ASSET_TYPES: &[&str] = &["STOCK", "CRYPTO", "ETF", "MUTUAL_FUND"];
 
-/// The transaction types the tax engine replays.
-pub const KNOWN_TRANSACTION_TYPES: &[&str] = &["BUY", "SELL", "SPLIT", "DIVIDEND"];
+/// The transaction types the engines replay — `tax_engine.rs` and `stats_engine.rs`
+/// branch on exactly these three, and `TransactionType` in `frontend/src/types.ts`
+/// offers exactly these three.
+///
+/// `DIVIDEND` used to be listed here and nothing in the application writes it:
+/// `docs/superpowers/specs/2026-11-09-tax-report-and-statement-design.md` rules
+/// dividends out explicitly ("The app does not record them"). Dead vocabulary in a
+/// persisted format contract is what this module's version policy exists to avoid.
+pub const KNOWN_TRANSACTION_TYPES: &[&str] = &["BUY", "SELL", "SPLIT"];
+
+/// A JSON Schema string restricted to `values`, for [`asset_type_schema`] and
+/// [`transaction_type_schema`].
+fn enumerated_string(values: &[&str]) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({ "type": "string", "enum": values }))
+        .expect("an array of strings is a JSON Schema")
+}
+
+/// The `asset_type` schema, built from [`KNOWN_ASSET_TYPES`] rather than written out.
+///
+/// `schema_with` is a derive feature of the `schemars` dependency this module already
+/// has, so the artifact enumerates the *same* set `collect()` enforces instead of
+/// carrying a second list that can drift from it. Before this, `v1.json` declared
+/// `asset_type` as a bare `"type": "string"` while the spec claimed "the schema
+/// enumerates them".
+fn asset_type_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    enumerated_string(KNOWN_ASSET_TYPES)
+}
+
+/// The `transaction.type` schema, from [`KNOWN_TRANSACTION_TYPES`], for the same
+/// reason as [`asset_type_schema`].
+fn transaction_type_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    enumerated_string(KNOWN_TRANSACTION_TYPES)
+}
 
 /// Total rows a restore has to write for this bundle, against `MAX_BUNDLE_ROWS`.
 ///
@@ -395,6 +452,27 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
                 for (field, value) in [("quantity", &t.quantity), ("price", &t.price), ("fee", &t.fee)] {
                     if rust_decimal::Decimal::from_str_exact(value).is_err() {
                         push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                    }
+                }
+                // A SPLIT is a ratio, not a trade, and the ordinary write path refuses
+                // one whose quantity or price is not positive
+                // (`api_routes::transactions::create_transaction`, which answers 400).
+                // A restore must not accept a row the write path would reject.
+                //
+                // The impact of not checking is silent rather than corrupting —
+                // `tax_engine::replay` guards `tx_qty > 0 && denominator > 0`, so a
+                // zero or negative SPLIT is a no-op on the lots — which is exactly why
+                // it belongs here: nothing downstream would ever report it. Only rows
+                // that parsed are compared, so a non-decimal is reported once, as the
+                // parse failure it is.
+                if t.r#type == "SPLIT" {
+                    for (field, value) in [("quantity", &t.quantity), ("price", &t.price)] {
+                        if let Ok(d) = rust_decimal::Decimal::from_str_exact(value)
+                            && d <= rust_decimal::Decimal::ZERO
+                        {
+                            push(format!("{tp}.{field}"),
+                                format!("{value:?} must be greater than zero for a SPLIT"));
+                        }
                     }
                 }
                 match chrono::DateTime::parse_from_rfc3339(&t.date) {
@@ -762,8 +840,11 @@ mod tests {
 
     #[test]
     fn an_unknown_asset_type_or_transaction_type_is_rejected() {
+        // Values from outside the app's vocabulary. `CRYPTO` and `MUTUAL_FUND` used to
+        // be the examples here, which is how the set that refused them survived: a
+        // test that asserts the app's own asset types are invalid cannot fail.
         let mut a = asset("a1", vec![tx("", "BUY", "1.0", "1.0", "2024-01-15T00:00:00Z")]);
-        a.asset_type = "CRYPTO".into();
+        a.asset_type = "ROTTEN".into();
         let errs = validate(&bundle(vec![port("p1", vec![a])]));
         assert!(errs.iter().any(|e| e.path.ends_with(".asset_type")
             && e.reason.contains("is not one of")), "{errs:?}");
@@ -774,6 +855,76 @@ mod tests {
         let errs = validate(&b);
         assert!(errs.iter().any(|e| e.path.ends_with(".transactions[0].type")
             && e.reason.contains("is not one of")), "{errs:?}");
+    }
+
+    /// Every asset type the application can produce must validate, because export
+    /// copies `asset_type` out of the database without checking it: a type the app
+    /// writes and restore refuses is a file the user cannot restore.
+    #[test]
+    fn every_asset_type_the_app_can_produce_validates() {
+        for kind in ["STOCK", "CRYPTO", "ETF", "MUTUAL_FUND"] {
+            let mut a = asset("a1", vec![]);
+            a.asset_type = kind.into();
+            assert_eq!(
+                validate(&bundle(vec![port("p1", vec![a])])),
+                Vec::<ValidationError>::new(),
+                "{kind} is produced by the app (frontend/src/types.ts, lookup.rs) and must restore"
+            );
+        }
+        // The set is the app's vocabulary and nothing else: `FUND`, `BOND` and `CASH`
+        // were listed here while nothing could produce them, which is the half of the
+        // bug this constant now fixes.
+        assert_eq!(KNOWN_ASSET_TYPES, ["STOCK", "CRYPTO", "ETF", "MUTUAL_FUND"]);
+        assert_eq!(KNOWN_TRANSACTION_TYPES, ["BUY", "SELL", "SPLIT"]);
+    }
+
+    /// A SPLIT is a ratio, and the ordinary write path refuses one whose quantity or
+    /// price is not positive (`api_routes::transactions.rs`). Both boundaries, on both
+    /// fields, plus the positive controls that keep the rule from being `<= 0` widened
+    /// to "everything".
+    #[test]
+    fn a_split_must_have_a_positive_quantity_and_price() {
+        let split = |qty: &str, price: &str| {
+            validate(&bundle(vec![port("p1", vec![asset("a1", vec![
+                tx("", "SPLIT", qty, price, "2024-01-15T00:00:00Z"),
+            ])])]))
+        };
+
+        for (qty, price, field) in [
+            ("0", "2", "quantity"),
+            ("-1", "2", "quantity"),
+            ("0.0", "2", "quantity"),
+            ("2", "0", "price"),
+            ("2", "-0.5", "price"),
+        ] {
+            let errs = split(qty, price);
+            assert_eq!(errs.len(), 1, "{qty} : {price} -> {errs:?}");
+            assert!(
+                errs[0].path.ends_with(format!(".transactions[0].{field}").as_str()),
+                "{qty} : {price} -> {errs:?}"
+            );
+            assert!(errs[0].reason.contains("greater than zero"), "{errs:?}");
+        }
+
+        // Positive controls: a real ratio, including a fractional one (a reverse
+        // split), and a zero *fee*, which the write path stores for every SPLIT.
+        for (qty, price) in [("2", "1"), ("0.5", "1"), ("1", "3") ] {
+            assert_eq!(split(qty, price), Vec::<ValidationError>::new(), "{qty} : {price}");
+        }
+
+        // A BUY is not a ratio and is not held to the rule: a zero-quantity BUY is
+        // what the write path calls a no-op, not a refusal.
+        assert_eq!(
+            validate(&bundle(vec![port("p1", vec![asset("a1", vec![
+                tx("", "BUY", "0", "0", "2024-01-15T00:00:00Z"),
+            ])])])),
+            Vec::<ValidationError>::new()
+        );
+
+        // A non-decimal is reported once, as the parse failure it is, not twice.
+        let errs = split("abc", "1");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].reason.contains("not a valid decimal"), "{errs:?}");
     }
 
     #[test]

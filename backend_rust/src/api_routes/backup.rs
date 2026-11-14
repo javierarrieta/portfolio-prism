@@ -220,6 +220,7 @@ fn parse_query_flag(raw: Option<&str>) -> Option<bool> {
         (status = 200, description = "The bundle; see docs/backup-schema/v1.json for its shape", body = serde_json::Value),
         (status = 404, description = "A portfolio id is not yours", body = serde_json::Value),
         (status = 422, description = "No portfolio selected; `portfolio_ids` or `include_prices` given more than once; an id that did not parse; an `include_prices` value that means neither on nor off; or a selection over the row or byte ceiling", body = serde_json::Value),
+        (status = 500, description = "The read failed for a reason that is not a lock", body = serde_json::Value),
         (status = 503, description = "The database is busy", body = serde_json::Value),
     )
 )]
@@ -282,6 +283,9 @@ pub async fn export(
             // (`an_exhausted_pool_is_a_lock_not_an_outage`) and the response a `Lock`
             // becomes (`a_lock_is_a_503_that_says_when_to_retry`).
             DbFailure::Lock => lock_response(),
+            // The id was authorised and the row is gone: a delete landed in between.
+            // Permanent, so it is a `404` and not a retryable `503`.
+            DbFailure::Missing => fail(Status::NotFound, "portfolio not found"),
             DbFailure::Other => fail(DbFailure::Other.status(),
                 "could not read the portfolio data"),
         })?;
@@ -349,6 +353,7 @@ fn too_large() -> BackupError {
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),
+        (status = 500, description = "The read of the caller's current data failed for a reason that is not a lock", body = serde_json::Value),
         (status = 503, description = "The database is busy", body = serde_json::Value),
     )
 )]
@@ -397,6 +402,10 @@ pub async fn preview(
         .await
         .map_err(|e| match e {
             DbFailure::Lock => lock_response(),
+            // Not produced on this path — nothing in a bundle names a server-side row —
+            // but `DbFailure` is shared with `export`, and a catch-all arm would let a
+            // future variant answer the wrong status silently.
+            DbFailure::Missing => fail(Status::NotFound, "portfolio not found"),
             DbFailure::Other => fail(
                 DbFailure::Other.status(),
                 "could not read the current data",
@@ -502,6 +511,9 @@ pub async fn restore(
             "this bundle contains price history and this server has price restore disabled",
         ),
         ApplyError::Db(DbFailure::Lock) => lock_response(),
+        // As in `preview`: unreachable from this path, and named rather than swallowed
+        // by a catch-all.
+        ApplyError::Db(DbFailure::Missing) => fail(Status::NotFound, "portfolio not found"),
         ApplyError::Db(DbFailure::Other) => fail(
             DbFailure::Other.status(),
             "restore failed; nothing was written",

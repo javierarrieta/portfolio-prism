@@ -656,6 +656,57 @@ async fn a_locked_database_is_a_503_with_retry_after_from_the_restore_route() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[tokio::test]
+async fn a_read_only_export_does_not_queue_behind_a_writer() {
+    // `export::build` wraps its reads in a **deferred** transaction, and this pins the
+    // deferred half of that choice: a writer holding a write transaction open (RESERVED
+    // under the rollback journal this app runs, `main.rs`) must not turn a read-only
+    // export into a 503. Changing `pool.begin()` to `pool.begin_with("BEGIN IMMEDIATE")`
+    // — the "hardening" this exists to prevent — makes the export wait out
+    // `busy_timeout` for a write lock no read needs, and fails here.
+    //
+    // What this test cannot pin, said plainly rather than glossed: that the reads are in
+    // a transaction at all. Uncommitted data is invisible to a reader either way, and no
+    // test can commit at a chosen moment *between* two of `build`'s queries. The
+    // snapshot is a property of the transaction `build` opens, and it is the transaction
+    // that carries it, not anything observable from outside.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "portfolio_export_reader_{}_{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let pool = file_pool(&tmp).await;
+    let (one, _) = seed_two_portfolios(&pool).await;
+
+    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp)).await.unwrap();
+    let mut holder = holder_pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *holder).await.unwrap();
+    sqlx::query("UPDATE portfolios SET name = 'Renamed mid-flight' WHERE id = ?")
+        .bind(one)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let c = client(pool.clone()).await;
+    let path = format!("/api/backup/export?portfolio_ids={one}");
+    let res = c.get(&path).header(session()).dispatch().await;
+    let status = res.status();
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(status, Status::Ok, "a reader must not queue behind a writer: {body}");
+    assert_eq!(
+        body["portfolios"][0]["name"], "One",
+        "and an uncommitted rename must not be half-visible"
+    );
+
+    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+    drop(holder);
+    holder_pool.close().await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp);
+}
+
 // ---------------------------------------------------------------------------
 // Preview.
 //
@@ -1032,6 +1083,30 @@ async fn preview_reports_the_price_section_and_warns_about_a_replace() {
 }
 
 #[tokio::test]
+async fn a_replace_plan_names_the_split_sync_rows_it_clears() {
+    // `Counts` has three fields because a bundle has rows in three tables. `replace`
+    // clears a fourth: `split_sync` throttle rows, whose `asset_id` carries no foreign
+    // key, so they are deleted explicitly rather than cascaded. A plan that
+    // under-reports what it is about to delete is the one thing a preview must not do,
+    // and the delete set is not visible in the counts (`restore::plan_for`).
+    let pool = setup_db(&disabled_config()).await;
+    let one = seed_portfolio(&pool, common::DEFAULT_USER, "One", "USD").await;
+    let asset = seed_asset(&pool, one, "AAPL", "Apple").await;
+    common::seed_split_sync(&pool, asset).await;
+    let c = client(pool).await;
+
+    let res = c.post("/api/backup/preview?mode=replace").header(session())
+        .header(rocket::http::ContentType::JSON).body(bundle_json("Restored")).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let warnings: Value = res.into_json().await.unwrap();
+    let warnings = warnings["warnings"].as_array().unwrap().clone();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("split-sync")),
+        "the plan must say the throttle rows go too: {warnings:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_preview_describes_only_the_caller_s_own_rows() {
     // Cross-tenant: a bundle names portfolios by bundle-local refs, which are labels
     // and never database ids, so a bundle cannot address another user's rows — and
@@ -1195,6 +1270,91 @@ async fn a_round_trip_through_export_and_restore_is_lossless() {
     assert_eq!(original, reexported);
 }
 
+/// An asset row of a caller-chosen type. `common::seed_asset` hard-codes `STOCK`,
+/// and every fixture in this file goes through it or through `bundle_json`, which also
+/// says `STOCK` — which is exactly how the suite stayed green while restore refused the
+/// two asset types the application produces.
+async fn seed_asset_type(
+    pool: &sqlx::SqlitePool,
+    portfolio_id: i32,
+    symbol: &str,
+    name: &str,
+    asset_type: &str,
+) -> i32 {
+    let (id,): (i32,) = sqlx::query_as(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
+         VALUES (?, ?, ?, ?, 'USD') RETURNING id",
+    )
+    .bind(portfolio_id)
+    .bind(symbol)
+    .bind(name)
+    .bind(asset_type)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
+    // The bug this pins: `KNOWN_ASSET_TYPES` listed `FUND`, `BOND` and `CASH` — none of
+    // which anything in the application can produce — and omitted `CRYPTO` and
+    // `MUTUAL_FUND`, which it produces from the create-asset dropdown
+    // (`frontend/src/components/PortfolioDetail.tsx`), from the ISIN lookup
+    // (`api_routes/lookup.rs`), and from its own demonstration portfolio
+    // (`frontend/src/App.tsx`). Export copies `asset_type` out of the database without
+    // checking it, so the failure surfaced as a `422` on **restore** — after the user
+    // was already holding the file, which is the one moment a backup must not fail.
+    let source = setup_db(&disabled_config()).await;
+    let pid = seed_portfolio(&source, common::DEFAULT_USER, "Mixed", "USD").await;
+    let crypto = seed_asset_type(&source, pid, "BTC-USD", "Bitcoin", "CRYPTO").await;
+    let fund = seed_asset_type(&source, pid, "VWRL", "Vanguard Global Stock", "MUTUAL_FUND").await;
+    seed_transaction(&source, crypto, "BUY", 0.5, 40000.0, 0.0).await;
+    seed_transaction(&source, fund, "BUY", 10.0, 100.0, 1.0).await;
+
+    let exported: String = {
+        let c = Client::tracked(build_rocket(source.clone(), common::DEFAULT_USER)).await.unwrap();
+        let path = format!("/api/backup/export?portfolio_ids={pid}");
+        c.get(&path).header(session()).dispatch().await.into_string().await.unwrap()
+    };
+    // The bundle really does carry both types, so the restore below cannot pass by
+    // having exported a bundle that dropped them.
+    let parsed: Value = serde_json::from_str(&exported).unwrap();
+    let exported_types: Vec<&str> = parsed["portfolios"][0]["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["asset_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(exported_types, vec!["CRYPTO", "MUTUAL_FUND"], "{exported}");
+
+    let target = setup_db(&disabled_config()).await;
+    let c = Client::tracked(build_rocket(target.clone(), common::DEFAULT_USER)).await.unwrap();
+    let res = c.post("/api/backup/restore?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(exported).dispatch().await;
+    let status = res.status();
+    let text = res.into_string().await.unwrap();
+    assert_eq!(status, Status::Ok, "a bundle the app exported must restore: {text}");
+
+    // And the types survived the write rather than being coerced to something safe.
+    // The new portfolio's id comes from the response: a restore mints ids, and the
+    // target's numbering is the target's own.
+    let new_id: i32 = serde_json::from_str::<Value>(&text).unwrap()["portfolio_ids"][0]
+        .as_i64()
+        .expect("the outcome names the portfolio it created") as i32;
+    let stored: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT asset_type FROM assets WHERE portfolio_id = ? ORDER BY symbol",
+    )
+    .bind(new_id)
+    .fetch_all(&target)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(t,)| t)
+    .collect();
+    assert_eq!(stored, vec!["CRYPTO", "MUTUAL_FUND"]);
+}
+
 #[tokio::test]
 async fn a_restored_portfolio_produces_the_same_tax_result() {
     // Proves the rewiring is semantically right, not just present: the tax engine
@@ -1224,6 +1384,114 @@ async fn a_restored_portfolio_produces_the_same_tax_result() {
     let restored: Value = c.get(&path)
         .header(session()).dispatch().await.into_json().await.unwrap();
     assert_eq!(original, restored);
+}
+
+#[tokio::test]
+async fn restore_refuses_a_split_the_ordinary_write_path_refuses() {
+    // A SPLIT is a ratio, and `create_transaction` answers a SPLIT with a non-positive
+    // quantity or price with a 400. A restore must not accept a row the ordinary write
+    // path would reject — and the impact of *not* refusing is silent: `tax_engine::replay`
+    // guards `tx_qty > 0 && denominator > 0`, so a zero-quantity SPLIT is a no-op on
+    // the lots and nothing downstream would ever report it.
+    let pool = setup_db(&disabled_config()).await;
+    seed_two_portfolios(&pool).await;
+    let before = rows(&pool).await;
+    let c = client(pool.clone()).await;
+
+    let split = |qty: &str, price: &str| -> String {
+        let mut v = bundle_value("Split");
+        v["portfolios"][0]["assets"][0]["transactions"] = json!([{
+            "type": "SPLIT", "quantity": qty, "price": price, "fee": "0",
+            "date": "2024-01-15T00:00:00Z"
+        }]);
+        v.to_string()
+    };
+
+    for (qty, price) in [("0", "2"), ("-1", "2"), ("2", "0"), ("2", "-0.5")] {
+        let res = c.post("/api/backup/restore?mode=copy").header(session())
+            .header(rocket::http::ContentType::JSON).body(split(qty, price)).dispatch().await;
+        let status = res.status();
+        let body: Value = res.into_json().await.unwrap();
+        assert_eq!(status, Status::UnprocessableEntity, "{qty} : {price} -> {body}");
+        assert!(
+            body["errors"].to_string().contains("greater than zero"),
+            "{qty} : {price} -> {body}"
+        );
+    }
+    assert_eq!(rows(&pool).await, before, "every refusal above wrote nothing");
+
+    // Positive control: a real ratio restores, so the four refusals are the boundary
+    // and not a blanket ban on SPLIT rows. A fractional quantity is a reverse split and
+    // is legal.
+    let res = c.post("/api/backup/restore?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(split("2", "1")).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
+}
+
+#[tokio::test]
+async fn a_split_is_stored_with_no_fee_as_the_write_path_stores_it() {
+    // `create_transaction` stores zero for a SPLIT's fee whatever the caller sent
+    // (`transactions.rs:215`) and the tax engine never reads one, so a hand-authored
+    // bundle must not be able to store a value the application itself cannot produce.
+    // Normalised rather than refused: refusing it would reject a bundle the write path
+    // accepts, which is the mirror image of the rule above.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool.clone()).await;
+
+    let mut v = bundle_value("Split fee");
+    v["portfolios"][0]["assets"][0]["transactions"] = json!([{
+        "type": "SPLIT", "quantity": "2", "price": "1", "fee": "99.00",
+        "date": "2024-01-15T00:00:00Z"
+    }]);
+    let res = c.post("/api/backup/restore?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok);
+    let body: Value = res.into_json().await.unwrap();
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+
+    let fee: (String,) = sqlx::query_as(
+        "SELECT t.fee FROM transactions t WHERE t.asset_id IN \
+         (SELECT id FROM assets WHERE portfolio_id = ?)",
+    )
+    .bind(new_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rust_decimal::Decimal::from_str_exact(&fee.0)
+            .unwrap_or_else(|e| panic!("{fee:?} is not a decimal: {e}")),
+        rust_decimal::Decimal::ZERO,
+        "a SPLIT's fee is stored as the write path stores it, not as the bundle spelled it"
+    );
+}
+
+#[tokio::test]
+async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() {
+    // `is_valid_isin` upper-cases internally, so a lowercase ISIN validates — and
+    // `create_asset` stores `to_uppercase()` (`transactions.rs:78`) while restore used
+    // to store the bundle's bytes verbatim. A hand-authored bundle could therefore
+    // create a row the ordinary path would never have produced, and one that slips past
+    // the ISIN uniqueness check at `transactions.rs:50-56`: two rows for one security.
+    let pool = setup_db(&disabled_config()).await;
+    let c = client(pool.clone()).await;
+
+    let mut v = bundle_value("Lowercase isin");
+    v["portfolios"][0]["assets"][0]["isin"] = json!("us0378331005");
+    let res = c.post("/api/backup/restore?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok, "a lowercase ISIN is a valid ISIN");
+    let body: Value = res.into_json().await.unwrap();
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+
+    let isin: (Option<String>,) = sqlx::query_as(
+        "SELECT isin FROM assets WHERE portfolio_id = ?",
+    )
+    .bind(new_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(isin.0.as_deref(), Some("US0378331005"));
 }
 
 #[tokio::test]
@@ -1831,15 +2099,29 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     let bundle = parse_and_validate(bundle.to_string().as_bytes())
         .expect("the fixture is a valid bundle");
 
-    let err = backup_restore::apply(
-        &pool,
-        common::DEFAULT_USER,
-        &bundle,
-        Mode::Copy,
-        true,
-        &BackupConfig { allow_price_restore: true },
+    // Bounded on purpose. The mutation this test exists to catch — the price loop
+    // running on the **pool** instead of on `&mut *tx` — does not fail, it *hangs*: the
+    // insert waits on the write lock the still-open transaction holds, and shared-cache
+    // unlock-notify is not bounded by `busy_timeout`. A guard that fails by hanging gets
+    // retried and skimmed rather than read, so the wait is bounded and the mutant fails
+    // with the message below instead. Far longer than two price rows ever need.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+    let err = tokio::time::timeout(
+        HANG_GUARD,
+        backup_restore::apply(
+            &pool,
+            common::DEFAULT_USER,
+            &bundle,
+            Mode::Copy,
+            true,
+            &BackupConfig { allow_price_restore: true },
+        ),
     )
     .await
+    .unwrap_or_else(|_| panic!(
+        "apply did not return within {HANG_GUARD:?} — a price insert on the pool rather than \
+         on the restore's transaction waits forever on the lock this transaction holds"
+    ))
     .expect_err("a price row the database itself refuses stops the write");
     assert!(matches!(err, ApplyError::Db(DbFailure::Other)), "{err:?}");
     assert_eq!(

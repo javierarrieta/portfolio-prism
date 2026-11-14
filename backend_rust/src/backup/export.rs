@@ -18,6 +18,12 @@ use crate::backup::{
 #[derive(Debug)]
 pub enum DbFailure {
     Lock,
+    /// A row the caller was authorised for is no longer there: `access::require`
+    /// cleared the id and the read that followed found nothing, so a delete landed in
+    /// between. Not retryable — the portfolio is not coming back — so it answers `404`,
+    /// not a `503` with a `Retry-After` promising otherwise. Only `export::build`
+    /// produces it; nothing that reads a bundle can name a server-side row.
+    Missing,
     Other,
 }
 
@@ -25,6 +31,7 @@ impl DbFailure {
     pub fn status(&self) -> rocket::http::Status {
         match self {
             DbFailure::Lock => rocket::http::Status::ServiceUnavailable,
+            DbFailure::Missing => rocket::http::Status::NotFound,
             DbFailure::Other => rocket::http::Status::InternalServerError,
         }
     }
@@ -79,8 +86,40 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 /// Build a bundle for exactly `portfolio_ids`, which the caller has already been
 /// authorised for. Order follows the order requested, so the file matches what the
 /// user ticked.
+///
+/// **Every read runs inside one deferred read transaction**, because the product is a
+/// point-in-time copy. On the pool each query is its own implicit transaction, so a
+/// commit landing between the portfolio read and the per-asset transaction reads
+/// yields a bundle that straddles two database states — a portfolio row from one
+/// moment and its transactions from a later one. `restore::apply` has always been one
+/// transaction; export being one too is the same promise seen from the other side.
+///
+/// Deferred, not `BEGIN IMMEDIATE`, and that is load-bearing rather than incidental:
+/// this app runs SQLite on the rollback journal with a 5 s `busy_timeout`
+/// (`main.rs`), where a deferred read transaction takes a `SHARED` lock on its first
+/// read. A concurrent writer still gets `RESERVED` and keeps working; only its final
+/// `EXCLUSIVE` upgrade waits for the export to finish, and the export is a handful of
+/// indexed reads. `BEGIN IMMEDIATE` would instead queue the export behind every
+/// writer and answer a busy database with a `503` on a route that only reads —
+/// `a_read_only_export_does_not_queue_behind_a_writer` is what fails if someone
+/// "hardens" it that way.
 pub async fn build(
     pool: &SqlitePool,
+    portfolio_ids: &[i32],
+    include_prices: bool,
+) -> Result<Bundle, DbFailure> {
+    let mut tx = pool.begin().await.map_err(classify)?;
+    let bundle = build_in(&mut tx, portfolio_ids, include_prices).await?;
+    // A read-only commit: nothing was written, and ending the transaction is what
+    // releases the `SHARED` lock the reads above are holding.
+    tx.commit().await.map_err(classify)?;
+    Ok(bundle)
+}
+
+/// The reads themselves, on a transaction [`build`] opened. Separate from `build` so
+/// the transaction's scope is three lines and impossible to widen by accident.
+async fn build_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     portfolio_ids: &[i32],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
@@ -92,17 +131,17 @@ pub async fn build(
             "SELECT name, description, currency, base_currency FROM portfolios WHERE id = ?",
         )
         .bind(*id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(classify)?;
 
         let Some((name, description, currency, base_currency)) = row else {
             // `require` already cleared this id; a row vanishing underneath us is a
-            // concurrent delete, not a denial.
-            return Err(DbFailure::Lock);
+            // concurrent delete, not a denial, and not something a retry fixes.
+            return Err(DbFailure::Missing);
         };
 
-        let assets = assets_for(pool, *id).await?;
+        let assets = assets_for(&mut *tx, *id).await?;
         for a in &assets {
             symbols.insert(a.symbol.clone());
         }
@@ -117,7 +156,7 @@ pub async fn build(
     }
 
     let prices = if include_prices {
-        prices_for(pool, &symbols).await?
+        prices_for(&mut *tx, &symbols).await?
     } else {
         Vec::new()
     };
@@ -183,13 +222,16 @@ type AssetRow = (i32, String, String, String, Option<String>, String, Option<Str
 /// One `transactions` row, in the order `assets_for` names its columns.
 type TransactionRow = (String, String, String, String, chrono::DateTime<Utc>);
 
-async fn assets_for(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<BundleAsset>, DbFailure> {
+async fn assets_for(
+    conn: &mut sqlx::SqliteConnection,
+    portfolio_id: i32,
+) -> Result<Vec<BundleAsset>, DbFailure> {
     let rows: Vec<AssetRow> = sqlx::query_as(
         "SELECT id, symbol, name, asset_type, sector, currency, isin \
          FROM assets WHERE portfolio_id = ? ORDER BY id",
     )
     .bind(portfolio_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(classify)?;
 
@@ -200,7 +242,7 @@ async fn assets_for(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<BundleAs
              WHERE asset_id = ? ORDER BY date, id",
         )
         .bind(id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(classify)?;
 
@@ -228,7 +270,7 @@ async fn assets_for(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<BundleAs
 }
 
 async fn prices_for(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     symbols: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<BundlePrice>, DbFailure> {
     let mut out = Vec::new();
@@ -241,7 +283,7 @@ async fn prices_for(
              WHERE symbol = ? ORDER BY date",
         )
         .bind(symbol)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(classify)?;
 
@@ -427,6 +469,19 @@ mod tests {
     fn a_lock_is_retryable_and_anything_else_is_an_outage() {
         assert_eq!(DbFailure::Lock.status(), Status::ServiceUnavailable);
         assert_eq!(DbFailure::Other.status(), Status::InternalServerError);
+    }
+
+    /// A portfolio that vanished between `access::require` and the read that follows is
+    /// permanent, so answering it as a `Lock` — which this did — tells the caller to
+    /// retry something that will never succeed, with a `Retry-After` header to match.
+    #[test]
+    fn a_row_that_vanished_is_gone_not_busy() {
+        assert_eq!(DbFailure::Missing.status(), Status::NotFound);
+        assert_ne!(
+            DbFailure::Missing.status(),
+            DbFailure::Lock.status(),
+            "a permanent condition must not share a status with a retryable one"
+        );
     }
 
     #[test]

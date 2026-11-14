@@ -35,6 +35,20 @@
 #   * Rule A's pass test is still file-level: one `require*` call anywhere in a file
 #     satisfies it for every handler in that file. The marker is per handler; the
 #     pass branch is not. Rule B is what pins the ordering per handler.
+#   * The three rules compose into a hole no single rule has: a handler that takes an id
+#     from a query string, a form field or a JSON body and never calls `require*` passes
+#     Rule A (a sibling in the same file calls it), Rule B (no `WHERE id` text to order)
+#     and Rule C (it takes `AuthedUser`). `api_routes/backup.rs` is the live example —
+#     `preview` and `restore` carry no marker and call no `require`, and clear Rule A
+#     through `export`'s call. A fifth route in that file that forgot the chokepoint
+#     would pass all three. The isolation matrix (`tests/isolation_test.rs`) is the
+#     gate for that shape, not this script.
+#   * All three rules anchor on a route attribute in column 0 (`^#\[(get|post|...)`), so
+#     an **indented** route attribute is invisible to every rule: not flagged, not
+#     counted, not printed. No handler is indented today (all 20 in `src/api_routes` are
+#     at column 0); a new one that is would be silently ungatechecked rather than
+#     failing. Fixing the anchor is a one-character change to each awk pattern; it is
+#     listed here so the gap is the script's known limit and not a discovery.
 #   * The marker's claim is cross-checked against the route path only, and by shape
 #     rather than spelling: any path parameter at all contradicts it, because the
 #     claim is "no caller-supplied id", not "no id-named id". A handler that takes an

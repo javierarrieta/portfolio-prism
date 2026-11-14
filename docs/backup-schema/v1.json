@@ -4,6 +4,13 @@
       "additionalProperties": false,
       "properties": {
         "asset_type": {
+          "description": "One of the asset types the application produces. The `enum` in the generated\nartifact comes from the same constant the server validates against.",
+          "enum": [
+            "STOCK",
+            "CRYPTO",
+            "ETF",
+            "MUTUAL_FUND"
+          ],
           "type": "string"
         },
         "currency": {
@@ -125,6 +132,12 @@
           "type": "string"
         },
         "type": {
+          "description": "One of the transaction types the engines replay. The `enum` in the generated\nartifact comes from the same constant the server validates against.",
+          "enum": [
+            "BUY",
+            "SELL",
+            "SPLIT"
+          ],
           "type": "string"
         }
       },

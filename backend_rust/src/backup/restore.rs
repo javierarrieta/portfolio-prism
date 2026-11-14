@@ -139,6 +139,18 @@ pub async fn plan_for(
             delete.portfolios
         ));
     }
+    if mode == Mode::Replace && delete.assets > 0 {
+        // `Counts` has three fields because those are the three tables a bundle has
+        // rows in. `replace` clears a fourth that a bundle says nothing about:
+        // `split_sync` throttle rows, which carry an `asset_id` with no foreign key,
+        // so they go explicitly (`apply`) rather than being stranded as orphans.
+        // Named here because a plan that under-reports what it is about to delete is
+        // the one thing a preview must not do. Gated on owning assets at all, so a
+        // caller with nothing to clear is not told about rows they have none of.
+        warnings.push(
+            "replace also clears the split-sync throttle rows for your assets".to_string(),
+        );
+    }
     if !bundle.prices.is_empty() {
         warnings.push(
             "this bundle carries price history; it is shared market data, not your data".into(),
@@ -219,6 +231,19 @@ pub async fn apply(
     if !bundle.prices.is_empty() && apply_prices && !cfg.allow_price_restore {
         return Err(ApplyError::PricesDisabled);
     }
+
+    // The spec's "restore logs the version it read". There is no second half to it
+    // yet — nothing upgrades, because `ACCEPTED_VERSIONS` holds one version — so the
+    // line names only what was read, and the upgrade half lands with the first
+    // upgrader. `eprintln!` is this codebase's logging: there is no logging macro to
+    // reach for (`access.rs`, `export.rs` and `auth/` all warn the same way).
+    eprintln!(
+        "INFO: backup: restoring schema_version {} in {} mode ({} portfolio(s), {} price row(s))",
+        bundle.schema_version,
+        mode.as_str(),
+        bundle.portfolios.len(),
+        bundle.prices.len(),
+    );
 
     let mut tx = pool.begin().await.map_err(classify)?;
 
@@ -301,7 +326,14 @@ pub async fn apply(
             .bind(&a.asset_type)
             .bind(&a.sector)
             .bind(&a.currency)
-            .bind(&a.isin)
+            // Upper-cased, because `create_asset` upper-cases (`transactions.rs:78`)
+            // and a hand-authored bundle must not be able to store a spelling the
+            // ordinary write path never produces: a lowercase ISIN would sail past the
+            // uniqueness check at `transactions.rs:50-56` and store a second row for
+            // one security. Validation already proved it is a valid ISIN, and
+            // `is_valid_isin` upper-cases internally, so this only normalises what is
+            // stored.
+            .bind(a.isin.as_ref().map(|isin| isin.to_uppercase()))
             .fetch_one(&mut *tx)
             .await
             .map_err(classify)?;
@@ -315,6 +347,13 @@ pub async fn apply(
                 let when = chrono::DateTime::parse_from_rfc3339(&t.date)
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .map_err(|_| ApplyError::Db(DbFailure::Other))?;
+                // A SPLIT carries no fee: the ordinary write path stores zero for one
+                // whatever the caller sent (`transactions.rs:215`) and the tax engine
+                // never reads a SPLIT's fee (`tax_engine.rs:775-789`). Normalised here
+                // rather than refused in `collect`, because refusing it would reject a
+                // bundle the write path accepts — the mirror-image of the rule the SPLIT
+                // quantity/price check exists to enforce.
+                let fee = if t.r#type == "SPLIT" { "0" } else { t.fee.as_str() };
                 sqlx::query(
                     "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
                      VALUES (?, ?, ?, ?, ?, ?)",
@@ -323,7 +362,7 @@ pub async fn apply(
                 .bind(&t.r#type)
                 .bind(&t.quantity)
                 .bind(&t.price)
-                .bind(&t.fee)
+                .bind(fee)
                 .bind(when)
                 .execute(&mut *tx)
                 .await

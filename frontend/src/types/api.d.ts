@@ -600,6 +600,12 @@ export interface operations {
           "application/json": unknown;
         };
       };
+      /** @description The read failed for a reason that is not a lock */
+      500: {
+        content: {
+          "application/json": unknown;
+        };
+      };
       /** @description The database is busy */
       503: {
         content: {
@@ -645,6 +651,12 @@ export interface operations {
       };
       /** @description `mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation */
       422: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The read of the caller's current data failed for a reason that is not a lock */
+      500: {
         content: {
           "application/json": unknown;
         };

@@ -40,6 +40,33 @@ mod tests {
         );
     }
 
+    /// The two fields the spec says the schema enumerates must carry an `enum`, and
+    /// carry **the same set `collect()` validates against**. That shared source is the
+    /// only automated link between the artifact and the rules: field names and
+    /// nullability come from the derive, these two come from the constants, and
+    /// everything else `collect()` enforces is prose in `docs/backup-schema/README.md`.
+    #[test]
+    fn the_artifact_enumerates_the_two_type_fields_from_the_validating_constants() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&document_json()).expect("document_json is JSON");
+        for (def, field, known) in [
+            ("BundleAsset", "asset_type", crate::backup::KNOWN_ASSET_TYPES),
+            ("BundleTransaction", "type", crate::backup::KNOWN_TRANSACTION_TYPES),
+        ] {
+            let prop = &doc["$defs"][def]["properties"][field];
+            assert_eq!(
+                prop["type"],
+                serde_json::json!("string"),
+                "{def}.{field} must stay a string in the artifact"
+            );
+            assert_eq!(
+                prop["enum"],
+                serde_json::json!(known),
+                "{def}.{field} must enumerate {known:?}, the set `collect()` enforces"
+            );
+        }
+    }
+
     #[test]
     fn the_schema_pins_the_root_required_set_and_every_nested_definition() {
         let doc: serde_json::Value =

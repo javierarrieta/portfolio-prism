@@ -166,6 +166,14 @@
               }
             }
           },
+          "500": {
+            "description": "The read failed for a reason that is not a lock",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
           "503": {
             "description": "The database is busy",
             "content": {
@@ -238,6 +246,14 @@
           },
           "422": {
             "description": "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "The read of the caller's current data failed for a reason that is not a lock",
             "content": {
               "application/json": {
                 "schema": {}
