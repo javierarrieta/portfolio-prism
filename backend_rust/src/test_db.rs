@@ -17,9 +17,13 @@
 //!   `prism_t_<pid>_<caller>`; the pid separates concurrent test binaries and
 //!   nothing inside one. A process-wide registry turns a duplicated `caller` into a
 //!   panic that names it, rather than two tests quietly sharing one database.
-//! * **The normal path leaves nothing behind.** When a test's pool is dropped its
-//!   connections close, and the next `create_database` in that process drops the
-//!   now-unreferenced database. That is the ordinary cleanup, not a sweep.
+//! * **The normal path leaves at most one database per process.** When a test's pool
+//!   is dropped its connections close, and the next `create_database` in that process
+//!   drops the now-unreferenced database. That is the ordinary cleanup, not a sweep —
+//!   and because it happens on the *next* call, the last test in a process has no next
+//!   call and its database survives. Expect roughly one binary's worth of `prism_t_%`
+//!   databases to linger after a green run; the crash sweep below removes them at the
+//!   start of the following run.
 //! * **A crash is cleaned up by the next run.** A run that is killed leaves the
 //!   databases its last few tests were holding. The first `create_database` of a
 //!   later run drops any harness database whose embedded pid is no longer a live
@@ -44,7 +48,7 @@ use std::time::{Duration, Instant};
 
 /// See the module comment. Panics rather than returning a `Result`: every caller is
 /// a test, and a failure here means the harness is broken, not the thing under test.
-pub async fn test_database(caller: &str) -> sqlx::PgPool {
+pub async fn test_pool(caller: &str) -> sqlx::PgPool {
     let (name, url) = create_database(caller).await;
     let pool = connect(&url)
         .await
@@ -73,7 +77,7 @@ pub async fn test_database(caller: &str) -> sqlx::PgPool {
 /// Because this hands out a URL instead of a pool, the harness never sees a connection
 /// appear and so never counts the database as live: it is reclaimed by the next run's
 /// crash sweep rather than by the in-run cleanup.
-pub async fn test_database_url(caller: &str) -> String {
+pub async fn test_pool_url(caller: &str) -> String {
     create_database(caller).await.1
 }
 
@@ -193,7 +197,7 @@ async fn create_database(caller: &str) -> (String, String) {
 /// How long a live database must have been idle before the reaper may take it.
 ///
 /// The backend count is the liveness signal, and it is only trustworthy once the test
-/// has had a chance to use its pool. A connection is acquired in [`test_database`]
+/// has had a chance to use its pool. A connection is acquired in [`test_pool`]
 /// before a database is marked live, and [`pool_options`] keeps idle connections open,
 /// which together close the obvious gap; this covers the rest, because "no backends" is
 /// a statement about one instant and a test that is about to run its first query also
@@ -482,9 +486,12 @@ pub fn database_url(base: &str, name: &str) -> String {
 
 /// A unique `caller` string for a helper that has one name but many callers.
 ///
-/// `tests/common::setup_db` is the reason this exists: it takes a `StartupConfig`,
-/// not a name, and there is one call per test. The counter makes each call's
-/// database distinct without every call site having to invent a string.
+/// The `src/` unit-test fixtures are the reason this exists: `access.rs`, `tax_engine.rs`,
+/// `stats_engine.rs` and `currency_service.rs` each build their database in one helper
+/// that several tests call, and a helper cannot see the name of the test above it. The
+/// counter makes each call's database distinct without every call site having to invent
+/// a string. An integration test passes its own name to [`test_pool`] instead — see
+/// `tests/common/mod.rs`, where `db_with_user` takes the caller from the test.
 pub fn next_caller(prefix: &str) -> String {
     static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     format!(

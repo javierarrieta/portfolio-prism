@@ -17,8 +17,13 @@ mod common;
 
 use backend_rust::services::currency_service::apply_split_events;
 use common::{
-    build_rocket_pricing, disabled_config, seed_asset, seed_portfolio, seed_split_sync,
-    seed_transaction_at, setup_db, MockYahoo, DEFAULT_USER,
+    MockYahoo,
+    build_rocket_pricing,
+    db_with_user,
+    seed_asset,
+    seed_portfolio,
+    seed_split_sync,
+    seed_transaction_at,
 };
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
@@ -61,13 +66,13 @@ async fn portfolio_payload(client: &Client, id: i64) -> serde_json::Value {
 /// because it is convenient.
 #[tokio::test]
 async fn a_get_no_longer_writes_split_rows() {
-    let pool = setup_db(&disabled_config()).await;
-    let port = seed_portfolio(&pool, DEFAULT_USER, "Read only", "USD").await;
+    let (pool, user) = db_with_user("a_get_no_longer_writes_split_rows").await;
+    let port = seed_portfolio(&pool, user, "Read only", "USD").await;
     let asset = seed_asset(&pool, port, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -100,13 +105,13 @@ async fn a_get_no_longer_writes_split_rows() {
 
 #[tokio::test]
 async fn post_sync_splits_records_the_split_and_reports_it() {
-    let pool = setup_db(&disabled_config()).await;
-    let port = seed_portfolio(&pool, DEFAULT_USER, "Explicit sync", "USD").await;
+    let (pool, user) = db_with_user("post_sync_splits_records_the_split_and_reports_it").await;
+    let port = seed_portfolio(&pool, user, "Explicit sync", "USD").await;
     let asset = seed_asset(&pool, port, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -132,13 +137,13 @@ async fn post_sync_splits_records_the_split_and_reports_it() {
 /// provider. This is the throttle from #38 doing its job on the new path.
 #[tokio::test]
 async fn a_second_sync_is_throttled_and_costs_no_provider_call() {
-    let pool = setup_db(&disabled_config()).await;
-    let port = seed_portfolio(&pool, DEFAULT_USER, "Twice", "USD").await;
+    let (pool, user) = db_with_user("a_second_sync_is_throttled_and_costs_no_provider_call").await;
+    let port = seed_portfolio(&pool, user, "Twice", "USD").await;
     let asset = seed_asset(&pool, port, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -166,8 +171,8 @@ async fn a_second_sync_is_throttled_and_costs_no_provider_call() {
 /// cost basis is off by the split ratio, with nothing reporting it.
 #[tokio::test]
 async fn concurrent_syncs_cannot_double_a_split() {
-    let pool = setup_db(&disabled_config()).await;
-    let port = seed_portfolio(&pool, DEFAULT_USER, "Race", "USD").await;
+    let (pool, user) = db_with_user("concurrent_syncs_cannot_double_a_split").await;
+    let port = seed_portfolio(&pool, user, "Race", "USD").await;
     let asset = seed_asset(&pool, port, SYMBOL, "Split me").await;
 
     let events = vec![(
@@ -191,13 +196,13 @@ async fn concurrent_syncs_cannot_double_a_split() {
 
 #[tokio::test]
 async fn another_user_cannot_sync_someone_elses_portfolio() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("another_user_cannot_sync_someone_elses_portfolio").await;
     let other = common::seed_user(&pool, "other@example.com").await;
     let port = seed_portfolio(&pool, other, "Not yours", "USD").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    // The client is authenticated as DEFAULT_USER, who owns nothing here.
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    // The client is authenticated as user, who owns nothing here.
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -219,13 +224,13 @@ async fn another_user_cannot_sync_someone_elses_portfolio() {
 /// asset would sit silently unsynced.
 #[tokio::test]
 async fn splits_last_synced_is_none_until_every_asset_is_synced() {
-    let pool = setup_db(&disabled_config()).await;
-    let port = seed_portfolio(&pool, DEFAULT_USER, "Staleness", "USD").await;
+    let (pool, user) = db_with_user("splits_last_synced_is_none_until_every_asset_is_synced").await;
+    let port = seed_portfolio(&pool, user, "Staleness", "USD").await;
     let a = seed_asset(&pool, port, "AAAA", "A").await;
     let b = seed_asset(&pool, port, "BBBB", "B").await;
 
     let yahoo = MockYahoo::start();
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -269,9 +274,9 @@ async fn splits_last_synced_is_none_until_every_asset_is_synced() {
 /// nothing to dedupe; what remains worth testing is that the index is there and bites.
 #[tokio::test]
 async fn the_schema_rejects_a_second_split_on_the_same_day() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_a = seed_portfolio(&pool, DEFAULT_USER, "A", "USD").await;
-    let port_b = seed_portfolio(&pool, DEFAULT_USER, "B", "USD").await;
+    let (pool, user) = db_with_user("the_schema_rejects_a_second_split_on_the_same_day").await;
+    let port_a = seed_portfolio(&pool, user, "A", "USD").await;
+    let port_b = seed_portfolio(&pool, user, "B", "USD").await;
     let asset_a = seed_asset(&pool, port_a, "AAA", "Aaa").await;
     let asset_b = seed_asset(&pool, port_b, "BBB", "Bbb").await;
 

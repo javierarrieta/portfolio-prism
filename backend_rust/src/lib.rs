@@ -160,8 +160,10 @@ pub const PLACEHOLDER_SUBJ: &str = "bootstrap";
 ///    row's id to become the caller. Without the row, `AUTH_MODE=disabled` — which
 ///    spec §10 of the Postgres design requires, and which `./start.sh` uses — has
 ///    nobody to be.
-/// 2. `tests/common::setup_db` and its `DEFAULT_USER` constant are that row. Every
-///    test that runs as the default user is running as the placeholder.
+/// 2. `tests/common::db_with_placeholder` runs this for the tests whose subject *is*
+///    the startup identity, and `tests/common::placeholder_id` reads the row's id back
+///    rather than assuming it. Every test that runs as the placeholder is running as
+///    this row.
 /// 3. `tests/startup_test.rs` pins the orphan rule below: unowned portfolios plus no
 ///    configured bootstrap subject is a refusal, not a warning.
 ///

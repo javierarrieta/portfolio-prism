@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction, setup_db};
+use common::{build_rocket, db_with_user, seed_asset, seed_portfolio, seed_transaction};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
 use backend_rust::db::DbPool;
@@ -48,7 +48,7 @@ fn json() -> Header<'static> {
 
 #[tokio::test]
 async fn b_cannot_read_a_s_portfolio_but_a_can() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_read_a_s_portfolio_but_a_can").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/portfolios/{}", u.a_portfolio);
 
@@ -61,7 +61,7 @@ async fn b_cannot_read_a_s_portfolio_but_a_can() {
 
 #[tokio::test]
 async fn b_cannot_update_or_delete_a_s_portfolio_but_a_can() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_update_or_delete_a_s_portfolio_but_a_can").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/portfolios/{}", u.a_portfolio);
     let body = r#"{"currency":"EUR"}"#;
@@ -81,7 +81,7 @@ async fn delete_of_a_foreign_empty_portfolio_is_404_not_409() {
     // The existence oracle the ordering inside `delete_portfolio` removes: a
     // non-owner must not be able to tell "exists and is empty" (409) from "does not
     // exist" (404).
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("delete_of_a_foreign_empty_portfolio_is_404_not_409").await;
     let a = common::seed_user(&pool, "user-a").await;
     let b = common::seed_user(&pool, "user-b").await;
     let empty = seed_portfolio(&pool, a, "empty but A's", "USD").await;
@@ -92,7 +92,7 @@ async fn delete_of_a_foreign_empty_portfolio_is_404_not_409() {
 
 #[tokio::test]
 async fn b_cannot_delete_a_s_asset_but_a_can() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_delete_a_s_asset_but_a_can").await;
     let u = seed_two_users(&pool).await;
     // A transaction-free asset: `delete_asset` issues a bare `DELETE FROM assets`,
     // which a foreign key rejects when transactions reference the asset. That is a
@@ -114,7 +114,7 @@ async fn deleting_an_asset_that_has_transactions_fails_today() {
     // `DELETE FROM assets` while sqlx enables `PRAGMA foreign_keys` by default, so
     // the delete is rejected and the handler reports 500. Recorded here so the
     // behaviour is visible rather than mistaken for an access-control regression.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("deleting_an_asset_that_has_transactions_fails_today").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/assets/{}", u.a_asset);
 
@@ -126,7 +126,7 @@ async fn deleting_an_asset_that_has_transactions_fails_today() {
 async fn b_cannot_write_into_a_s_asset_through_b_s_own_path() {
     // The cross-portfolio nested write: B owns `b_portfolio`, A owns `a_asset`
     // inside `a_portfolio`, and B addresses the asset through B's own path.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_write_into_a_s_asset_through_b_s_own_path").await;
     let u = seed_two_users(&pool).await;
     let b_path = format!("/api/portfolios/{}/assets/{}", u.b_portfolio, u.a_asset);
     let a_path = format!("/api/portfolios/{}/assets/{}", u.a_portfolio, u.a_asset);
@@ -141,7 +141,7 @@ async fn b_cannot_write_into_a_s_asset_through_b_s_own_path() {
 
 #[tokio::test]
 async fn b_cannot_add_an_asset_to_a_s_portfolio() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_add_an_asset_to_a_s_portfolio").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/portfolios/{}/assets", u.a_portfolio);
     let body = r#"{"symbol":"ZZZ","name":"Z","asset_type":"STOCK","sector":"","currency":"USD","isin":""}"#;
@@ -157,7 +157,7 @@ async fn b_cannot_add_an_asset_to_a_s_portfolio() {
 
 #[tokio::test]
 async fn b_cannot_write_a_transaction_into_a_s_asset() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_write_a_transaction_into_a_s_asset").await;
     let u = seed_two_users(&pool).await;
     let body = r#"{"quantity":1.0,"price":10.0,"fee":0.0,"date":"2024-01-01T00:00:00Z","type":"BUY"}"#;
     let b_path = format!("/api/portfolios/{}/assets/{}/transactions", u.b_portfolio, u.a_asset);
@@ -172,7 +172,7 @@ async fn b_cannot_write_a_transaction_into_a_s_asset() {
 
 #[tokio::test]
 async fn b_cannot_list_or_delete_a_s_transactions() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_list_or_delete_a_s_transactions").await;
     let u = seed_two_users(&pool).await;
     let list = format!("/api/portfolios/{}/transactions", u.a_portfolio);
     let del = format!("/api/transactions/{}", u.a_transaction);
@@ -188,7 +188,7 @@ async fn b_cannot_list_or_delete_a_s_transactions() {
 
 #[tokio::test]
 async fn b_cannot_read_a_s_tax_summary_performance_or_sell_pnl() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_read_a_s_tax_summary_performance_or_sell_pnl").await;
     let u = seed_two_users(&pool).await;
     let q = "strategy=FIFO&threshold_days=365";
     let paths = vec![
@@ -231,7 +231,7 @@ async fn the_list_endpoint_returns_no_foreign_rows() {
     // D-5: filtering only the portfolios query would still return B's asset rows,
     // because the assets query had no filter at all and the handler groups by
     // portfolio_id afterwards.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("the_list_endpoint_returns_no_foreign_rows").await;
     let u = seed_two_users(&pool).await;
     seed_asset(&pool, u.b_portfolio, "BBB", "Asset B").await;
 
@@ -249,7 +249,7 @@ async fn the_list_endpoint_returns_no_foreign_rows() {
 #[tokio::test]
 async fn a_nonexistent_portfolio_is_404_not_201_when_creating_an_asset() {
     // D-6: the insert used to accept any portfolio_id and create a dangling asset.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("a_nonexistent_portfolio_is_404_not_201_when_creating_an_asset").await;
     let a = common::seed_user(&pool, "user-a").await;
     let client = client_as(pool, a).await;
     let resp = client
@@ -265,7 +265,7 @@ async fn a_nonexistent_portfolio_is_404_not_201_when_creating_an_asset() {
 async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
     // What makes "email never decides ownership" enforceable rather than a comment:
     // with self-registration enabled, an email claim is claimable by anyone.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("two_users_sharing_an_email_cannot_reach_each_other_s_rows").await;
     let a = common::seed_user(&pool, "user-a").await;
     let b = common::seed_user(&pool, "user-b").await;
     for id in [a, b] {
@@ -301,7 +301,7 @@ async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
 async fn b_cannot_export_a_s_portfolio_but_a_can() {
     // The export handler loops `require(.., Viewer)` over every id before it reads
     // anything. This is what proves that loop exists; the static gate cannot.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("b_cannot_export_a_s_portfolio_but_a_can").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/backup/export?portfolio_ids={}", u.a_portfolio);
 
@@ -316,7 +316,7 @@ async fn b_cannot_export_a_s_portfolio_but_a_can() {
 async fn one_foreign_id_denies_the_whole_export() {
     // A request for `[mine, theirs]` must not return mine and quietly drop theirs.
     // A partial success would look like a bug in the user's own selection.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("one_foreign_id_denies_the_whole_export").await;
     let u = seed_two_users(&pool).await;
     let path = format!("/api/backup/export?portfolio_ids={},{}", u.a_portfolio, u.b_portfolio);
 
@@ -334,7 +334,7 @@ async fn an_export_never_contains_another_user_s_rows() {
     // B's. `seed_two_users` gives B an empty portfolio, so B's asset is seeded
     // here — and A's own asset is asserted present, or an empty bundle would pass
     // the negative half for the wrong reason.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("an_export_never_contains_another_user_s_rows").await;
     let u = seed_two_users(&pool).await;
     seed_asset(&pool, u.b_portfolio, "BBB", "Asset B").await;
 
@@ -364,7 +364,7 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
     // Restore always writes the caller as owner. A bundle is data, not a grant:
     // carrying A's rows into B's session must not make them visible to A, and must
     // not let B write into A's space.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("a_bundle_exported_by_a_and_restored_by_b_becomes_b_s").await;
     let u = seed_two_users(&pool).await;
     let exported: String = {
         let a = client_as(pool.clone(), u.a).await;

@@ -1088,7 +1088,7 @@ mod tests {
     /// real migrated database rather than the old hand-made `historical_prices`,
     /// because the point of the fixture is "the table exists and holds nothing".
     async fn empty_pool() -> DbPool {
-        crate::test_db::test_database(&crate::test_db::next_caller("currency_empty")).await
+        crate::test_db::test_pool(&crate::test_db::next_caller("currency_empty")).await
     }
 
     #[tokio::test]
@@ -1128,7 +1128,7 @@ mod tests {
     /// A database whose `historical_prices` is the migrated one — primary key and
     /// all — instead of a hand-written copy that could drift from it.
     async fn priced_pool() -> DbPool {
-        crate::test_db::test_database(&crate::test_db::next_caller("currency_priced")).await
+        crate::test_db::test_pool(&crate::test_db::next_caller("currency_priced")).await
     }
 
     async fn seed_prices(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
@@ -1318,7 +1318,7 @@ mod tests {
     /// invented its own schema is how this helper once managed to test a shape
     /// production never runs.
     async fn split_fixture() -> (DbPool, i64) {
-        let pool = crate::test_db::test_database(&crate::test_db::next_caller("currency_split")).await;
+        let pool = crate::test_db::test_pool(&crate::test_db::next_caller("currency_split")).await;
         let pid: (i64,) = sqlx::query_as(
             "INSERT INTO portfolios (name, currency, base_currency) \
              VALUES ('split fixture', 'USD', 'USD') RETURNING id",

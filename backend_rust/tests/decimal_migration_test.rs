@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 
 mod common;
-use common::{seed_asset, seed_portfolio, setup_db, DEFAULT_USER};
+use common::{db_with_user, seed_asset, seed_portfolio};
 
 /// The values that break a float: not representable in binary, and each one a real
 /// price or fee a broker would send.
@@ -26,8 +26,8 @@ const EXACT_VALUES: &[&str] = &[
     "9.99", "0.1", "0.3", "0.000000000000000001", "1234567890.123456789", "100.0",
 ];
 
-async fn stored(pool: &DbPool, column: &str, value: &str) -> String {
-    let portfolio = seed_portfolio(pool, DEFAULT_USER, "Exact", "USD").await;
+async fn stored(pool: &DbPool, user: i64, column: &str, value: &str) -> String {
+    let portfolio = seed_portfolio(pool, user, "Exact", "USD").await;
     let asset = seed_asset(pool, portfolio, "EXACT", "Exact").await;
 
     // `seed_transaction` takes floats, which is the very thing under test, so the row
@@ -46,10 +46,10 @@ async fn stored(pool: &DbPool, column: &str, value: &str) -> String {
 
 #[tokio::test]
 async fn a_value_written_as_text_is_read_back_identically() {
-    let pool = setup_db(&common::disabled_config()).await;
+    let (pool, user) = db_with_user("a_value_written_as_text_is_read_back_identically").await;
 
     for value in EXACT_VALUES {
-        let raw = stored(&pool, "quantity", value).await;
+        let raw = stored(&pool, user, "quantity", value).await;
         assert_eq!(
             &raw, value,
             "{value} must come back from a text column as the same string"
@@ -66,8 +66,8 @@ async fn a_value_written_as_text_is_read_back_identically() {
 async fn the_same_holds_for_price_and_fee() {
     // Three separate columns, three separate chances for a schema change to quietly
     // make one of them a numeric type again.
-    let pool = setup_db(&common::disabled_config()).await;
-    let portfolio = seed_portfolio(&pool, DEFAULT_USER, "Exact", "USD").await;
+    let (pool, user) = db_with_user("the_same_holds_for_price_and_fee").await;
+    let portfolio = seed_portfolio(&pool, user, "Exact", "USD").await;
     let asset = seed_asset(&pool, portfolio, "EXACT", "Exact").await;
 
     let (qty, price, fee): (String, String, String) = sqlx::query_as(

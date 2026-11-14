@@ -7,8 +7,15 @@
 mod common;
 
 use common::{
-    DEFAULT_USER, build_rocket, build_rocket_oidc, disabled_config, expired_session_cookie,
-    oidc_cfg, oidc_config, session_cookie, setup_db,
+    build_rocket,
+    build_rocket_oidc,
+    db_with_placeholder,
+    disabled_config,
+    expired_session_cookie,
+    oidc_cfg,
+    oidc_config,
+    placeholder_id,
+    session_cookie,
 };
 use rocket::http::{Cookie, Header, Method, SameSite, Status};
 use rocket::local::asynchronous::Client;
@@ -21,8 +28,14 @@ use serde_json::Value;
 /// without touching this file is swept automatically. A hand-maintained copy here
 /// and the inventory in `route_coverage_test.rs` were two lists that could each
 /// agree with themselves while neither matched the mount.
-async fn all_api_routes() -> Vec<(Method, String)> {
-    let pool = setup_db(&oidc_config()).await;
+async fn all_api_routes(caller: &str) -> Vec<(Method, String)> {
+    // Its own database, and its own *name*: the test that calls this already spent its
+    // bare name on the client's database, and two pools in one test still need two
+    // databases or the harness's duplicate-`caller` guard fires. The discriminator
+    // goes at the *front* because Postgres folds an identifier to 63 bytes and these
+    // test names are already at the limit — a suffix would be truncated away and the
+    // two names would collide again, which is exactly what the guard is for.
+    let pool = db_with_placeholder(&format!("routes_{caller}"), &oidc_config()).await;
     let rocket = build_rocket_oidc(pool)
         .ignite()
         .await
@@ -54,11 +67,16 @@ async fn all_api_routes() -> Vec<(Method, String)> {
         .collect()
 }
 
-async fn oidc_client() -> Client {
-    let pool = setup_db(&oidc_config()).await;
-    Client::tracked(build_rocket_oidc(pool))
+/// A client in OIDC mode, and the id of the placeholder owner its database holds —
+/// read back from the row `ensure_bootstrap_owner` upserted, which is the id a session
+/// cookie has to name for the guard to accept it.
+async fn oidc_client(caller: &str) -> (Client, i64) {
+    let pool = db_with_placeholder(caller, &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
+    let client = Client::tracked(build_rocket_oidc(pool))
         .await
-        .expect("valid rocket")
+        .expect("valid rocket");
+    (client, owner)
 }
 
 // ---------------------------------------------------------------------------
@@ -67,24 +85,26 @@ async fn oidc_client() -> Client {
 
 #[tokio::test]
 async fn a_valid_session_cookie_authenticates() {
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_valid_session_cookie_authenticates", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool)).await.unwrap();
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER, 0))
+        .private_cookie(session_cookie(owner, 0))
         .dispatch()
         .await;
 
     assert_eq!(resp.status(), Status::Ok);
     let body: Value = resp.into_json().await.unwrap();
-    assert_eq!(body["id"], DEFAULT_USER);
+    assert_eq!(body["id"], owner);
     assert_eq!(body["sub"], "bootstrap");
 }
 
 #[tokio::test]
 async fn a_tampered_session_cookie_is_rejected() {
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_tampered_session_cookie_is_rejected", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
         .unwrap();
@@ -122,19 +142,20 @@ async fn a_tampered_session_cookie_is_rejected() {
 
     // The positive control: the same construction for a real user is accepted.
     // That is what shows the AEAD tag, not the shape of the value, authenticates.
-    let real = session_cookie(DEFAULT_USER, 0);
+    let real = session_cookie(owner, 0);
     let resp = client.get("/auth/me").private_cookie(real).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
 }
 
 #[tokio::test]
 async fn a_cookie_whose_token_version_is_stale_is_rejected() {
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_cookie_whose_token_version_is_stale_is_rejected", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool)).await.unwrap();
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER, 41))
+        .private_cookie(session_cookie(owner, 41))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -144,12 +165,13 @@ async fn a_cookie_whose_token_version_is_stale_is_rejected() {
 async fn an_expired_cookie_is_rejected_even_with_a_matching_token_version() {
     // The point of `exp`: a Rocket private cookie is otherwise valid forever, so
     // without a server-side check a stolen cookie never stops working.
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("an_expired_cookie_is_rejected_even_with_a_matching_token_version", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool)).await.unwrap();
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(expired_session_cookie(DEFAULT_USER, 0))
+        .private_cookie(expired_session_cookie(owner, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -157,11 +179,12 @@ async fn an_expired_cookie_is_rejected_even_with_a_matching_token_version() {
 
 #[tokio::test]
 async fn a_deactivated_user_is_rejected() {
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_deactivated_user_is_rejected", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     // `false`, not `0`: `users.is_active` is a Postgres `BOOLEAN`, and Postgres will
     // not coerce an integer into one the way SQLite's integer storage allowed.
     sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
-        .bind(DEFAULT_USER)
+        .bind(owner)
         .execute(&pool)
         .await
         .unwrap();
@@ -171,7 +194,7 @@ async fn a_deactivated_user_is_rejected() {
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER, 0))
+        .private_cookie(session_cookie(owner, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -179,11 +202,12 @@ async fn a_deactivated_user_is_rejected() {
 
 #[tokio::test]
 async fn logout_all_bumps_the_token_version_and_invalidates_the_live_cookie() {
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("logout_all_bumps_the_token_version_and_invalidates_the_live_cookie", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
         .unwrap();
-    let cookie = session_cookie(DEFAULT_USER, 0);
+    let cookie = session_cookie(owner, 0);
 
     // Valid before.
     let resp = client
@@ -201,7 +225,7 @@ async fn logout_all_bumps_the_token_version_and_invalidates_the_live_cookie() {
     assert_eq!(resp.status(), Status::SeeOther);
 
     let (version,): (i64,) = sqlx::query_as("SELECT token_version FROM users WHERE id = $1")
-        .bind(DEFAULT_USER)
+        .bind(owner)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -224,7 +248,7 @@ async fn a_forged_authorization_header_does_not_authenticate() {
     // The guard reads the session cookie only. Accepting a bearer header here
     // would silently widen the authentication surface beyond what this change
     // claims to provide.
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("a_forged_authorization_header_does_not_authenticate").await;
     let resp = client
         .get("/api/portfolios/")
         .header(Header::new("Authorization", "Bearer forged-token"))
@@ -239,9 +263,9 @@ async fn a_forged_authorization_header_does_not_authenticate() {
 
 #[tokio::test]
 async fn every_api_route_is_unauthenticated_without_a_session() {
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("every_api_route_is_unauthenticated_without_a_session").await;
     let mut checked = 0;
-    for (method, path) in all_api_routes().await {
+    for (method, path) in all_api_routes("every_api_route_is_unauthenticated_without_a_session").await {
         let resp = client.req(method, path.as_str()).dispatch().await;
         assert_eq!(resp.status(), Status::Unauthorized, "{method} {path}");
         let body: Value = resp.into_json().await.unwrap();
@@ -258,8 +282,8 @@ async fn every_api_route_is_unauthenticated_without_a_session() {
 /// call if it were allowed to reach its handler. `GET /api/assets/lookup` is
 /// covered by the unauthenticated sweep above; reaching it here would make the
 /// suite depend on the network and on a third-party quota.
-async fn reachable_api_routes() -> Vec<(Method, String)> {
-    all_api_routes()
+async fn reachable_api_routes(caller: &str) -> Vec<(Method, String)> {
+    all_api_routes(caller)
         .await
         .into_iter()
         .filter(|(_, path)| !path.starts_with("/api/assets/lookup"))
@@ -271,7 +295,7 @@ async fn reachable_api_routes() -> Vec<(Method, String)> {
 /// entry exists to sweep. The window is denied before the handler runs.
 #[tokio::test]
 async fn every_tax_route_denies_the_dated_variant_without_a_session() {
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("every_tax_route_denies_the_dated_variant_without_a_session").await;
     let dated = "/api/portfolios/1/tax-summary?strategy=FIFO&threshold_days=365&from=2024-01-01&to=2024-12-31";
     assert_eq!(client.get(dated).dispatch().await.status(), Status::Unauthorized);
     // The bare window too: `strategy` and `threshold_days` are optional, so a request
@@ -288,12 +312,12 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
     // the bug this file now pins: the callback used to mint sessions at
     // `token_version = 0` regardless of the row, so the first `logout-all` locked a
     // user out of all 16 routes forever and every test still passed.
-    let client = oidc_client().await;
+    let (client, owner) = oidc_client("every_api_route_reaches_a_handler_with_a_session").await;
     let mut checked = 0;
-    for (method, path) in reachable_api_routes().await {
+    for (method, path) in reachable_api_routes("every_api_route_reaches_a_handler_with_a_session").await {
         let resp = client
             .req(method, path.as_str())
-            .private_cookie(session_cookie(DEFAULT_USER, 0))
+            .private_cookie(session_cookie(owner, 0))
             .dispatch()
             .await;
         assert_ne!(
@@ -315,7 +339,7 @@ async fn logging_out_everywhere_does_not_lock_the_user_out() {
     // account lock: it raises `users.token_version`, while the callback kept issuing
     // `tv = 0`, so every later login was rejected and nothing could lower the column
     // again. The session must be issued at the version the guard is about to demand.
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("logging_out_everywhere_does_not_lock_the_user_out", &oidc_config()).await;
     let cfg = oidc_cfg();
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
@@ -392,7 +416,8 @@ async fn a_database_failure_is_not_reported_as_a_denial() {
     // `apiFetch` obeys — so during a transient `SQLITE_BUSY` (reachable: the read
     // endpoints write) a signed-in user is bounced to the provider, comes back, and
     // is bounced again. An outage has to look like an outage.
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_database_failure_is_not_reported_as_a_denial", &oidc_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
         .expect("valid rocket");
@@ -405,7 +430,7 @@ async fn a_database_failure_is_not_reported_as_a_denial() {
 
     let resp = client
         .get("/api/portfolios/")
-        .private_cookie(session_cookie(DEFAULT_USER, 0))
+        .private_cookie(session_cookie(owner, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::ServiceUnavailable);
@@ -417,7 +442,7 @@ async fn a_database_failure_is_not_reported_as_a_denial() {
 async fn a_malformed_session_cookie_is_a_denial_not_a_500() {
     // The cookie is attacker-controlled bytes. Anything that is not the payload we
     // wrote must read as "no session", not as a server error and not as a panic.
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("a_malformed_session_cookie_is_a_denial_not_a_500").await;
     for junk in [
         "not json at all",
         "",
@@ -439,7 +464,7 @@ async fn a_malformed_session_cookie_is_a_denial_not_a_500() {
 async fn a_denied_post_has_no_side_effect() {
     // The test that distinguishes the URI-rewrite design from a guards-only one:
     // the handler must not merely fail to authorise, it must not run at all.
-    let pool = setup_db(&oidc_config()).await;
+    let pool = db_with_placeholder("a_denied_post_has_no_side_effect", &oidc_config()).await;
     let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios")
         .fetch_one(&pool)
         .await
@@ -466,7 +491,7 @@ async fn a_denied_post_has_no_side_effect() {
 #[tokio::test]
 async fn an_unauthenticated_put_is_401_not_405() {
     // Why the sentinel is mounted for all seven methods.
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("an_unauthenticated_put_is_401_not_405").await;
     for method in [Method::Put, Method::Patch, Method::Delete, Method::Head] {
         let resp = client.req(method, "/api/portfolios/1").dispatch().await;
         assert_eq!(resp.status(), Status::Unauthorized, "{method}");
@@ -475,7 +500,7 @@ async fn an_unauthenticated_put_is_401_not_405() {
 
 #[tokio::test]
 async fn a_bare_options_is_denied_but_a_real_preflight_is_not() {
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("a_bare_options_is_denied_but_a_real_preflight_is_not").await;
 
     let resp = client.options("/api/portfolios/").dispatch().await;
     assert_eq!(
@@ -517,7 +542,7 @@ async fn a_bare_options_is_denied_but_a_real_preflight_is_not() {
 
 #[tokio::test]
 async fn the_root_and_the_api_contract_stay_public() {
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("the_root_and_the_api_contract_stay_public").await;
 
     assert_eq!(client.get("/").dispatch().await.status(), Status::Ok);
 
@@ -537,8 +562,9 @@ async fn the_root_and_the_api_contract_stay_public() {
 
 #[tokio::test]
 async fn auth_me_reports_the_placeholder_under_disabled_mode() {
-    let pool = setup_db(&disabled_config()).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER))
+    let pool = db_with_placeholder("auth_me_reports_the_placeholder_under_disabled_mode", &disabled_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
+    let client = Client::tracked(build_rocket(pool, owner))
         .await
         .unwrap();
 
@@ -551,7 +577,7 @@ async fn auth_me_reports_the_placeholder_under_disabled_mode() {
 
 #[tokio::test]
 async fn auth_me_without_a_session_returns_the_shared_unauthenticated_body() {
-    let client = oidc_client().await;
+    let (client, _) = oidc_client("auth_me_without_a_session_returns_the_shared_unauthenticated_body").await;
     let resp = client.get("/auth/me").dispatch().await;
     assert_eq!(resp.status(), Status::Unauthorized);
     // `/auth/me` is outside `/api`, so the denial route never runs for it; this
@@ -565,8 +591,9 @@ async fn auth_me_without_a_session_returns_the_shared_unauthenticated_body() {
 
 #[tokio::test]
 async fn login_under_disabled_mode_does_not_try_to_reach_a_provider() {
-    let pool = setup_db(&disabled_config()).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER))
+    let pool = db_with_placeholder("login_under_disabled_mode_does_not_try_to_reach_a_provider", &disabled_config()).await;
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner that startup guarantees");
+    let client = Client::tracked(build_rocket(pool, owner))
         .await
         .unwrap();
     // No OIDC-only routes are mounted in this mode, so the route is simply absent.

@@ -223,7 +223,7 @@ mod tests {
     /// needs a shape the real schema forbids says so where it does it
     /// ([`a_transaction_whose_asset_is_gone_is_not_found`]).
     async fn pool_with_schema() -> DbPool {
-        test_db::test_database(&test_db::next_caller("access")).await
+        test_db::test_pool(&test_db::next_caller("access")).await
     }
 
     /// A real `users` row, because `portfolios.owner_id` is a foreign key here and

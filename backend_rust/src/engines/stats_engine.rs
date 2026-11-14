@@ -341,7 +341,7 @@ mod tests {
     /// is already there with its `(symbol, date)` primary key, so the fixture is a
     /// connection and not a `CREATE TABLE`.
     async fn pool() -> DbPool {
-        crate::test_db::test_database(&crate::test_db::next_caller("stats_engine")).await
+        crate::test_db::test_pool(&crate::test_db::next_caller("stats_engine")).await
     }
 
     fn empty_asset() -> Asset {

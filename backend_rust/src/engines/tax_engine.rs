@@ -28,7 +28,7 @@ mod tests {
     /// touches the database, so an empty pool is a real pool that answers nothing.
     /// There are no seeded prices in this file to look for.
     async fn empty_pool() -> DbPool {
-        crate::test_db::test_database(&crate::test_db::next_caller("tax_engine_empty")).await
+        crate::test_db::test_pool(&crate::test_db::next_caller("tax_engine_empty")).await
     }
 
     fn day(s: &str) -> NaiveDate {
@@ -39,7 +39,7 @@ mod tests {
     /// is never queried at all, which is enough for the USD/USD fixtures and not for
     /// these; both are real migrated databases now, so the two differ only in intent.
     async fn priced_pool() -> DbPool {
-        crate::test_db::test_database(&crate::test_db::next_caller("tax_engine_priced")).await
+        crate::test_db::test_pool(&crate::test_db::next_caller("tax_engine_priced")).await
     }
 
     async fn seed_fx(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {

@@ -15,8 +15,13 @@ mod common;
 use backend_rust::models::Asset;
 use backend_rust::services::currency_service::CurrencyService;
 use common::{
-    build_rocket_pricing, disabled_config, seed_asset, seed_portfolio, seed_split_sync,
-    seed_transaction_at, setup_db, MockYahoo, DEFAULT_USER,
+    MockYahoo,
+    build_rocket_pricing,
+    db_with_user,
+    seed_asset,
+    seed_portfolio,
+    seed_split_sync,
+    seed_transaction_at,
 };
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
@@ -67,18 +72,18 @@ async fn two_portfolios_holding_the_same_symbol_each_get_their_own_split() {
     //
     // Note this is ordinary usage, not a corner: the duplicate-asset guard is scoped
     // per portfolio, so "US Large Cap" and "Retirement" both holding AAPL is normal.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("two_portfolios_holding_the_same_symbol_each_get_their_own_split").await;
 
-    let port_a = seed_portfolio(&pool, DEFAULT_USER, "Taxable", "USD").await;
+    let port_a = seed_portfolio(&pool, user, "Taxable", "USD").await;
     let asset_a = seed_asset(&pool, port_a, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_a, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
-    let port_b = seed_portfolio(&pool, DEFAULT_USER, "Retirement", "USD").await;
+    let port_b = seed_portfolio(&pool, user, "Retirement", "USD").await;
     let asset_b = seed_asset(&pool, port_b, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_b, "BUY", 10.0, 65.0, 0.0, "2024-02-01T00:00:00Z").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -108,20 +113,20 @@ async fn a_portfolio_that_bought_before_the_split_is_not_suppressed_by_one_that_
     // Portfolio A bought after the split, so the split correctly predates it and
     // nothing is inserted — but that sync still records a throttle row. Portfolio B
     // bought before the split and genuinely needs the row.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_portfolio_that_bought_before_the_split_is_not_suppressed_by_one_that_bought_after").await;
 
     // A: first trade 2024-09-01, after the 2024-06-01 split.
-    let port_a = seed_portfolio(&pool, DEFAULT_USER, "After the split", "USD").await;
+    let port_a = seed_portfolio(&pool, user, "After the split", "USD").await;
     let asset_a = seed_asset(&pool, port_a, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_a, "BUY", 10.0, 120.0, 0.0, "2024-09-01T00:00:00Z").await;
 
     // B: first trade 2024-01-01, before the split.
-    let port_b = seed_portfolio(&pool, DEFAULT_USER, "Before the split", "USD").await;
+    let port_b = seed_portfolio(&pool, user, "Before the split", "USD").await;
     let asset_b = seed_asset(&pool, port_b, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_b, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
-    let client = Client::tracked(build_rocket_pricing(pool.clone(), DEFAULT_USER, yahoo.base_url()))
+    let client = Client::tracked(build_rocket_pricing(pool.clone(), user, yahoo.base_url()))
         .await
         .unwrap();
 
@@ -157,8 +162,8 @@ async fn a_transaction_older_than_the_last_sync_reopens_the_throttle() {
     // evidence that nothing new is owed if it still covers the asset's history.
     // Record a trade older than anything the last sync saw and the splits predating
     // the old earliest are missing, so the window must not suppress the sync.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Late entry", "USD").await;
+    let (pool, user) = db_with_user("a_transaction_older_than_the_last_sync_reopens_the_throttle").await;
+    let port_id = seed_portfolio(&pool, user, "Late entry", "USD").await;
     let asset_id = seed_asset(&pool, port_id, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 120.0, 0.0, "2024-09-01T00:00:00Z").await;
 
@@ -187,8 +192,8 @@ async fn a_transaction_older_than_the_last_sync_reopens_the_throttle() {
 async fn a_throttle_within_the_window_and_covering_the_history_suppresses_the_fetch() {
     // The throttle still throttles. Without this the fix could pass by simply never
     // skipping, which would multiply provider calls against a shared quota.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Already covered", "USD").await;
+    let (pool, user) = db_with_user("a_throttle_within_the_window_and_covering_the_history_suppresses_the_fetch").await;
+    let port_id = seed_portfolio(&pool, user, "Already covered", "USD").await;
     let asset_id = seed_asset(&pool, port_id, SYMBOL, "Split me").await;
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 60.0, 0.0, "2024-01-01T00:00:00Z").await;
 
@@ -214,14 +219,14 @@ async fn deleting_an_asset_drops_its_throttle_row() {
     // Not a correctness requirement — `assets.id` is AUTOINCREMENT, so the id is
     // never handed to a later asset. This is what keeps the throttle table from
     // keeping one permanent row per asset the user ever deleted.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Deletion", "USD").await;
+    let (pool, user) = db_with_user("deleting_an_asset_drops_its_throttle_row").await;
+    let port_id = seed_portfolio(&pool, user, "Deletion", "USD").await;
     let asset_id = seed_asset(&pool, port_id, SYMBOL, "Split me").await;
     seed_split_sync(&pool, asset_id).await;
 
     let client = Client::tracked(build_rocket_pricing(
         pool.clone(),
-        DEFAULT_USER,
+        user,
         common::mock_pricing_url(),
     ))
     .await

@@ -35,7 +35,7 @@ use backend_rust::schemas::TransactionCreate;
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
 
-use common::{DEFAULT_USER, build_rocket, disabled_config, seed_asset, seed_portfolio, setup_db};
+use common::{build_rocket, db_with_user, seed_asset, seed_portfolio};
 
 /// The body the API takes for a transaction. `asset_id` is deliberately absent:
 /// the asset comes from the URL path, not the body.
@@ -82,10 +82,10 @@ async fn a_date_only_string_is_a_422_from_the_api_and_never_a_500() {
     // `500` here would mean the bad string reached the database and Postgres
     // rejected it, which would put a parse error in the server's log and a
     // meaningless body in front of the user.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Date Boundary", "USD").await;
+    let (pool, user) = db_with_user("a_date_only_string_is_a_422_from_the_api_and_never_a_500").await;
+    let port_id = seed_portfolio(&pool, user, "Date Boundary", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
-    let client = Client::tracked(build_rocket(pool.clone(), DEFAULT_USER))
+    let client = Client::tracked(build_rocket(pool.clone(), user))
         .await
         .unwrap();
 
@@ -117,10 +117,10 @@ async fn a_full_rfc3339_timestamp_is_written_and_echoed_back() {
     // The other half of the pin: the accepted shape is not merely parseable, it
     // round-trips through the real column. The response renders UTC as `Z`, the
     // same string that went in.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Date Boundary", "USD").await;
+    let (pool, user) = db_with_user("a_full_rfc3339_timestamp_is_written_and_echoed_back").await;
+    let port_id = seed_portfolio(&pool, user, "Date Boundary", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
-    let client = Client::tracked(build_rocket(pool.clone(), DEFAULT_USER))
+    let client = Client::tracked(build_rocket(pool.clone(), user))
         .await
         .unwrap();
 

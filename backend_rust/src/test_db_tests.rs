@@ -12,7 +12,7 @@
 //! Included from `src/lib.rs` only, so it runs once rather than once per binary.
 
 use crate::test_db::{
-    database_name, database_url, harness_pid, has_backends, next_caller, test_database,
+    database_name, database_url, harness_pid, has_backends, next_caller, test_pool,
 };
 use sqlx::Connection as _;
 
@@ -23,7 +23,9 @@ use sqlx::Connection as _;
 #[test]
 fn a_harness_database_reports_its_pid() {
     assert_eq!(harness_pid("prism_t_4242_split_sync"), Some(4242));
-    assert_eq!(harness_pid("prism_t_1_setup_db_0"), Some(1));
+    // The shape a `next_caller` label actually produces today (`access_0` in
+    // `src/access.rs`), because a test of the name shape should name a real one.
+    assert_eq!(harness_pid("prism_t_1_access_0"), Some(1));
 }
 
 #[test]
@@ -108,8 +110,8 @@ async fn two_labels_that_collapse_onto_one_name_are_caught_as_a_duplicate_caller
         "these two labels must collapse, which is what the registry is for"
     );
 
-    let pool_a = test_database(&next_caller("collapse_a")).await;
-    let pool_b = test_database(&next_caller("collapse_b")).await;
+    let pool_a = test_pool(&next_caller("collapse_a")).await;
+    let pool_b = test_pool(&next_caller("collapse_b")).await;
     assert_ne!(
         pool_a.connect_options().get_database(),
         pool_b.connect_options().get_database(),
@@ -157,7 +159,7 @@ fn a_base_url_with_no_database_path_still_produces_one() {
 
 #[tokio::test]
 async fn a_database_this_test_is_connected_to_reads_as_in_use() {
-    let pool = test_database("harness_has_backends").await;
+    let pool = test_pool("harness_has_backends").await;
     let name = pool
         .connect_options()
         .get_database()
@@ -178,7 +180,7 @@ async fn a_database_this_test_is_connected_to_reads_as_in_use() {
 async fn a_database_nothing_is_connected_to_reads_as_free() {
     // The other half: the count has to go back to zero, or `reap_finished` would never
     // delete anything and every run would leak its databases.
-    let pool = test_database("harness_goes_idle").await;
+    let pool = test_pool("harness_goes_idle").await;
     let name = pool
         .connect_options()
         .get_database()

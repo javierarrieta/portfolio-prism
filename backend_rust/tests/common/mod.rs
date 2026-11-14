@@ -4,6 +4,14 @@
 //! it unused; `dead_code` is allowed for the whole module rather than function by
 //! function, which is the only way a helper can be added without hunting down which
 //! of the binaries will not call it.
+//!
+//! What belongs here is only what the integration suite needs and `src/` does not:
+//! Rocket builders, and the `seed_*` fixtures. The database itself is not here —
+//! [`test_pool`] is re-exported from `src/test_db.rs` rather than wrapped, so there is
+//! one implementation of "a database this test owns alone" and one name for it. The
+//! `seed_*` helpers stay here rather than moving into `src/test_db.rs` because no `src/`
+//! unit test calls any of them: each writes its own `INSERT` against its own private
+//! database, so moving them would relocate a single copy, not collapse two.
 #![allow(dead_code)]
 
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
@@ -29,15 +37,15 @@ mod test_db;
 #[allow(unused_imports)]
 pub use test_provider::{MockYahoo, mock_pricing_url};
 
-/// The user every existing test runs as: the placeholder row
-/// [`ensure_bootstrap_owner`] upserts unconditionally, which is `id = 1` on a freshly
-/// migrated database — the identity restarts at 1 and the placeholder is the first
-/// row any fixture path creates.
-///
-/// `i64` because `users.id` is `BIGINT`: every seed helper returns a row id, and a
-/// fixture that narrowed one to `i32` would be a fixture that could not express the
-/// ids the database produces.
-pub const DEFAULT_USER: i64 = 1;
+// Re-exported, not wrapped. These used to be one-line delegates to `test_db::`, each
+// with a doc comment restating the doc comment it delegated to — two places to keep in
+// sync and no behaviour in the middle. `pool_options` is the one the backup tests call
+// directly, because a test that needs a *second* pool against the same database must
+// build it the way the harness builds the first. The fourth delegate, `unique_caller`,
+// is gone rather than re-exported: its only caller was `setup_db`, and a counted name
+// is exactly what the call sites no longer need.
+#[allow(unused_imports)]
+pub use test_db::{pool_options, test_pool, test_pool_url};
 
 /// A `StartupConfig` asking for `disabled` mode, built through the injectable
 /// environment source rather than by mutating the process environment (which is
@@ -151,52 +159,54 @@ pub fn build_rocket_oidc_with_cors(pool: DbPool, origins: Vec<String>) -> Rocket
     )
 }
 
-/// A database for one test, migrated to the same head `main` migrates to, and given
-/// the same placeholder owner `main` guarantees. Isolation is per call — see
-/// `src/test_db.rs` — so a test's rows are its own and nothing truncates them.
+/// A private, freshly migrated database for one test, and the id of a user in it.
 ///
-/// `cfg` decides only whether the placeholder owner is *claimable*, exactly as at
-/// startup: under `disabled` the placeholder is usable, under OIDC it is usable only
-/// if a bootstrap subject was configured. Tests that pass [`disabled_config`] get the
-/// row they have always assumed; a test passing [`oidc_config`] gets an empty `users`
-/// table, which is what production would have.
-pub async fn setup_db(cfg: &StartupConfig) -> DbPool {
-    // Every existing caller wants the placeholder owner and has no name of its own to
-    // pass, so the name is counted rather than chosen. Task 5 replaces the call sites
-    // with `test_pool("<test name>")`, which names the database after the test that
-    // owns it.
-    let pool = test_db::test_database(&test_db::next_caller("setup_db")).await;
+/// The user is [`seed_user`]'s, not the bootstrap placeholder. A test that owns rows
+/// needs a `users.id` for `portfolios.owner_id` to point at and does not care which;
+/// a test whose subject *is* the startup identity says so with [`db_with_placeholder`].
+///
+/// Replaces `setup_db(&cfg)` plus the `DEFAULT_USER` constant, both of which assumed
+/// the placeholder row was always `id = 1`. Here the id is the one the insert
+/// returned, so the fixture cannot drift from the database.
+pub async fn db_with_user(caller: &str) -> (DbPool, i64) {
+    let pool = test_pool(caller).await;
+    let user = seed_user(&pool, "test-subject").await;
+    (pool, user)
+}
+
+/// A database exactly as `main` leaves one: migrated, then [`ensure_bootstrap_owner`].
+///
+/// For the tests whose subject is that startup step and nothing else: `finalise_auth`
+/// in `disabled` mode reads the placeholder's id, `tests/startup_test.rs` pins the
+/// ownership backfill, and `tests/auth_test.rs` exercises the handover. `cfg` decides
+/// only whether the placeholder is *claimable*, exactly as at startup.
+///
+/// An ordinary test wants [`db_with_user`] instead; a fixture that seeds its own user
+/// has one less piece of startup policy to know about.
+pub async fn db_with_placeholder(caller: &str, cfg: &StartupConfig) -> DbPool {
+    let pool = test_pool(caller).await;
     ensure_bootstrap_owner(&pool, cfg)
         .await
         .expect("bootstrap owner");
     pool
 }
 
-/// A private, freshly migrated database named after `caller`. See `src/test_db.rs`.
-pub async fn test_pool(caller: &str) -> DbPool {
-    test_db::test_database(caller).await
-}
-
-/// The URL of a private database, for a test that must open a **second** pool against
-/// the same one — a lock holder and the connection it locks out cannot share a pool.
-pub async fn test_pool_url(caller: &str) -> String {
-    test_db::test_database_url(caller).await
-}
-
-/// The harness pool options: `main`'s, plus `idle_timeout(None)`. See
-/// [`crate::test_db::pool_options`] for why the one extra setting is not optional —
-/// this exists so a test that needs a *second* pool against the same database
-/// (`test_pool_url`) builds it the same way the harness would build the first.
-pub fn pool_options() -> sqlx::postgres::PgPoolOptions {
-    test_db::pool_options()
-}
-
-/// A `caller` unique within this test binary, for a fixture several tests in one
-/// binary share and that has no test name of its own to borrow. Prefer passing the
-/// test's own name to [`test_pool`]; this is the fallback when the fixture cannot see
-/// it.
-pub fn unique_caller(prefix: &str) -> String {
-    test_db::next_caller(prefix)
+/// The id of the bootstrap placeholder owner, or `None` when the row is not there.
+///
+/// `DEFAULT_USER = 1` was the SQLite suite's assumption: the placeholder was always
+/// the first row of a database whose identity restarted at 1. Postgres gives the same
+/// answer today and nothing guarantees it, so the id comes from the row.
+///
+/// `Option` rather than a panic because "the placeholder is gone" is a state three
+/// tests assert on — a handover consumes the row in place — and not a harness failure.
+pub async fn placeholder_id(pool: &DbPool) -> Option<i64> {
+    sqlx::query_as::<_, (i64,)>("SELECT id FROM users WHERE issuer = $1 AND subj = $2")
+        .bind(backend_rust::PLACEHOLDER_ISSUER)
+        .bind(backend_rust::PLACEHOLDER_SUBJ)
+        .fetch_optional(pool)
+        .await
+        .expect("the users table is readable")
+        .map(|row| row.0)
 }
 
 /// A session cookie pair for `LocalRequest::private_cookie`.

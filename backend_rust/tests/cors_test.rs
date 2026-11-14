@@ -4,7 +4,7 @@ use backend_rust::get_cors_options;
 use backend_rust::parse_allowed_origins;
 mod common;
 
-use common::offline_pricing_service;
+use common::{db_with_placeholder, offline_pricing_service};
 
 use backend_rust::auth::finalise_auth;
 use rocket::http::{Header, Status};
@@ -13,7 +13,7 @@ use rocket::local::asynchronous::Client;
 #[tokio::test]
 async fn test_cors_allowed_origin() {
     let cfg = common::disabled_config();
-    let pool = common::setup_db(&cfg).await;
+    let pool = db_with_placeholder("test_cors_allowed_origin", &cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -46,7 +46,7 @@ async fn a_disallowed_origin_is_answered_before_authentication_gets_a_turn() {
     // `DELETE`, so a deployment that leaves `ALLOWED_ORIGINS` at its localhost default
     // answers 403 to every write from the public site, and `apiFetch` only redirects
     // on 401, so the user sees a silent failure.
-    let pool = common::setup_db(&common::oidc_config()).await;
+    let pool = db_with_placeholder("a_disallowed_origin_is_answered_before_authentication_gets_a_turn", &common::oidc_config()).await;
     let client = Client::tracked(common::build_rocket_oidc_with_cors(
         pool.clone(),
         vec!["https://elsewhere.example".to_string()],
@@ -83,7 +83,7 @@ async fn a_disallowed_origin_is_answered_before_authentication_gets_a_turn() {
 #[tokio::test]
 async fn test_cors_disallowed_origin() {
     let cfg = common::disabled_config();
-    let pool = common::setup_db(&cfg).await;
+    let pool = db_with_placeholder("test_cors_disallowed_origin", &cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -109,7 +109,7 @@ async fn test_cors_disallowed_origin() {
 #[tokio::test]
 async fn test_cors_multiple_origins() {
     let cfg = common::disabled_config();
-    let pool = common::setup_db(&cfg).await;
+    let pool = db_with_placeholder("test_cors_multiple_origins", &cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -156,7 +156,7 @@ async fn test_cors_trailing_comma_origin_is_allowed() {
     // Regression: "https://app,": used to yield an empty entry, rocket_cors
     // rejected it, and get_cors_options panicked before the server bound a port.
     let cfg = common::disabled_config();
-    let pool = common::setup_db(&cfg).await;
+    let pool = db_with_placeholder("test_cors_trailing_comma_origin_is_allowed", &cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -182,7 +182,7 @@ async fn test_cors_blank_env_falls_back_to_dev_defaults() {
     // An empty allowlist would answer 403 to every browser while the process
     // looked healthy, so a blank value must restore the dev defaults instead.
     let cfg = common::disabled_config();
-    let pool = common::setup_db(&cfg).await;
+    let pool = db_with_placeholder("test_cors_blank_env_falls_back_to_dev_defaults", &cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 

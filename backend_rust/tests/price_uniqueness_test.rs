@@ -14,11 +14,11 @@
 
 mod common;
 
-use common::{seed_price, setup_db, test_pool};
+use common::{db_with_user, seed_price, test_pool};
 
 #[tokio::test]
 async fn a_duplicate_insert_is_rejected_by_the_schema() {
-    let pool = setup_db(&common::disabled_config()).await;
+    let (pool, _) = db_with_user("a_duplicate_insert_is_rejected_by_the_schema").await;
     seed_price(&pool, "AAPL", common::FULLY_COVERED, "100.0").await;
 
     let dup = sqlx::query(

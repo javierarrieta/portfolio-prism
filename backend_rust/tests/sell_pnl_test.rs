@@ -1,9 +1,6 @@
 mod common;
 
-use common::{
-    build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction_at, setup_db,
-    DEFAULT_USER,
-};
+use common::{build_rocket, db_with_user, seed_asset, seed_portfolio, seed_transaction_at};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::{Build, Rocket};
@@ -26,20 +23,20 @@ fn d(s: &str) -> Decimal {
 
 // FIFO fixture: two buys, one sell of 80 units split across both lots.
 // Returns the unlaunched Rocket; each test wraps it in its own tracked Client.
-async fn fifo_fixture() -> (Rocket<Build>, i64, i64, i64) {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Sell PnL", "USD").await;
+async fn fifo_fixture(caller: &str) -> (Rocket<Build>, i64, i64, i64) {
+    let (pool, user) = db_with_user(caller).await;
+    let port_id = seed_portfolio(&pool, user, "Sell PnL", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     let buy1 = seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let buy2 = seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
     let _ = buy2;
-    (build_rocket(pool, DEFAULT_USER), sell, buy1, asset_id)
+    (build_rocket(pool, user), sell, buy1, asset_id)
 }
 
 #[tokio::test]
 async fn test_sell_pnl_unknown_transaction_is_404() {
-    let (rocket, _, _, _) = fifo_fixture().await;
+    let (rocket, _, _, _) = fifo_fixture("test_sell_pnl_unknown_transaction_is_404").await;
     let client = Client::tracked(rocket).await.unwrap();
     let resp = client.get("/api/transactions/999999/pnl?strategy=FIFO&threshold_days=30").dispatch().await;
     assert_eq!(resp.status(), Status::NotFound);
@@ -47,7 +44,7 @@ async fn test_sell_pnl_unknown_transaction_is_404() {
 
 #[tokio::test]
 async fn test_sell_pnl_rejects_non_sell_transaction() {
-    let (rocket, _, buy1, _) = fifo_fixture().await;
+    let (rocket, _, buy1, _) = fifo_fixture("test_sell_pnl_rejects_non_sell_transaction").await;
     let client = Client::tracked(rocket).await.unwrap();
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", buy1)).dispatch().await;
     assert_eq!(resp.status(), Status::BadRequest);
@@ -55,7 +52,7 @@ async fn test_sell_pnl_rejects_non_sell_transaction() {
 
 #[tokio::test]
 async fn test_sell_pnl_fifo_breakdown_shape() {
-    let (rocket, sell, buy1, _) = fifo_fixture().await;
+    let (rocket, sell, buy1, _) = fifo_fixture("test_sell_pnl_fifo_breakdown_shape").await;
     let client = Client::tracked(rocket).await.unwrap();
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO&threshold_days=30", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
@@ -93,13 +90,13 @@ async fn test_sell_pnl_split_before_every_buy_is_not_claimed() {
     // The replay rescales lots that already exist, so a split older than every buy
     // adjusted nothing. Claiming otherwise would tell the user the table shows
     // split-adjusted prices when it shows exactly what they typed.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Too Early", "USD").await;
+    let (pool, user) = db_with_user("test_sell_pnl_split_before_every_buy_is_not_claimed").await;
+    let port_id = seed_portfolio(&pool, user, "Split Too Early", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "EARLY", "Early Split").await;
     seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, "2023-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -109,7 +106,7 @@ async fn test_sell_pnl_split_before_every_buy_is_not_claimed() {
 
 #[tokio::test]
 async fn test_sell_pnl_lifo_attributes_different_lots() {
-    let (rocket, sell, _, _) = fifo_fixture().await;
+    let (rocket, sell, _, _) = fifo_fixture("test_sell_pnl_lifo_attributes_different_lots").await;
     let client = Client::tracked(rocket).await.unwrap();
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=LIFO&threshold_days=30", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -119,7 +116,7 @@ async fn test_sell_pnl_lifo_attributes_different_lots() {
 
 #[tokio::test]
 async fn test_sell_pnl_defaults_to_fifo_when_params_omitted() {
-    let (rocket, sell, _, _) = fifo_fixture().await;
+    let (rocket, sell, _, _) = fifo_fixture("test_sell_pnl_defaults_to_fifo_when_params_omitted").await;
     let client = Client::tracked(rocket).await.unwrap();
     let resp = client.get(format!("/api/transactions/{}/pnl", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -130,12 +127,12 @@ async fn test_sell_pnl_defaults_to_fifo_when_params_omitted() {
 
 #[tokio::test]
 async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Unmatched", "USD").await;
+    let (pool, user) = db_with_user("test_sell_pnl_unmatched_quantity_is_declared_not_dropped").await;
+    let port_id = seed_portfolio(&pool, user, "Unmatched", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "TSLA", "Tesla").await;
     seed_transaction_at(&pool, asset_id, "BUY", 50.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
@@ -147,11 +144,11 @@ async fn test_sell_pnl_unmatched_quantity_is_declared_not_dropped() {
 
 #[tokio::test]
 async fn test_sell_pnl_roi_is_null_when_cost_basis_is_zero() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "No Buys", "USD").await;
+    let (pool, user) = db_with_user("test_sell_pnl_roi_is_null_when_cost_basis_is_zero").await;
+    let port_id = seed_portfolio(&pool, user, "No Buys", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "NOBUYS", "No Buys").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 120.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
@@ -176,14 +173,14 @@ async fn test_sell_pnl_sums_to_tax_summary_realized_pnl() {
     // SPLIT rows and this endpoint is read-only, so the breakdown only agrees when the
     // summary has run first -- which is what the UI guarantees. Do not reorder this test
     // as a "cleanup"; that is the ordering this pins.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Reconcile", "USD").await;
+    let (pool, user) = db_with_user("test_sell_pnl_sums_to_tax_summary_realized_pnl").await;
+    let port_id = seed_portfolio(&pool, user, "Reconcile", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "RECON", "Reconcile").await;
     seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell1 = seed_transaction_at(&pool, asset_id, "SELL", 50.0, 130.0, 0.0, "2024-08-01T00:00:00Z").await;
     let sell2 = seed_transaction_at(&pool, asset_id, "SELL", 40.0, 150.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     for strategy in ["FIFO", "LIFO", "HYBRID"] {
         let tax_resp = client
@@ -227,13 +224,13 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
     // attribution method, so it must name the method actually used -- not echo back
     // whatever the caller typed. FIFO and LIFO differ on this fixture (2000 vs
     // 1600), so the figure proves which one ran.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Strategy Echo", "USD").await;
+    let (pool, user) = db_with_user("test_sell_pnl_unrecognized_strategy_is_applied_as_fifo").await;
+    let port_id = seed_portfolio(&pool, user, "Strategy Echo", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     seed_transaction_at(&pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 40.0, 120.0, 0.0, "2024-06-01T00:00:00Z").await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 80.0, 130.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=moon-time&threshold_days=30", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
@@ -242,19 +239,19 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
     assert_eq!(dec(&body, "realized_pnl"), d("2000"), "FIFO figure, not LIFO's 1600");
 }
 
-async fn split_fixture(split_date: &str) -> (Client, i64) {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Flag", "USD").await;
+async fn split_fixture(caller: &str, split_date: &str) -> (Client, i64) {
+    let (pool, user) = db_with_user(caller).await;
+    let port_id = seed_portfolio(&pool, user, "Split Flag", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
     seed_transaction_at(&pool, asset_id, "BUY", 100.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SPLIT", 2.0, 1.0, 0.0, split_date).await;
     let sell = seed_transaction_at(&pool, asset_id, "SELL", 100.0, 60.0, 0.0, "2024-12-01T00:00:00Z").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     (client, sell)
 }
 
-async fn split_applied_at(split_date: &str) -> serde_json::Value {
-    let (client, sell) = split_fixture(split_date).await;
+async fn split_applied_at(caller: &str, split_date: &str) -> serde_json::Value {
+    let (client, sell) = split_fixture(caller, split_date).await;
     let resp = client.get(format!("/api/transactions/{}/pnl?strategy=FIFO", sell)).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
     serde_json::from_str(&resp.into_string().await.unwrap()).unwrap()
@@ -264,7 +261,7 @@ async fn split_applied_at(split_date: &str) -> serde_json::Value {
 async fn test_sell_pnl_split_before_sell_sets_split_applied() {
     // The `true` branch of split_applied had no endpoint coverage: the modal's own
     // test drives the payload directly, so the server-side computation was untested.
-    let body = split_applied_at("2024-06-01T00:00:00Z").await;
+    let body = split_applied_at("test_sell_pnl_split_before_sell_sets_split_applied", "2024-06-01T00:00:00Z").await;
     assert_eq!(body["split_applied"], true);
     // 2:1 split halves the recorded buy price; the footnote exists because the
     // table then shows a price nobody typed into a form.
@@ -275,7 +272,7 @@ async fn test_sell_pnl_split_before_sell_sets_split_applied() {
 async fn test_sell_pnl_split_on_the_sell_date_counts() {
     // Pins the `<=` boundary. Splits sort ahead of same-day sells in the replay, so
     // a same-date split has already been applied to the lots this sell consumed.
-    let body = split_applied_at("2024-12-01T00:00:00Z").await;
+    let body = split_applied_at("test_sell_pnl_split_on_the_sell_date_counts", "2024-12-01T00:00:00Z").await;
     assert_eq!(body["split_applied"], true);
     assert_eq!(dec(&body["matches"][0], "buy_price"), d("50"));
 }
@@ -284,7 +281,7 @@ async fn test_sell_pnl_split_on_the_sell_date_counts() {
 async fn test_sell_pnl_split_after_the_sell_does_not_count() {
     // Pins the other side of `<=`: a split that happened later did not touch the
     // prices this sell was computed from, so claiming it did would be a lie.
-    let body = split_applied_at("2025-01-01T00:00:00Z").await;
+    let body = split_applied_at("test_sell_pnl_split_after_the_sell_does_not_count", "2025-01-01T00:00:00Z").await;
     assert_eq!(body["split_applied"], false);
     assert_eq!(dec(&body["matches"][0], "buy_price"), d("100"));
 }

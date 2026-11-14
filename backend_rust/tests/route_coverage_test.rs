@@ -9,6 +9,7 @@
 mod common;
 
 use backend_rust::access::Access;
+use common::db_with_user;
 use backend_rust::auth::fairing::{DENIED_PATH, UNAVAILABLE_PATH};
 use rocket::http::Method;
 use std::collections::HashSet;
@@ -118,8 +119,8 @@ fn to_document_path(rocket_uri: &str) -> String {
 }
 
 /// Every route the router actually holds, after ignition.
-async fn mounted() -> Vec<(Method, String)> {
-    let pool = common::setup_db(&common::oidc_config()).await;
+async fn mounted(caller: &str) -> Vec<(Method, String)> {
+    let (pool, _) = db_with_user(caller).await;
     let rocket = common::build_rocket_oidc(pool)
         .ignite()
         .await
@@ -134,7 +135,7 @@ async fn mounted() -> Vec<(Method, String)> {
 async fn every_mounted_api_route_is_in_the_published_document() {
     let document = backend_rust::openapi::document();
     let mut checked = 0;
-    for (method, uri) in mounted().await {
+    for (method, uri) in mounted("every_mounted_api_route_is_in_the_published_document").await {
         let path = to_document_path(&uri);
         if !is_api(&path) {
             continue;
@@ -174,7 +175,7 @@ async fn no_mounted_route_escapes_the_prefix_rule() {
     // the assertion is inverted: every mounted route must be in a namespace that is
     // public by decision, and anything else is an escape.
     const PUBLIC_NAMESPACES: &[&str] = &["/api/", "/auth", "/_auth", "/api-docs"];
-    for (method, uri) in mounted().await {
+    for (method, uri) in mounted("no_mounted_route_escapes_the_prefix_rule").await {
         let path = uri.split('?').next().unwrap();
         if path == "/api" {
             panic!("{method} {uri} resolves to exactly /api and would bypass enforcement");
@@ -202,7 +203,7 @@ async fn the_outage_sentinel_covers_every_method_outside_api() {
     // Same reasoning as the denial sentinel: a method that is not mounted there
     // answers 405 where the truth is 503, and 405 tells the client nothing is wrong
     // with the server.
-    let mounted = mounted().await;
+    let mounted = mounted("the_outage_sentinel_covers_every_method_outside_api").await;
     for method in [
         Method::Get,
         Method::Post,
@@ -224,7 +225,7 @@ async fn the_outage_sentinel_covers_every_method_outside_api() {
 
 #[tokio::test]
 async fn every_mounted_options_route_is_outside_api() {
-    for (method, uri) in mounted().await {
+    for (method, uri) in mounted("every_mounted_options_route_is_outside_api").await {
         if method == Method::Options {
             assert!(
                 !uri.starts_with("/api/"),
@@ -236,7 +237,7 @@ async fn every_mounted_options_route_is_outside_api() {
 
 #[tokio::test]
 async fn the_denial_sentinel_covers_every_method_outside_api() {
-    let mounted = mounted().await;
+    let mounted = mounted("the_denial_sentinel_covers_every_method_outside_api").await;
     for method in [
         Method::Get,
         Method::Post,
@@ -263,7 +264,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         .map(|(m, p, _)| (m.to_string(), canonical(p)))
         .collect();
 
-    let mounted_api: HashSet<(String, String)> = mounted()
+    let mounted_api: HashSet<(String, String)> = mounted("the_route_inventory_matches_the_mounted_surface_exactly")
         .await
         .into_iter()
         .filter(|(m, u)| {

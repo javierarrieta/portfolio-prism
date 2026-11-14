@@ -1,14 +1,14 @@
 mod common;
 
-use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfolio, seed_asset};
+use common::{build_rocket, db_with_user, seed_asset, seed_portfolio};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::serde::json::Json;
 
 #[tokio::test]
 async fn test_create_portfolio() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_create_portfolio").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -34,9 +34,9 @@ async fn test_create_portfolio() {
 
 #[tokio::test]
 async fn test_list_portfolios() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "List Test", "USD").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_list_portfolios").await;
+    let id = seed_portfolio(&pool, user, "List Test", "USD").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/").dispatch().await;
@@ -50,8 +50,8 @@ async fn test_list_portfolios() {
 
 #[tokio::test]
 async fn test_create_portfolio_with_description() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_create_portfolio_with_description").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -76,8 +76,8 @@ async fn test_create_portfolio_with_description() {
 
 #[tokio::test]
 async fn test_list_portfolios_empty_db() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_list_portfolios_empty_db").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/").dispatch().await;
@@ -89,12 +89,12 @@ async fn test_list_portfolios_empty_db() {
 
 #[tokio::test]
 async fn test_list_portfolios_multi_asset() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Multi Asset", "USD").await;
+    let (pool, user) = db_with_user("test_list_portfolios_multi_asset").await;
+    let id = seed_portfolio(&pool, user, "Multi Asset", "USD").await;
     seed_asset(&pool, id, "AAPL", "Apple").await;
     seed_asset(&pool, id, "GOOGL", "Google").await;
     seed_asset(&pool, id, "MSFT", "Microsoft").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/").dispatch().await;
@@ -112,9 +112,9 @@ async fn test_list_portfolios_multi_asset() {
 
 #[tokio::test]
 async fn test_get_portfolio_by_id() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Get Test", "EUR").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_get_portfolio_by_id").await;
+    let id = seed_portfolio(&pool, user, "Get Test", "EUR").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}", id)).dispatch().await;
@@ -128,8 +128,8 @@ async fn test_get_portfolio_by_id() {
 
 #[tokio::test]
 async fn test_get_portfolio_not_found() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_get_portfolio_not_found").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/9999").dispatch().await;
@@ -138,9 +138,9 @@ async fn test_get_portfolio_not_found() {
 
 #[tokio::test]
 async fn test_delete_portfolio() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Delete Test", "USD").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_delete_portfolio").await;
+    let id = seed_portfolio(&pool, user, "Delete Test", "USD").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete(format!("/api/portfolios/{}", id)).dispatch().await;
@@ -153,10 +153,10 @@ async fn test_delete_portfolio() {
 
 #[tokio::test]
 async fn test_delete_portfolio_with_assets_returns_conflict() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Delete With Assets", "USD").await;
+    let (pool, user) = db_with_user("test_delete_portfolio_with_assets_returns_conflict").await;
+    let id = seed_portfolio(&pool, user, "Delete With Assets", "USD").await;
     seed_asset(&pool, id, "AAPL", "Apple").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete(format!("/api/portfolios/{}", id)).dispatch().await;
@@ -169,8 +169,8 @@ async fn test_delete_portfolio_with_assets_returns_conflict() {
 
 #[tokio::test]
 async fn test_delete_portfolio_not_found() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_delete_portfolio_not_found").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.delete("/api/portfolios/9999").dispatch().await;
@@ -179,9 +179,9 @@ async fn test_delete_portfolio_not_found() {
 
 #[tokio::test]
 async fn test_update_portfolio_currency() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Update Cur", "USD").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_update_portfolio_currency").await;
+    let id = seed_portfolio(&pool, user, "Update Cur", "USD").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -210,8 +210,8 @@ async fn test_update_portfolio_currency() {
 
 #[tokio::test]
 async fn test_update_portfolio_not_found() {
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let (pool, user) = db_with_user("test_update_portfolio_not_found").await;
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let body = Json(serde_json::json!({
@@ -229,11 +229,11 @@ async fn test_update_portfolio_not_found() {
 
 #[tokio::test]
 async fn test_list_portfolios_includes_assets() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Asset Test", "USD").await;
+    let (pool, user) = db_with_user("test_list_portfolios_includes_assets").await;
+    let id = seed_portfolio(&pool, user, "Asset Test", "USD").await;
     seed_asset(&pool, id, "AAPL", "Apple Inc").await;
     seed_asset(&pool, id, "BTC-USD", "Bitcoin").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get("/api/portfolios/").dispatch().await;
@@ -248,10 +248,10 @@ async fn test_list_portfolios_includes_assets() {
 
 #[tokio::test]
 async fn test_get_portfolio_includes_assets() {
-    let pool = setup_db(&disabled_config()).await;
-    let id = seed_portfolio(&pool, DEFAULT_USER, "Single Asset Test", "USD").await;
+    let (pool, user) = db_with_user("test_get_portfolio_includes_assets").await;
+    let id = seed_portfolio(&pool, user, "Single Asset Test", "USD").await;
     seed_asset(&pool, id, "SPY", "SPDR S&P 500").await;
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}", id)).dispatch().await;
@@ -271,7 +271,7 @@ async fn test_portfolio_id_above_i32_max_round_trips() {
     // future change narrows an id on the way in or out, this test is what notices.
     const BIG_ID: i64 = 2_147_483_648; // i32::MAX + 1
 
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("test_portfolio_id_above_i32_max_round_trips").await;
     // `GENERATED ALWAYS` refuses a supplied id, and `OVERRIDING SYSTEM VALUE` is the
     // documented way to name one, so no sequence has to be touched to get here.
     sqlx::query(
@@ -279,12 +279,12 @@ async fn test_portfolio_id_above_i32_max_round_trips() {
          OVERRIDING SYSTEM VALUE VALUES ($1, 'Big Id', NULL, 'USD', 'USD', $2)",
     )
     .bind(BIG_ID)
-    .bind(DEFAULT_USER)
+    .bind(user)
     .execute(&pool)
     .await
     .unwrap();
 
-    let rocket = build_rocket(pool, DEFAULT_USER);
+    let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
     let resp = client.get(format!("/api/portfolios/{}", BIG_ID)).dispatch().await;
