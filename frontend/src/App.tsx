@@ -636,7 +636,20 @@ export default function App() {
         </div>
 
         {/* Tab View Selection */}
-        {currentPortfolio ? (
+        {/*
+          Backup is asked first, and is the only tab that sits outside the
+          `currentPortfolio` guard below it. Every tab under that guard renders the
+          selected portfolio, so with nothing selected they have nothing to say and
+          `No Portfolio Active` is the honest answer. Backup is account-level: it
+          exports whichever portfolios the signed-in user owns, and the restore half
+          that follows it is exactly what a user with no portfolio needs -- a fresh
+          account, or someone whose replace went wrong. Guarding it produced a dead
+          end: the sidebar item highlighted and the pane answered `No Portfolio
+          Active`.
+        */}
+        {activeTab === 'backup' ? (
+          <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (
               <Dashboard 
@@ -720,10 +733,6 @@ export default function App() {
                 />
                 {currentReport !== null && <TaxReportTable report={currentReport} />}
               </>
-            )}
-
-            {activeTab === 'backup' && (
-              <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
             )}
 
             {sellPnl !== null && sellPnl.portfolioId === selectedId && (

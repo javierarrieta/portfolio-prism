@@ -21,4 +21,23 @@ describe('the backup tab', () => {
     // The capabilities read is the tab's own, and its limits reach the screen.
     expect(await screen.findByTestId('caps-note')).toHaveTextContent('50,000 rows')
   })
+
+  it('opens the export card for a user who owns no portfolios', async () => {
+    server.use(
+      http.get('/api/portfolios', () => HttpResponse.json([])),
+      http.get('/api/backup/capabilities', () => HttpResponse.json({
+        schema_versions: [1], allow_price_restore: false, max_bytes: 8388608, max_rows: 50000,
+      })),
+    )
+    render(<App />)
+    await userEvent.click(await screen.findByText('Backup'))
+
+    // Export is account-level, so the per-portfolio guard must not stand in front of
+    // it. This is also the only way into the restore card that Task 12 adds, and the
+    // user who needs restore is exactly the one with nothing to select: a fresh
+    // account, or a replace that went wrong.
+    expect(await screen.findByTestId('export-card')).toBeInTheDocument()
+    expect(screen.getByTestId('no-portfolios')).toBeInTheDocument()
+    expect(screen.queryByText('No Portfolio Active')).toBeNull()
+  })
 })

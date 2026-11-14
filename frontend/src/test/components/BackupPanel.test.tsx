@@ -42,6 +42,14 @@ describe('export card', () => {
     expect(screen.getByRole('checkbox', { name: /IRA/i })).not.toBeChecked()
   })
 
+  it('says why the download is disabled', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    // A disabled control that gives no reason reads as a broken one, and the fix is
+    // one tick away.
+    expect(screen.getByTestId('export-button'))
+      .toHaveAttribute('title', 'Select at least one portfolio')
+  })
+
   it('builds the download href from exactly the selected ids', async () => {
     render(<BackupPanel portfolios={portfolios} />)
     await userEvent.click(screen.getByRole('checkbox', { name: /IRA/i }))
@@ -101,15 +109,67 @@ describe('export card', () => {
     expect(screen.getByTestId('no-portfolios')).toBeInTheDocument()
     expect(screen.getByTestId('export-button')).toBeDisabled()
   })
+
+  it('keeps the panel usable when the capabilities read fails', async () => {
+    let answered = false
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) {
+        answered = true
+        return new Response('bad gateway', { status: 500 })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    // One macrotask after the answer is in, every hop of the component's promise chain
+    // has run, so the missing note below is a decision and not a response that had not
+    // landed. There is no caps-note to wait for here -- that is the whole point.
+    await waitFor(() => expect(answered).toBe(true))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The limits line is the only thing the read was for. Losing it must not cost the
+    // export, which needs no capability to work.
+    expect(screen.queryByTestId('caps-note')).toBeNull()
+    await userEvent.click(screen.getByRole('checkbox', { name: /IRA/i }))
+    expect(await screen.findByTestId('download-bundle'))
+      .toHaveAttribute('href', '/api/backup/export?portfolio_ids=2')
+  })
+
+  it('keeps the panel usable when a 200 carries a body that is not capabilities', async () => {
+    // A proxy envelope, or a renamed field: `max_rows` here is a string, and
+    // `max_bytes` is missing altogether. Cast onto `Capabilities` and the limits line
+    // throws during render -- and with no error boundary in this app, a thrown render
+    // is a blank page, not a panel with one line missing.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ok: true, max_rows: '50000' })
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+
+    expect(await screen.findByTestId('export-card')).toBeInTheDocument()
+    expect(screen.queryByTestId('caps-note')).toBeNull()
+    await userEvent.click(screen.getByRole('checkbox', { name: /IRA/i }))
+    expect(await screen.findByTestId('download-bundle'))
+      .toHaveAttribute('href', '/api/backup/export?portfolio_ids=2')
+  })
 })
 
 describe('export download', () => {
   const realCreateObjectURL = URL.createObjectURL
   const realRevokeObjectURL = URL.revokeObjectURL
-  const BUNDLE_BODY = '{"format":"portfolio-prism-backup","schema_version":1}'
+  /** Deliberately not a string that `JSON.stringify(JSON.parse(x))` reproduces: the
+   * line breaks and the indent are dropped by a re-serialise, and `1e999` parses to
+   * `Infinity` and comes back out as `null`. The read-back below compares the bytes
+   * that were handed to `createObjectURL`, so a download that parsed the bundle and
+   * wrote it again fails here rather than passing. */
+  const BUNDLE_BODY =
+    '{\n  "format": "portfolio-prism-backup",\n  "schema_version": 1,\n  "assets": [{ "symbol": "Österreichische", "weight": 1e999 }]\n}'
 
   let created: Blob[]
   let clicked: HTMLAnchorElement[]
+  /** What happened to the object URL, in the order it happened. */
+  let events: string[]
   let createObjectURL: Mock<(blob: Blob) => string>
   let revokeObjectURL: Mock<() => void>
 
@@ -126,14 +186,27 @@ describe('export download', () => {
   beforeEach(() => {
     created = []
     clicked = []
-    createObjectURL = vi.fn((blob: Blob) => { created.push(blob); return 'blob:downloaded' })
-    revokeObjectURL = vi.fn()
+    events = []
+    createObjectURL = vi.fn((blob: Blob) => {
+      created.push(blob)
+      events.push('createObjectURL')
+      return 'blob:downloaded'
+    })
+    revokeObjectURL = vi.fn(() => { events.push('revoke') })
     URL.createObjectURL = createObjectURL
     URL.revokeObjectURL = revokeObjectURL
     // jsdom has no download manager. Recording the click instead of running it is
     // what makes the generated anchor, and the name it downloads under, observable.
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(
-      function capture(this: HTMLAnchorElement) { clicked.push(this) },
+      function capture(this: HTMLAnchorElement) {
+        clicked.push(this)
+        events.push('click')
+        // Registered from inside the click the component makes, so it enters the
+        // timer queue ahead of anything the component schedules once `click()` has
+        // returned. A revoke left in the click's own task is recorded before this
+        // probe fires; one deferred to the next task is recorded after it.
+        setTimeout(() => { events.push('click-task-ended') }, 0)
+      },
     )
   })
   afterEach(() => {
@@ -172,12 +245,51 @@ describe('export download', () => {
     await waitFor(() => expect(clicked).toHaveLength(1))
 
     expect(createObjectURL).toHaveBeenCalledTimes(1)
-    // The blob is the server's body and nothing else: not a re-serialisation of a
-    // parsed payload, which is how a download ends up empty or subtly corrupt.
+    // The blob carries the server's bytes and nothing else. The fixture above is what
+    // makes this worth asserting: a component that parsed the body and downloaded
+    // `JSON.stringify(JSON.parse(body))` would produce a different string here.
     expect(await readBlob(created[0])).toBe(BUNDLE_BODY)
     expect(clicked[0].getAttribute('download')).toBe('portfolio-prism-backup-2026-11-13.json')
     expect(clicked[0].getAttribute('href')).toBe('blob:downloaded')
-    expect(revokeObjectURL).toHaveBeenCalledWith('blob:downloaded')
+    // The revoke is deferred out of the click's task, so it is waited for rather than
+    // asserted in this tick -- and the order is what matters, not just the call.
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:downloaded'))
+    // The URL was still live when the click ran, and it went only after that click's
+    // task had ended: revoking before the click, or in the same tick after it, both
+    // cut the file off in a real browser.
+    expect(events).toEqual(['createObjectURL', 'click', 'click-task-ended', 'revoke'])
+  })
+
+  it('falls back to its own name when the server named nothing', async () => {
+    exportRespondsWith(new Response(BUNDLE_BODY, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await tickAndClickDownload()
+    await waitFor(() => expect(clicked).toHaveLength(1))
+    // The route does name its file. This is the answer to an answer that named
+    // nothing, and it has to be a plausible file name rather than no name at all --
+    // an unnamed download lands as `download`, which is the file nobody can identify
+    // later in a folder of them.
+    expect(clicked[0].getAttribute('download')).toBe('portfolio-prism-backup.json')
+  })
+
+  it('refuses a 200 that carried no bytes instead of handing over an empty backup', async () => {
+    exportRespondsWith(new Response('', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await tickAndClickDownload()
+
+    await waitFor(() => expect(screen.getByTestId('export-error'))
+      .toHaveTextContent('empty file'))
+    // The failure this guards is the quiet one: a zero-byte file downloads cleanly,
+    // looks like a backup in the folder, and is the backup that is there when it is
+    // needed. Nothing reaches the disk, and the selection stays ticked to retry.
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(clicked).toHaveLength(0)
+    expect(screen.getByTestId('download-bundle')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /IRA/i })).toBeChecked()
   })
 
   it('names the file when the server named it without quotes', async () => {

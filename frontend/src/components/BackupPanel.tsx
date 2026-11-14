@@ -60,6 +60,24 @@ async function readFailure(res: Response): Promise<FailureBody> {
   }
 }
 
+/** The capabilities body, or `null` when it is not a capabilities body.
+ *
+ * A bare `as Capabilities` on whatever a 200 happened to carry is not a check: a
+ * proxy's envelope, a truncated body, or a renamed field reaches
+ * `caps.max_rows.toLocaleString()` and throws during render, and there is no error
+ * boundary anywhere in this app, so the whole page would go blank instead of showing
+ * a panel that simply cannot state the limits. Refusing the shape keeps the panel
+ * usable — the export needs no capability — which is the same rule the capabilities
+ * failure path already follows. */
+function asCapabilities(body: unknown): Capabilities | null {
+  const c = body as Partial<Capabilities> | null;
+  if (!c || typeof c !== 'object') return null;
+  if (!Array.isArray(c.schema_versions)) return null;
+  if (typeof c.allow_price_restore !== 'boolean') return null;
+  if (!Number.isFinite(c.max_bytes) || !Number.isFinite(c.max_rows)) return null;
+  return c as Capabilities;
+}
+
 /** The name the server chose, off its `Content-Disposition`. The route names the
  * file after the day it was built, which is the name that survives a folder full of
  * them; the fallback is for an answer that named nothing, and is not a guess anyone
@@ -91,7 +109,10 @@ export default function BackupPanel({ portfolios }: Props) {
     let cancelled = false;
     apiFetch(`${API_BASE}/backup/capabilities`)
       .then((res) => (res.ok ? res.json() : null))
-      .then((body) => { if (!cancelled && body) setCaps(body as Capabilities); })
+      .then((body) => {
+        const read = asCapabilities(body);
+        if (!cancelled && read) setCaps(read);
+      })
       .catch(() => { /* nothing to switch off: see the comment above */ });
     return () => { cancelled = true; };
   }, []);
@@ -142,14 +163,27 @@ function ExportCard({ portfolios, caps }: { portfolios: PortfolioOption[]; caps:
       }
       // The bytes go to the download manager as they arrived. Nothing here parses or
       // re-serialises the bundle, which is how a download ends up empty or corrupt.
-      const url = URL.createObjectURL(await res.blob());
+      const blob = await res.blob();
+      // A 200 is not a backup. A gateway that swallowed the upstream body, or a route
+      // that answered before it had anything to say, arrives as an empty 200, and the
+      // one file a user must never be handed is the empty one — it downloads cleanly,
+      // sits in the folder looking like a backup, and is the backup they reach for
+      // after the disk fails. Refusing it in the panel is the whole point.
+      if (blob.size === 0) {
+        setExportError('The server answered with an empty file, so nothing was downloaded. Try again.');
+        return;
+      }
+      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
       link.download = filenameFrom(res.headers.get('Content-Disposition'));
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(url);
+      // The URL has to outlive the click: the browser opens the blob when the save
+      // begins, and that is not until this task has yielded. Revoking in the same tick
+      // is the race that truncates a file, so it goes on the next macrotask.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
     } catch {
       setExportError('The download could not be completed. Check the connection and try again.');
     } finally {
@@ -186,6 +220,14 @@ function ExportCard({ portfolios, caps }: { portfolios: PortfolioOption[]; caps:
           </li>
         ))}
       </ul>
+      {/* Gated on `allow_price_restore`, which is the server's *restore* permission and
+          is never consulted by the export route — so this is deliberately stricter than
+          the backend, and not a bug to fix. A bundle carrying a price section is a
+          bundle that cannot be applied while the flag is off: `restore::apply` refuses
+          it (`PricesDisabled`, backend_rust/src/backup/restore.rs) before it opens a
+          transaction. Offering the toggle would sell the user a file they can never
+          restore, which is worse than not offering it. Do not "correct" this to match
+          what the export route checks. */}
       {caps?.allow_price_restore && (
         <label style={{ display: 'block', marginTop: '12px' }}>
           <input
@@ -216,7 +258,12 @@ function ExportCard({ portfolios, caps }: { portfolios: PortfolioOption[]; caps:
           {downloading ? 'Downloading…' : 'Download bundle'}
         </a>
       ) : (
-        <button data-testid="export-button" className="btn btn-primary" disabled>
+        <button
+          data-testid="export-button"
+          className="btn btn-primary"
+          disabled
+          title="Select at least one portfolio"
+        >
           Download bundle
         </button>
       )}
