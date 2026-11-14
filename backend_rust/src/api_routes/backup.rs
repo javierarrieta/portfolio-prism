@@ -213,8 +213,14 @@ fn parse_query_flag(raw: Option<&str>) -> Option<bool> {
     get,
     path = "/api/backup/export",
     params(
-        ("portfolio_ids" = Vec<String>, Query, style = Form, explode = false, description = "Comma-separated portfolio ids to include; the parameter may appear only once"),
-        ("include_prices" = Vec<String>, Query, style = Form, explode = false, description = "Include the price-history section: 1/true/yes to include, 0/false/no to omit; the parameter may appear only once, with one value"),
+        // `portfolio_ids` is required in the published document — an absent one is a
+        // `422`, not an empty bundle, and a contract that calls it optional teaches
+        // clients to omit it. The flag cannot be set here: utoipa infers `required`
+        // from the handler's `Option` argument, so `openapi::mark_required_query_params`
+        // sets it. `include_prices` really is optional — absent means off
+        // (`parse_query_flag`) — and so is `apply_prices` below.
+        ("portfolio_ids" = Vec<String>, Query, style = Form, explode = false, description = "Comma-separated portfolio ids to include; required, and the parameter may appear only once"),
+        ("include_prices" = Vec<String>, Query, style = Form, explode = false, description = "Include the price-history section: 1/true/yes to include, 0/false/no to omit; optional, absent means omit; the parameter may appear only once, with one value"),
     ),
     responses(
         (status = 200, description = "The bundle; see docs/backup-schema/v1.json for its shape", body = serde_json::Value),
@@ -345,7 +351,10 @@ fn too_large() -> BackupError {
     post,
     path = "/api/backup/preview",
     params(
-        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; the parameter may appear only once"),
+        // Required in the published document for the reason `only_once` documents — an
+        // absent `mode` is a `422`, because neither mode is the safe one to guess — and
+        // set there rather than here, for the reason `export`'s comment gives.
+        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; required, and the parameter may appear only once"),
     ),
     request_body = serde_json::Value,
     responses(
@@ -429,8 +438,10 @@ pub async fn preview(
     post,
     path = "/api/backup/restore",
     params(
-        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; the parameter may appear only once"),
-        ("apply_prices" = Vec<String>, Query, style = Form, explode = false, description = "apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; needs the server flag, and may appear only once"),
+        // As on `preview`: `mode` is required — an absent one is a `422` — and
+        // `apply_prices` is optional, absent meaning leave the price section alone.
+        ("mode" = Vec<String>, Query, style = Form, explode = false, description = "copy or replace; required, and the parameter may appear only once"),
+        ("apply_prices" = Vec<String>, Query, style = Form, explode = false, description = "apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; optional, absent means leave it alone; needs the server flag, and may appear only once"),
     ),
     request_body = serde_json::Value,
     responses(

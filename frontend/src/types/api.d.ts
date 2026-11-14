@@ -570,10 +570,10 @@ export interface operations {
   };
   export: {
     parameters: {
-      query?: {
-        /** @description Comma-separated portfolio ids to include; the parameter may appear only once */
-        portfolio_ids?: string[] | null;
-        /** @description Include the price-history section: 1/true/yes to include, 0/false/no to omit; the parameter may appear only once, with one value */
+      query: {
+        /** @description Comma-separated portfolio ids to include; required, and the parameter may appear only once */
+        portfolio_ids: string[] | null;
+        /** @description Include the price-history section: 1/true/yes to include, 0/false/no to omit; optional, absent means omit; the parameter may appear only once, with one value */
         include_prices?: string[] | null;
       };
     };
@@ -616,9 +616,9 @@ export interface operations {
   };
   preview: {
     parameters: {
-      query?: {
-        /** @description copy or replace; the parameter may appear only once */
-        mode?: string[] | null;
+      query: {
+        /** @description copy or replace; required, and the parameter may appear only once */
+        mode: string[] | null;
       };
     };
     requestBody: {
@@ -671,10 +671,10 @@ export interface operations {
   };
   restore: {
     parameters: {
-      query?: {
-        /** @description copy or replace; the parameter may appear only once */
-        mode?: string[] | null;
-        /** @description apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; needs the server flag, and may appear only once */
+      query: {
+        /** @description copy or replace; required, and the parameter may appear only once */
+        mode: string[] | null;
+        /** @description apply the bundle's price section: 1/true/yes to apply, 0/false/no to leave it alone; optional, absent means leave it alone; needs the server flag, and may appear only once */
         apply_prices?: string[] | null;
       };
     };

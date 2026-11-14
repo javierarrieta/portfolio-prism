@@ -162,6 +162,13 @@ be worse than leaving it clean.
   is `YYYY-MM-DD`, because `historical_prices.date` is a `DATE` column read back as
   `NaiveDate`. Normalising the two would be a change to stored data, which this feature does not
   make.
+  **Which UTC spelling, exactly.** Validation accepts either offset form or `Z`
+  (`parse_from_rfc3339`), and the fixtures in `backend_rust/tests/backup_test.rs` are written
+  with `Z`, but export writes what `DateTime<Utc>::to_rfc3339()` prints —
+  `2024-01-15T00:00:00+00:00` — and `created_at` is the same call, so it also carries
+  sub-second digits. Nothing in this build writes a `Z`, so a document that expects one in a
+  downloaded bundle is describing a row the exporter cannot produce; `docs/walkthrough.md` §3
+  records the offset spelling for that reason.
 - Transaction dates must additionally fall inside **1900-01-01 to 2100-01-01**, the range
   `create_transaction` already enforces (`transactions.rs:223-229`). A restore must not accept a
   row the ordinary write path would reject.

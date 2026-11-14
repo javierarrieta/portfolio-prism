@@ -24,6 +24,19 @@ jobs:
           cd backend_rust
           cargo test
 
+      - name: Clippy
+        # `AGENTS.md` ("Backend gates") and `docs/auth-testing.md` both list this as a
+        # backend gate, and no job ran it, so the documented gate list and the enforced
+        # one had different contents: a lint that fails on someone's machine shipped
+        # green. The command is the one the docs give rather than
+        # `cargo clippy --all-targets -- -D warnings`, because the tree has pre-existing
+        # warnings (deprecated `rocket::http::CookieBuilder::finish` in the auth tests,
+        # dead_code in others) and silencing those is a change to the gate, not a step
+        # to add here. What this step makes impossible is a clippy *error* reaching main.
+        run: |
+          cd backend_rust
+          cargo clippy --all-targets
+
       - name: Pricing-seam gate
         # Static rule: no test may construct a pricing service pointed at the live
         # provider. The suite used to make 21 outbound calls per run and still passed

@@ -52,6 +52,10 @@ backend/tests/test_tax_engine.py ...                                     [100%]
 ============================== 3 passed in 0.05s ===============================
 ```
 
+> **Historical transcript.** That is `pytest` output from the Python backend this
+> repository replaced. `cargo test` from `backend_rust/` — the command above — prints
+> Rust test names and a `test result:` line, and nothing in this tree runs `pytest`.
+
 ### 2. End-to-End API Integration Verification
 We executed an integration verification script ([verify_app.py](file:///Users/javier/.gemini/antigravity/brain/fb89866f-f765-45d0-98a1-2b68c71256dc/scratch/verify_app.py)) that creates a portfolio, logs transactions, pulls live prices, and checks metrics.
 
@@ -232,17 +236,22 @@ Sign back in before §3, and re-export `PP` — a new login mints a new cookie.
 1. Sign in and note your portfolios, their assets, and a transaction count you recognise:
    ```bash
    curl -sS --cookie "pp_session=$PP" http://localhost:8000/api/portfolios/ \
-     | python3 -c 'import json,sys;[print(p["id"],p["name"],p["base_currency"]) for p in json.load(sys.stdin)]'
+     | python3 -c 'import json,sys;[print(p["id"],p["name"],p["currency"]) for p in json.load(sys.stdin)]'
    curl -sS --cookie "pp_session=$PP" http://localhost:8000/api/portfolios/<id>/transactions \
      | python3 -c 'import json,sys;print(len(json.load(sys.stdin)),"transactions")'
    ```
-2. Open **Backup**, tick one portfolio of several, and click **Download bundle**.
+   `GET /api/portfolios/` answers `currency`, not `base_currency` — `base_currency` is a
+   *bundle* field (`PortfolioOut` does not carry it), so asking the API for it raises
+   `KeyError: 'base_currency'`. Step 3 reads it out of the file instead.
+2. Open **Backup**, tick one portfolio of several — **one that has transactions**, because
+   step 3 reads the first transaction out of the file and a portfolio with none has no
+   first transaction — and click **Download bundle**.
    Expected: the browser saves `portfolio-prism-backup-YYYY-MM-DD.json` — that name comes
    from the server's `Content-Disposition`, not from the URL, and the response also
    carries `Cache-Control: no-store`.
 3. Open the file. Confirm: the unselected portfolios are absent; `quantity`, `price` and
-   `fee` are quoted strings, not numbers; transaction `date` values carry a time and a
-   `Z`; there is no `prices` array unless you asked for it. In one command, with the
+   `fee` are quoted strings, not numbers; transaction `date` values carry a time and a UTC
+   offset; there is no `prices` array unless you asked for it. In one command, with the
    downloaded file copied to `/tmp/bundle.json`:
    ```bash
    python3 - <<'PY'
@@ -250,18 +259,30 @@ Sign back in before §3, and re-export `PP` — a new login mints a new cookie.
    b = json.load(open('/tmp/bundle.json'))
    print('format/version:', b['format'], b['schema_version'], b['created_at'])
    print('portfolios   :', [p['name'] for p in b['portfolios']])
+   print('base currency:', [p['base_currency'] for p in b['portfolios']])
    print('has prices   :', 'prices' in b)
-   t = next(t for p in b['portfolios'] for a in p['assets'] for t in a['transactions'])
-   print('tx field types:', {k: type(t[k]).__name__ for k in ('quantity','price','fee')})
-   print('tx date      :', t['date'])
+   txs = [t for p in b['portfolios'] for a in p['assets'] for t in a['transactions']]
+   if not txs:
+       print('transactions : none in this bundle — tick a portfolio that has some')
+   else:
+       t = txs[0]
+       print('tx field types:', {k: type(t[k]).__name__ for k in ('quantity','price','fee')})
+       print('tx date      :', t['date'])
    PY
    ```
    Expected: `portfolio-prism-backup 1 <RFC 3339 UTC>` (that tag is `FORMAT_TAG`, and a
    file without it is refused as "not a portfolio-prism-backup bundle"); only the ticked
-   portfolio names;
-   `has prices: False` (or `True` with a flat `prices` array if you ticked price history);
-   `{'quantity': 'str', 'price': 'str', 'fee': 'str'}`; and a date like
-   `2024-05-02T14:30:00Z`. A bare `2024-05-02` is a defect: the column is a datetime and
+   portfolio names; `base_currency` present on every portfolio (it is a bundle field, and
+   this is where you read it); `has prices: False` (or `True` with a flat `prices` array if
+   you ticked price history); `{'quantity': 'str', 'price': 'str', 'fee': 'str'}`; and a
+   date like `2024-05-02T14:30:00+00:00`.
+
+   **`+00:00`, not `Z`.** `export` writes `DateTime<Utc>::to_rfc3339()`, which spells UTC
+   with the explicit offset, and `created_at` is the same call so it also carries
+   sub-second digits. A `Z` is accepted on the way in — `parse_from_rfc3339` takes either
+   spelling, and the fixtures in `backend_rust/tests/backup_test.rs` are written with one —
+   but nothing in this build writes one, so expecting `Z` here is expecting a row the
+   exporter cannot produce. A bare `2024-05-02` is a defect: the column is a datetime and
    the time is what orders same-day rows.
 4. Open the **Tax Report** tab for that portfolio and compare its realized-P&L figure
    against the numbers the bundle implies. If they disagree, stop — the format is missing
@@ -318,19 +339,47 @@ instance to restore into.
    `apply_prices`, so a bundle carrying a `prices` section previews
    `N price rows in this bundle will be left alone — this panel does not restore price
    history.` and restores without them. Checking the flag itself needs a bundle that
-   **has** a `prices` section, and that needs the server flag on at export time — the panel
-   only offers the *Include price history* tick when `/api/backup/capabilities` reports
-   `allow_price_restore` (`BackupPanel.tsx:589`), and §0 left the flag unset. So this part
-   needs three restarts:
+   **has** a `prices` section, and that needs the server flag on at export time — the
+   export card renders the *Include price history* tick only when
+   `/api/backup/capabilities` reports `allow_price_restore` (the `caps?.allow_price_restore`
+   gate in `BackupPanel.tsx`), and §0 left the flag unset.
 
-   a. Restart the backend with `export BACKUP_ALLOW_PRICE_RESTORE=1`, tick **Include
-      price history** on the export card, download, and save the file as
-      `/tmp/bundle-prices.json`. Expected: it carries a `prices` array of
-      `{symbol, date, close_price}` rows —
+   **Read this before starting, because it is the step most easily misread.** `prices_for`
+   (`backend_rust/src/backup/export.rs`) reads the bars out of the `historical_prices`
+   table of the instance you export from, and restore writes them with
+   `INSERT … ON CONFLICT (symbol, date) DO NOTHING`. Export from an instance and post the
+   same file back **into that same instance** and every row conflicts with the row it was
+   just read from, so `prices_inserted` is necessarily `0` — a correct answer, not a failed
+   step. Steps a–c are that same-instance check: they prove the **guard**. Step d is what
+   proves the **write**. The other way to see a count above zero is to restore into a
+   *different* `DATABASE_URL`, one with no bars for those symbols — that is the case §6
+   step 5 needs to compare metrics across instances — and it means signing in again after
+   the switch, because a session cookie names a user row of the database that minted it.
+   Steps a–d all stay on the instance from step 1 and need three restarts.
+
+   a. **Precondition: this instance has to have bars, and nothing earlier in this document
+      gives it any.** §6 step 5 says plainly that a fresh instance has no bars until the
+      provider fills them, and §4 has been running on a fresh instance since step 1. Open
+      the **Dashboard** for one of the restored portfolios and wait for the value chart to
+      draw — that request is what fills `historical_prices` — then check, with the same
+      `$DB` derivation §5 uses:
+      ```bash
+      export DB="${DATABASE_URL:-sqlite:../portfolio.db?mode=rwc}"
+      export DB="${DB#sqlite:}"; export DB="${DB%%\?*}"
+      sqlite3 "$DB" 'select symbol, count(*) from historical_prices group by symbol'
+      ```
+      Expected: at least one symbol with rows. If it answers nothing, the provider did not
+      answer either, and every number below depends on that being fixed first.
+
+      Then restart the backend with `export BACKUP_ALLOW_PRICE_RESTORE=1`, tick **Include
+      price history** on the export card — tick the same portfolio you opened — download,
+      and save the file as `/tmp/bundle-prices.json`. Expected: it carries a `prices` array
+      of `{symbol, date, close_price}` rows, and
       `python3 -c 'import json;print(len(json.load(open("/tmp/bundle-prices.json"))["prices"]))'`
-      prints a number above zero. With the flag off the tick is not offered at all and the
-      file has no `prices` key, which is exactly what would make the next two checks
-      unreachable.
+      prints a number above zero, and it is the bars for the ticked portfolios' symbols and
+      no others (`prices_for` is asked for exactly those). With the flag off the tick is not
+      offered at all and the file has no `prices` key, which is exactly what would make the
+      checks below unreachable.
    b. Restart with the flag **off** (unset the variable) and post that file:
       ```bash
       curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
@@ -338,17 +387,53 @@ instance to restore into.
            'http://localhost:8000/api/backup/restore?mode=copy&apply_prices=1'
       ```
       Expected: `422` naming price restore as disabled, and **nothing written** — the
-      refusal is the first thing `apply` does, before `pool.begin()`
-      (`backend_rust/src/backup/restore.rs:216-222`), so none of the bundle's portfolios
-      appear either.
-   c. Restart with the flag **on** and post the same file. Expected: `200` and a
-      `prices_inserted` count above zero.
+      refusal is the first thing `apply` does, before `pool.begin()` (the `PricesDisabled`
+      guard at the top of `apply`, `backend_rust/src/backup/restore.rs`), so none of the
+      bundle's portfolios appear either.
+   c. Restart with the flag **on** and post the same file. Expected: `200` and
+      `"prices_inserted": 0` — **zero, on this instance, by construction.** This is the
+      database those rows were read from, so all of them conflict and `DO NOTHING` writes
+      none. A count above zero here would be the thing to investigate, not the thing to
+      celebrate. What this step does prove is that the flag is what lets a price-bearing
+      bundle through at all: the identical request was a `422` one restart earlier.
+   d. Now the write itself, still on this instance. Clear one symbol's bars, and post the
+      same file again:
+      ```bash
+      SYMBOL=$(python3 -c 'import json;print(json.load(open("/tmp/bundle-prices.json"))["prices"][0]["symbol"])')
+      IN_BUNDLE=$(python3 -c 'import json,sys; print(sum(1 for p in json.load(open("/tmp/bundle-prices.json"))["prices"] if p["symbol"] == sys.argv[1]))' "$SYMBOL")
+      echo "$SYMBOL: $IN_BUNDLE rows in the bundle"
+      sqlite3 "$DB" "delete from historical_prices where symbol = '$SYMBOL'"
+      curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
+           --data-binary @/tmp/bundle-prices.json -w 'status=%{http_code}\n' \
+           'http://localhost:8000/api/backup/restore?mode=copy&apply_prices=1'
+      sqlite3 "$DB" "select count(*) from historical_prices where symbol = '$SYMBOL'"
+      ```
+      Expected: `prices_inserted` equals `$IN_BUNDLE`, and the last `select` prints
+      `$IN_BUNDLE` too — the restore filled the gap it found. Count the rows in the bundle
+      rather than the rows in the table because the two can differ: if the provider cached
+      new bars after the export, the table had more rows than the file, and only the file's
+      can be inserted. Post it once more and `prices_inserted` is `0`, which is the other
+      half of the rule and the reason the statement is `DO NOTHING` and not `DO UPDATE`: a
+      bundle may fill gaps in the cache, it may not overwrite a bar that is already there.
 
-   Note what the three of these pin down between them: the guard is the **combination** of
-   a bundle that carries prices, `apply_prices` set, and the flag off. A flag-off restore
-   of a bundle with no price section is a plain `200` whether or not `apply_prices` is
-   set — that is the guard's own design ("a bundle with no prices asks for nothing the flag
-   could forbid") and is pinned by a test, so it is not a hole to report.
+      Do the delete and the post back to back. If a dashboard loads in between, the
+      provider refills the gap and the count comes back lower for that reason alone.
+
+   Each of b, c and d is a `mode=copy` restore, so the portfolio list keeps growing as you
+   run them. That is expected, and it is not what these steps are checking.
+
+   Note what these pin down between them: the guard is the **combination** of a bundle that
+   carries prices, `apply_prices` set, and the flag off. A flag-off restore of a bundle
+   with no price section is a plain `200` whether or not `apply_prices` is set — that is the
+   guard's own design ("a bundle with no prices asks for nothing the flag could forbid") and
+   is pinned by a test, so it is not a hole to report.
+
+   And c and d are not left to this page alone: both halves are pinned in
+   `backend_rust/tests/backup_test.rs` — `a_price_restore_fills_gaps_and_never_overwrites_an_existing_close`
+   (a stored date is neither overwritten nor counted, a gap is, and a row repeated inside
+   one bundle counts once) and `the_price_section_round_trips_byte_for_byte` (empty the
+   table, restore the file the export just produced, and every row comes back with its
+   decimals unrescaled).
 
 If step 2 or 4 disagrees with the preview you were shown, that is a defect in `plan_for`
 versus `apply` — the two must count the same rows by the same rule.
@@ -412,8 +497,9 @@ Expected: **`200`, immediately.** Not a `503`, and not the feature failing. A RE
 writer does not block readers under the rollback journal, and `backup_export::build`
 issues no write, so there is nothing for a read-only route to wait on — the auth guard's
 own read of `users` gets through for the same reason. The consequence is written into the
-route at `src/api_routes/backup.rs:270-283`: **the export's `Lock` arm is unreachable
-from a held lock in this journal mode.** The failure that could reach it, pool exhaustion,
+route at the `DbFailure::Lock` arm of `export`'s error mapping in
+`src/api_routes/backup.rs`: **the export's `Lock` arm is unreachable from a held lock in
+this journal mode.** The failure that could reach it, pool exhaustion,
 is met earlier by the guard and answered a `500` before that arm. Both halves are pinned by
 tests instead (`an_exhausted_pool_is_a_lock_not_an_outage`, and
 `a_lock_is_a_503_that_says_when_to_retry` for the response shape). So a `200` here is the
@@ -475,7 +561,10 @@ constants as if it were a check.
      compare across instances you must carry the bars: export with price history, restore
      with `apply_prices=1` and `BACKUP_ALLOW_PRICE_RESTORE=1` (§4 step 6) — and remember
      that writing those rows is one tenant writing market data every other tenant's dated
-     reports read, which is why the flag ships off.
+     reports read, which is why the flag ships off. (Note which count belongs where: §4
+     step 6 posts back into the instance the bars were read from and so expects
+     `prices_inserted: 0`; it is a restore into a file with no bars for those symbols —
+     the case this bullet is about — that puts a number above zero.)
 6. Record which figures you actually compared, and say that a human did it.
 
 ### 7. What this still does not prove

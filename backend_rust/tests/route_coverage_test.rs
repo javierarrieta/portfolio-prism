@@ -301,3 +301,58 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         "five routes authenticate without checking an id"
     );
 }
+
+/// The query parameters a route answers `422` without are published `required`, and the
+/// two whose absence means "off" are not.
+///
+/// utoipa infers `required` from the handler's argument type, and every backup query
+/// parameter is `Option<Vec<String>>` there — reading the field as a sequence is the only
+/// way `only_once` can see a repeated parameter — so the derive calls all of them optional
+/// and `#[utoipa::path]` has no attribute to overrule it. The correction lives in
+/// `openapi::mark_required_query_params`, and this is the mutation that proves it holds:
+/// delete that call and the first three assertions fail, because the published contract
+/// would tell a generated client to omit a parameter the route refuses without. Widen the
+/// list to `include_prices` or `apply_prices` and the last two fail — absent means off for
+/// those two, and the panel relies on that on every plain restore.
+#[test]
+fn required_query_parameters_are_published_required() {
+    use utoipa::openapi::path::PathItemType;
+    let document = backend_rust::openapi::document();
+    let is_required = |path: &str, method: PathItemType, name: &str| {
+        document
+            .paths
+            .paths
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} is not in the document"))
+            .operations
+            .get(&method)
+            .unwrap_or_else(|| panic!("{path} has no such operation in the document"))
+            .parameters
+            .as_ref()
+            .and_then(|params| params.iter().find(|p| p.name == name))
+            .unwrap_or_else(|| panic!("{name} is not a parameter of {path}"))
+            .required
+            == utoipa::openapi::Required::True
+    };
+
+    assert!(
+        is_required("/api/backup/export", PathItemType::Get, "portfolio_ids"),
+        "an absent portfolio_ids is a 422, never an empty bundle"
+    );
+    assert!(
+        is_required("/api/backup/preview", PathItemType::Post, "mode"),
+        "an absent mode is a 422: neither mode is the safe one to guess"
+    );
+    assert!(
+        is_required("/api/backup/restore", PathItemType::Post, "mode"),
+        "the write must not guess a mode either"
+    );
+    assert!(
+        !is_required("/api/backup/export", PathItemType::Get, "include_prices"),
+        "absent include_prices means omit, so it really is optional"
+    );
+    assert!(
+        !is_required("/api/backup/restore", PathItemType::Post, "apply_prices"),
+        "absent apply_prices means leave the price section alone, so it really is optional"
+    );
+}
