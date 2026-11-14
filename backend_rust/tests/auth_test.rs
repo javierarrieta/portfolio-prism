@@ -72,7 +72,7 @@ async fn a_valid_session_cookie_authenticates() {
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER as i64, 0))
+        .private_cookie(session_cookie(DEFAULT_USER, 0))
         .dispatch()
         .await;
 
@@ -122,7 +122,7 @@ async fn a_tampered_session_cookie_is_rejected() {
 
     // The positive control: the same construction for a real user is accepted.
     // That is what shows the AEAD tag, not the shape of the value, authenticates.
-    let real = session_cookie(DEFAULT_USER as i64, 0);
+    let real = session_cookie(DEFAULT_USER, 0);
     let resp = client.get("/auth/me").private_cookie(real).dispatch().await;
     assert_eq!(resp.status(), Status::Ok);
 }
@@ -134,7 +134,7 @@ async fn a_cookie_whose_token_version_is_stale_is_rejected() {
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER as i64, 41))
+        .private_cookie(session_cookie(DEFAULT_USER, 41))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -149,7 +149,7 @@ async fn an_expired_cookie_is_rejected_even_with_a_matching_token_version() {
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(expired_session_cookie(DEFAULT_USER as i64, 0))
+        .private_cookie(expired_session_cookie(DEFAULT_USER, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -161,7 +161,7 @@ async fn a_deactivated_user_is_rejected() {
     // `false`, not `0`: `users.is_active` is a Postgres `BOOLEAN`, and Postgres will
     // not coerce an integer into one the way SQLite's integer storage allowed.
     sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
-        .bind(DEFAULT_USER as i64)
+        .bind(DEFAULT_USER)
         .execute(&pool)
         .await
         .unwrap();
@@ -171,7 +171,7 @@ async fn a_deactivated_user_is_rejected() {
 
     let resp = client
         .get("/auth/me")
-        .private_cookie(session_cookie(DEFAULT_USER as i64, 0))
+        .private_cookie(session_cookie(DEFAULT_USER, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::Unauthorized);
@@ -183,7 +183,7 @@ async fn logout_all_bumps_the_token_version_and_invalidates_the_live_cookie() {
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
         .unwrap();
-    let cookie = session_cookie(DEFAULT_USER as i64, 0);
+    let cookie = session_cookie(DEFAULT_USER, 0);
 
     // Valid before.
     let resp = client
@@ -201,7 +201,7 @@ async fn logout_all_bumps_the_token_version_and_invalidates_the_live_cookie() {
     assert_eq!(resp.status(), Status::SeeOther);
 
     let (version,): (i64,) = sqlx::query_as("SELECT token_version FROM users WHERE id = $1")
-        .bind(DEFAULT_USER as i64)
+        .bind(DEFAULT_USER)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -293,7 +293,7 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
     for (method, path) in reachable_api_routes().await {
         let resp = client
             .req(method, path.as_str())
-            .private_cookie(session_cookie(DEFAULT_USER as i64, 0))
+            .private_cookie(session_cookie(DEFAULT_USER, 0))
             .dispatch()
             .await;
         assert_ne!(
@@ -405,7 +405,7 @@ async fn a_database_failure_is_not_reported_as_a_denial() {
 
     let resp = client
         .get("/api/portfolios/")
-        .private_cookie(session_cookie(DEFAULT_USER as i64, 0))
+        .private_cookie(session_cookie(DEFAULT_USER, 0))
         .dispatch()
         .await;
     assert_eq!(resp.status(), Status::ServiceUnavailable);

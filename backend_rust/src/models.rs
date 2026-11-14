@@ -15,8 +15,10 @@ use utoipa::ToSchema;
 // and whichever prepared it first fixes `$1`'s type. The other then sends the wrong
 // number of bytes and Postgres answers `22P03 incorrect binary data format in bind
 // parameter 1` (or `08P01 insufficient data left in message`) — a 500 that depends on
-// which route ran first. Path parameters stay `i32` so the OpenAPI surface does not
-// move, so every bind of one of these ids narrows no further than `i64`.
+// which route ran first. Path parameters are `i64` as well, so every bind of one of
+// these ids is `i64` at the point it is bound and no call site can prepare the same
+// SQL text at a narrower width. Do not reintroduce a narrowing here to "keep the OpenAPI
+// surface still": the surface is already `int64` and the bind failure is not.
 #[derive(Debug, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Portfolio {
     pub id: i64,

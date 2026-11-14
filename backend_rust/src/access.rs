@@ -16,6 +16,13 @@
 use rocket::http::Status;
 use crate::db::DbPool;
 
+// Every id in this module is `i64`, the width of every id column in
+// `migrations/0001_init.sql`. That matters more here than anywhere else in the crate:
+// a narrowing on these parameters is not a wrong number in a response body, it is an
+// authorization decision made about a *different row* than the one the caller named.
+// `resolve` compares against `portfolios.owner_id` directly, so no id may arrive here
+// having been squeezed through `i32`.
+
 /// What a caller needs in order to perform an operation.
 ///
 /// There is no membership table in this change, so every level is satisfied by
@@ -38,10 +45,7 @@ pub enum Access {
 /// real 500s.
 async fn resolve(
     pool: &DbPool,
-    user_id: i32,
-    // `i64` because `portfolios.id` is `BIGINT`. Taking `i32` here and widening at the
-    // bind would mean the authorization decision is made on a value that had already
-    // been narrowed — silently, for any id above `i32::MAX`.
+    user_id: i64,
     portfolio_id: i64,
 ) -> Result<Option<Access>, sqlx::Error> {
     let row: Option<(Option<i64>,)> =
@@ -54,7 +58,7 @@ async fn resolve(
         return Ok(None);
     };
 
-    if owner_id != user_id as i64 {
+    if owner_id != user_id {
         return Ok(None);
     }
     // Ownership is the only level this change can grant.
@@ -72,7 +76,7 @@ fn grade(granted: Access, min: Access) -> Result<Access, Status> {
 
 /// Deny a caller-supplied id as **not found**, never forbidden: a `403` confirms
 /// the resource exists, which is the oracle this rule removes.
-fn deny(what: &str, id: i32, user_id: i32) -> Status {
+fn deny(what: &str, id: i64, user_id: i64) -> Status {
     eprintln!("WARN: access denied: user {user_id} has no access to {what} {id}");
     Status::NotFound
 }
@@ -82,8 +86,8 @@ fn deny(what: &str, id: i32, user_id: i32) -> Status {
 fn outcome(
     resolved: Result<Option<Access>, sqlx::Error>,
     what: &str,
-    id: i32,
-    user_id: i32,
+    id: i64,
+    user_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
     match resolved {
@@ -99,12 +103,12 @@ fn outcome(
 /// Check the caller's access to a portfolio by id.
 pub async fn require(
     pool: &DbPool,
-    user_id: i32,
-    portfolio_id: i32,
+    user_id: i64,
+    portfolio_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
     outcome(
-        resolve(pool, user_id, portfolio_id as i64).await,
+        resolve(pool, user_id, portfolio_id).await,
         "portfolio",
         portfolio_id,
         user_id,
@@ -115,13 +119,13 @@ pub async fn require(
 /// Check access to an asset by id, via its portfolio.
 pub async fn require_asset(
     pool: &DbPool,
-    user_id: i32,
-    asset_id: i32,
+    user_id: i64,
+    asset_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
     let portfolio_id: Option<(i64,)> =
         sqlx::query_as("SELECT portfolio_id FROM assets WHERE id = $1")
-            .bind(asset_id as i64)
+            .bind(asset_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| {
@@ -150,13 +154,13 @@ pub async fn require_asset(
 /// into somebody else's asset.
 pub async fn require_asset_in(
     pool: &DbPool,
-    user_id: i32,
-    path_portfolio_id: i32,
-    asset_id: i32,
+    user_id: i64,
+    path_portfolio_id: i64,
+    asset_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
     let row: Option<(i64,)> = sqlx::query_as("SELECT portfolio_id FROM assets WHERE id = $1")
-        .bind(asset_id as i64)
+        .bind(asset_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| {
@@ -168,7 +172,7 @@ pub async fn require_asset_in(
         return Err(deny("asset", asset_id, user_id));
     };
 
-    if real_portfolio != path_portfolio_id as i64 {
+    if real_portfolio != path_portfolio_id {
         // The path and the row disagree: deny without revealing which is wrong,
         // and without a second query to find out.
         return Err(deny("asset", asset_id, user_id));
@@ -180,12 +184,12 @@ pub async fn require_asset_in(
 /// Check access to a transaction by id, via its asset and portfolio.
 pub async fn require_transaction(
     pool: &DbPool,
-    user_id: i32,
-    tx_id: i32,
+    user_id: i64,
+    tx_id: i64,
     min: Access,
 ) -> Result<Access, Status> {
     let asset: Option<(i64,)> = sqlx::query_as("SELECT asset_id FROM transactions WHERE id = $1")
-        .bind(tx_id as i64)
+        .bind(tx_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| {
@@ -204,7 +208,7 @@ pub async fn require_transaction(
     // database still can, and this branch must not grant on it;
     // `a_transaction_whose_asset_is_gone_is_not_found` constructs that case by
     // dropping the constraint, because nothing else can.
-    require_asset(pool, user_id, asset_id as i32, min).await
+    require_asset(pool, user_id, asset_id, min).await
 }
 
 #[cfg(test)]
@@ -271,8 +275,8 @@ mod tests {
         let owner = seed_user(&pool, "owner").await;
         let (pid, _, _) = seed(&pool, Some(owner)).await;
         for min in [Access::Viewer, Access::Editor, Access::Owner] {
-            assert_eq!(resolve(&pool, owner as i32, pid).await.unwrap(), Some(Access::Owner), "{min:?}");
-            assert!(require(&pool, owner as i32, pid as i32, min).await.is_ok(), "{min:?}");
+            assert_eq!(resolve(&pool, owner, pid).await.unwrap(), Some(Access::Owner), "{min:?}");
+            assert!(require(&pool, owner, pid, min).await.is_ok(), "{min:?}");
         }
     }
 
@@ -283,9 +287,9 @@ mod tests {
         let other = seed_user(&pool, "other").await;
         let (pid, _, _) = seed(&pool, Some(owner)).await;
         for min in [Access::Viewer, Access::Editor, Access::Owner] {
-            assert_eq!(resolve(&pool, other as i32, pid).await.unwrap(), None, "{min:?}");
+            assert_eq!(resolve(&pool, other, pid).await.unwrap(), None, "{min:?}");
             assert_eq!(
-                require(&pool, other as i32, pid as i32, min).await.unwrap_err(),
+                require(&pool, other, pid, min).await.unwrap_err(),
                 Status::NotFound,
                 "{min:?}"
             );
@@ -297,8 +301,8 @@ mod tests {
         let pool = pool_with_schema().await;
         let owner = seed_user(&pool, "owner").await;
         let (pid, _, _) = seed(&pool, None).await;
-        assert_eq!(resolve(&pool, owner as i32, pid).await.unwrap(), None);
-        assert_eq!(require(&pool, owner as i32, pid as i32, Access::Viewer).await.unwrap_err(), Status::NotFound);
+        assert_eq!(resolve(&pool, owner, pid).await.unwrap(), None);
+        assert_eq!(require(&pool, owner, pid, Access::Viewer).await.unwrap_err(), Status::NotFound);
     }
 
     #[tokio::test]
@@ -325,14 +329,14 @@ mod tests {
         let owner = seed_user(&pool, "owner").await;
         let other = seed_user(&pool, "other").await;
         let (_, aid, tid) = seed(&pool, Some(owner)).await;
-        assert!(require_asset(&pool, owner as i32, aid as i32, Access::Viewer).await.is_ok());
+        assert!(require_asset(&pool, owner, aid, Access::Viewer).await.is_ok());
         assert_eq!(
-            require_asset(&pool, other as i32, aid as i32, Access::Viewer).await.unwrap_err(),
+            require_asset(&pool, other, aid, Access::Viewer).await.unwrap_err(),
             Status::NotFound
         );
-        assert!(require_transaction(&pool, owner as i32, tid as i32, Access::Editor).await.is_ok());
+        assert!(require_transaction(&pool, owner, tid, Access::Editor).await.is_ok());
         assert_eq!(
-            require_transaction(&pool, other as i32, tid as i32, Access::Editor).await.unwrap_err(),
+            require_transaction(&pool, other, tid, Access::Editor).await.unwrap_err(),
             Status::NotFound
         );
     }
@@ -345,15 +349,15 @@ mod tests {
         let (other_pid, _, _) = seed(&pool, Some(owner)).await;
         // Right asset, wrong portfolio in the path.
         assert_eq!(
-            require_asset_in(&pool, owner as i32, other_pid as i32, aid as i32, Access::Editor)
+            require_asset_in(&pool, owner, other_pid, aid, Access::Editor)
                 .await
                 .unwrap_err(),
             Status::NotFound
         );
         // Right asset, right portfolio.
-        assert!(require_asset_in(&pool, owner as i32, pid as i32, aid as i32, Access::Editor).await.is_ok());
+        assert!(require_asset_in(&pool, owner, pid, aid, Access::Editor).await.is_ok());
         // The same asset with no path to disagree with is fine.
-        assert!(require_asset(&pool, owner as i32, aid as i32, Access::Editor).await.is_ok());
+        assert!(require_asset(&pool, owner, aid, Access::Editor).await.is_ok());
     }
 
     #[tokio::test]
@@ -372,7 +376,7 @@ mod tests {
             .unwrap();
         sqlx::query("DELETE FROM assets").execute(&pool).await.unwrap();
         assert_eq!(
-            require_transaction(&pool, owner as i32, tid as i32, Access::Viewer).await.unwrap_err(),
+            require_transaction(&pool, owner, tid, Access::Viewer).await.unwrap_err(),
             Status::NotFound
         );
     }

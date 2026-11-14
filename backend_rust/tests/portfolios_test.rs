@@ -101,7 +101,7 @@ async fn test_list_portfolios_multi_asset() {
     assert_eq!(resp.status(), Status::Ok);
     let body_str = resp.into_string().await.unwrap();
     let parsed: Vec<serde_json::Value> = serde_json::from_str(&body_str).unwrap();
-    let portfolio = parsed.iter().find(|p| p["id"].as_i64().unwrap() == id as i64).unwrap();
+    let portfolio = parsed.iter().find(|p| p["id"].as_i64().unwrap() == id).unwrap();
     let assets = portfolio["assets"].as_array().unwrap();
     assert_eq!(assets.len(), 3);
     let symbols: Vec<&serde_json::Value> = assets.iter().map(|a| &a["symbol"]).collect();
@@ -240,7 +240,7 @@ async fn test_list_portfolios_includes_assets() {
     assert_eq!(resp.status(), Status::Ok);
     let body_str = resp.into_string().await.unwrap();
     let parsed: Vec<serde_json::Value> = serde_json::from_str(&body_str).unwrap();
-    let portfolio = parsed.iter().find(|p| p["id"].as_i64().unwrap() == id as i64).unwrap();
+    let portfolio = parsed.iter().find(|p| p["id"].as_i64().unwrap() == id).unwrap();
     assert_eq!(portfolio["assets"].as_array().unwrap().len(), 2);
     assert_eq!(portfolio["assets"][0]["symbol"], "AAPL");
     assert_eq!(portfolio["assets"][1]["symbol"], "BTC-USD");
@@ -261,4 +261,45 @@ async fn test_get_portfolio_includes_assets() {
     let assets = parsed["assets"].as_array().unwrap();
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0]["symbol"], "SPY");
+}
+
+#[tokio::test]
+async fn test_portfolio_id_above_i32_max_round_trips() {
+    // `BIGINT GENERATED ALWAYS AS IDENTITY` reaches this without anyone doing anything
+    // exotic, and every id in the API is `i64` on purpose. This is the runtime tripwire
+    // behind that width: grep and the type system say nothing is narrowed, and if a
+    // future change narrows an id on the way in or out, this test is what notices.
+    const BIG_ID: i64 = 2_147_483_648; // i32::MAX + 1
+
+    let pool = setup_db(&disabled_config()).await;
+    // `GENERATED ALWAYS` refuses a supplied id, and `OVERRIDING SYSTEM VALUE` is the
+    // documented way to name one, so no sequence has to be touched to get here.
+    sqlx::query(
+        "INSERT INTO portfolios (id, name, description, currency, base_currency, owner_id) \
+         OVERRIDING SYSTEM VALUE VALUES ($1, 'Big Id', NULL, 'USD', 'USD', $2)",
+    )
+    .bind(BIG_ID)
+    .bind(DEFAULT_USER)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rocket = build_rocket(pool, DEFAULT_USER);
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let resp = client.get(format!("/api/portfolios/{}", BIG_ID)).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok, "a path parameter past i32::MAX must route and resolve");
+    let body: serde_json::Value = resp.into_json().await.unwrap();
+    assert_eq!(body["id"].as_i64(), Some(BIG_ID), "the id must come back undiminished");
+
+    // The list route reaches the same id through a different query and a `HashMap<i64,_>`
+    // grouping, so it is pinned on the same claim.
+    let resp = client.get("/api/portfolios/").dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let list: serde_json::Value = resp.into_json().await.unwrap();
+    let hits = list.as_array().unwrap()
+        .iter()
+        .filter(|p| p["id"].as_i64() == Some(BIG_ID))
+        .count();
+    assert_eq!(hits, 1, "the list route must carry the same id");
 }

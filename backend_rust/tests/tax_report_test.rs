@@ -68,7 +68,7 @@ fn fixture_sell(id: i64) -> Transaction {
 /// clean and passes every assertion — while over-reporting on any real multi-lot sell,
 /// because every lot row would carry the whole sell's P&L. `lot_pnl` is the column the
 /// CSV sums. The two sources now differ (1800 vs 2200) and a swap fails.
-fn fixture_breakdown(sell_id: i32) -> SellBreakdown {
+fn fixture_breakdown(sell_id: i64) -> SellBreakdown {
     SellBreakdown {
         sell_transaction_id: sell_id,
         sell_date: ts("2024-12-01"),
@@ -256,7 +256,7 @@ fn an_open_lot_row_maps_every_dated_lot_field_and_leaves_the_sell_side_null() {
 /// an unmatched tail realizes nothing and is a row of its own), so the *fixture* is what
 /// moved: 40 @ 130 puts the May sell's realized at exactly 1800 and leaves the June sell
 /// with nothing to match. See the task-4 report, defects §1.
-async fn fixture(pool: &DbPool, through: &str) -> (i32, i32, i32) {
+async fn fixture(pool: &DbPool, through: &str) -> (i64, i64, i64) {
     let port_id = common::seed_portfolio(pool, DEFAULT_USER, "Dated", "USD").await;
     let sold = common::seed_asset(pool, port_id, "SOLDIT", "Sold it").await;
     let held = common::seed_asset(pool, port_id, "HELDIT", "Held it").await;
@@ -283,17 +283,17 @@ fn dec_at(v: &serde_json::Value, path: &str) -> Decimal {
 
 /// The loaded rows `build_tax_report` takes, read back through SQLx: two three-line
 /// helpers, because that function takes the rows rather than the ids.
-async fn load_fixture_portfolio(pool: &DbPool, id: i32) -> Portfolio {
+async fn load_fixture_portfolio(pool: &DbPool, id: i64) -> Portfolio {
     sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = $1")
-        .bind(id as i64)
+        .bind(id)
         .fetch_one(pool)
         .await
         .unwrap()
 }
 
-async fn load_fixture_assets(pool: &DbPool, portfolio_id: i32) -> Vec<Asset> {
+async fn load_fixture_assets(pool: &DbPool, portfolio_id: i64) -> Vec<Asset> {
     sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = $1")
-        .bind(portfolio_id as i64)
+        .bind(portfolio_id)
         .fetch_all(pool)
         .await
         .unwrap()
@@ -541,7 +541,7 @@ async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
 /// 10 bought @ 100 USD on 2024-01-02 and 6 sold @ 130 USD on 2024-03-08, so the sell is
 /// matched and 4 units stay open: one fixture covers both the realized leg and the
 /// market-value leg of the conversion.
-async fn fx_fixture(pool: &DbPool) -> (i32, i32) {
+async fn fx_fixture(pool: &DbPool) -> (i64, i64) {
     let port_id = common::seed_portfolio(pool, DEFAULT_USER, "FX Dated", "EUR").await;
     let asset = common::seed_asset_currency(pool, port_id, "AAPL", "Apple", "USD").await;
     common::seed_transaction_at(pool, asset, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;

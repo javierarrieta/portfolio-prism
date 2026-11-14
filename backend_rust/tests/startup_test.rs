@@ -151,7 +151,7 @@ async fn the_bootstrap_subject_takes_over_the_placeholder_row_and_keeps_its_id()
         .await
         .unwrap();
 
-    assert_eq!(user.id as i64, placeholder, "handover preserves the id, which is the point");
+    assert_eq!(user.id, placeholder, "handover preserves the id, which is the point");
     assert!(placeholder_id(&pool).await.is_none(), "the placeholder row became the real one");
     let owner: (i64,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
         .bind(portfolio)
@@ -170,7 +170,7 @@ async fn a_non_matching_subject_provisions_a_new_row_and_leaves_the_placeholder(
         .await
         .unwrap();
 
-    assert_ne!(user.id as i64, placeholder);
+    assert_ne!(user.id, placeholder);
     assert_eq!(placeholder_id(&pool).await, Some(placeholder));
 }
 
@@ -217,7 +217,7 @@ async fn a_restart_recreates_an_empty_placeholder_and_a_new_subject_can_take_it(
     let next = provision_or_update(&pool, "https://auth/x", "authlib:99", None, None, Some("authlib:99"))
         .await
         .unwrap();
-    assert_eq!(next.id as i64, recreated, "the newly designated subject takes the new placeholder");
+    assert_eq!(next.id, recreated, "the newly designated subject takes the new placeholder");
 }
 
 #[tokio::test]
@@ -232,7 +232,7 @@ async fn a_known_identity_is_updated_not_duplicated() {
 
     assert_eq!(first.id, second.id);
     let (email,): (Option<String>,) =
-        sqlx::query_as("SELECT email FROM users WHERE id = $1").bind(first.id as i64).fetch_one(&pool).await.unwrap();
+        sqlx::query_as("SELECT email FROM users WHERE id = $1").bind(first.id).fetch_one(&pool).await.unwrap();
     assert_eq!(email.as_deref(), Some("new@x.y"), "email/name refresh on every login");
 }
 

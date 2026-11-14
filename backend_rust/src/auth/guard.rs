@@ -19,7 +19,15 @@ use super::session;
 /// The authenticated caller.
 #[derive(Debug, Clone)]
 pub struct AuthedUser {
-    pub id: i32,
+    /// `users.id` is `BIGINT GENERATED ALWAYS AS IDENTITY`, so this is `i64` and not
+    /// one bit narrower. Narrowing it is an authorization bug either way, and the two
+    /// halves depend on the size of the id: one past `i32::MAX` but below `2^32`
+    /// truncates to a negative number that matches no `users.id`, so the caller is
+    /// spuriously *denied*; only at `2^32` and above can the low 32 bits land on a row
+    /// that belongs to someone else, which is being authorized as *a different user, or
+    /// as nobody at all*. Every read of `users.id` already decodes `i64`; this is where
+    /// that width used to be thrown away.
+    pub id: i64,
     pub email: Option<String>,
     pub name: Option<String>,
     pub sub: String,
@@ -37,7 +45,7 @@ impl AuthedUser {
     /// that chooses it: two places picking a token version is how the `logout-all`
     /// lockout shipped.
     pub fn session_pair(&self) -> (&'static str, String) {
-        super::session::pair(self.id as i64, self.token_version)
+        super::session::pair(self.id, self.token_version)
     }
 
     /// Mint a session for this identity, attaching exactly what [`Self::session_pair`]
@@ -116,7 +124,7 @@ pub async fn resolve_caller(
             (payload.uid, Some(payload.tv))
         }
         #[cfg(debug_assertions)]
-        AuthMode::Disabled { as_user } => (*as_user as i64, None),
+        AuthMode::Disabled { as_user } => (*as_user, None),
     };
 
     // (id, email, name, subj, is_active, token_version)
@@ -144,7 +152,7 @@ pub async fn resolve_caller(
     }
 
     Ok(Some(AuthedUser {
-        id: id as i32,
+        id,
         email,
         name,
         sub,

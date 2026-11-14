@@ -65,7 +65,7 @@ pub enum AuthMode {
     /// asks for it.
     #[cfg(debug_assertions)]
     Disabled {
-        as_user: i32,
+        as_user: i64,
     },
 }
 
@@ -210,7 +210,7 @@ pub async fn finalise_auth(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result
                         "AUTH_MODE=disabled: every request runs as user id {id} \
                          (local/bootstrap). Do not use this configuration in production."
                     );
-                    Ok(AuthMode::Disabled { as_user: id as i32 })
+                    Ok(AuthMode::Disabled { as_user: id })
                 }
                 None => anyhow::bail!(
                     "AUTH_MODE=disabled needs the bootstrap placeholder user row, which \

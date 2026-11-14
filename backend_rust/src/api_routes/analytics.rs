@@ -51,7 +51,7 @@ use crate::auth::guard::AuthedUser;
 #[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>&<format>")]
 pub async fn get_portfolio_tax_summary(
     user: AuthedUser,
-    id: i32,
+    id: i64,
     pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
@@ -116,18 +116,18 @@ pub async fn get_portfolio_tax_summary(
     }
 }
 
-async fn load_portfolio(pool: &DbPool, id: i32) -> Result<Portfolio, ReportError> {
+async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError> {
     sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = $1")
-        .bind(id as i64)
+        .bind(id)
         .fetch_optional(pool)
         .await
         .map_err(|e| ReportError::internal(e.to_string()))?
         .ok_or_else(ReportError::not_found)
 }
 
-async fn load_assets(pool: &DbPool, portfolio_id: i32) -> Result<Vec<Asset>, ReportError> {
+async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, ReportError> {
     sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = $1")
-        .bind(portfolio_id as i64)
+        .bind(portfolio_id)
         .fetch_all(pool)
         .await
         .map_err(|e| ReportError::internal(e.to_string()))
@@ -241,7 +241,7 @@ async fn undated_summary(
 #[post("/<id>/sync-splits")]
 pub async fn sync_portfolio_splits(
     user: AuthedUser,
-    id: i32,
+    id: i64,
     pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
 ) -> Result<Json<SyncSplitsOut>, ReportError> {
@@ -261,7 +261,7 @@ pub async fn sync_portfolio_splits(
         match currency_service.sync_splits_for_asset(asset, pool).await {
             Ok(n) => out.splits_inserted += n,
             Err(e) => out.failures.push(SyncSplitFailure {
-                asset_id: asset.id as i32,
+                asset_id: asset.id,
                 symbol: asset.symbol.clone(),
                 error: e.to_string(),
             }),
@@ -294,7 +294,7 @@ pub async fn sync_portfolio_splits(
 #[get("/<id>/performance")]
 pub async fn get_portfolio_performance(
     user: AuthedUser,
-    id: i32,
+    id: i64,
     pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
 ) -> Result<Json<serde_json::Value>, Status> {
@@ -304,14 +304,14 @@ pub async fn get_portfolio_performance(
     require(pool.inner(), user.id, id, Access::Viewer).await?;
 
     let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = $1")
-        .bind(id as i64)
+        .bind(id)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?
         .ok_or(Status::NotFound)?;
 
     let assets = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = $1")
-        .bind(id as i64)
+        .bind(id)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -325,7 +325,7 @@ pub async fn get_portfolio_performance(
     let transactions = sqlx::query_as::<_, Transaction>(
         "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1)"
     )
-    .bind(id as i64)
+    .bind(id)
     .fetch_all(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -345,7 +345,7 @@ pub async fn get_portfolio_performance(
     get,
     path = "/api/transactions/<id>/pnl",
     params(
-        ("id" = i32, Path, description = "Sell transaction id"),
+        ("id" = i64, Path, description = "Sell transaction id"),
         ("strategy" = Option<String>, Query, description = "FIFO, LIFO or HYBRID (default FIFO)"),
         ("threshold_days" = Option<i64>, Query, description = "HYBRID short-term threshold (default 30)")
     ),
@@ -358,7 +358,7 @@ pub async fn get_portfolio_performance(
 #[get("/transactions/<id>/pnl?<strategy>&<threshold_days>")]
 pub async fn get_transaction_sell_pnl(
     user: AuthedUser,
-    id: i32,
+    id: i64,
     pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
@@ -369,7 +369,7 @@ pub async fn get_transaction_sell_pnl(
     // The three lookups below (transaction -> asset -> portfolio) stay: they are the
     // response's data source, not the authorization decision.
     let tx = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = $1")
-        .bind(id as i64)
+        .bind(id)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?
@@ -425,7 +425,7 @@ pub async fn get_transaction_sell_pnl(
         .map_err(|_| Status::InternalServerError)?;
 
     let breakdown = TaxLotEngine::sell_breakdown(
-        tx.id as i32,
+        tx.id,
         &transactions,
         &asset.currency,
         &portfolio.base_currency,
@@ -465,8 +465,8 @@ pub async fn get_transaction_sell_pnl(
     };
 
     Ok(Json(SellPnlResponse {
-        transaction_id: tx.id as i32,
-        asset_id: asset.id as i32,
+        transaction_id: tx.id,
+        asset_id: asset.id,
         symbol: asset.symbol.clone(),
         asset_type: asset.asset_type.clone(),
         strategy: strategy_val,
@@ -1020,7 +1020,7 @@ pub async fn build_tax_report(
                 continue;
             }
             let sell = txs.iter()
-                .find(|tx| tx.id == breakdown.sell_transaction_id as i64)
+                .find(|tx| tx.id == breakdown.sell_transaction_id)
                 .expect("every breakdown came from this transaction set");
             for matched in &breakdown.matches {
                 rows.push(ReportRow::sold_lot(
@@ -1049,7 +1049,7 @@ pub async fn build_tax_report(
         totals.cost_basis += cost_basis;
 
         asset_totals.push(AssetTotals {
-            asset_id: asset.id as i32,
+            asset_id: asset.id,
             symbol: asset.symbol.clone(),
             asset_type: asset.asset_type.clone(),
             asset_currency: asset.currency.clone(),
@@ -1074,7 +1074,7 @@ pub async fn build_tax_report(
 
     Ok(ReportResponse {
         context: ReportContext {
-            portfolio_id: portfolio.id as i32,
+            portfolio_id: portfolio.id,
             portfolio_name: portfolio.name.clone(),
             base_currency: portfolio.base_currency.clone(),
             strategy: strategy.to_string(),

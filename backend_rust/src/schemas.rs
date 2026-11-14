@@ -5,6 +5,14 @@ use rust_decimal::Decimal;
 use crate::db_types::{decimal_json, decimal_opt_json};
 use crate::models::{Asset, Transaction};
 
+// Every id in this file is `i64` because every id in the schema is `BIGINT GENERATED
+// ALWAYS AS IDENTITY` (`migrations/0001_init.sql`). These structs used to be `i32`
+// and the handlers narrowed with `as i32` at the boundary, which is a silent
+// truncation of an id the database can legitimately produce — an identity sequence
+// reaches `i32::MAX` without help. Widening them here is what lets the handlers hand
+// the row's own value straight through; a narrowing that survives this file is a bug,
+// not a boundary.
+
 // --- Transaction ---
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TransactionCreate {
@@ -20,8 +28,8 @@ pub struct TransactionCreate {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TransactionOut {
-    pub id: i32,
-    pub asset_id: i32,
+    pub id: i64,
+    pub asset_id: i64,
     pub r#type: String,
     #[serde(with = "decimal_json")]
     pub quantity: Decimal,
@@ -46,8 +54,8 @@ pub struct AssetCreate {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AssetOut {
-    pub id: i32,
-    pub portfolio_id: i32,
+    pub id: i64,
+    pub portfolio_id: i64,
     pub symbol: String,
     pub name: String,
     pub asset_type: String,
@@ -67,7 +75,7 @@ pub struct PortfolioCreate {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PortfolioOut {
-    pub id: i32,
+    pub id: i64,
     pub name: String,
     pub description: Option<String>,
     pub currency: String,
@@ -83,7 +91,7 @@ pub struct PortfolioOut {
 /// One asset whose split sync failed while syncing a whole portfolio.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SyncSplitFailure {
-    pub asset_id: i32,
+    pub asset_id: i64,
     pub symbol: String,
     pub error: String,
 }
@@ -117,7 +125,7 @@ pub struct AssetUpdate {
 pub struct TaxLot {
     /// The buy that opened this lot. Present so a lot can be joined back to the ledger
     /// row a person is reading.
-    pub buy_transaction_id: i32,
+    pub buy_transaction_id: i64,
     pub buy_date: DateTime<Utc>,
     #[serde(with = "decimal_json")]
     pub buy_price: Decimal,
@@ -161,7 +169,7 @@ pub struct AssetTaxSummary {
 /// additionally carries the amortised buy fee.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LotMatch {
-    pub buy_transaction_id: i32,
+    pub buy_transaction_id: i64,
     pub buy_date: DateTime<Utc>,
     #[serde(with = "decimal_json")]
     pub buy_price: Decimal,
@@ -190,7 +198,7 @@ pub struct LotMatch {
 /// response body is of this type.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SellBreakdown {
-    pub sell_transaction_id: i32,
+    pub sell_transaction_id: i64,
     pub sell_date: DateTime<Utc>,
     #[serde(with = "decimal_json")]
     pub sold_qty: Decimal,
@@ -212,7 +220,7 @@ pub struct SellBreakdown {
 /// basis, so a consumer can tell "not applicable" from "0%".
 #[derive(Debug, Clone)]
 pub struct DatedLot {
-    pub buy_transaction_id: i32,
+    pub buy_transaction_id: i64,
     pub buy_date: DateTime<Utc>,
     /// Split-adjusted purchase price per unit, **in the portfolio's base currency** —
     /// converted at the buy's own date, not the asset's own currency. The value is
@@ -255,8 +263,8 @@ pub struct DatedReplay {
 /// in `asset_currency`; every other money field is in `currency`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SellPnlResponse {
-    pub transaction_id: i32,
-    pub asset_id: i32,
+    pub transaction_id: i64,
+    pub asset_id: i64,
     pub symbol: String,
     pub asset_type: String,
     pub strategy: String,
@@ -336,7 +344,7 @@ impl RowKind {
 /// `strategy` and `threshold_days`: the response does not repeat them at top level.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReportContext {
-    pub portfolio_id: i32,
+    pub portfolio_id: i64,
     pub portfolio_name: String,
     pub base_currency: String,
     pub strategy: String,
@@ -359,7 +367,7 @@ pub struct ReportContext {
 /// produced the rows; no renderer sums anything.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AssetTotals {
-    pub asset_id: i32,
+    pub asset_id: i64,
     pub symbol: String,
     pub asset_type: String,
     pub asset_currency: String,
@@ -406,7 +414,7 @@ pub struct ReportTotals {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReportRow {
     pub row_type: RowKind,
-    pub asset_id: i32,
+    pub asset_id: i64,
     pub symbol: String,
     pub asset_type: String,
     pub asset_currency: String,
@@ -416,7 +424,7 @@ pub struct ReportRow {
 
     // Sell-level, mirrored from `SellBreakdown` and the sell transaction. Repeated on
     // every lot row of that sell so the file pivots, exactly as `sellPnlCsv.ts` does.
-    pub sell_transaction_id: Option<i32>,
+    pub sell_transaction_id: Option<i64>,
     pub sell_date: Option<DateTime<Utc>>,
     #[serde(with = "decimal_opt_json")]
     pub sold_qty: Option<Decimal>,
@@ -448,7 +456,7 @@ pub struct ReportRow {
     pub unmatched_qty: Option<Decimal>,
 
     // Buy-lot cells: present on SOLD_LOT and OPEN_LOT.
-    pub buy_transaction_id: Option<i32>,
+    pub buy_transaction_id: Option<i64>,
     pub buy_date: Option<DateTime<Utc>>,
     /// Split-adjusted, in the portfolio's **base** currency — converted at the buy's own
     /// date. NOT `asset_currency`: `DatedLot.buy_price` and `LotMatch.buy_price` are both
@@ -489,7 +497,7 @@ pub struct ReportRow {
 
 impl ReportRow {
     /// The empty row every constructor starts from: every kind-specific cell null.
-    fn of(kind: RowKind, asset_id: i32, symbol: &str, asset_type: &str, asset_currency: &str,
+    fn of(kind: RowKind, asset_id: i64, symbol: &str, asset_type: &str, asset_currency: &str,
           price_source: Option<PriceSource>) -> Self {
         ReportRow {
             row_type: kind,
@@ -522,10 +530,10 @@ impl ReportRow {
         breakdown: &SellBreakdown,
         matched: &LotMatch,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::SoldLot, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::SoldLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
-        row.sell_transaction_id = Some(sell.id as i32);
+        row.sell_transaction_id = Some(sell.id);
         row.sell_date = Some(sell.date);
         row.sold_qty = Some(breakdown.sold_qty);
         row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
@@ -563,10 +571,10 @@ impl ReportRow {
         sell: &Transaction,
         breakdown: &SellBreakdown,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::Unmatched, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::Unmatched, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
-        row.sell_transaction_id = Some(sell.id as i32);
+        row.sell_transaction_id = Some(sell.id);
         row.sell_date = Some(sell.date);
         row.sold_qty = Some(breakdown.sold_qty);
         row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
@@ -584,7 +592,7 @@ impl ReportRow {
         price_source: Option<PriceSource>,
         lot: &DatedLot,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::OpenLot, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::OpenLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
         row.buy_transaction_id = Some(lot.buy_transaction_id);
@@ -605,7 +613,7 @@ impl AssetTotals {
     /// open lot, and no close to report.
     pub fn empty(asset: &Asset, fx_applied: bool, split_applied: bool) -> Self {
         AssetTotals {
-            asset_id: asset.id as i32,
+            asset_id: asset.id,
             symbol: asset.symbol.clone(),
             asset_type: asset.asset_type.clone(),
             asset_currency: asset.currency.clone(),

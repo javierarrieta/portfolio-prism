@@ -251,7 +251,7 @@ pub async fn provision_or_update(
             .execute(pool)
             .await?;
         return Ok(AuthedUser {
-            id: id as i32,
+            id,
             email: email.map(str::to_string),
             name: name.map(str::to_string),
             sub: sub.to_string(),
@@ -288,7 +288,7 @@ pub async fn provision_or_update(
                  issuer={issuer} sub={sub}; portfolios it owned came with it"
             );
             return Ok(AuthedUser {
-                id: placeholder_id as i32,
+                id: placeholder_id,
                 email: email.map(str::to_string),
                 name: name.map(str::to_string),
                 sub: sub.to_string(),
@@ -324,7 +324,7 @@ pub async fn provision_or_update(
     let (id, email, name, token_version) = row;
     eprintln!("INFO: provisioned user id={id} issuer={issuer} sub={sub}");
     Ok(AuthedUser {
-        id: id as i32,
+        id,
         email,
         name,
         sub: sub.to_string(),
@@ -333,9 +333,9 @@ pub async fn provision_or_update(
 }
 
 /// Bump the caller's `token_version`, invalidating every session issued to them.
-pub async fn bump_token_version(pool: &DbPool, user_id: i32) -> anyhow::Result<()> {
+pub async fn bump_token_version(pool: &DbPool, user_id: i64) -> anyhow::Result<()> {
     sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
-        .bind(user_id as i64)
+        .bind(user_id)
         .execute(pool)
         .await?;
     Ok(())

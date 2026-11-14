@@ -16,12 +16,12 @@ use rocket::local::asynchronous::Client;
 use backend_rust::db::DbPool;
 
 struct Users {
-    a: i32,
-    b: i32,
-    a_portfolio: i32,
-    a_asset: i32,
-    a_transaction: i32,
-    b_portfolio: i32,
+    a: i64,
+    b: i64,
+    a_portfolio: i64,
+    a_asset: i64,
+    a_transaction: i64,
+    b_portfolio: i64,
 }
 
 async fn seed_two_users(pool: &DbPool) -> Users {
@@ -38,7 +38,7 @@ async fn seed_two_users(pool: &DbPool) -> Users {
 ///
 /// Bound to a variable at every call site: a `LocalRequest` borrows the `Client`,
 /// so chaining straight off a temporary does not compile.
-async fn client_as(pool: DbPool, as_user: i32) -> Client {
+async fn client_as(pool: DbPool, as_user: i64) -> Client {
     Client::tracked(build_rocket(pool, as_user)).await.expect("valid rocket")
 }
 
@@ -270,7 +270,7 @@ async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
     let b = common::seed_user(&pool, "user-b").await;
     for id in [a, b] {
         sqlx::query("UPDATE users SET email = 'shared@example.com' WHERE id = $1")
-            .bind(id as i64)
+            .bind(id)
             .execute(&pool)
             .await
             .unwrap();
@@ -385,7 +385,7 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
         .await;
     assert_eq!(res.status(), Status::Ok);
     let body: serde_json::Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
     // Deliberately not `assert_ne!(new_id, u.a_portfolio)`: `portfolios.id` is
     // `BIGINT GENERATED ALWAYS AS IDENTITY` and A's portfolio is the first row the
     // fixture writes, so that comparison could never fail. The claim underneath it
@@ -395,8 +395,8 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
         "SELECT (SELECT COUNT(*) FROM portfolios WHERE owner_id = $1), \
                 (SELECT COUNT(*) FROM portfolios WHERE owner_id = $2)",
     )
-    .bind(u.b as i64)
-    .bind(u.a as i64)
+    .bind(u.b)
+    .bind(u.a)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -406,11 +406,11 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
     );
 
     let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
-        .bind(new_id as i64)
+        .bind(new_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(owner.0, Some(u.b as i64), "the restorer owns what they restored");
+    assert_eq!(owner.0, Some(u.b), "the restorer owns what they restored");
 
     // And A cannot see it.
     let a = client_as(pool.clone(), u.a).await;

@@ -26,7 +26,7 @@ fn d(s: &str) -> Decimal {
 
 // FIFO fixture: two buys, one sell of 80 units split across both lots.
 // Returns the unlaunched Rocket; each test wraps it in its own tracked Client.
-async fn fifo_fixture() -> (Rocket<Build>, i32, i32, i32) {
+async fn fifo_fixture() -> (Rocket<Build>, i64, i64, i64) {
     let pool = setup_db(&disabled_config()).await;
     let port_id = seed_portfolio(&pool, DEFAULT_USER, "Sell PnL", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;
@@ -242,7 +242,7 @@ async fn test_sell_pnl_unrecognized_strategy_is_applied_as_fifo() {
     assert_eq!(dec(&body, "realized_pnl"), d("2000"), "FIFO figure, not LIFO's 1600");
 }
 
-async fn split_fixture(split_date: &str) -> (Client, i32) {
+async fn split_fixture(split_date: &str) -> (Client, i64) {
     let pool = setup_db(&disabled_config()).await;
     let port_id = seed_portfolio(&pool, DEFAULT_USER, "Split Flag", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "AAPL", "Apple").await;

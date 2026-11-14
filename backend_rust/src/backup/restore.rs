@@ -71,9 +71,9 @@ pub struct Plan {
 /// Scoped by `owner_id` and by nothing else: every count a foreign bundle can
 /// provoke is a count of the caller's own rows, because the caller's id is the
 /// only filter any of these three queries has.
-pub async fn owned_counts(pool: &DbPool, user_id: i32) -> Result<Counts, DbFailure> {
+pub async fn owned_counts(pool: &DbPool, user_id: i64) -> Result<Counts, DbFailure> {
     let portfolios: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id = $1")
-        .bind(user_id as i64)
+        .bind(user_id)
         .fetch_one(pool)
         .await
         .map_err(classify)?;
@@ -82,7 +82,7 @@ pub async fn owned_counts(pool: &DbPool, user_id: i32) -> Result<Counts, DbFailu
         "SELECT COUNT(*) FROM assets WHERE portfolio_id IN \
          (SELECT id FROM portfolios WHERE owner_id = $1)",
     )
-    .bind(user_id as i64)
+    .bind(user_id)
     .fetch_one(pool)
     .await
     .map_err(classify)?;
@@ -92,7 +92,7 @@ pub async fn owned_counts(pool: &DbPool, user_id: i32) -> Result<Counts, DbFailu
          (SELECT id FROM assets WHERE portfolio_id IN \
           (SELECT id FROM portfolios WHERE owner_id = $1))",
     )
-    .bind(user_id as i64)
+    .bind(user_id)
     .fetch_one(pool)
     .await
     .map_err(classify)?;
@@ -123,7 +123,7 @@ pub fn bundle_counts(bundle: &Bundle) -> Counts {
 /// The plan the user must see before restoring. Reads only; writes nothing.
 pub async fn plan_for(
     pool: &DbPool,
-    user_id: i32,
+    user_id: i64,
     bundle: &Bundle,
     mode: Mode,
 ) -> Result<Plan, DbFailure> {
@@ -172,7 +172,7 @@ pub struct RestoreOutcome {
     pub inserted: Counts,
     /// The database ids the restore allocated, in bundle order. Returned so the UI
     /// can link straight to what appeared — and as proof that the ids are new.
-    pub portfolio_ids: Vec<i32>,
+    pub portfolio_ids: Vec<i64>,
     pub prices_inserted: usize,
 }
 
@@ -218,7 +218,7 @@ impl From<DbFailure> for ApplyError {
 /// written fails the whole transaction rather than writing half a bundle.
 pub async fn apply(
     pool: &DbPool,
-    user_id: i32,
+    user_id: i64,
     bundle: &Bundle,
     mode: Mode,
     apply_prices: bool,
@@ -268,7 +268,7 @@ pub async fn apply(
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
         )
-        .bind(user_id as i64)
+        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
@@ -278,7 +278,7 @@ pub async fn apply(
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
         )
-        .bind(user_id as i64)
+        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
@@ -287,13 +287,13 @@ pub async fn apply(
             "DELETE FROM assets WHERE portfolio_id IN \
              (SELECT id FROM portfolios WHERE owner_id = $1)",
         )
-        .bind(user_id as i64)
+        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
         sqlx::query("DELETE FROM portfolios WHERE owner_id = $1")
-            .bind(user_id as i64)
+            .bind(user_id)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
@@ -313,13 +313,15 @@ pub async fn apply(
         .bind(&p.description)
         .bind(&p.currency)
         .bind(&p.base_currency)
-        .bind(user_id as i64)
+        .bind(user_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(classify)?;
-        // `RestoreOutcome::portfolio_ids` is API surface and still `i32`; the row id
-        // is not. Task 4 widens the DTO and this narrowing goes away.
-        portfolio_ids.push(new_portfolio as i32);
+        // The id the database allocated, handed straight through. It used to be
+        // narrowed to `i32` here because the response type was `i32`; both are
+        // `i64` now, so a restore of a portfolio whose id passed `i32::MAX` names
+        // the row it actually wrote.
+        portfolio_ids.push(new_portfolio);
         inserted.portfolios += 1;
 
         for a in &p.assets {

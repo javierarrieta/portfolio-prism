@@ -50,7 +50,7 @@ fn cell<'a>(header: &[&str], row: &'a [&'a str], column: &str) -> &'a str {
 /// Two buys, a sell that drains both and over-sells, and a later buy fix both while keeping
 /// the brief's anchors: an unmatched tail of exactly 20.0 and `realized_in_window` 1800
 /// (60 x (130-100) + 60 x (130-130)).
-async fn csv_fixture(pool: &DbPool) -> i32 {
+async fn csv_fixture(pool: &DbPool) -> i64 {
     let port_id = common::seed_portfolio(pool, DEFAULT_USER, "=cmd|'/c calc'!A1", "USD").await;
     let asset_id = common::seed_asset(pool, port_id, "-SYM", "Minus symbol").await;
     common::seed_transaction_at(pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;

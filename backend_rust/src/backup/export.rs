@@ -105,7 +105,7 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 /// "hardens" it that way.
 pub async fn build(
     pool: &DbPool,
-    portfolio_ids: &[i32],
+    portfolio_ids: &[i64],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
     let mut tx = pool.begin().await.map_err(classify)?;
@@ -120,7 +120,7 @@ pub async fn build(
 /// the transaction's scope is three lines and impossible to widen by accident.
 async fn build_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    portfolio_ids: &[i32],
+    portfolio_ids: &[i64],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
     let mut portfolios = Vec::with_capacity(portfolio_ids.len());
@@ -130,7 +130,7 @@ async fn build_in(
         let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
             "SELECT name, description, currency, base_currency FROM portfolios WHERE id = $1",
         )
-        .bind(*id as i64)
+        .bind(*id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(classify)?;
@@ -227,13 +227,13 @@ type TransactionRow = (String, String, String, String, chrono::DateTime<Utc>);
 
 async fn assets_for(
     conn: &mut sqlx::PgConnection,
-    portfolio_id: i32,
+    portfolio_id: i64,
 ) -> Result<Vec<BundleAsset>, DbFailure> {
     let rows: Vec<AssetRow> = sqlx::query_as(
         "SELECT id, symbol, name, asset_type, sector, currency, isin \
          FROM assets WHERE portfolio_id = $1 ORDER BY id",
     )
-    .bind(portfolio_id as i64)
+    .bind(portfolio_id)
     .fetch_all(&mut *conn)
     .await
     .map_err(classify)?;

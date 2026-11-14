@@ -27,7 +27,7 @@ use backend_rust::db::DbPool;
 const SPLIT_ME: &str = r#"{"chart":{"result":[{"timestamp":[],"indicators":{"quote":[{"close":[]}]},"events":{"splits":{"1717200000":{"date":1717200000,"numerator":2.0,"denominator":1.0,"splitRatio":"2:1"}}}}],"error":null}}"#;
 
 const SYMBOL: &str = "SPLITME";
-async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
+async fn split_rows(pool: &DbPool, asset_id: i64) -> Vec<String> {
     // The UTC day, spelled the way `uq_split_asset_date` spells it, and cast to text
     // so the assertion below still compares `%Y-%m-%d` strings.
     sqlx::query_as::<_, (String,)>(
@@ -35,7 +35,7 @@ async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
          FROM transactions WHERE asset_id = $1 AND type = 'SPLIT' \
          ORDER BY ((date AT TIME ZONE 'UTC')::date)",
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .fetch_all(pool)
     .await
     .unwrap()
@@ -164,7 +164,7 @@ async fn a_transaction_older_than_the_last_sync_reopens_the_throttle() {
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
     let svc = CurrencyService::with_base_url(yahoo.base_url());
-    let a = asset(asset_id as i64, port_id as i64);
+    let a = asset(asset_id, port_id);
 
     assert_eq!(
         svc.sync_splits_for_asset(&a, &pool).await.unwrap(),
@@ -198,7 +198,7 @@ async fn a_throttle_within_the_window_and_covering_the_history_suppresses_the_fe
     let svc = CurrencyService::with_base_url(yahoo.base_url());
 
     assert_eq!(
-        svc.sync_splits_for_asset(&asset(asset_id as i64, port_id as i64), &pool).await.unwrap(),
+        svc.sync_splits_for_asset(&asset(asset_id, port_id), &pool).await.unwrap(),
         0,
         "a seeded throttle covering the asset's whole history must short-circuit"
     );
@@ -230,7 +230,7 @@ async fn deleting_an_asset_drops_its_throttle_row() {
     assert_eq!(resp.status(), Status::NoContent);
 
     let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM split_sync WHERE asset_id = $1")
-        .bind(asset_id as i64)
+        .bind(asset_id)
         .fetch_one(&pool)
         .await
         .unwrap();

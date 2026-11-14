@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(result.current_shares, Decimal::from_str("50.0").unwrap());
     }
 
-    async fn run_breakdown(txs: &[Transaction], sell_id: i32, strategy: &str, threshold: i64) -> Option<SellBreakdown> {
+    async fn run_breakdown(txs: &[Transaction], sell_id: i64, strategy: &str, threshold: i64) -> Option<SellBreakdown> {
         let svc = crate::offline_pricing_service();
         let pool = empty_pool().await;
         TaxLotEngine::sell_breakdown(
@@ -606,7 +606,7 @@ mod tests {
 pub struct TaxLotEngine;
 
 struct InternalLot {
-    source_tx_id: i32,
+    source_tx_id: i64,
     date: DateTime<Utc>,
     price: Decimal,
     qty: Decimal,
@@ -668,7 +668,7 @@ impl TaxLotEngine {
                 };
                 let unit_cost_base = unit_cost_asset * tx_rate;
                 buy_lots.push(InternalLot {
-                    source_tx_id: tx.id as i32,
+                    source_tx_id: tx.id,
                     date: tx.date,
                     price: tx_price * tx_rate,
                     qty: tx_qty,
@@ -756,7 +756,7 @@ impl TaxLotEngine {
                 let proceeds: Decimal = matches.iter().map(|m| m.proceeds).sum();
 
                 breakdowns.push(SellBreakdown {
-                    sell_transaction_id: tx.id as i32,
+                    sell_transaction_id: tx.id,
                     sell_date: tx.date,
                     sold_qty: tx_qty,
                     matched_qty,
@@ -1008,7 +1008,7 @@ impl TaxLotEngine {
     /// eighth argument is the `DbPool` threaded through for `get_rate`.
     #[allow(clippy::too_many_arguments)]
     pub async fn sell_breakdown(
-        sell_transaction_id: i32,
+        sell_transaction_id: i64,
         transactions: &[Transaction],
         asset_currency: &str,
         base_currency: &str,

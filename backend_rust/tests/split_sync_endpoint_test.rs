@@ -29,13 +29,13 @@ const SPLIT_ME: &str = r#"{"chart":{"result":[{"timestamp":[],"indicators":{"quo
 
 const SYMBOL: &str = "SPLITME";
 
-async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
+async fn split_rows(pool: &DbPool, asset_id: i64) -> Vec<String> {
     sqlx::query_as::<_, (String,)>(
         "SELECT ((date AT TIME ZONE 'UTC')::date)::text \
          FROM transactions WHERE asset_id = $1 AND type = 'SPLIT' \
          ORDER BY ((date AT TIME ZONE 'UTC')::date)",
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .fetch_all(pool)
     .await
     .unwrap()
@@ -44,7 +44,7 @@ async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
     .collect()
 }
 
-async fn portfolio_payload(client: &Client, id: i32) -> serde_json::Value {
+async fn portfolio_payload(client: &Client, id: i64) -> serde_json::Value {
     let resp = client
         .get(format!("/api/portfolios/{id}"))
         .dispatch()
@@ -176,8 +176,8 @@ async fn concurrent_syncs_cannot_double_a_split() {
         1u32,
     )];
 
-    let a = apply_split_events(asset as i64, None, &events, &pool);
-    let b = apply_split_events(asset as i64, None, &events, &pool);
+    let a = apply_split_events(asset, None, &events, &pool);
+    let b = apply_split_events(asset, None, &events, &pool);
     let (ra, rb) = tokio::join!(a, b);
     let inserted = ra.unwrap() + rb.unwrap();
 
@@ -282,7 +282,7 @@ async fn the_schema_rejects_a_second_split_on_the_same_day() {
             "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
              VALUES ($1, 'SPLIT', '2', '1', '0', $2)",
         )
-        .bind(asset_a as i64)
+        .bind(asset_a)
         .bind(
             chrono::DateTime::parse_from_rfc3339(ts)
                 .unwrap()
@@ -305,7 +305,7 @@ async fn the_schema_rejects_a_second_split_on_the_same_day() {
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
          VALUES ($1, 'SPLIT', '2', '1', '0', '2024-06-01T00:00:00Z')",
     )
-    .bind(asset_b as i64)
+    .bind(asset_b)
     .execute(&pool)
     .await
     .unwrap();
@@ -313,7 +313,7 @@ async fn the_schema_rejects_a_second_split_on_the_same_day() {
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
          VALUES ($1, 'BUY', '5', '10', '0', '2024-06-01T00:00:00Z')",
     )
-    .bind(asset_a as i64)
+    .bind(asset_a)
     .execute(&pool)
     .await
     .unwrap();
@@ -328,9 +328,9 @@ async fn the_schema_rejects_a_second_split_on_the_same_day() {
     assert_eq!(
         kept,
         vec![
-            (asset_a as i64, "BUY".to_string(), "2024-06-01".to_string()),
-            (asset_a as i64, "SPLIT".to_string(), "2024-06-01".to_string()),
-            (asset_b as i64, "SPLIT".to_string(), "2024-06-01".to_string()),
+            (asset_a, "BUY".to_string(), "2024-06-01".to_string()),
+            (asset_a, "SPLIT".to_string(), "2024-06-01".to_string()),
+            (asset_b, "SPLIT".to_string(), "2024-06-01".to_string()),
         ],
         "one split per asset per day, other rows untouched"
     );

@@ -150,7 +150,7 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
         "SELECT * FROM transactions WHERE asset_id = $1",
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .fetch_all(&pool)
     .await
     .unwrap();
@@ -217,7 +217,7 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
         "SELECT * FROM transactions WHERE asset_id = $1",
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .fetch_all(&pool)
     .await
     .unwrap();

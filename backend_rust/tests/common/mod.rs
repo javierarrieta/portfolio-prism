@@ -8,11 +8,11 @@
 
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::backup::BackupConfig;
+use backend_rust::db::DbPool;
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{build_rocket as lib_build_rocket, ensure_bootstrap_owner, get_cors_options};
 use chrono::{DateTime, NaiveDate, Utc};
 use rocket::{Build, Rocket};
-use backend_rust::db::DbPool;
 
 // The mock lives in `src/test_provider.rs` so the library's own unit tests can use
 // it too; this include compiles the same file into the integration-test binary.
@@ -27,13 +27,17 @@ mod test_db;
 // Each integration-test binary uses a subset of these; the ones it does not use are
 // not dead code in the file, only in that binary.
 #[allow(unused_imports)]
-pub use test_provider::{mock_pricing_url, MockYahoo};
+pub use test_provider::{MockYahoo, mock_pricing_url};
 
 /// The user every existing test runs as: the placeholder row
 /// [`ensure_bootstrap_owner`] upserts unconditionally, which is `id = 1` on a freshly
 /// migrated database — the identity restarts at 1 and the placeholder is the first
 /// row any fixture path creates.
-pub const DEFAULT_USER: i32 = 1;
+///
+/// `i64` because `users.id` is `BIGINT`: every seed helper returns a row id, and a
+/// fixture that narrowed one to `i32` would be a fixture that could not express the
+/// ids the database produces.
+pub const DEFAULT_USER: i64 = 1;
 
 /// A `StartupConfig` asking for `disabled` mode, built through the injectable
 /// environment source rather than by mutating the process environment (which is
@@ -69,7 +73,7 @@ pub fn oidc_config() -> StartupConfig {
 
 /// Build the app running as `as_user` (development mode). Tests that need the
 /// cookie path construct `AuthMode::Oidc(oidc_cfg())` themselves.
-pub fn build_rocket(pool: DbPool, as_user: i32) -> Rocket<Build> {
+pub fn build_rocket(pool: DbPool, as_user: i64) -> Rocket<Build> {
     rocket_with_service(pool, offline_pricing_service(), as_user)
 }
 
@@ -78,7 +82,7 @@ pub fn build_rocket(pool: DbPool, as_user: i32) -> Rocket<Build> {
 /// mock gives. `build_rocket` is already offline; this is for tests that need the
 /// provider to answer *something*.
 #[allow(dead_code)]
-pub fn build_rocket_pricing(pool: DbPool, as_user: i32, base_url: &str) -> Rocket<Build> {
+pub fn build_rocket_pricing(pool: DbPool, as_user: i64, base_url: &str) -> Rocket<Build> {
     rocket_with_service(pool, CurrencyService::with_base_url(base_url), as_user)
 }
 
@@ -93,7 +97,7 @@ pub fn offline_pricing_service() -> CurrencyService {
 fn rocket_with_service(
     pool: DbPool,
     currency_service: CurrencyService,
-    as_user: i32,
+    as_user: i64,
 ) -> Rocket<Build> {
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
@@ -109,7 +113,7 @@ fn rocket_with_service(
 #[allow(dead_code)]
 pub fn build_rocket_with_backup_config(
     pool: DbPool,
-    as_user: i32,
+    as_user: i64,
     backup_cfg: BackupConfig,
 ) -> Rocket<Build> {
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
@@ -162,7 +166,9 @@ pub async fn setup_db(cfg: &StartupConfig) -> DbPool {
     // with `test_pool("<test name>")`, which names the database after the test that
     // owns it.
     let pool = test_db::test_database(&test_db::next_caller("setup_db")).await;
-    ensure_bootstrap_owner(&pool, cfg).await.expect("bootstrap owner");
+    ensure_bootstrap_owner(&pool, cfg)
+        .await
+        .expect("bootstrap owner");
     pool
 }
 
@@ -212,7 +218,7 @@ pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 
 /// Create a user row and return its id.
 #[allow(dead_code)]
-pub async fn seed_user(pool: &DbPool, subj: &str) -> i32 {
+pub async fn seed_user(pool: &DbPool, subj: &str) -> i64 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
          VALUES ('https://auth.example.invalid', $1, 'user@example.com', $2, now()) \
@@ -223,12 +229,12 @@ pub async fn seed_user(pool: &DbPool, subj: &str) -> i32 {
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 /// Create a portfolio owned by `owner_id`.
 #[allow(dead_code)]
-pub async fn seed_portfolio(pool: &DbPool, owner_id: i32, name: &str, currency: &str) -> i32 {
+pub async fn seed_portfolio(pool: &DbPool, owner_id: i64, name: &str, currency: &str) -> i64 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id"
     )
@@ -236,26 +242,26 @@ pub async fn seed_portfolio(pool: &DbPool, owner_id: i32, name: &str, currency: 
     .bind(None::<String>)
     .bind(currency)
     .bind(currency)
-    .bind(owner_id as i64)
+    .bind(owner_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 #[allow(dead_code)]
-pub async fn seed_asset(pool: &DbPool, portfolio_id: i32, symbol: &str, name: &str) -> i32 {
+pub async fn seed_asset(pool: &DbPool, portfolio_id: i64, symbol: &str, name: &str) -> i64 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, $2, $3, $4, 'USD') RETURNING id"
     )
-    .bind(portfolio_id as i64)
+    .bind(portfolio_id)
     .bind(symbol)
     .bind(name)
     .bind("STOCK")
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 /// `seed_asset` hardcodes `'USD'`, which is why no fixture in the suite could tell a
@@ -265,15 +271,15 @@ pub async fn seed_asset(pool: &DbPool, portfolio_id: i32, symbol: &str, name: &s
 #[allow(dead_code)]
 pub async fn seed_asset_currency(
     pool: &DbPool,
-    portfolio_id: i32,
+    portfolio_id: i64,
     symbol: &str,
     name: &str,
     currency: &str,
-) -> i32 {
+) -> i64 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id"
     )
-    .bind(portfolio_id as i64)
+    .bind(portfolio_id)
     .bind(symbol)
     .bind(name)
     .bind("STOCK")
@@ -281,7 +287,7 @@ pub async fn seed_asset_currency(
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 /// The text a fixture stores for a float, computed here rather than by the database.
@@ -306,19 +312,19 @@ fn dec(value: f64) -> String {
 #[allow(dead_code)]
 pub async fn seed_transaction(
     pool: &DbPool,
-    asset_id: i32,
+    asset_id: i64,
     tx_type: &str,
     qty: f64,
     price: f64,
     fee: f64,
-) -> i32 {
+) -> i64 {
     let date = DateTime::parse_from_rfc3339("2024-06-15T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .bind(tx_type)
     .bind(dec(qty))
     .bind(dec(price))
@@ -327,25 +333,25 @@ pub async fn seed_transaction(
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 #[allow(dead_code)]
 pub async fn seed_transaction_at(
     pool: &DbPool,
-    asset_id: i32,
+    asset_id: i64,
     tx_type: &str,
     qty: f64,
     price: f64,
     fee: f64,
     date: &str,
-) -> i32 {
+) -> i64 {
     let date = DateTime::parse_from_rfc3339(date)
         .unwrap()
         .with_timezone(&Utc);
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .bind(tx_type)
     .bind(dec(qty))
     .bind(dec(price))
@@ -354,7 +360,7 @@ pub async fn seed_transaction_at(
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 /// One stored close. The pricing layer reads `historical_prices` before the provider, so
@@ -416,13 +422,13 @@ pub async fn seed_daily_prices(pool: &DbPool, symbol: &str, start: &str, end: &s
 /// and fetches from the provider. Do not "simplify" the bind back to a SQL datetime
 /// function.
 #[allow(dead_code)]
-pub async fn seed_split_sync(pool: &DbPool, asset_id: i32) {
+pub async fn seed_split_sync(pool: &DbPool, asset_id: i64) {
     sqlx::query(
         "INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) \
          ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, \
                                               covered_from   = EXCLUDED.covered_from",
     )
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .bind(Utc::now().date_naive())
     .bind(FULLY_COVERED)
     .execute(pool)

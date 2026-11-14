@@ -122,11 +122,11 @@ export interface components {
     AssetOut: {
       asset_type: string;
       currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       isin?: string | null;
       name: string;
-      /** Format: int32 */
+      /** Format: int64 */
       portfolio_id: number;
       sector?: string | null;
       symbol: string;
@@ -151,7 +151,7 @@ export interface components {
      */
     AssetTotals: {
       asset_currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       asset_type: string;
       cost_basis: string;
@@ -195,7 +195,7 @@ export interface components {
       /** Format: date-time */
       buy_date: string;
       buy_price: string;
-      /** Format: int32 */
+      /** Format: int64 */
       buy_transaction_id: number;
       cost_basis: string;
       /** Format: int64 */
@@ -233,7 +233,7 @@ export interface components {
       assets: components["schemas"]["AssetOut"][];
       currency: string;
       description?: string | null;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       name: string;
       /**
@@ -261,7 +261,7 @@ export interface components {
      */
     ReportContext: {
       base_currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       portfolio_id: number;
       portfolio_name: string;
       /**
@@ -302,7 +302,7 @@ export interface components {
      */
     ReportRow: {
       asset_currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       asset_type: string;
       /** Format: date-time */
@@ -315,7 +315,7 @@ export interface components {
        * price on the same row IS asset currency, so the two columns must not share a label.
        */
       buy_price?: string | null;
-      /** Format: int32 */
+      /** Format: int64 */
       buy_transaction_id?: number | null;
       /**
        * @description Sell-level, **matched quantity only**, in the portfolio's base currency. Summed
@@ -362,7 +362,7 @@ export interface components {
       sell_fee?: string | null;
       /** @description As entered, in `asset_currency`. */
       sell_price?: string | null;
-      /** Format: int32 */
+      /** Format: int64 */
       sell_transaction_id?: number | null;
       sold_qty?: string | null;
       symbol: string;
@@ -395,7 +395,7 @@ export interface components {
      */
     SellPnlResponse: {
       asset_currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       asset_type: string;
       cost_basis: string;
@@ -421,13 +421,13 @@ export interface components {
       symbol: string;
       /** Format: int64 */
       threshold_days: number;
-      /** Format: int32 */
+      /** Format: int64 */
       transaction_id: number;
       unmatched_qty: string;
     };
     /** @description One asset whose split sync failed while syncing a whole portfolio. */
     SyncSplitFailure: {
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       error: string;
       symbol: string;
@@ -449,7 +449,7 @@ export interface components {
       buy_date: string;
       buy_price: string;
       /**
-       * Format: int32
+       * Format: int64
        * @description The buy that opened this lot. Present so a lot can be joined back to the ledger
        * row a person is reading.
        */
@@ -480,12 +480,12 @@ export interface components {
       type: string;
     };
     TransactionOut: {
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       /** Format: date-time */
       date: string;
       fee: string;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       price: string;
       quantity: string;

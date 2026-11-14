@@ -155,15 +155,15 @@ pub async fn capabilities(
 /// Parse `?portfolio_ids=1,2` into a de-duplicated, ordered list.
 /// `None` on anything unparseable, so the handler answers 422 rather than
 /// silently exporting a subset of what was asked for.
-fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
+fn parse_ids(raw: Option<&str>) -> Option<Vec<i64>> {
     let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
-    let mut ids: Vec<i32> = Vec::new();
+    let mut ids: Vec<i64> = Vec::new();
     for part in raw.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let id: i32 = part.parse().ok()?;
+        let id: i64 = part.parse().ok()?;
         if !ids.contains(&id) {
             ids.push(id);
         }

@@ -192,7 +192,7 @@ async fn one_byte_more_arrives_capped_for_the_handler_to_refuse() {
 // ---------------------------------------------------------------------------
 
 /// Seed: portfolio "One" with one asset and one buy; portfolio "Two" with nothing.
-async fn seed_two_portfolios(pool: &DbPool) -> (i32, i32) {
+async fn seed_two_portfolios(pool: &DbPool) -> (i64, i64) {
     let one = seed_portfolio(pool, common::DEFAULT_USER, "One", "USD").await;
     let two = seed_portfolio(pool, common::DEFAULT_USER, "Two", "EUR").await;
     let asset = seed_asset(pool, one, "AAPL", "Apple").await;
@@ -406,14 +406,14 @@ async fn a_repeated_query_parameter_is_refused_not_half_read() {
 
 /// `n` transactions on one asset in a single statement. A loop of 50k inserts would
 /// dominate the suite; a recursive CTE is one round trip.
-async fn seed_many_transactions(pool: &DbPool, asset_id: i32, n: usize) {
+async fn seed_many_transactions(pool: &DbPool, asset_id: i64, n: usize) {
     sqlx::query(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
          WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < $1) \
          SELECT $2, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
     )
     .bind(n as i64)
-    .bind(asset_id as i64)
+    .bind(asset_id)
     .execute(pool)
     .await
     .unwrap();
@@ -1143,16 +1143,16 @@ async fn copy_mode_adds_alongside_and_assigns_new_ids() {
     // The new portfolio is owned by the caller, and its asset and transaction are
     // reachable through it — that is the ref rewiring, not merely the row counts.
     let new_id = body["portfolio_ids"][0].as_i64().unwrap();
-    assert_ne!(new_id, one as i64, "a bundle ref must never become a database id");
+    assert_ne!(new_id, one, "a bundle ref must never become a database id");
     let chain: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
          (SELECT id FROM assets WHERE portfolio_id = $1)")
-        .bind(new_id as i32).fetch_one(&pool).await.unwrap();
+        .bind(new_id).fetch_one(&pool).await.unwrap();
     assert_eq!(chain.0, 1, "the transaction must hang off the new asset under the new portfolio");
 
     let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
-        .bind(new_id as i32).fetch_one(&pool).await.unwrap();
-    assert_eq!(owner.0, Some(common::DEFAULT_USER as i64));
+        .bind(new_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(owner.0, Some(common::DEFAULT_USER));
 }
 
 #[tokio::test]
@@ -1198,25 +1198,25 @@ async fn a_round_trip_through_export_and_restore_is_lossless() {
 /// two asset types the application produces.
 async fn seed_asset_type(
     pool: &DbPool,
-    portfolio_id: i32,
+    portfolio_id: i64,
     symbol: &str,
     name: &str,
     asset_type: &str,
-) -> i32 {
+) -> i64 {
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
          VALUES ($1, $2, $3, $4, 'USD') RETURNING id",
     )
-    .bind(portfolio_id as i64)
+    .bind(portfolio_id)
     .bind(symbol)
     .bind(name)
     .bind(asset_type)
     .fetch_one(pool)
     .await
     .unwrap();
-    // Same narrowing as `common::seed_asset`: the row id is `i64`, this helper's
-    // callers speak the API's `i32`.
-    id as i32
+    // The row id, undiminished: `common::seed_asset` returns `i64` too, and so
+    // does every caller now.
+    id
 }
 
 #[tokio::test]
@@ -1263,13 +1263,13 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
     // And the types survived the write rather than being coerced to something safe.
     // The new portfolio's id comes from the response: a restore mints ids, and the
     // target's numbering is the target's own.
-    let new_id: i32 = serde_json::from_str::<Value>(&text).unwrap()["portfolio_ids"][0]
+    let new_id: i64 = serde_json::from_str::<Value>(&text).unwrap()["portfolio_ids"][0]
         .as_i64()
-        .expect("the outcome names the portfolio it created") as i32;
+        .expect("the outcome names the portfolio it created");
     let stored: Vec<String> = sqlx::query_as::<_, (String,)>(
         "SELECT asset_type FROM assets WHERE portfolio_id = $1 ORDER BY symbol",
     )
-    .bind(new_id as i64)
+    .bind(new_id)
     .fetch_all(&target)
     .await
     .unwrap()
@@ -1302,7 +1302,7 @@ async fn a_restored_portfolio_produces_the_same_tax_result() {
     let res = c.post("/api/backup/restore?mode=copy").header(session())
         .header(rocket::http::ContentType::JSON).body(exported).dispatch().await;
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let path = format!("/api/portfolios/{new_id}/tax-summary");
     let restored: Value = c.get(&path)
@@ -1372,13 +1372,13 @@ async fn a_split_is_stored_with_no_fee_as_the_write_path_stores_it() {
         .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let fee: (String,) = sqlx::query_as(
         "SELECT t.fee FROM transactions t WHERE t.asset_id IN \
          (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
-    .bind(new_id as i64)
+    .bind(new_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1406,12 +1406,12 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
         .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
     assert_eq!(res.status(), Status::Ok, "a lowercase ISIN is a valid ISIN");
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let isin: (Option<String>,) = sqlx::query_as(
         "SELECT isin FROM assets WHERE portfolio_id = $1",
     )
-    .bind(new_id as i64)
+    .bind(new_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1456,7 +1456,7 @@ async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
 /// `split_sync` row is stranded on a deleted asset. `split_sync` belongs in here for
 /// that reason — its `asset_id` has no foreign key to `assets`, so nothing in the
 /// schema would notice and nothing else in the suite would either.
-async fn owned_fingerprint(pool: &DbPool, user: i32) -> Vec<String> {
+async fn owned_fingerprint(pool: &DbPool, user: i64) -> Vec<String> {
     // One `$1` each, bound to the caller's id, and nothing else: the same scoping rule
     // the deletes under test claim to follow.
     //
@@ -1491,7 +1491,7 @@ async fn owned_fingerprint(pool: &DbPool, user: i32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for sql in queries {
         let rows: Vec<(String,)> = sqlx::query_as(sql)
-            .bind(user as i64)
+            .bind(user)
             .fetch_all(pool)
             .await
             .unwrap();
@@ -2433,15 +2433,15 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
     let new_id = body["portfolio_ids"][0].as_i64().unwrap();
-    assert_ne!(new_id, theirs as i64, "a foreign ref must not become an id");
+    assert_ne!(new_id, theirs, "a foreign ref must not become an id");
 
     // The caller owns what the caller restored...
     let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
-        .bind(new_id as i32)
+        .bind(new_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(owner.0, Some(common::DEFAULT_USER as i64));
+    assert_eq!(owner.0, Some(common::DEFAULT_USER));
 
     // ...and B's rows are untouched, in count and in owner.
     let theirs_now: (i64, i64, i64) = sqlx::query_as(
@@ -2453,9 +2453,9 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
           (SELECT id FROM assets WHERE portfolio_id IN \
            (SELECT id FROM portfolios WHERE owner_id = $3)))",
     )
-    .bind(other as i64)
-    .bind(other as i64)
-    .bind(other as i64)
+    .bind(other)
+    .bind(other)
+    .bind(other)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -2494,14 +2494,14 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
          (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
-    .bind(new_id as i32)
+    .bind(new_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(chain.0, 1);
     // And no column holds a ref: the name is what the bundle's `name` said.
     let (name,): (String,) = sqlx::query_as("SELECT name FROM portfolios WHERE id = $1")
-        .bind(new_id as i32)
+        .bind(new_id)
         .fetch_one(&pool)
         .await
         .unwrap();
