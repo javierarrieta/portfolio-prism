@@ -1074,7 +1074,7 @@ and add `DATABASE_URL` to the env of the existing `Run Tests` step.
 
 - [ ] **Step 2: Update the documented gate list**
 
-In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it. Say explicitly that `check_migrations.sh` inspects a **database**, not the migration file — it will happily pass against a stale schema — so it is only meaningful after `sqlx migrate run` on a database nobody has touched since.
+In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it. Say explicitly that `check_migrations.sh` inspects a **database**, not the migration file — it will happily pass against a stale schema — so it is only meaningful after `sqlx migrate run` on a database nobody has touched since. Until this task landed, that gate was advisory: it existed, proved itself able to fail, and ran nowhere anyone was watching.
 
 - [ ] **Step 3: Verify locally in the same order**
 
