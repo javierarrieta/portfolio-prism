@@ -94,7 +94,7 @@ async fn a_tampered_session_cookie_is_rejected() {
         .http_only(true)
         .same_site(SameSite::Lax)
         .path("/")
-        .finish();
+        .build();
     let resp = client.get("/auth/me").cookie(forged).dispatch().await;
     assert_eq!(resp.status(), Status::Unauthorized);
 
@@ -158,7 +158,9 @@ async fn an_expired_cookie_is_rejected_even_with_a_matching_token_version() {
 #[tokio::test]
 async fn a_deactivated_user_is_rejected() {
     let pool = setup_db(&oidc_config()).await;
-    sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
+    // `false`, not `0`: `users.is_active` is a Postgres `BOOLEAN`, and Postgres will
+    // not coerce an integer into one the way SQLite's integer storage allowed.
+    sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
         .bind(DEFAULT_USER as i64)
         .execute(&pool)
         .await
@@ -198,7 +200,7 @@ async fn logout_all_bumps_the_token_version_and_invalidates_the_live_cookie() {
         .await;
     assert_eq!(resp.status(), Status::SeeOther);
 
-    let (version,): (i64,) = sqlx::query_as("SELECT token_version FROM users WHERE id = ?")
+    let (version,): (i64,) = sqlx::query_as("SELECT token_version FROM users WHERE id = $1")
         .bind(DEFAULT_USER as i64)
         .fetch_one(&pool)
         .await
@@ -394,7 +396,9 @@ async fn a_database_failure_is_not_reported_as_a_denial() {
     let client = Client::tracked(build_rocket_oidc(pool.clone()))
         .await
         .expect("valid rocket");
-    sqlx::query("DROP TABLE users")
+    // `CASCADE`: `portfolios.owner_id` has a foreign key onto `users`, and Postgres
+    // refuses the drop rather than silently orphaning it (`2BP01`).
+    sqlx::query("DROP TABLE users CASCADE")
         .execute(&pool)
         .await
         .unwrap();

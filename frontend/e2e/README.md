@@ -105,8 +105,13 @@ Four things the job has to do that a local run does not:
     `if: always()`.
 
 The stack boots twice, once per smoke, because each `run.sh` invocation owns its own
-throwaway database, backend and vite. The second boot is cheap — the binary is
-already compiled.
+backend and vite. Whether it owns its own *database* depends on where it got
+`DATABASE_URL`: CI gives each smoke a separate empty one (see the per-step
+`DATABASE_URL` in `.github/workflows/ci.yml`, and why sharing one would make the
+statement smoke render the other run's portfolio), but locally, with no
+`DATABASE_URL`, `run.sh` brings up the dev cluster and both smokes write into its
+`prism` database — the same one `start.sh` uses. The second boot is cheap — the
+binary is already compiled.
 
 ### Traps that are already handled — do not re-break them
 
@@ -123,7 +128,7 @@ already compiled.
 *   **Do not pin prices by writing to `historical_prices`.** No API route writes
     that table — the only writers are internal cache writes after a successful
     provider fetch (`currency_service.rs:397`, `:490`) — so pinning would mean
-    writing SQLite out-of-band, against this harness's own REST-seeding rule.
+    writing to the Postgres database out-of-band, against this harness's own REST-seeding rule.
     It also couples the smoke to a schema the pricing-layer work is actively
     revising. A smoke that asserts no figure cannot fail on a zero price, so
     there is nothing for it to buy.

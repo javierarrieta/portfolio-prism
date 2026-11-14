@@ -4,7 +4,7 @@
 Portfolio Prism: Full-stack app for portfolio management and tax lot (FIFO/LIFO/Hybrid) calculations.
 
 ## Architecture
-- **Backend**: Rust (Rocket) in `backend_rust/`. Uses SQLite (see *Database* below) via SQLx.
+- **Backend**: Rust (Rocket) in `backend_rust/`. Uses **Postgres** (see *Database* below) via SQLx.
 - **Frontend**: React + Vite in `frontend/`.
 
 ## Commands
@@ -47,11 +47,15 @@ From root:
   the release image refuses to start without OIDC configuration.
 - **API Prefix**: All routes are under `/api`.
 - **Tax Logic**: `backend_rust/src/engines/tax_engine.rs` contains the core `TaxLotEngine` supporting `FIFO`, `LIFO`, and `HYBRID` (using `hybrid_threshold_days`) strategies.
-- **Database**: The default `DATABASE_URL` is `sqlite:../portfolio.db?mode=rwc`, resolved
-  against the process cwd — so in development that is **`portfolio.db` in the repository
-  root** when the backend is run from `backend_rust/` (`main.rs:53-54`). There is no
-  `backend/` directory. Production sets `DATABASE_URL` to `/app/data/portfolio.db`
-  (`k8s/configmap.yaml`).
+- **Database**: Postgres, and only Postgres — there is no engine flag and no SQLite
+  support in the crate. `DATABASE_URL` has **no default**: `main` refuses to start
+  without it and names the variable (`main.rs`). In development that is
+  `postgres://postgres@127.0.0.1:55432/prism`, the URL `backend_rust/scripts/dev-db.sh`
+  prints; `start.sh` exports it if the environment does not already set one. Schema comes
+  from `backend_rust/migrations/` via `sqlx::migrate!` at startup, not from any
+  create-if-not-exists code. There is no `backend/` directory. **`k8s/configmap.yaml`
+  still ships a `sqlite:` DSN and is wrong for this build** — swapping it is a cutover
+  step, tracked in Task 10, because a running deployment consumes that manifest.
 - **Metrics Engine**: `backend_rust/src/engines/stats_engine.rs` computes the daily value
   series, cumulative **TWR**, portfolio value and beta-adjusted exposure. Volatility,
   Sharpe Ratio and Portfolio Beta are **not** computed — the response carries them as the
@@ -83,7 +87,9 @@ From root:
   `tests/backup_portability_test.rs`) that runs the real script against a throwaway
   tree; a gate is only as good as the mutation that proves it can fail.
 - **Provider smoke (no browser)**: `bash scripts/auth_smoke.sh` from `backend_rust/`,
-  with `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` set.
+  with `DATABASE_URL` (Postgres — `scripts/dev-db.sh` prints one; a `sqlite:` URL is
+  refused) plus `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI`
+  set.
 - **Local OIDC harness**: `docker-compose.auth-test.yml` with `.auth-test.env`
   (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
 

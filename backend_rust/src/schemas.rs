@@ -522,10 +522,10 @@ impl ReportRow {
         breakdown: &SellBreakdown,
         matched: &LotMatch,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::SoldLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::SoldLot, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
-        row.sell_transaction_id = Some(sell.id);
+        row.sell_transaction_id = Some(sell.id as i32);
         row.sell_date = Some(sell.date);
         row.sold_qty = Some(breakdown.sold_qty);
         row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
@@ -563,10 +563,10 @@ impl ReportRow {
         sell: &Transaction,
         breakdown: &SellBreakdown,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::Unmatched, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::Unmatched, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
-        row.sell_transaction_id = Some(sell.id);
+        row.sell_transaction_id = Some(sell.id as i32);
         row.sell_date = Some(sell.date);
         row.sold_qty = Some(breakdown.sold_qty);
         row.sell_price = Some(crate::db_types::str_to_decimal(&sell.price));
@@ -584,7 +584,7 @@ impl ReportRow {
         price_source: Option<PriceSource>,
         lot: &DatedLot,
     ) -> Self {
-        let mut row = ReportRow::of(RowKind::OpenLot, asset.id, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
+        let mut row = ReportRow::of(RowKind::OpenLot, asset.id as i32, &asset.symbol, &asset.asset_type, &asset.currency, price_source);
         row.price_date_used = price_date_used;
         row.fx_rate_date_used = fx_rate_date_used;
         row.buy_transaction_id = Some(lot.buy_transaction_id);
@@ -605,7 +605,7 @@ impl AssetTotals {
     /// open lot, and no close to report.
     pub fn empty(asset: &Asset, fx_applied: bool, split_applied: bool) -> Self {
         AssetTotals {
-            asset_id: asset.id,
+            asset_id: asset.id as i32,
             symbol: asset.symbol.clone(),
             asset_type: asset.asset_type.clone(),
             asset_currency: asset.currency.clone(),

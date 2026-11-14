@@ -4,6 +4,11 @@ metadata:
   name: backend-config
   namespace: investment-portfolio-manager
 data:
+  # PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE. The backend is Postgres-only now and
+  # refuses to start on a `sqlite:` DSN, so applying this manifest as-is produces a
+  # CrashLoopBackOff. The value is deliberately left alone: changing it is the deployment
+  # cutover (Task 10), which has to move this and the Secret's POSTGRES_* together with a
+  # real host, and a running cluster consumes this file. Do not "fix" it here.
   DATABASE_URL: "sqlite:///app/data/portfolio.db?mode=rwc"
 
   # Authentication. `oidc` is the only value the release image accepts: the

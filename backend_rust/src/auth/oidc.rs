@@ -24,7 +24,7 @@ use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, ProviderMetadataWithLogout, RedirectUrl, Scope,
 };
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use super::OidcConfig;
 use super::guard::AuthedUser;
@@ -222,19 +222,20 @@ pub fn identity_from(claims: &CoreIdTokenClaims) -> (String, Option<String>, Opt
 ///    `id`, which is what keeps pre-existing portfolios attached to it.
 /// 3. Otherwise a new row is provisioned.
 pub async fn provision_or_update(
-    pool: &SqlitePool,
+    pool: &DbPool,
     issuer: &str,
     sub: &str,
     email: Option<&str>,
     name: Option<&str>,
     bootstrap_subj: Option<&str>,
 ) -> anyhow::Result<AuthedUser> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
 
-    // 1. Known identity.
+    // 1. Known identity. `UserRow` decodes `is_active` as `bool`; it is unused
+    // here, so the pattern keeps the `_` in position 5 rather than naming it.
     let existing: Option<crate::auth::guard::UserRow> = sqlx::query_as(
         "SELECT id, email, name, subj, is_active, token_version FROM users \
-         WHERE issuer = ? AND subj = ?",
+         WHERE issuer = $1 AND subj = $2",
     )
     .bind(issuer)
     .bind(sub)
@@ -242,10 +243,10 @@ pub async fn provision_or_update(
     .await?;
 
     if let Some((id, _, _, _, _, token_version)) = existing {
-        sqlx::query("UPDATE users SET email = ?, name = ?, last_login_at = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET email = $1, name = $2, last_login_at = $3 WHERE id = $4")
             .bind(email)
             .bind(name)
-            .bind(&now)
+            .bind(now)
             .bind(id)
             .execute(pool)
             .await?;
@@ -271,14 +272,14 @@ pub async fn provision_or_update(
 
         if let Some((placeholder_id,)) = placeholder {
             let handed: (i64,) = sqlx::query_as(
-                "UPDATE users SET issuer = ?, subj = ?, email = ?, name = ?, last_login_at = ? \
-                 WHERE id = ? RETURNING token_version",
+                "UPDATE users SET issuer = $1, subj = $2, email = $3, name = $4, last_login_at = $5 \
+                 WHERE id = $6 RETURNING token_version",
             )
             .bind(issuer)
             .bind(sub)
             .bind(email)
             .bind(name)
-            .bind(&now)
+            .bind(now)
             .bind(placeholder_id)
             .fetch_one(pool)
             .await?;
@@ -301,19 +302,19 @@ pub async fn provision_or_update(
     // still gets the row, instead of failing a whole login on the unique index.
     sqlx::query(
         "INSERT INTO users (issuer, subj, email, name, created_at, last_login_at) \
-         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (issuer, subj) DO NOTHING",
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (issuer, subj) DO NOTHING",
     )
     .bind(issuer)
     .bind(sub)
     .bind(email)
     .bind(name)
-    .bind(&now)
-    .bind(&now)
+    .bind(now)
+    .bind(now)
     .execute(pool)
     .await?;
 
     let row: (i64, Option<String>, Option<String>, i64) = sqlx::query_as(
-        "SELECT id, email, name, token_version FROM users WHERE issuer = ? AND subj = ?",
+        "SELECT id, email, name, token_version FROM users WHERE issuer = $1 AND subj = $2",
     )
     .bind(issuer)
     .bind(sub)
@@ -332,8 +333,8 @@ pub async fn provision_or_update(
 }
 
 /// Bump the caller's `token_version`, invalidating every session issued to them.
-pub async fn bump_token_version(pool: &SqlitePool, user_id: i32) -> anyhow::Result<()> {
-    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = ?")
+pub async fn bump_token_version(pool: &DbPool, user_id: i32) -> anyhow::Result<()> {
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
         .bind(user_id as i64)
         .execute(pool)
         .await?;

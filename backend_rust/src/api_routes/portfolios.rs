@@ -1,5 +1,6 @@
 use rocket::{State, serde::json::Json, http::Status};
-use sqlx::SqlitePool;
+use chrono::NaiveDate;
+use crate::db::DbPool;
 use std::collections::HashMap;
 use crate::models::{Portfolio as DbPortfolio, Asset as DbAsset, Transaction as DbTransaction};
 use crate::schemas::{AssetOut, PortfolioCreate, PortfolioOut, PortfolioUpdate, TransactionOut};
@@ -17,14 +18,14 @@ use crate::auth::guard::AuthedUser;
 #[post("/", data = "<portfolio>")]
 pub async fn create_portfolio(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     portfolio: Json<PortfolioCreate>
 ) -> Result<Json<PortfolioOut>, Status> {
     // The creator is the owner. There is no other write path for owner_id in this
     // change, which is what makes ownership trustworthy.
     let res = sqlx::query_as::<_, DbPortfolio>(
         "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) 
-         VALUES (?, ?, ?, ?, ?) RETURNING *"
+         VALUES ($1, $2, $3, $4, $5) RETURNING *"
     )
     .bind(&portfolio.name)
     .bind(&portfolio.description)
@@ -39,7 +40,7 @@ pub async fn create_portfolio(
             let assets = fetch_assets_for_portfolio(pool.inner(), p.id).await
                 .map_err(|_| Status::InternalServerError)?;
             Ok(Json(PortfolioOut {
-                id: p.id,
+                id: p.id as i32,
                 name: p.name,
                 description: p.description,
                 currency: p.currency,
@@ -63,13 +64,18 @@ pub async fn create_portfolio(
 ///
 /// `MIN` over the covered assets rather than `MAX`: the portfolio is only as fresh as
 /// its least recently synced holding.
-pub async fn split_sync_age(pool: &sqlx::sqlite::SqlitePool, portfolio_id: i32) -> Result<Option<String>, sqlx::Error> {
-    let (total, synced, oldest): (i64, i64, Option<String>) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM assets WHERE portfolio_id = ?),
+pub async fn split_sync_age(pool: &DbPool, portfolio_id: i64) -> Result<Option<String>, sqlx::Error> {
+    // `oldest` is a `DATE`, and `String` is not a decodable target for a Postgres
+    // `DATE` (`sqlx-postgres`'s `str` accepts TEXT/NAME/BPCHAR/VARCHAR/UNKNOWN and
+    // nothing else). So the day is decoded as `NaiveDate` and formatted here, at the
+    // edge, which keeps `splits_last_synced_at` the `%Y-%m-%d` string the API has
+    // always returned.
+    let (total, synced, oldest): (i64, i64, Option<NaiveDate>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM assets WHERE portfolio_id = $1),
                 (SELECT COUNT(*) FROM assets a JOIN split_sync s ON s.asset_id = a.id
-                  WHERE a.portfolio_id = ?),
+                  WHERE a.portfolio_id = $2),
                 (SELECT MIN(s.last_synced_at) FROM assets a JOIN split_sync s ON s.asset_id = a.id
-                  WHERE a.portfolio_id = ?)"
+                  WHERE a.portfolio_id = $3)"
     )
     .bind(portfolio_id)
     .bind(portfolio_id)
@@ -77,13 +83,13 @@ pub async fn split_sync_age(pool: &sqlx::sqlite::SqlitePool, portfolio_id: i32) 
     .fetch_one(pool)
     .await?;
 
-    Ok(if total > 0 && synced == total { oldest } else { None })
+    Ok(if total > 0 && synced == total { oldest.map(|d| d.format("%Y-%m-%d").to_string()) } else { None })
 }
 
 /// Batch form for `list_portfolios`, so the dashboard does not pay one query per
 /// portfolio. Same semantics as `split_sync_age`.
-pub async fn split_sync_ages(pool: &sqlx::sqlite::SqlitePool) -> Result<HashMap<i32, Option<String>>, sqlx::Error> {
-    let rows: Vec<(i32, i64, i64, Option<String>)> = sqlx::query_as(
+pub async fn split_sync_ages(pool: &DbPool) -> Result<HashMap<i64, Option<String>>, sqlx::Error> {
+    let rows: Vec<(i64, i64, i64, Option<NaiveDate>)> = sqlx::query_as(
         "SELECT p.id,
                 (SELECT COUNT(*) FROM assets a WHERE a.portfolio_id = p.id),
                 (SELECT COUNT(*) FROM assets a JOIN split_sync s ON s.asset_id = a.id
@@ -98,23 +104,34 @@ pub async fn split_sync_ages(pool: &sqlx::sqlite::SqlitePool) -> Result<HashMap<
     Ok(rows
         .into_iter()
         .map(|(id, total, synced, oldest)| {
-            (id, if total > 0 && synced == total { oldest } else { None })
+            (
+                id,
+                if total > 0 && synced == total {
+                    oldest.map(|d| d.format("%Y-%m-%d").to_string())
+                } else {
+                    None
+                },
+            )
         })
         .collect())
 }
 
-async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_id: i32) -> Result<Vec<AssetOut>, sqlx::Error> {
-    let assets = sqlx::query_as::<_, DbAsset>("SELECT * FROM assets WHERE portfolio_id = ?")
+async fn fetch_assets_for_portfolio(pool: &DbPool, portfolio_id: i64) -> Result<Vec<AssetOut>, sqlx::Error> {
+    let assets = sqlx::query_as::<_, DbAsset>("SELECT * FROM assets WHERE portfolio_id = $1")
         .bind(portfolio_id)
         .fetch_all(pool)
         .await?;
 
-    let asset_ids: Vec<i32> = assets.iter().map(|a| a.id).collect();
+    let asset_ids: Vec<i64> = assets.iter().map(|a| a.id).collect();
 
     let all_txs = if asset_ids.is_empty() {
         vec![]
     } else {
-        let placeholders: Vec<String> = (0..asset_ids.len()).map(|_| "?".to_string()).collect();
+        // Built by hand because the id list is variable-length, so it is one of the
+        // two places in this crate that a statement is not a literal — and the only
+        // one where the placeholders are numbered rather than written.
+        let placeholders: Vec<String> =
+            (1..=asset_ids.len()).map(|n| format!("${n}")).collect();
         let sql = format!("SELECT * FROM transactions WHERE asset_id IN ({})", placeholders.join(","));
         let mut query = sqlx::query_as::<_, DbTransaction>(&sql);
         for id in &asset_ids {
@@ -123,14 +140,14 @@ async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_i
         query.fetch_all(pool).await?
     };
 
-    let mut txs_by_asset: HashMap<i32, Vec<TransactionOut>> = HashMap::new();
+    let mut txs_by_asset: HashMap<i64, Vec<TransactionOut>> = HashMap::new();
     for tx in all_txs {
         txs_by_asset
             .entry(tx.asset_id)
             .or_default()
             .push(TransactionOut {
-                id: tx.id,
-                asset_id: tx.asset_id,
+                id: tx.id as i32,
+                asset_id: tx.asset_id as i32,
                 r#type: tx.r#type,
                 quantity: crate::db_types::str_to_decimal(&tx.quantity),
                 price: crate::db_types::str_to_decimal(&tx.price),
@@ -140,8 +157,8 @@ async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_i
     }
 
     let out = assets.into_iter().map(|a| AssetOut {
-        id: a.id,
-        portfolio_id: a.portfolio_id,
+        id: a.id as i32,
+        portfolio_id: a.portfolio_id as i32,
         symbol: a.symbol,
         name: a.name,
         asset_type: a.asset_type,
@@ -164,29 +181,29 @@ async fn fetch_assets_for_portfolio(pool: &sqlx::sqlite::SqlitePool, portfolio_i
 #[get("/")]
 pub async fn list_portfolios(
     user: AuthedUser,
-    pool: &State<SqlitePool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
+    pool: &State<DbPool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
     // Both queries are scoped. Filtering only the portfolios would still return
     // every other user's asset rows, because the assets query had no filter at
     // all and the handler groups them by portfolio_id afterwards.
-    let portfolios = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE owner_id = ?")
+    let portfolios = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE owner_id = $1")
         .bind(user.id as i64)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
 
     let all_assets = sqlx::query_as::<_, DbAsset>(
-        "SELECT * FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = ?)",
+        "SELECT * FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = $1)",
     )
         .bind(user.id as i64)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    let mut by_portfolio: HashMap<i32, Vec<AssetOut>> = all_assets
+    let mut by_portfolio: HashMap<i64, Vec<AssetOut>> = all_assets
         .into_iter()
         .map(|a| AssetOut {
-            id: a.id,
-            portfolio_id: a.portfolio_id,
+            id: a.id as i32,
+            portfolio_id: a.portfolio_id as i32,
             symbol: a.symbol,
             name: a.name,
             asset_type: a.asset_type,
@@ -196,7 +213,7 @@ pub async fn list_portfolios(
             transactions: vec![],
         })
         .fold(HashMap::new(), |mut map, asset| {
-            map.entry(asset.portfolio_id).or_default().push(asset);
+            map.entry(asset.portfolio_id as i64).or_default().push(asset);
             map
         });
 
@@ -206,7 +223,7 @@ pub async fn list_portfolios(
         .map_err(|_| Status::InternalServerError)?;
 
     let out = portfolios.into_iter().map(|p| PortfolioOut {
-        id: p.id,
+        id: p.id as i32,
         name: p.name,
         description: p.description,
         currency: p.currency,
@@ -226,13 +243,13 @@ pub async fn list_portfolios(
     )
 )]
 #[get("/<id>")]
-pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Json<PortfolioOut>, Status> {
+pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<DbPool>) -> Result<Json<PortfolioOut>, Status> {
     require(pool.inner(), user.id, id, Access::Viewer).await?;
 
     // Kept deliberately: `require` answers whether the caller may touch this id and
     // never returns the row, so the read below is the response body, not a check.
-    let p = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(id)
+    let p = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = $1")
+        .bind(id as i64)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -242,7 +259,7 @@ pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) 
             let assets = fetch_assets_for_portfolio(pool.inner(), p.id).await
                 .map_err(|_| Status::InternalServerError)?;
             Ok(Json(PortfolioOut {
-                id: p.id,
+                id: p.id as i32,
                 name: p.name,
                 description: p.description,
                 currency: p.currency,
@@ -267,23 +284,23 @@ pub async fn get_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) 
 pub async fn update_portfolio(
     user: AuthedUser,
     id: i32,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     update: Json<PortfolioUpdate>
 ) -> Result<Json<PortfolioOut>, Status> {
     require(pool.inner(), user.id, id, Access::Owner).await?;
 
     let new_currency = &update.currency;
 
-    sqlx::query("UPDATE portfolios SET currency = ?, base_currency = ? WHERE id = ?")
+    sqlx::query("UPDATE portfolios SET currency = $1, base_currency = $2 WHERE id = $3")
         .bind(new_currency)
         .bind(new_currency)
-        .bind(id)
+        .bind(id as i64)
         .execute(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    let p = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(id)
+    let p = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = $1")
+        .bind(id as i64)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -293,7 +310,7 @@ pub async fn update_portfolio(
             let assets = fetch_assets_for_portfolio(pool.inner(), p.id).await
                 .map_err(|_| Status::InternalServerError)?;
             Ok(Json(PortfolioOut {
-                id: p.id,
+                id: p.id as i32,
                 name: p.name,
                 description: p.description,
                 currency: p.currency,
@@ -315,14 +332,14 @@ pub async fn update_portfolio(
     )
 )]
 #[delete("/<id>")]
-pub async fn delete_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool>) -> Result<Status, Status> {
+pub async fn delete_portfolio(user: AuthedUser, id: i32, pool: &State<DbPool>) -> Result<Status, Status> {
     // Before the asset-count check: otherwise a non-owner could tell "exists and is
     // empty" (409) from "does not exist" (404) and use the difference as an
     // existence oracle.
     require(pool.inner(), user.id, id, Access::Owner).await?;
 
-    let portfolio = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(id)
+    let portfolio = sqlx::query_as::<_, DbPortfolio>("SELECT * FROM portfolios WHERE id = $1")
+        .bind(id as i64)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -332,8 +349,8 @@ pub async fn delete_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool
         None => return Err(Status::NotFound),
     }
 
-    let asset_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM assets WHERE portfolio_id = ?")
-        .bind(id)
+    let asset_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM assets WHERE portfolio_id = $1")
+        .bind(id as i64)
         .fetch_one(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -342,8 +359,8 @@ pub async fn delete_portfolio(user: AuthedUser, id: i32, pool: &State<SqlitePool
         return Err(Status::Conflict);
     }
 
-    let res = sqlx::query("DELETE FROM portfolios WHERE id = ?")
-        .bind(id)
+    let res = sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(id as i64)
         .execute(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;

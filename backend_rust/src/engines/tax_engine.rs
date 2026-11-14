@@ -4,7 +4,7 @@ use crate::services::currency_service::CurrencyService;
 use rust_decimal::Decimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use anyhow::Result;
-use sqlx::sqlite::SqlitePool;
+use crate::db::DbPool;
 
 #[cfg(test)]
 mod tests {
@@ -12,7 +12,7 @@ mod tests {
     use chrono::Utc as ChronoUtc;
     use std::str::FromStr;
 
-    fn make_tx(id: i32, tx_type: &str, qty: &str, price: &str, fee: &str, date_str: &str) -> Transaction {
+    fn make_tx(id: i64, tx_type: &str, qty: &str, price: &str, fee: &str, date_str: &str) -> Transaction {
         Transaction {
             id,
             asset_id: 1,
@@ -27,30 +27,24 @@ mod tests {
     /// Every in-file fixture is USD/USD, which `get_rate` short-circuits before it
     /// touches the database, so an empty pool is a real pool that answers nothing.
     /// There are no seeded prices in this file to look for.
-    async fn empty_pool() -> SqlitePool {
-        SqlitePool::connect(":memory:").await.unwrap()
+    async fn empty_pool() -> DbPool {
+        crate::test_db::test_database(&crate::test_db::next_caller("tax_engine_empty")).await
     }
 
     fn day(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
-    /// A pool with the real schema, for the fixtures that seed FX rows. `empty_pool()`
-    /// above is a bare `:memory:` connection with no tables, which is enough for the
-    /// USD/USD fixtures and not enough for these.
-    async fn priced_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        let cfg = crate::auth::StartupConfig::from_env_with(&|key| {
-            (key == "AUTH_MODE").then(|| "disabled".to_string())
-        })
-        .expect("AUTH_MODE=disabled parses in a debug build");
-        crate::init_db(&pool, &cfg).await.unwrap();
-        pool
+    /// A pool the FX fixtures can seed `historical_prices` into. `empty_pool()` above
+    /// is never queried at all, which is enough for the USD/USD fixtures and not for
+    /// these; both are real migrated databases now, so the two differ only in intent.
+    async fn priced_pool() -> DbPool {
+        crate::test_db::test_database(&crate::test_db::next_caller("tax_engine_priced")).await
     }
 
-    async fn seed_fx(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+    async fn seed_fx(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
         for (date, price) in rows {
-            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)")
                 .bind(symbol)
                 .bind(day(date))
                 .bind(*price)
@@ -642,7 +636,7 @@ impl TaxLotEngine {
     /// breakdowns by the caller, never accumulated on a separate path.
     async fn replay(
         sorted_txs: &[Transaction],
-        pool: &SqlitePool,
+        pool: &DbPool,
         currency_service: &CurrencyService,
         asset_currency: &str,
         base_currency: &str,
@@ -674,7 +668,7 @@ impl TaxLotEngine {
                 };
                 let unit_cost_base = unit_cost_asset * tx_rate;
                 buy_lots.push(InternalLot {
-                    source_tx_id: tx.id,
+                    source_tx_id: tx.id as i32,
                     date: tx.date,
                     price: tx_price * tx_rate,
                     qty: tx_qty,
@@ -762,7 +756,7 @@ impl TaxLotEngine {
                 let proceeds: Decimal = matches.iter().map(|m| m.proceeds).sum();
 
                 breakdowns.push(SellBreakdown {
-                    sell_transaction_id: tx.id,
+                    sell_transaction_id: tx.id as i32,
                     sell_date: tx.date,
                     sold_qty: tx_qty,
                     matched_qty,
@@ -793,7 +787,7 @@ impl TaxLotEngine {
     }
 
     /// `too_many_arguments` is silenced rather than grouping the arguments into a
-    /// struct: the tenth is the `SqlitePool` threaded through so `replay`'s FX calls
+    /// struct: the tenth is the `DbPool` threaded through so `replay`'s FX calls
     /// can read dated closes, and a params struct is a wider refactor than this fix.
     #[allow(clippy::too_many_arguments)]
     pub async fn calculate_lots(
@@ -806,7 +800,7 @@ impl TaxLotEngine {
         currency_service: &CurrencyService,
         strategy: &str,
         hybrid_threshold_days: i64,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<AssetTaxSummary> {
         let sorted_txs = Self::sorted_transactions(transactions);
 
@@ -902,7 +896,7 @@ impl TaxLotEngine {
     /// move the cost basis of a window that closed before it happened.
     ///
     /// `too_many_arguments` is silenced for the same reason as `calculate_lots`: the
-    /// tenth is the `SqlitePool` threaded through for `get_rate`.
+    /// tenth is the `DbPool` threaded through for `get_rate`.
     #[allow(clippy::too_many_arguments)]
     pub async fn replay_at(
         transactions: &[Transaction],
@@ -914,7 +908,7 @@ impl TaxLotEngine {
         currency_service: &CurrencyService,
         strategy: &str,
         hybrid_threshold_days: i64,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<DatedReplay> {
         let in_window: Vec<Transaction> = transactions
             .iter()
@@ -1011,7 +1005,7 @@ impl TaxLotEngine {
     /// `calculate_lots` makes. Takes no current price — realized P&L needs none.
     ///
     /// `too_many_arguments` is silenced for the same reason as `calculate_lots`: the
-    /// eighth argument is the `SqlitePool` threaded through for `get_rate`.
+    /// eighth argument is the `DbPool` threaded through for `get_rate`.
     #[allow(clippy::too_many_arguments)]
     pub async fn sell_breakdown(
         sell_transaction_id: i32,
@@ -1021,7 +1015,7 @@ impl TaxLotEngine {
         currency_service: &CurrencyService,
         strategy: &str,
         hybrid_threshold_days: i64,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<Option<SellBreakdown>> {
         let sorted_txs = Self::sorted_transactions(transactions);
         let (_, breakdowns) = Self::replay(

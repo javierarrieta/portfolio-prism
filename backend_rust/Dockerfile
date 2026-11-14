@@ -34,12 +34,16 @@ WORKDIR /app
 
 COPY --from=builder /build/target/release/backend_rust /app/backend_rust
 
-# Expose volume for persistent SQLite database
+# Expose volume for persistent data. PRE-CUTOVER: the app no longer writes to a file —
+# it connects to a Postgres server — so this volume is unused by the current image.
 VOLUME /app/data
 
-# The app defaults to ../portfolio.db relative to its working dir.
-# When run with: docker run -v $(pwd)/portfolio.db:/app/data/portfolio.db ...
-# we set DATABASE_URL so the path is correct.
+# PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE. This default is a SQLite DSN and the
+# backend refuses to start on one, so `docker run` without an explicit -e DATABASE_URL
+# exits immediately. Left as-is on purpose: the real URL carries a host and credentials
+# and belongs in the deployment's Secret, not baked into an image layer. Overriding it
+# (`docker run -e DATABASE_URL=postgres://...`) is the only correct way to use this image
+# until the cutover in Task 10 removes these two lines.
 ENV DATABASE_URL=sqlite:///app/data/portfolio.db?mode=rwc
 
 RUN useradd -r -s /bin/false app

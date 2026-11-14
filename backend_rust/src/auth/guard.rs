@@ -7,11 +7,11 @@
 
 use std::io::Cursor;
 
+use crate::db::DbPool;
 use rocket::http::{ContentType, Status};
 use rocket::request::{self, FromRequest, Outcome};
 use rocket::response::Responder;
 use rocket::{Request, Response};
-use sqlx::SqlitePool;
 
 use super::AuthMode;
 use super::session;
@@ -79,7 +79,12 @@ impl Responder<'_, 'static> for Unauthenticated {
 }
 
 /// The columns `resolve_caller` reads, in select order.
-pub(crate) type UserRow = (i64, Option<String>, Option<String>, String, i64, i64);
+///
+/// Position 5 is `bool`, not `i64`: `users.is_active` is `BOOLEAN` in Postgres and
+/// was `INTEGER` in SQLite, and `sqlx-postgres` will not decode `BOOL` into an
+/// integer. Position 1 and position 6 are `i64` because both columns are `BIGINT`
+/// — `token_version` deliberately so, see `migrations/0001_init.sql`.
+pub(crate) type UserRow = (i64, Option<String>, Option<String>, String, bool, i64);
 
 /// Resolve the caller, or explain why there is none.
 ///
@@ -94,7 +99,7 @@ pub(crate) type UserRow = (i64, Option<String>, Option<String>, String, i64, i64
 pub async fn resolve_caller(
     req: &Request<'_>,
     mode: &AuthMode,
-    pool: &SqlitePool,
+    pool: &DbPool,
 ) -> Result<Option<AuthedUser>, sqlx::Error> {
     // `expected_tv` is `None` in development mode, where there is no session to
     // compare a token version against.
@@ -116,7 +121,7 @@ pub async fn resolve_caller(
 
     // (id, email, name, subj, is_active, token_version)
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, name, subj, is_active, token_version FROM users WHERE id = ?",
+        "SELECT id, email, name, subj, is_active, token_version FROM users WHERE id = $1",
     )
     .bind(uid)
     .fetch_optional(pool)
@@ -128,7 +133,7 @@ pub async fn resolve_caller(
 
     // A deactivated account, or a session minted before a `logout-all`, is
     // denied the same way a missing cookie is.
-    if is_active == 0 {
+    if !is_active {
         return Ok(None);
     }
     if let Some(tv) = expected_tv {
@@ -156,7 +161,7 @@ impl<'r> FromRequest<'r> for AuthedUser {
         // copy of each and no fairing owns a duplicate.
         let (Some(mode), Some(pool)) = (
             req.rocket().state::<AuthMode>(),
-            req.rocket().state::<SqlitePool>(),
+            req.rocket().state::<DbPool>(),
         ) else {
             // Not wired up: a programming error, not a client error.
             return Outcome::Error((Status::InternalServerError, Unauthenticated));
@@ -165,7 +170,7 @@ impl<'r> FromRequest<'r> for AuthedUser {
         // The fairing already resolved this caller to decide about the URI
         // rewrite. Rocket 0.5.1 has no request-local state to hand the result
         // down, so the session is resolved a second time: two primary-key reads
-        // of a local SQLite row per request. Do NOT replace the second read with
+        // of the caller's own `users` row per request. Do NOT replace the second read with
         // a request-header marker — request headers are client-controlled, so a
         // marker would be an authentication bypass.
         match resolve_caller(req, mode, pool).await {

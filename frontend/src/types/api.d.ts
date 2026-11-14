@@ -97,11 +97,11 @@ export interface components {
     Asset: {
       asset_type: string;
       currency: string;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       isin?: string | null;
       name: string;
-      /** Format: int32 */
+      /** Format: int64 */
       portfolio_id: number;
       sector?: string | null;
       symbol: string;
@@ -220,7 +220,7 @@ export interface components {
       base_currency: string;
       currency: string;
       description?: string | null;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       name: string;
     };
@@ -460,12 +460,12 @@ export interface components {
       remaining_qty: string;
     };
     Transaction: {
-      /** Format: int32 */
+      /** Format: int64 */
       asset_id: number;
       /** Format: date-time */
       date: string;
       fee: string;
-      /** Format: int32 */
+      /** Format: int64 */
       id: number;
       price: string;
       quantity: string;

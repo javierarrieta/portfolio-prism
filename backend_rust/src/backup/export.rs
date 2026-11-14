@@ -6,7 +6,7 @@
 //! here runs; nothing in this file decides who may see a row.
 
 use chrono::{NaiveDate, Utc};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use crate::backup::{
     Bundle, BundleAsset, BundlePortfolio, BundlePrice, BundleTransaction, CURRENT_SCHEMA_VERSION,
     FORMAT_TAG, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS, row_count,
@@ -104,7 +104,7 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 /// `a_read_only_export_does_not_queue_behind_a_writer` is what fails if someone
 /// "hardens" it that way.
 pub async fn build(
-    pool: &SqlitePool,
+    pool: &DbPool,
     portfolio_ids: &[i32],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
@@ -119,7 +119,7 @@ pub async fn build(
 /// The reads themselves, on a transaction [`build`] opened. Separate from `build` so
 /// the transaction's scope is three lines and impossible to widen by accident.
 async fn build_in(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     portfolio_ids: &[i32],
     include_prices: bool,
 ) -> Result<Bundle, DbFailure> {
@@ -128,9 +128,9 @@ async fn build_in(
 
     for id in portfolio_ids {
         let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
-            "SELECT name, description, currency, base_currency FROM portfolios WHERE id = ?",
+            "SELECT name, description, currency, base_currency FROM portfolios WHERE id = $1",
         )
-        .bind(*id)
+        .bind(*id as i64)
         .fetch_optional(&mut **tx)
         .await
         .map_err(classify)?;
@@ -217,20 +217,23 @@ pub fn cap_error(bundle: &Bundle) -> Option<String> {
 /// rather than the inline tuple: seven positional columns is past what a reader can
 /// hold in their head at the `for` that destructures it, and clippy's
 /// `type_complexity` says so too.
-type AssetRow = (i32, String, String, String, Option<String>, String, Option<String>);
+// The leading `i64` is `assets.id`, which is `BIGINT`. Reading it as `i32` is a
+// runtime mismatched-types error under sqlx-postgres, so the alias is where the row
+// shape has to be right.
+type AssetRow = (i64, String, String, String, Option<String>, String, Option<String>);
 
 /// One `transactions` row, in the order `assets_for` names its columns.
 type TransactionRow = (String, String, String, String, chrono::DateTime<Utc>);
 
 async fn assets_for(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     portfolio_id: i32,
 ) -> Result<Vec<BundleAsset>, DbFailure> {
     let rows: Vec<AssetRow> = sqlx::query_as(
         "SELECT id, symbol, name, asset_type, sector, currency, isin \
-         FROM assets WHERE portfolio_id = ? ORDER BY id",
+         FROM assets WHERE portfolio_id = $1 ORDER BY id",
     )
-    .bind(portfolio_id)
+    .bind(portfolio_id as i64)
     .fetch_all(&mut *conn)
     .await
     .map_err(classify)?;
@@ -239,7 +242,7 @@ async fn assets_for(
     for (id, symbol, name, asset_type, sector, currency, isin) in rows {
         let txs: Vec<TransactionRow> = sqlx::query_as(
             "SELECT type, quantity, price, fee, date FROM transactions \
-             WHERE asset_id = ? ORDER BY date, id",
+             WHERE asset_id = $1 ORDER BY date, id",
         )
         .bind(id)
         .fetch_all(&mut *conn)
@@ -270,7 +273,7 @@ async fn assets_for(
 }
 
 async fn prices_for(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     symbols: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<BundlePrice>, DbFailure> {
     let mut out = Vec::new();
@@ -280,7 +283,7 @@ async fn prices_for(
     for symbol in symbols {
         let rows: Vec<(String, NaiveDate, String)> = sqlx::query_as(
             "SELECT symbol, date, close_price FROM historical_prices \
-             WHERE symbol = ? ORDER BY date",
+             WHERE symbol = $1 ORDER BY date",
         )
         .bind(symbol)
         .fetch_all(&mut *conn)

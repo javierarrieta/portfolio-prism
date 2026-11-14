@@ -5,9 +5,9 @@
 //!
 //! * [`AuthRequest`] is the *parsed* `AUTH_MODE` value. It exists before the
 //!   database does, so it cannot carry a user id.
-//! * [`AuthMode`] is the *final* mode, after [`init_db`] has run. Its `Disabled`
-//!   variant carries the id of the placeholder user, which only exists once the
-//!   `users` table has been populated.
+//! * [`AuthMode`] is the *final* mode, after [`crate::ensure_bootstrap_owner`] has
+//!   run. Its `Disabled` variant carries the id of the placeholder user, which only
+//!   exists once the `users` table has been populated.
 //!
 //! Collapsing them would mean either reading the database before it is migrated,
 //! or pretending a user id exists before it does.
@@ -18,7 +18,7 @@ pub mod oidc;
 pub mod routes;
 pub mod session;
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 /// The parsed value of `AUTH_MODE`, known before a database exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +40,8 @@ pub struct OidcConfig {
     /// thing to get wrong.
     pub post_logout_redirect_uri: String,
     /// Authoritative copy of `BOOTSTRAP_OWNER_SUBJ`. [`StartupConfig`] keeps the
-    /// same parsed value for `init_db`'s backfill; [`StartupConfig::from_env_with`]
-    /// is the only place that fills both.
+    /// same parsed value for [`crate::ensure_bootstrap_owner`]'s backfill;
+    /// [`StartupConfig::from_env_with`] is the only place that fills both.
     pub bootstrap_subj: Option<String>,
 }
 
@@ -50,8 +50,9 @@ pub struct OidcConfig {
 pub struct StartupConfig {
     pub requested: AuthRequest,
     pub oidc: Option<OidcConfig>,
-    /// Copy of [`OidcConfig::bootstrap_subj`], kept here because `init_db` runs
-    /// before an [`OidcConfig`] is handed to anything.
+    /// Copy of [`OidcConfig::bootstrap_subj`], kept here because
+    /// [`crate::ensure_bootstrap_owner`] runs before an [`OidcConfig`] is handed to
+    /// anything.
     pub bootstrap_subj: Option<String>,
 }
 
@@ -183,9 +184,10 @@ impl StartupConfig {
 /// Turn the final [`AuthMode`] once the database is ready.
 ///
 /// In `Disabled` mode the placeholder user must already exist, which is why
-/// `init_db` creates it unconditionally. Reaching this error means the order of
-/// operations in `main` is wrong, not that the operator misconfigured something.
-pub async fn finalise_auth(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<AuthMode> {
+/// [`crate::ensure_bootstrap_owner`] creates it unconditionally. Reaching this error
+/// means the order of operations in `main` is wrong, not that the operator
+/// misconfigured something.
+pub async fn finalise_auth(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result<AuthMode> {
     // `pool` is read only by the `disabled` branch, which a release build compiles
     // out; without this the release build warns about an unused parameter.
     #[cfg(not(debug_assertions))]
@@ -212,7 +214,8 @@ pub async fn finalise_auth(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Re
                 }
                 None => anyhow::bail!(
                     "AUTH_MODE=disabled needs the bootstrap placeholder user row, which \
-                     init_db creates; this error means init_db did not run first"
+                     ensure_bootstrap_owner creates; this error means \
+                     ensure_bootstrap_owner did not run after the migrations"
                 ),
             }
         }

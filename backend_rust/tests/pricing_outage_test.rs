@@ -19,18 +19,14 @@ use backend_rust::services::currency_service::{CurrencyService, PRICE_WINDOW_FRE
 use chrono::{DateTime, Utc};
 use common::MockYahoo;
 use rust_decimal::Decimal;
-use sqlx::SqlitePool;
+use backend_rust::db::DbPool;
 use std::str::FromStr;
 
-/// A `historical_prices` table with nothing in it — what each moved test assumed
-/// when it was a unit test.
-async fn empty_price_table() -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool
+/// A migrated database with an empty `historical_prices` table — what each moved
+/// test assumed when it was a unit test. The caller name keeps each test on its own
+/// database, so a close written by one cannot answer another's outage.
+async fn empty_price_table(caller: &str) -> DbPool {
+    common::test_pool(caller).await
 }
 
 /// One close, in Yahoo's chart envelope. The service takes the last non-null entry
@@ -44,7 +40,7 @@ async fn a_mocked_close_prices_the_portfolio_so_the_success_path_is_hermetic_too
     // request, and response parsing to land in the portfolio value. That is the
     // half of the pricing path the outage tests do not cover, and the half
     // v0.0.6-M5's release notes had to describe as untested.
-    let pool = empty_price_table().await;
+    let pool = empty_price_table("mocked_close_prices_portfolio").await;
     let yahoo = MockYahoo::serving([("MOCKED", MOCKED_CHART)]);
     let svc = CurrencyService::with_base_url(yahoo.base_url());
 
@@ -87,7 +83,7 @@ async fn a_mocked_close_prices_the_portfolio_so_the_success_path_is_hermetic_too
 
 #[tokio::test]
 async fn test_multicurrency_asset_with_conversion() {
-    let pool = empty_price_table().await;
+    let pool = empty_price_table("multicurrency_asset_with_conversion").await;
     let yahoo = MockYahoo::start();
     let svc = CurrencyService::with_base_url(yahoo.base_url());
 
@@ -125,7 +121,7 @@ async fn test_multicurrency_asset_with_conversion() {
 }
 #[tokio::test]
 async fn test_fallback_to_current_price_when_no_historical_data() {
-    let pool = empty_price_table().await;
+    let pool = empty_price_table("fallback_to_current_price").await;
     let yahoo = MockYahoo::start();
     let svc = CurrencyService::with_base_url(yahoo.base_url());
 
@@ -173,7 +169,7 @@ async fn a_provider_outage_prices_from_the_stored_window_instead_of_zero() {
     // asked for the tail; the symbol is one the provider cannot serve, so the
     // outage is real whichever way the request fails. What the fix has to produce
     // is the stored closes in the series instead of nothing at all.
-    let pool = empty_price_table().await;
+    let pool = empty_price_table("provider_outage_stored_window").await;
 
     let today = Utc::now().date_naive();
     let symbol = "NOSUCHSYMBOL-OUTAGE";
@@ -181,7 +177,7 @@ async fn a_provider_outage_prices_from_the_stored_window_instead_of_zero() {
         - chrono::Duration::days(PRICE_WINDOW_FRESH_DAYS + 1);
     let mut date = newest - chrono::Duration::days(4);
     while date <= newest {
-        sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)")
             .bind(symbol)
             .bind(date)
             .bind("3.00")

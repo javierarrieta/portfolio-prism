@@ -185,7 +185,7 @@ fn the_script_bans_exactly_the_pinned_set() {
 fn a_banned_construct_in_a_sql_string_fails() {
     let (code, text) = run_tree(
         "pragma-in-sql",
-        r#"pub async fn leak(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        r#"pub async fn leak(pool: &DbPool) -> Result<(), sqlx::Error> {
     sqlx::query("PRAGMA table_info(assets)").execute(pool).await
 }
 "#,

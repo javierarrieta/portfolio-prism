@@ -13,10 +13,12 @@
 
 mod common;
 
+use backend_rust::ensure_bootstrap_owner;
 use common::{
-    build_rocket, disabled_config, seed_asset, seed_daily_prices, seed_portfolio, seed_transaction,
-    setup_db,
+    build_rocket, disabled_config, pool_options, seed_asset, seed_daily_prices, seed_portfolio,
+    seed_transaction, setup_db, test_pool_url,
 };
+use sqlx::Connection as _;
 use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
@@ -25,18 +27,19 @@ use rocket::{get, post, routes};
 use serde_json::{json, Value};
 
 use backend_rust::api_routes::backup::{BackupError, lock_response};
+use backend_rust::db::DbPool;
 use backend_rust::backup::export::{self as backup_export, DbFailure};
 use backend_rust::backup::restore::{self as backup_restore, ApplyError, Mode};
 use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS, parse_and_validate};
 
 /// The session header the existing tests use to run as the placeholder user.
-async fn client(pool: sqlx::SqlitePool) -> Client {
+async fn client(pool: DbPool) -> Client {
     Client::tracked(build_rocket(pool, common::DEFAULT_USER)).await.unwrap()
 }
 
 /// The same, with the price-restore flag on — the only thing a test can do about it:
 /// `build_rocket_with_backup_config` documents why the flag is injected, not exported.
-async fn price_restore_client(pool: sqlx::SqlitePool) -> Client {
+async fn price_restore_client(pool: DbPool) -> Client {
     Client::tracked(common::build_rocket_with_backup_config(
         pool,
         common::DEFAULT_USER,
@@ -129,7 +132,7 @@ async fn probe_data(body: Data<'_>) -> String {
     format!("{}:{}", capped.value.len(), capped.is_complete())
 }
 
-async fn probe_client(pool: sqlx::SqlitePool) -> Client {
+async fn probe_client(pool: DbPool) -> Client {
     let rocket = build_rocket(pool, common::DEFAULT_USER).mount("/probe", routes![probe_data]);
     Client::tracked(rocket).await.unwrap()
 }
@@ -189,7 +192,7 @@ async fn one_byte_more_arrives_capped_for_the_handler_to_refuse() {
 // ---------------------------------------------------------------------------
 
 /// Seed: portfolio "One" with one asset and one buy; portfolio "Two" with nothing.
-async fn seed_two_portfolios(pool: &sqlx::SqlitePool) -> (i32, i32) {
+async fn seed_two_portfolios(pool: &DbPool) -> (i32, i32) {
     let one = seed_portfolio(pool, common::DEFAULT_USER, "One", "USD").await;
     let two = seed_portfolio(pool, common::DEFAULT_USER, "Two", "EUR").await;
     let asset = seed_asset(pool, one, "AAPL", "Apple").await;
@@ -268,7 +271,7 @@ async fn a_duplicate_id_is_exported_once() {
 /// Price rows for two symbols, only one of which `seed_two_portfolios` puts in the
 /// selection. The unheld one is what makes "prices are for the selection, not for the
 /// whole `historical_prices` table" a checked claim rather than an assumption.
-async fn seed_two_symbols(pool: &sqlx::SqlitePool) {
+async fn seed_two_symbols(pool: &DbPool) {
     seed_daily_prices(pool, "AAPL", "2024-01-01", "2024-01-03", "150.00").await;
     seed_daily_prices(pool, "MSFT", "2024-01-01", "2024-01-02", "90.00").await;
 }
@@ -403,14 +406,14 @@ async fn a_repeated_query_parameter_is_refused_not_half_read() {
 
 /// `n` transactions on one asset in a single statement. A loop of 50k inserts would
 /// dominate the suite; a recursive CTE is one round trip.
-async fn seed_many_transactions(pool: &sqlx::SqlitePool, asset_id: i32, n: usize) {
+async fn seed_many_transactions(pool: &DbPool, asset_id: i32, n: usize) {
     sqlx::query(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
-         WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < ?) \
-         SELECT ?, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
+         WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < $1) \
+         SELECT $2, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
     )
     .bind(n as i64)
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .execute(pool)
     .await
     .unwrap();
@@ -518,31 +521,45 @@ async fn a_lock_is_a_503_that_says_when_to_retry() {
 // Two arms turn a `DbFailure::Lock` into the response, and they are not equally
 // reachable from a test:
 //
-// * `restore`'s arm is driven for real below, by a second connection holding a write
-//   transaction open against a file-backed database. A write is the one thing SQLite
-//   refuses with `SQLITE_BUSY` here.
-// * `export`'s arm still cannot be driven. `export` only reads, and under the
-//   rollback journal this app uses a writer does not block readers, so the lock that
-//   a test can actually provoke never reaches a read-only route; the one failure that
-//   would (`PoolTimedOut`) is met by `access::require` — or by the auth guard, which
-//   reads `users` on every request — and answered a 500 there before this arm is
-//   reached. Its two halves are pinned where they can be: `build()` producing `Lock`
-//   below, and the response a `Lock` becomes in `a_lock_is_a_503_that_says_when_to_retry`.
+// * `build()` producing a `Lock` at all is driven below, by a pool with no free
+//   connection. `PoolTimedOut` is the retryable database condition a test can actually
+//   provoke here.
+// * The response a `Lock` becomes is pinned by `a_lock_is_a_503_that_says_when_to_retry`
+//   on a probe route.
+//
+// What is *not* pinned here, and deliberately so: the SQLite version of this section
+// drove `restore`'s arm over HTTP by holding a write transaction open against a
+// file-backed database, which is how SQLite answers a second writer. Postgres does not
+// work that way — MVCC means a writer blocks no reader, and two restores writing
+// *different* rows do not block each other at all. The Postgres condition that means
+// "try later" is a serialisation failure (`40001`) from two restores writing the *same*
+// rows under `SERIALIZABLE`, and that is Task 7's test to write, together with the
+// `classify` arm that recognises it. Proving a 503 here by locking a table outright
+// would hang the request instead — the pool sets `acquire_timeout`, not `lock_timeout` —
+// so it would be a test of the harness, not of the code.
+//
+// TODO(Task 7): `restore`'s `ApplyError::Db(DbFailure::Lock) => lock_response()` arm
+// (`src/api_routes/backup.rs:524`) has had no end-to-end proof since the engine switch.
+// The SQLite test that proved it —
+// `a_locked_database_is_a_503_with_retry_after_from_the_restore_route` — was removed
+// with the SQLite lock section, and the tests below only reach `DbFailure::Lock`
+// through `build()`/`export`, never through `restore`. Write the Postgres version
+// alongside the `classify` arm that recognises `40001`/`40P01`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_exhausted_pool_is_a_lock_not_an_outage() {
-    // Under SQLite a reader rarely lives long enough to meet `SQLITE_BUSY`; the
-    // likelier way to be kept out is every connection in the pool being checked out.
-    // That is just as retryable, so it must arrive as the same failure the busy
-    // timeout does rather than a bare 500 with no `Retry-After`.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    // The likeliest way to be kept out of a healthy Postgres is every connection in the
+    // pool being checked out. That is just as retryable as a lock wait, so it must
+    // arrive as the same failure rather than a bare 500 with no `Retry-After`.
+    let url = test_pool_url("an_exhausted_pool_is_a_lock").await;
+    let pool = pool_options()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_millis(50))
-        .connect(":memory:")
+        .connect(&url)
         .await
         .unwrap();
-    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
+    ensure_bootstrap_owner(&pool, &disabled_config()).await.unwrap();
     let pid = seed_portfolio(&pool, common::DEFAULT_USER, "One", "USD").await;
 
     // The pool's only connection, held: nothing else can reach the database.
@@ -559,133 +576,34 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
     assert_eq!(bundle.portfolios.len(), 1);
 }
 
-/// The same options for both halves of the lock test: the app's pool and the
-/// connection that locks it out must describe the same database.
-fn file_opts(path: &std::path::Path) -> sqlx::sqlite::SqliteConnectOptions {
-    sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        // Production waits five seconds for the lock (`main.rs`); this test only needs
-        // the wait to end, and a 5s busy_timeout would cost the suite five seconds.
-        .busy_timeout(std::time::Duration::from_millis(250))
-}
-
-/// A database on disk. `:memory:` cannot host this test: every connection of an
-/// in-memory pool is the *same* shared-cache database, and shared-cache writers
-/// collide at table level (`SQLITE_LOCKED`) rather than the `SQLITE_BUSY` a second
-/// connection — in production, a second process — meets against the file.
-async fn file_pool(path: &std::path::Path) -> sqlx::SqlitePool {
-    // One connection, deliberately: `init_db` runs its migrations statement by statement
-    // against the pool, and a file-backed pool with several connections can hand a later
-    // statement a stale per-connection schema — the same class of bug
-    // `tests/decimal_migration_test.rs` guards. The lock under test comes from a *second*
-    // pool, so a single connection here costs nothing.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(file_opts(path))
-        .await
-        .unwrap();
-    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
-    pool
-}
-
-#[tokio::test]
-async fn a_locked_database_is_a_503_with_retry_after_from_the_restore_route() {
-    // Every other lock test here pins one part: `classify` on a fake error, the
-    // responder on a probe route, `build()` against an exhausted pool. This is the
-    // whole path over HTTP — a real `SQLITE_BUSY` from a real second writer, through
-    // `classify`, through `ApplyError::Db(DbFailure::Lock)`, out of `lock_response()`
-    // — and it is the only one that can fail if a future change routes a lock to a
-    // bare 500.
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_backup_lock_test_{}_{}.db",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let pool = file_pool(&tmp).await;
-    seed_two_portfolios(&pool).await;
-    let before = rows(&pool).await;
-
-    // A second connection holding a write transaction open. Reads still succeed — a
-    // RESERVED writer does not block readers under the rollback journal this app uses,
-    // which is also why the auth guard's read of `users` gets through — but the
-    // restore's first INSERT cannot be granted the write lock and waits out
-    // `busy_timeout`.
-    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp))
-        .await
-        .unwrap();
-    let mut holder = holder_pool.acquire().await.unwrap();
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *holder)
-        .await
-        .unwrap();
-
-    let c = client(pool.clone()).await;
-    // Built twice rather than dispatched twice: a `LocalRequest` is consumed by
-    // `dispatch`, and the second request must be identical to the first for "it was
-    // the lock" to mean anything.
-    let restore = || {
-        c.post("/api/backup/restore?mode=copy")
-            .header(session())
-            .header(rocket::http::ContentType::JSON)
-            .body(bundle_json("Locked out"))
-    };
-    let res = restore().dispatch().await;
-    assert_eq!(res.status(), Status::ServiceUnavailable, "a busy database is retryable, not an outage");
-    assert_eq!(
-        res.headers().get_one("Retry-After"),
-        Some("2"),
-        "a 503 that does not say when to retry is a 503 a client will not retry"
-    );
-    let body: Value = res.into_json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
-    assert_eq!(rows(&pool).await, before, "the refused restore wrote nothing");
-
-    // And it was the lock rather than something else about the file: release it and
-    // the identical request succeeds.
-    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
-    let res = restore().dispatch().await;
-    assert_eq!(res.status(), Status::Ok);
-    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
-
-    drop(holder);
-    holder_pool.close().await;
-    pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
-}
-
 #[tokio::test]
 async fn a_read_only_export_does_not_queue_behind_a_writer() {
-    // `export::build` wraps its reads in a **deferred** transaction, and this pins the
-    // deferred half of that choice: a writer holding a write transaction open (RESERVED
-    // under the rollback journal this app runs, `main.rs`) must not turn a read-only
-    // export into a 503. Changing `pool.begin()` to `pool.begin_with("BEGIN IMMEDIATE")`
-    // — the "hardening" this exists to prevent — makes the export wait out
-    // `busy_timeout` for a write lock no read needs, and fails here.
+    // `export::build` wraps its reads in a transaction, and under Postgres this is the
+    // stronger claim SQLite could only make weakly: an open writer blocks nothing. A
+    // reader does not wait for the lock *or* see the uncommitted write — it reads the
+    // snapshot its transaction started on.
+    //
+    // Changing `pool.begin()` to `pool.begin_with("BEGIN READ ONLY FOR UPDATE")`, or
+    // to anything that takes a write lock no read needs, fails here.
     //
     // What this test cannot pin, said plainly rather than glossed: that the reads are in
     // a transaction at all. Uncommitted data is invisible to a reader either way, and no
     // test can commit at a chosen moment *between* two of `build`'s queries. The
     // snapshot is a property of the transaction `build` opens, and it is the transaction
     // that carries it, not anything observable from outside.
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_export_reader_{}_{}.db",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let pool = file_pool(&tmp).await;
+    let url = test_pool_url("a_read_only_export_does_not_queue").await;
+    let pool = pool_options().connect(&url).await.unwrap();
+    ensure_bootstrap_owner(&pool, &disabled_config()).await.unwrap();
+    seed_two_portfolios(&pool).await;
     let (one, _) = seed_two_portfolios(&pool).await;
 
-    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp)).await.unwrap();
+    // A second pool, because the point is that a *different* session is mid-write.
+    let holder_pool = pool_options().connect(&url).await.unwrap();
     let mut holder = holder_pool.acquire().await.unwrap();
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *holder).await.unwrap();
-    sqlx::query("UPDATE portfolios SET name = 'Renamed mid-flight' WHERE id = ?")
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query("UPDATE portfolios SET name = 'Renamed mid-flight' WHERE id = $1")
         .bind(one)
-        .execute(&mut *holder)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -700,11 +618,10 @@ async fn a_read_only_export_does_not_queue_behind_a_writer() {
         "and an uncommitted rename must not be half-visible"
     );
 
-    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+    tx.rollback().await.unwrap();
     drop(holder);
     holder_pool.close().await;
     pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +757,7 @@ async fn preview_writes_nothing() {
 /// one tenant writing the market data every other tenant's dated reports read. The
 /// id sum is there because counts alone would miss a delete-and-reinsert of the same
 /// number of rows.
-async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
+async fn snapshot(pool: &DbPool) -> Vec<(String, i64)> {
     let mut out: Vec<(String, i64)> = Vec::new();
     for table in ["portfolios", "assets", "transactions", "historical_prices"] {
         let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
@@ -849,7 +766,12 @@ async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
             .unwrap();
         out.push((table.to_string(), n));
     }
-    let (sum,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(id), 0) FROM portfolios")
+    // `::bigint` because `SUM` of a `BIGINT` column is `NUMERIC` in Postgres, and
+    // `NUMERIC` does not decode into `i64`. The sum is a fingerprint, not a money
+    // amount, so narrowing it back is the point rather than a shortcut.
+    let (sum,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(id), 0)::bigint FROM portfolios",
+    )
         .fetch_one(pool)
         .await
         .unwrap();
@@ -1183,7 +1105,7 @@ async fn preview_requires_a_session() {
 // ---------------------------------------------------------------------------
 
 /// Row counts for the three tables a restore writes.
-async fn rows(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
+async fn rows(pool: &DbPool) -> (i64, i64, i64) {
     let p: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios").fetch_one(pool).await.unwrap();
     let a: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM assets").fetch_one(pool).await.unwrap();
     let t: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions").fetch_one(pool).await.unwrap();
@@ -1193,7 +1115,7 @@ async fn rows(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
 /// Rows in the one table a restore writes that no user owns. Separate from `rows`
 /// because a refusal that writes no portfolios can still have written market data,
 /// and only this count can see it.
-async fn price_rows(pool: &sqlx::SqlitePool) -> i64 {
+async fn price_rows(pool: &DbPool) -> i64 {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM historical_prices")
         .fetch_one(pool)
         .await
@@ -1224,11 +1146,11 @@ async fn copy_mode_adds_alongside_and_assigns_new_ids() {
     assert_ne!(new_id, one as i64, "a bundle ref must never become a database id");
     let chain: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)")
+         (SELECT id FROM assets WHERE portfolio_id = $1)")
         .bind(new_id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(chain.0, 1, "the transaction must hang off the new asset under the new portfolio");
 
-    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
         .bind(new_id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(owner.0, Some(common::DEFAULT_USER as i64));
 }
@@ -1254,7 +1176,7 @@ async fn a_round_trip_through_export_and_restore_is_lossless() {
 
     // Re-export from the target and compare, ignoring the informational timestamp
     // and the ids that are target-local by construction.
-    let new_id: (i32,) = sqlx::query_as("SELECT id FROM portfolios WHERE name = 'One'")
+    let new_id: (i64,) = sqlx::query_as("SELECT id FROM portfolios WHERE name = 'One'")
         .fetch_one(&target).await.unwrap();
     let path = format!("/api/backup/export?portfolio_ids={}", new_id.0);
     let res = c.get(&path).header(session()).dispatch().await;
@@ -1275,24 +1197,26 @@ async fn a_round_trip_through_export_and_restore_is_lossless() {
 /// says `STOCK` — which is exactly how the suite stayed green while restore refused the
 /// two asset types the application produces.
 async fn seed_asset_type(
-    pool: &sqlx::SqlitePool,
+    pool: &DbPool,
     portfolio_id: i32,
     symbol: &str,
     name: &str,
     asset_type: &str,
 ) -> i32 {
-    let (id,): (i32,) = sqlx::query_as(
+    let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
-         VALUES (?, ?, ?, ?, 'USD') RETURNING id",
+         VALUES ($1, $2, $3, $4, 'USD') RETURNING id",
     )
-    .bind(portfolio_id)
+    .bind(portfolio_id as i64)
     .bind(symbol)
     .bind(name)
     .bind(asset_type)
     .fetch_one(pool)
     .await
     .unwrap();
-    id
+    // Same narrowing as `common::seed_asset`: the row id is `i64`, this helper's
+    // callers speak the API's `i32`.
+    id as i32
 }
 
 #[tokio::test]
@@ -1343,9 +1267,9 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
         .as_i64()
         .expect("the outcome names the portfolio it created") as i32;
     let stored: Vec<String> = sqlx::query_as::<_, (String,)>(
-        "SELECT asset_type FROM assets WHERE portfolio_id = ? ORDER BY symbol",
+        "SELECT asset_type FROM assets WHERE portfolio_id = $1 ORDER BY symbol",
     )
-    .bind(new_id)
+    .bind(new_id as i64)
     .fetch_all(&target)
     .await
     .unwrap()
@@ -1452,9 +1376,9 @@ async fn a_split_is_stored_with_no_fee_as_the_write_path_stores_it() {
 
     let fee: (String,) = sqlx::query_as(
         "SELECT t.fee FROM transactions t WHERE t.asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)",
+         (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
-    .bind(new_id)
+    .bind(new_id as i64)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1485,9 +1409,9 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
     let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
 
     let isin: (Option<String>,) = sqlx::query_as(
-        "SELECT isin FROM assets WHERE portfolio_id = ?",
+        "SELECT isin FROM assets WHERE portfolio_id = $1",
     )
-    .bind(new_id)
+    .bind(new_id as i64)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1532,29 +1456,36 @@ async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
 /// `split_sync` row is stranded on a deleted asset. `split_sync` belongs in here for
 /// that reason — its `asset_id` has no foreign key to `assets`, so nothing in the
 /// schema would notice and nothing else in the suite would either.
-async fn owned_fingerprint(pool: &sqlx::SqlitePool, user: i32) -> Vec<String> {
-    // One `?` each, bound to the caller's id, and nothing else: the same scoping rule
+async fn owned_fingerprint(pool: &DbPool, user: i32) -> Vec<String> {
+    // One `$1` each, bound to the caller's id, and nothing else: the same scoping rule
     // the deletes under test claim to follow.
+    //
+    // The `::text` casts are not decoration. SQLite stored `transactions.date`,
+    // `split_sync.last_synced_at` and `split_sync.covered_from` as text, so `||` took
+    // them as-is; Postgres has them as `timestamptz`/`DATE` and has no implicit
+    // concatenation from those. Casting explicitly also *pins the spelling* the
+    // fingerprint compares: a date rendered `2024-01-02` on both sides of a restore is
+    // the assertion, and leaving the cast out would compare two different renderings.
     let queries = [
         "SELECT 'portfolios|' || id || '|' || name || '|' || COALESCE(description, '') || \
                 '|' || currency || '|' || base_currency || '|owner=' || COALESCE(owner_id, -1) \
-         FROM portfolios WHERE owner_id = ? ORDER BY id",
+         FROM portfolios WHERE owner_id = $1 ORDER BY id",
         "SELECT 'assets|' || id || '|' || portfolio_id || '|' || symbol || '|' || name || '|' \
                 || asset_type || '|' || COALESCE(sector, '') || '|' || currency || '|' \
                 || COALESCE(isin, '') \
-         FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = ?) \
+         FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = $1) \
          ORDER BY id",
         "SELECT 'transactions|' || id || '|' || asset_id || '|' || type || '|' || quantity || \
-                '|' || price || '|' || fee || '|' || date \
+                '|' || price || '|' || fee || '|' || date::text \
          FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+              (SELECT id FROM portfolios WHERE owner_id = $1)) \
          ORDER BY id",
-        "SELECT 'split_sync|' || asset_id || '|' || last_synced_at || '|' || \
-                COALESCE(covered_from, '') \
+        "SELECT 'split_sync|' || asset_id || '|' || last_synced_at::text || '|' || \
+                COALESCE(covered_from::text, '') \
          FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+              (SELECT id FROM portfolios WHERE owner_id = $1)) \
          ORDER BY asset_id",
     ];
     let mut out: Vec<String> = Vec::new();
@@ -1959,7 +1890,7 @@ async fn a_replace_that_asks_for_prices_while_the_flag_is_off_deletes_nothing() 
 
 /// `common::seed_price` with the date spelled the way `prices[].date` spells it.
 /// `seed_daily_prices` is the dense-range form, and a gap is the thing under test here.
-async fn seed_price_on(pool: &sqlx::SqlitePool, symbol: &str, day: &str, close: &str) {
+async fn seed_price_on(pool: &DbPool, symbol: &str, day: &str, close: &str) {
     let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").expect("a YYYY-MM-DD date");
     common::seed_price(pool, symbol, day, close).await;
 }
@@ -1997,7 +1928,7 @@ async fn a_price_restore_fills_gaps_and_never_overwrites_an_existing_close() {
     );
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT date, close_price FROM historical_prices ORDER BY date",
+        "SELECT date::text, close_price FROM historical_prices ORDER BY date",
     )
     .fetch_all(&pool)
     .await
@@ -2073,17 +2004,32 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     // test passes just as happily if the loop executes on the pool, which in production
     // would commit shared `historical_prices` rows and then roll back the caller's
     // bundle, leaving market data every other tenant reads from a restore that
-    // reported failure. A trigger is the only way to make SQLite refuse a price row
-    // that the Rust side already approved.
+    // reported failure. A trigger is the only way to make the database refuse a price
+    // row that the Rust side already approved.
     let pool = setup_db(&disabled_config()).await;
     seed_two_portfolios(&pool).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
 
+    // A trigger, because a row the *database* refuses is the only failure the Rust
+    // side cannot have already caught. Postgres needs a function for it; SQLite's
+    // inline `BEGIN SELECT RAISE(ABORT, ...) END` has no equivalent.
+    sqlx::query(
+        "CREATE FUNCTION refuse_the_second_price() RETURNS trigger AS $$ \
+         BEGIN \
+             IF NEW.date = '2024-01-02' THEN \
+                 RAISE EXCEPTION 'boom'; \
+             END IF; \
+             RETURN NEW; \
+         END \
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "CREATE TRIGGER refuse_the_second_price BEFORE INSERT ON historical_prices \
-         WHEN NEW.date = '2024-01-02' \
-         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+         FOR EACH ROW EXECUTE FUNCTION refuse_the_second_price()",
     )
     .execute(&pool)
     .await
@@ -2099,12 +2045,13 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     let bundle = parse_and_validate(bundle.to_string().as_bytes())
         .expect("the fixture is a valid bundle");
 
-    // Bounded on purpose. The mutation this test exists to catch — the price loop
-    // running on the **pool** instead of on `&mut *tx` — does not fail, it *hangs*: the
-    // insert waits on the write lock the still-open transaction holds, and shared-cache
-    // unlock-notify is not bounded by `busy_timeout`. A guard that fails by hanging gets
-    // retried and skimmed rather than read, so the wait is bounded and the mutant fails
-    // with the message below instead. Far longer than two price rows ever need.
+    // Bounded on purpose, as a belt to the assertion's braces. Under SQLite the
+    // mutation this test exists to catch — the price loop running on the **pool**
+    // instead of on `&mut *tx` — did not fail, it *hung* on the file write lock. Under
+    // Postgres MVCC a second connection simply inserts and commits, so the mutation is
+    // caught by `price_rows` below rather than by the timeout; the guard stays because a
+    // future change that makes the two paths contend on a row lock should fail loudly
+    // and quickly, not on a CI timeout nobody reads. Far longer than two rows need.
     const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     let err = tokio::time::timeout(
         HANG_GUARD,
@@ -2138,7 +2085,8 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     // Positive control: with the trigger gone the same bundle writes both halves, so
     // the assertions above are a rollback and not a restore that never reached the
     // price section at all.
-    sqlx::query("DROP TRIGGER refuse_the_second_price")
+    // Postgres scopes a trigger to its table, so the drop names both.
+    sqlx::query("DROP TRIGGER refuse_the_second_price ON historical_prices")
         .execute(&pool)
         .await
         .unwrap();
@@ -2259,7 +2207,7 @@ async fn the_price_section_round_trips_byte_for_byte() {
     assert_eq!(body["prices_inserted"], 2, "{body}");
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT date, close_price FROM historical_prices ORDER BY date",
+        "SELECT date::text, close_price FROM historical_prices ORDER BY date",
     )
     .fetch_all(&pool)
     .await
@@ -2488,7 +2436,7 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
     assert_ne!(new_id, theirs as i64, "a foreign ref must not become an id");
 
     // The caller owns what the caller restored...
-    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
         .bind(new_id as i32)
         .fetch_one(&pool)
         .await
@@ -2498,12 +2446,12 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
     // ...and B's rows are untouched, in count and in owner.
     let theirs_now: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
-         (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?), \
+         (SELECT COUNT(*) FROM portfolios WHERE owner_id = $1), \
          (SELECT COUNT(*) FROM assets WHERE portfolio_id IN \
-          (SELECT id FROM portfolios WHERE owner_id = ?)), \
+          (SELECT id FROM portfolios WHERE owner_id = $2)), \
          (SELECT COUNT(*) FROM transactions WHERE asset_id IN \
           (SELECT id FROM assets WHERE portfolio_id IN \
-           (SELECT id FROM portfolios WHERE owner_id = ?)))",
+           (SELECT id FROM portfolios WHERE owner_id = $3)))",
     )
     .bind(other as i64)
     .bind(other as i64)
@@ -2544,7 +2492,7 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
     // blank ref used as a key would have hung the transaction off nothing.
     let chain: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)",
+         (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
     .bind(new_id as i32)
     .fetch_one(&pool)
@@ -2552,7 +2500,7 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
     .unwrap();
     assert_eq!(chain.0, 1);
     // And no column holds a ref: the name is what the bundle's `name` said.
-    let (name,): (String,) = sqlx::query_as("SELECT name FROM portfolios WHERE id = ?")
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM portfolios WHERE id = $1")
         .bind(new_id as i32)
         .fetch_one(&pool)
         .await

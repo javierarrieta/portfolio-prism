@@ -13,7 +13,7 @@ mod common;
 use common::{build_rocket, disabled_config, seed_asset, seed_portfolio, seed_transaction, setup_db};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
-use sqlx::SqlitePool;
+use backend_rust::db::DbPool;
 
 struct Users {
     a: i32,
@@ -24,7 +24,7 @@ struct Users {
     b_portfolio: i32,
 }
 
-async fn seed_two_users(pool: &SqlitePool) -> Users {
+async fn seed_two_users(pool: &DbPool) -> Users {
     let a = common::seed_user(pool, "user-a").await;
     let b = common::seed_user(pool, "user-b").await;
     let a_portfolio = seed_portfolio(pool, a, "A portfolio", "USD").await;
@@ -38,7 +38,7 @@ async fn seed_two_users(pool: &SqlitePool) -> Users {
 ///
 /// Bound to a variable at every call site: a `LocalRequest` borrows the `Client`,
 /// so chaining straight off a temporary does not compile.
-async fn client_as(pool: SqlitePool, as_user: i32) -> Client {
+async fn client_as(pool: DbPool, as_user: i32) -> Client {
     Client::tracked(build_rocket(pool, as_user)).await.expect("valid rocket")
 }
 
@@ -269,7 +269,7 @@ async fn two_users_sharing_an_email_cannot_reach_each_other_s_rows() {
     let a = common::seed_user(&pool, "user-a").await;
     let b = common::seed_user(&pool, "user-b").await;
     for id in [a, b] {
-        sqlx::query("UPDATE users SET email = 'shared@example.com' WHERE id = ?")
+        sqlx::query("UPDATE users SET email = 'shared@example.com' WHERE id = $1")
             .bind(id as i64)
             .execute(&pool)
             .await
@@ -387,13 +387,13 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
     let body: serde_json::Value = res.into_json().await.unwrap();
     let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
     // Deliberately not `assert_ne!(new_id, u.a_portfolio)`: `portfolios.id` is
-    // `INTEGER PRIMARY KEY AUTOINCREMENT` and A's portfolio is the first row the
+    // `BIGINT GENERATED ALWAYS AS IDENTITY` and A's portfolio is the first row the
     // fixture writes, so that comparison could never fail. The claim underneath it
     // can fail, and is what "a restore allocates its own ids" is for: the restore
     // wrote new rows in B's space and left every one of A's rows where it was.
     let counts: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?), \
-                (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?)",
+        "SELECT (SELECT COUNT(*) FROM portfolios WHERE owner_id = $1), \
+                (SELECT COUNT(*) FROM portfolios WHERE owner_id = $2)",
     )
     .bind(u.b as i64)
     .bind(u.a as i64)
@@ -405,8 +405,8 @@ async fn a_bundle_exported_by_a_and_restored_by_b_becomes_b_s() {
         "B gained exactly the restored portfolio and A lost none of their own"
     );
 
-    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
-        .bind(new_id)
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
+        .bind(new_id as i64)
         .fetch_one(&pool)
         .await
         .unwrap();

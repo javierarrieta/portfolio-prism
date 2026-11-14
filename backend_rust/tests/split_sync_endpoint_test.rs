@@ -15,7 +15,6 @@
 
 mod common;
 
-use backend_rust::enforce_split_uniqueness;
 use backend_rust::services::currency_service::apply_split_events;
 use common::{
     build_rocket_pricing, disabled_config, seed_asset, seed_portfolio, seed_split_sync,
@@ -23,18 +22,20 @@ use common::{
 };
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
-use sqlx::SqlitePool;
+use backend_rust::db::DbPool;
 
 /// A 2:1 split on 2024-06-01, in Yahoo's chart envelope.
 const SPLIT_ME: &str = r#"{"chart":{"result":[{"timestamp":[],"indicators":{"quote":[{"close":[]}]},"events":{"splits":{"1717200000":{"date":1717200000,"numerator":2.0,"denominator":1.0,"splitRatio":"2:1"}}}}],"error":null}}"#;
 
 const SYMBOL: &str = "SPLITME";
 
-async fn split_rows(pool: &SqlitePool, asset_id: i32) -> Vec<String> {
+async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
     sqlx::query_as::<_, (String,)>(
-        "SELECT date(date) FROM transactions WHERE asset_id = ? AND type = 'SPLIT' ORDER BY date(date)",
+        "SELECT ((date AT TIME ZONE 'UTC')::date)::text \
+         FROM transactions WHERE asset_id = $1 AND type = 'SPLIT' \
+         ORDER BY ((date AT TIME ZONE 'UTC')::date)",
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .fetch_all(pool)
     .await
     .unwrap()
@@ -175,8 +176,8 @@ async fn concurrent_syncs_cannot_double_a_split() {
         1u32,
     )];
 
-    let a = apply_split_events(asset, None, &events, &pool);
-    let b = apply_split_events(asset, None, &events, &pool);
+    let a = apply_split_events(asset as i64, None, &events, &pool);
+    let b = apply_split_events(asset as i64, None, &events, &pool);
     let (ra, rb) = tokio::join!(a, b);
     let inserted = ra.unwrap() + rb.unwrap();
 
@@ -258,51 +259,68 @@ async fn splits_last_synced_is_none_until_every_asset_is_synced() {
     );
 }
 
-/// The index cannot be created over data that already violates it, so the migration
-/// dedupes first. A database that raced before this change exists somewhere.
+/// `apply_split_events` has no read-based dedupe at all — it inserts and counts
+/// `rows_affected()`. The unique index is the whole guarantee, so this asserts the
+/// migrated schema really rejects a second split on the same UTC day, while leaving a
+/// different asset and a non-split on that day alone.
+///
+/// It used to test a migration that deduped an existing SQLite table. Postgres installs
+/// fresh and `0001_init.sql` creates the index as part of the schema, so there is
+/// nothing to dedupe; what remains worth testing is that the index is there and bites.
 #[tokio::test]
-async fn the_migration_dedupes_existing_duplicate_splits() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
+async fn the_schema_rejects_a_second_split_on_the_same_day() {
+    let pool = setup_db(&disabled_config()).await;
+    let port_a = seed_portfolio(&pool, DEFAULT_USER, "A", "USD").await;
+    let port_b = seed_portfolio(&pool, DEFAULT_USER, "B", "USD").await;
+    let asset_a = seed_asset(&pool, port_a, "AAA", "Aaa").await;
+    let asset_b = seed_asset(&pool, port_b, "BBB", "Bbb").await;
+
+    // Two different timestamps on one calendar day is exactly what a count-then-insert
+    // check let through, because it compared the day while storing a timestamp.
+    for ts in ["2024-06-01T00:00:00Z", "2024-06-01T14:30:00Z"] {
+        let dup = sqlx::query(
+            "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+             VALUES ($1, 'SPLIT', '2', '1', '0', $2)",
+        )
+        .bind(asset_a as i64)
+        .bind(
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .execute(&pool)
+        .await;
+        if ts.ends_with("00:00:00Z") {
+            dup.unwrap();
+        } else {
+            assert!(
+                dup.is_err(),
+                "the second split on the same UTC day must be rejected by uq_split_asset_date"
+            );
+        }
+    }
+
+    // A different asset on the same day is not a duplicate, and neither is a non-split.
     sqlx::query(
-        "CREATE TABLE transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            asset_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            quantity TEXT NOT NULL,
-            price TEXT NOT NULL,
-            fee TEXT NOT NULL,
-            date TEXT NOT NULL
-        )",
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         VALUES ($1, 'SPLIT', '2', '1', '0', '2024-06-01T00:00:00Z')",
     )
+    .bind(asset_b as i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         VALUES ($1, 'BUY', '5', '10', '0', '2024-06-01T00:00:00Z')",
+    )
+    .bind(asset_a as i64)
     .execute(&pool)
     .await
     .unwrap();
 
-    // The same split twice on the same calendar day, expressed as two different
-    // timestamps — which is what the old count-then-insert let through, since it
-    // compared `date(date)` while storing a full timestamp.
-    for ts in ["2024-06-01T00:00:00Z", "2024-06-01T14:30:00Z"] {
-        sqlx::query("INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (1, 'SPLIT', '2', '1', '0', ?)")
-            .bind(ts)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-    // A different asset on the same day is not a duplicate and must survive.
-    sqlx::query("INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (2, 'SPLIT', '2', '1', '0', '2024-06-01T00:00:00Z')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    // A non-split on the same day must be untouched.
-    sqlx::query("INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (1, 'BUY', '5', '10', '0', '2024-06-01T00:00:00Z')")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    enforce_split_uniqueness(&pool).await.unwrap();
-
-    let kept: Vec<(i32, String, String)> = sqlx::query_as(
-        "SELECT asset_id, type, date(date) FROM transactions ORDER BY asset_id, type",
+    let kept: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT asset_id, type, ((date AT TIME ZONE 'UTC')::date)::text \
+         FROM transactions ORDER BY asset_id, type",
     )
     .fetch_all(&pool)
     .await
@@ -310,19 +328,10 @@ async fn the_migration_dedupes_existing_duplicate_splits() {
     assert_eq!(
         kept,
         vec![
-            (1, "BUY".to_string(), "2024-06-01".to_string()),
-            (1, "SPLIT".to_string(), "2024-06-01".to_string()),
-            (2, "SPLIT".to_string(), "2024-06-01".to_string()),
+            (asset_a as i64, "BUY".to_string(), "2024-06-01".to_string()),
+            (asset_a as i64, "SPLIT".to_string(), "2024-06-01".to_string()),
+            (asset_b as i64, "SPLIT".to_string(), "2024-06-01".to_string()),
         ],
         "one split per asset per day, other rows untouched"
     );
-
-    // Idempotent, and the index really is there: a direct duplicate insert now fails.
-    enforce_split_uniqueness(&pool).await.unwrap();
-    let dup = sqlx::query(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (1, 'SPLIT', '2', '1', '0', '2024-06-01T09:00:00Z')",
-    )
-    .execute(&pool)
-    .await;
-    assert!(dup.is_err(), "the unique index must reject a second split on the same day");
 }

@@ -444,7 +444,13 @@ for iteration speed.
   per-statement), so a runaway analytics query cannot pin a pool connection
   indefinitely. The #64 review recorded that export holds a pool connection for
   its whole duration; this is the backstop.
-- `AUTH_MODE=disabled` still works for local development.
+- `AUTH_MODE=disabled` still works for local development. That mode resolves the
+  caller against a placeholder user row (`issuer='local'`, `subj='bootstrap'`) that
+  `init_db` used to create, so **the row and the ownership backfill survive the
+  engine switch as an explicit post-migration startup step**
+  (`db::ensure_bootstrap_owner`, plan Task 3 Step 5) — idempotent, silent when it
+  changes nothing, and still refusing to start when orphans exist with no owner to
+  hand them to. It is data, not schema, so it cannot live in a migration.
 - The SQLite commentary in `main.rs:57-77` about WAL and restic is deleted with
   the code it describes. It is a good comment about a dead engine.
 

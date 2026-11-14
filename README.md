@@ -2,7 +2,7 @@
 
 Full-stack portfolio management application with tax lot tracking (FIFO/LIFO/Hybrid) and analytics.
 
-- **Backend**: Rust (Rocket) + SQLite (SQLx)
+- **Backend**: Rust (Rocket) + PostgreSQL (SQLx)
 - **Frontend**: React 19 + Vite + TypeScript + Recharts
 
 ---
@@ -108,7 +108,7 @@ k8s/
   namespace.yaml          # Namespace
   storageclass.yaml       # StorageClass
   configmap.yaml          # Backend configuration
-  pv.yaml                 # Persistent volume for SQLite database
+  pv.yaml                 # Persistent volume for the (pre-cutover) file-backed database
   pvc.yaml                # Persistent volume claim
   app-deployment.yaml     # Single pod: frontend + backend containers
   app-service.yaml        # ClusterIP service (:80)
@@ -127,7 +127,7 @@ Single Pod
   │   └── proxies /api/* and /api-docs → 127.0.0.1:8000
   │
   └── backend (Rocket, :8000)
-      └── SQLite via PVC → /app/data/portfolio.db
+      └── DATABASE_URL → Postgres (manifest still names a SQLite file; see Storage)
 ```
 
 Both containers run in the same pod and communicate over `127.0.0.1`. The frontend nginx proxies all API requests (`/api/*`, `/api-docs/*`) to the backend. The browser only talks to the frontend — no cross-service calls are needed.
@@ -141,9 +141,16 @@ retries, which is cheaper than a probe that cannot succeed by construction.
 
 ### Storage
 
-The backend uses a SQLite database (`portfolio.db`). A persistent volume and claim are included to retain data across pod restarts. The volume is mounted at `/app/data/`.
+The backend connects to **PostgreSQL** and nothing else: `DATABASE_URL` is required, has
+no default, and the process refuses to start without it. In development
+`backend_rust/scripts/dev-db.sh` brings up a local cluster on `127.0.0.1:55432` and
+prints the URL to export; `./start.sh` does that for you if the environment does not
+already set one. Schema comes from `backend_rust/migrations/` at startup.
 
-For production, use block-backed storage (e.g. `gp2`, `ssd`, `azure-disk`) or a managed database.
+The `k8s/` manifests and `backend_rust/Dockerfile` still ship a `sqlite:` DSN and are
+**pre-cutover** — applying them as-is produces a pod that exits on its configuration
+check. Replacing them with a Postgres service and a Secret is tracked in Task 10; until
+then the persistent volume below is unused by the current image.
 
 > **The manifests in `k8s/` are stale and do not describe the running deployment.** The
 > StorageClass is *named* `nfs-client`, but its provisioner is
@@ -159,14 +166,15 @@ Backend environment variables are configured in the ConfigMap:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `sqlite:///app/data/portfolio.db?mode=rwc` | SQLite connection string |
+| `DATABASE_URL` | *none — required* | Postgres connection string. There is no default and no SQLite support; a `sqlite:` URL is refused at startup. Development: `postgres://postgres@127.0.0.1:55432/prism`, printed by `backend_rust/scripts/dev-db.sh`. |
 | `BACKUP_ALLOW_PRICE_RESTORE` | `false` | Let `POST /api/backup/restore` write the bundle's `prices` section. **Security-relevant:** `historical_prices` has no `owner_id`, so a restore that writes it is one tenant writing market data every other tenant's dated reports read. `1/true/yes` enable, `0/false/no` disable, anything else stays off and logs a warning, and the backend prints a `WARN` on every start with it on. Deliberately **absent** from `k8s/configmap.yaml`, so the deployed app has it off. See `docs/backup-schema/README.md` and `docs/walkthrough.md` §4 step 6. |
 
 ### Scaling
 
-The backend is a single replica against one SQLite file, and SQLite is not a
-client/server database — horizontal scaling means changing the storage engine, not
-adding replicas.
+The backend is stateless now that it talks to a Postgres server, so replicas are a
+matter of pointing every pod at the same `DATABASE_URL`. What still holds it to one
+replica is the deployment: `k8s/` ships a file-backed volume and a `sqlite:` DSN
+(pre-cutover, see *Storage*), and `Recreate` rollout strategy.
 
 > **Do not follow the previous advice in this section**, which suggested "SQLite with WAL
 > mode and NFS". SQLite's own WAL documentation rules that out: *"All processes using a
@@ -192,7 +200,7 @@ The default deployment runs a single pod. For higher availability, increase repl
 kubectl scale deployment app -n investment-portfolio-manager --replicas=3
 ```
 
-Note: scaling beyond 1 replica with SQLite requires migration to a shared database (e.g., PostgreSQL). The nginx proxy pass in the frontend container makes horizontal scaling straightforward once the storage layer is externalized.
+Note: the storage engine is no longer the limit — the backend already talks to a Postgres server over a network, so replicas only need the same `DATABASE_URL`. What still needs doing before `--replicas=3` is meaningful is the cutover itself (Task 10): a Postgres service or managed instance in the cluster, the `sqlite:` DSN in `k8s/configmap.yaml` replaced, and the file-backed `pv.yaml`/`pvc.yaml` retired. The nginx proxy pass in the frontend container already makes horizontal scaling straightforward.
 
 ### Cleanup
 

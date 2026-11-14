@@ -39,7 +39,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use serde::Serialize;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
@@ -233,7 +233,7 @@ fn parse_query_flag(raw: Option<&str>) -> Option<bool> {
 #[get("/backup/export?<portfolio_ids>&<include_prices>")]
 pub async fn export(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     portfolio_ids: Option<Vec<String>>,
     include_prices: Option<Vec<String>>,
 ) -> Result<BundleDownload, BackupError> {
@@ -369,7 +369,7 @@ fn too_large() -> BackupError {
 #[post("/backup/preview?<mode>", data = "<body>")]
 pub async fn preview(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     mode: Option<Vec<String>>,
     body: Data<'_>,
 ) -> Result<Json<Plan>, BackupError> {
@@ -456,7 +456,7 @@ pub async fn preview(
 #[post("/backup/restore?<mode>&<apply_prices>", data = "<body>")]
 pub async fn restore(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     backup_cfg: &State<BackupConfig>,
     mode: Option<Vec<String>>,
     apply_prices: Option<Vec<String>>,

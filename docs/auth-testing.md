@@ -163,6 +163,7 @@ Six variables, and the backend refuses to start if any of the first four is miss
 From `backend_rust/`:
 
 ```fish
+set -x DATABASE_URL (bash scripts/dev-db.sh | tail -1 | sed 's/^DATABASE_URL=//')
 set -x OIDC_ISSUER "https://auth.titan.arrieta.eu/application/o/portfolio-prism/"
 set -x OIDC_CLIENT_ID portfolio-prism
 set -x OIDC_CLIENT_SECRET whatever-not-used
@@ -170,7 +171,16 @@ set -x OIDC_REDIRECT_URI http://localhost:8000/auth/callback
 bash scripts/auth_smoke.sh
 ```
 
-It starts its own backend on a throwaway SQLite file, so it does not touch your data.
+`DATABASE_URL` is required and must be Postgres: the backend is Postgres-only and the
+script refuses a `sqlite:` URL rather than starting a server that would die on its own
+configuration check. `scripts/dev-db.sh` prints the URL to use (run it inside
+`nix-shell -p postgresql_18` if `initdb` is not on PATH).
+
+It starts its own backend, on the database `DATABASE_URL` names and on its own
+`ROCKET_SECRET_KEY`, so it does not disturb a backend you already have running. It is
+**additive** to that database — it creates the schema if absent and writes a placeholder
+user and whatever the checks seed — so point `DATABASE_URL` at a scratch database if you
+want the run to leave nothing behind.
 What it checks, and what it looked like when run against a live authentik (using
 another app's issuer as a stand-in, since this app's provider does not exist yet):
 
@@ -458,8 +468,8 @@ above), *before* setting the variable.
 
 **The transfer is one-way.** The first login whose `sub` matches takes the placeholder
 row and everything it owns, and there is no admin surface to undo it. Set it to the
-wrong value, let that person log in, and the recovery is hand-editing SQLite with the
-pod scaled to zero. This was raised in review and accepted by the operator on the basis
+wrong value, let that person log in, and the recovery is hand-editing the `users` and
+`portfolios` rows in Postgres with the pod scaled to zero. This was raised in review and accepted by the operator on the basis
 that the operator is the first identity to log in.
 
 Leave it **empty** to keep the refusal rather than guess. A placeholder string such as
@@ -484,9 +494,15 @@ Leave it **empty** to keep the refusal rather than guess. A placeholder string s
 
 ## 8. What this still does not prove
 
-- **Concurrency.** Single-writer SQLite, `replicas: 1`. The read endpoints write
-  (analytics inserts split rows on a `GET`), which is how `SQLITE_BUSY` becomes
-  reachable — that is why a database failure now answers `503` instead of `401`.
+- **Concurrency.** `replicas: 1`, and the read endpoints still write (analytics inserts
+  split rows on a `GET`). Postgres is MVCC, so there is no `SQLITE_BUSY` to reach any
+  more: a writer blocks no reader, and two writers touching different rows do not block
+  each other. What still makes a database failure reachable is a saturated pool — every
+  connection checked out, `acquire_timeout` expiring — which is what
+  `backup_test.rs::an_exhausted_pool_is_a_lock_not_an_outage` pins as
+  `PoolTimedOut` → `DbFailure::Lock` → `503`. A serialisation failure (`40001`/`40P01`)
+  is the other real "try later" condition and is not yet classified; that mapping is
+  Task 7's.
 - **Key rotation.** The JWKS cache has a 15-minute TTL, so a provider key rotation is
   self-healing within that window rather than an outage until restart. Not tested
   against a real rotation.

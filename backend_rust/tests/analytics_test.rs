@@ -4,7 +4,7 @@ use common::{build_rocket, disabled_config, setup_db, DEFAULT_USER, seed_portfol
 use chrono::{Datelike, NaiveDate, Utc};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use sqlx::sqlite::SqlitePool;
+use backend_rust::db::DbPool;
 
 #[tokio::test]
 async fn test_tax_summary_empty_portfolio() {
@@ -159,7 +159,7 @@ async fn test_performance_value_reflects_split_transaction() {
 /// gaps are what make that claim mean something. Today is the one weekend day still
 /// seeded, because the endpoint reports the portfolio value as of today and the
 /// fixture has to cover the date it reads.
-async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
+async fn seeded_performance_fixture() -> (i32, DbPool, NaiveDate) {
     let pool = setup_db(&disabled_config()).await;
     let port_id = seed_portfolio(&pool, DEFAULT_USER, "Perf Split", "USD").await;
     let asset_id = seed_asset(&pool, port_id, "SPLITINTTEST", "Split Int").await;
@@ -170,10 +170,10 @@ async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
     let buy_date = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
     let start_date = buy_date - chrono::Duration::days(365);
 
-    sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, 'BUY', ?, ?, '0', ?) RETURNING id"
+    sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, 'BUY', $2, $3, '0', $4) RETURNING id"
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .bind("100.0")
     .bind("100.0")
     .bind(buy_date.and_hms_opt(0, 0, 0).unwrap().and_utc())
@@ -181,10 +181,10 @@ async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
     .await
     .unwrap();
 
-    sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, 'SPLIT', ?, ?, '0', ?) RETURNING id"
+    sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, 'SPLIT', $2, $3, '0', $4) RETURNING id"
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .bind("2.0")
     .bind("1.0")
     .bind(split_date.and_hms_opt(0, 0, 0).unwrap().and_utc())
@@ -200,7 +200,7 @@ async fn seeded_performance_fixture() -> (i32, SqlitePool, NaiveDate) {
         let is_weekend = weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun;
         if !is_weekend || curr == today {
             sqlx::query(
-                "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
                      ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
             )
             .bind(symbol)

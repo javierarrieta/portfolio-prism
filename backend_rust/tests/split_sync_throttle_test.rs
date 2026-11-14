@@ -13,7 +13,6 @@
 mod common;
 
 use backend_rust::models::Asset;
-use backend_rust::migrate_split_sync_key;
 use backend_rust::services::currency_service::CurrencyService;
 use common::{
     build_rocket_pricing, disabled_config, seed_asset, seed_portfolio, seed_split_sync,
@@ -21,18 +20,22 @@ use common::{
 };
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
-use sqlx::SqlitePool;
+use backend_rust::db::DbPool;
 
 /// The corporate action: a 2:1 split on 2024-06-01, in Yahoo's chart envelope.
 /// `1717200000` is 2024-06-01T00:00:00Z.
 const SPLIT_ME: &str = r#"{"chart":{"result":[{"timestamp":[],"indicators":{"quote":[{"close":[]}]},"events":{"splits":{"1717200000":{"date":1717200000,"numerator":2.0,"denominator":1.0,"splitRatio":"2:1"}}}}],"error":null}}"#;
 
 const SYMBOL: &str = "SPLITME";
-async fn split_rows(pool: &SqlitePool, asset_id: i32) -> Vec<String> {
+async fn split_rows(pool: &DbPool, asset_id: i32) -> Vec<String> {
+    // The UTC day, spelled the way `uq_split_asset_date` spells it, and cast to text
+    // so the assertion below still compares `%Y-%m-%d` strings.
     sqlx::query_as::<_, (String,)>(
-        "SELECT date(date) FROM transactions WHERE asset_id = ? AND type = 'SPLIT' ORDER BY date(date)",
+        "SELECT ((date AT TIME ZONE 'UTC')::date)::text \
+         FROM transactions WHERE asset_id = $1 AND type = 'SPLIT' \
+         ORDER BY ((date AT TIME ZONE 'UTC')::date)",
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .fetch_all(pool)
     .await
     .unwrap()
@@ -41,7 +44,7 @@ async fn split_rows(pool: &SqlitePool, asset_id: i32) -> Vec<String> {
     .collect()
 }
 
-fn asset(id: i32, portfolio_id: i32) -> Asset {
+fn asset(id: i64, portfolio_id: i64) -> Asset {
     Asset {
         id,
         portfolio_id,
@@ -161,7 +164,7 @@ async fn a_transaction_older_than_the_last_sync_reopens_the_throttle() {
 
     let yahoo = MockYahoo::serving([(SYMBOL, SPLIT_ME)]);
     let svc = CurrencyService::with_base_url(yahoo.base_url());
-    let a = asset(asset_id, port_id);
+    let a = asset(asset_id as i64, port_id as i64);
 
     assert_eq!(
         svc.sync_splits_for_asset(&a, &pool).await.unwrap(),
@@ -195,7 +198,7 @@ async fn a_throttle_within_the_window_and_covering_the_history_suppresses_the_fe
     let svc = CurrencyService::with_base_url(yahoo.base_url());
 
     assert_eq!(
-        svc.sync_splits_for_asset(&asset(asset_id, port_id), &pool).await.unwrap(),
+        svc.sync_splits_for_asset(&asset(asset_id as i64, port_id as i64), &pool).await.unwrap(),
         0,
         "a seeded throttle covering the asset's whole history must short-circuit"
     );
@@ -226,47 +229,10 @@ async fn deleting_an_asset_drops_its_throttle_row() {
     let resp = client.delete(format!("/api/assets/{}", asset_id)).dispatch().await;
     assert_eq!(resp.status(), Status::NoContent);
 
-    let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM split_sync WHERE asset_id = ?")
-        .bind(asset_id)
+    let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM split_sync WHERE asset_id = $1")
+        .bind(asset_id as i64)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(left.0, 0, "the throttle row must not outlive the asset");
-}
-
-#[tokio::test]
-async fn the_migration_replaces_the_symbol_keyed_table() {
-    // `CREATE TABLE IF NOT EXISTS` will not alter an existing table, so an old-shaped
-    // `split_sync` left in place would keep the bug while the code above it looked
-    // fixed. The migration detects the old column and replaces the table.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    sqlx::query(
-        "CREATE TABLE split_sync (symbol TEXT PRIMARY KEY, last_synced_at DATE NOT NULL)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO split_sync (symbol, last_synced_at) VALUES ('OLD', '2026-01-01')")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    migrate_split_sync_key(&pool).await.unwrap();
-
-    let columns = sqlx::query("PRAGMA table_info(split_sync)").fetch_all(&pool).await.unwrap();
-    let names: Vec<String> = columns
-        .iter()
-        .map(|r| sqlx::Row::try_get::<String, _>(r, "name").unwrap())
-        .collect();
-    assert!(names.contains(&"asset_id".to_string()), "got {names:?}");
-    assert!(names.contains(&"covered_from".to_string()), "got {names:?}");
-    assert!(!names.contains(&"symbol".to_string()), "got {names:?}");
-
-    // Idempotent: running it again on the new shape is a no-op, not a drop.
-    migrate_split_sync_key(&pool).await.unwrap();
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM split_sync")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count.0, 0);
 }

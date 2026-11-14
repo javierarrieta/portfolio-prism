@@ -193,14 +193,15 @@ jobs:
 
   e2e-smoke:
     # The only layer in the repo that drives a real browser against the real Rocket API and a
-    # real SQLite file. jsdom mocks the endpoint it would need to get wrong; cargo tests render
-    # nothing. See frontend/e2e/README.md.
+    # real Postgres database. jsdom mocks the endpoint it would need to get wrong; cargo tests
+    # render nothing. See frontend/e2e/README.md.
     #
     # Blocking on purpose. A `continue-on-error` job reads as coverage while checking nothing,
     # which is worse than no job at all.
     #
     # Boots the whole stack twice, once per smoke, because each `run.sh` invocation owns its own
-    # throwaway database, backend and vite. The second boot is cheap: the binary is already
+    # backend, vite and database (see the DATABASE_URL on each step for why the database has to
+    # be per-smoke). The second boot is cheap: the binary is already
     # compiled. The statement step is deliberately *not* `if: always()` — if the sell-pnl run
     # could not even start the backend, the statement run would burn another 420 s proving it
     # could not either.
@@ -212,6 +213,22 @@ jobs:
     # being the cheap part.
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # `run.sh` boots the real backend, and the backend is Postgres-only: it refuses to start
+    # without DATABASE_URL and refuses a `sqlite:` DSN outright. Before this service existed the
+    # job fell through to `run.sh`'s "no DATABASE_URL" branch, demanded `initdb` on PATH, and
+    # died — the same way `build-and-test` would once Task 9 gives it the service. Same image,
+    # same port and same DSN shape as there, so the two jobs cannot drift into testing
+    # different servers.
+    services:
+      postgres:
+        # Same major as production (CloudNativePG ghcr.io/cloudnative-pg/postgresql:18.6).
+        # The local harness runs 18.7 via nix-shell; patch drift is accepted and documented in
+        # the spec, §9.1.
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: prism }
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
 
@@ -251,6 +268,20 @@ jobs:
       - name: Sell P&L smoke
         working-directory: frontend
         env:
+          # One empty database per smoke, and it has to be per-smoke rather than per-job. Each
+          # `run.sh` boots its own backend against the same server, and the app auto-selects the
+          # first portfolio the list hands back (`statement.smoke.mjs:100` says so, and
+          # `GET /api/portfolios` has no ORDER BY to make that deterministic). Share one
+          # database and the statement smoke renders the sell-pnl run's portfolio, prints a
+          # plausible document, and passes without testing anything — the exact
+          # "coverage that checks nothing" this job's header refuses to accept.
+          #
+          # `prism` is the database the service creates; the second step uses the image's own
+          # empty `postgres` database for the same purpose. Both arrive unmigrated and the
+          # backend runs `sqlx::migrate!` against whichever it is pointed at, so there is no
+          # migrate step and no `createdb` — the runner is not promised a psql, and Task 9's
+          # proper per-run databases should not depend on this job guessing one.
+          DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism
           SMOKE_SHOT: /tmp/e2e-sell-pnl.png
           SMOKE_LOG_DIR: /tmp/e2e-logs/sell-pnl
         run: npm run e2e:sell-pnl
@@ -258,6 +289,7 @@ jobs:
       - name: Printable statement smoke
         working-directory: frontend
         env:
+          DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/postgres
           SMOKE_SHOT: /tmp/e2e-statement.png
           SMOKE_LOG_DIR: /tmp/e2e-logs/statement
         run: npm run e2e:statement

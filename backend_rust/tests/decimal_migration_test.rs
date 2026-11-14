@@ -1,239 +1,86 @@
-use std::str::FromStr;
-use sqlx::sqlite::SqlitePool;
+//! Money and quantity are stored as text and come back exactly.
+//!
+//! This file used to test `migrate_decimal_columns`, which rewrote SQLite's `REAL`
+//! columns to `TEXT` and had four recovery paths for a rename interrupted halfway.
+//! Postgres has no such history: `0001_init.sql` declares the columns `text` from the
+//! start, and `scripts/check_migrations.sh` fails the build if any of them is not
+//! `text` — so there is nothing left here to migrate and nothing left to recover.
+//!
+//! What the migration was *for* is still worth asserting, and is the reason the columns
+//! are text at all: a binary float cannot hold 9.99, and a portfolio whose cost basis
+//! drifts by a rounding unit per row is wrong on tax figures. So this file now checks
+//! the invariant directly against the real schema — write a value the API accepts, read
+//! it back through the same decoder the routes use, and require it to be identical.
+
+use backend_rust::db::DbPool;
 use backend_rust::db_types::str_to_decimal;
+use rust_decimal::Decimal;
+use std::str::FromStr;
 
-async fn create_legacy_schema(pool: &SqlitePool) {
-    sqlx::query(
-        "CREATE TABLE transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            asset_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            price REAL NOT NULL,
-            fee REAL NOT NULL,
-            date TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
+mod common;
+use common::{seed_asset, seed_portfolio, setup_db, DEFAULT_USER};
+
+/// The values that break a float: not representable in binary, and each one a real
+/// price or fee a broker would send.
+const EXACT_VALUES: &[&str] = &[
+    "9.99", "0.1", "0.3", "0.000000000000000001", "1234567890.123456789", "100.0",
+];
+
+async fn stored(pool: &DbPool, column: &str, value: &str) -> String {
+    let portfolio = seed_portfolio(pool, DEFAULT_USER, "Exact", "USD").await;
+    let asset = seed_asset(pool, portfolio, "EXACT", "Exact").await;
+
+    // `seed_transaction` takes floats, which is the very thing under test, so the row
+    // is written by hand with the text the column actually holds.
+    let (got,): (String,) = sqlx::query_as(&format!(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         VALUES ($1, 'BUY', $2, '1', '0', '2024-01-01T00:00:00Z') RETURNING {column}",
+    ))
+    .bind(asset)
+    .bind(value)
+    .fetch_one(pool)
     .await
     .unwrap();
-    sqlx::query(
-        "CREATE TABLE historical_prices (
-            symbol TEXT NOT NULL,
-            date DATE NOT NULL,
-            close_price REAL NOT NULL
-        )",
+    got
+}
+
+#[tokio::test]
+async fn a_value_written_as_text_is_read_back_identically() {
+    let pool = setup_db(&common::disabled_config()).await;
+
+    for value in EXACT_VALUES {
+        let raw = stored(&pool, "quantity", value).await;
+        assert_eq!(
+            &raw, value,
+            "{value} must come back from a text column as the same string"
+        );
+        assert_eq!(
+            str_to_decimal(&raw),
+            Decimal::from_str(value).unwrap(),
+            "{value} must decode to the decimal it was written as"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_same_holds_for_price_and_fee() {
+    // Three separate columns, three separate chances for a schema change to quietly
+    // make one of them a numeric type again.
+    let pool = setup_db(&common::disabled_config()).await;
+    let portfolio = seed_portfolio(&pool, DEFAULT_USER, "Exact", "USD").await;
+    let asset = seed_asset(&pool, portfolio, "EXACT", "Exact").await;
+
+    let (qty, price, fee): (String, String, String) = sqlx::query_as(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         VALUES ($1, 'BUY', '3.14159', '9.99', '0.0075', '2024-01-01T00:00:00Z') \
+         RETURNING quantity, price, fee",
     )
-    .execute(pool)
+    .bind(asset)
+    .fetch_one(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (1, 'BUY', 100.0, 9.99, 0.0, '2024-01-01T00:00:00Z')")
-        .execute(pool).await.unwrap();
-    sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES ('AAPL', '2024-01-01', 9.99)")
-        .execute(pool).await.unwrap();
-}
 
-async fn column_affinity(pool: &SqlitePool, table: &str, column: &str) -> String {
-    // PRAGMA table_info returns 6 columns: cid, name, type, notnull, dflt_value, pk
-    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as(&format!("PRAGMA table_info({table})")).fetch_all(pool).await.unwrap();
-    rows.into_iter().find(|r| r.1 == column).unwrap().2
-}
-
-#[tokio::test]
-async fn migration_converts_real_to_text_and_preserves_values() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_schema(&pool).await;
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "fee").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "historical_prices", "close_price").await, "TEXT");
-
-    // values survive and parse as decimals ("100.0" came from REAL 100.0 via CAST AS TEXT)
-    let (qty,): (String,) = sqlx::query_as("SELECT quantity FROM transactions WHERE id = 1")
-        .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&qty), rust_decimal::Decimal::from_str("100.0").unwrap());
-}
-
-#[tokio::test]
-async fn migration_is_idempotent() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_schema(&pool).await;
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-    assert_eq!(column_affinity(&pool, "transactions", "price").await, "TEXT");
-}
-
-async fn create_partially_migrated_schema(pool: &SqlitePool) {
-    // Start from clean legacy and simulate a crashed prior migration:
-    // quantity & price were RENAMEd to _old but their TEXT replacements were never added.
-    sqlx::query(
-        "CREATE TABLE transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            asset_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            quantity_old REAL NOT NULL,
-            price_old REAL NOT NULL,
-            fee REAL NOT NULL,
-            date TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TABLE historical_prices (
-            symbol TEXT NOT NULL,
-            date DATE NOT NULL,
-            close_price REAL NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO transactions (asset_id, type, quantity_old, price_old, fee, date) VALUES (1, 'BUY', 100.0, 9.99, 0.0, '2024-01-01T00:00:00Z')")
-        .execute(pool).await.unwrap();
-    sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES ('AAPL', '2024-01-01', 9.99)")
-        .execute(pool).await.unwrap();
-}
-
-#[tokio::test]
-async fn migration_recovers_partial_rename_state() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_partially_migrated_schema(&pool).await;
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-
-    // quantity & price recreated as TEXT with preserved values, no _old leftovers.
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "price").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "fee").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "historical_prices", "close_price").await, "TEXT");
-
-    let (qty, price): (String, String) =
-        sqlx::query_as("SELECT quantity, price FROM transactions WHERE id = 1")
-            .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&qty), rust_decimal::Decimal::from_str("100.0").unwrap());
-    assert_eq!(str_to_decimal(&price), rust_decimal::Decimal::from_str("9.99").unwrap());
-
-    let info: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(transactions)").fetch_all(&pool).await.unwrap();
-    assert!(!info.iter().any(|r| r.1.ends_with("_old")), "no _old columns should remain");
-}
-
-#[tokio::test]
-async fn migration_works_on_file_backed_database() {
-    // The motivating bug (duplicate column name after ALTER) only manifests on
-    // file-backed SQLite databases because of a stale per-connection schema cache.
-    // `:memory:` connections hide it, so guard the file-backed code path explicitly.
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_migration_test_{}.db",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&tmp);
-
-    let url = format!("sqlite:{}?mode=rwc", tmp.display());
-    let pool = SqlitePool::connect(&url).await.unwrap();
-    create_legacy_schema(&pool).await;
-
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "price").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "fee").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "historical_prices", "close_price").await, "TEXT");
-
-    let (qty, price, fee): (String, String, String) =
-        sqlx::query_as("SELECT quantity, price, fee FROM transactions WHERE id = 1")
-            .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&qty), rust_decimal::Decimal::from_str("100.0").unwrap());
-    assert_eq!(str_to_decimal(&price), rust_decimal::Decimal::from_str("9.99").unwrap());
-    assert_eq!(str_to_decimal(&fee), rust_decimal::Decimal::from_str("0.0").unwrap());
-
-    let (close,): (String,) = sqlx::query_as(
-        "SELECT close_price FROM historical_prices WHERE symbol = 'AAPL'",
-    )
-    .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&close), rust_decimal::Decimal::from_str("9.99").unwrap());
-
-    let info: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(transactions)").fetch_all(&pool).await.unwrap();
-    assert!(!info.iter().any(|r| r.1.ends_with("_old")), "no _old columns should remain");
-
-    pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
-}
-
-#[tokio::test]
-async fn migration_recovers_text_plus_leftover_old() {
-    // simulate crash between ADD and DROP: column is TEXT, _old still present.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_schema(&pool).await;   // existing helper (clean legacy)
-    sqlx::query("ALTER TABLE transactions RENAME COLUMN quantity TO quantity_old")
-        .execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transactions ADD COLUMN quantity TEXT NOT NULL DEFAULT '0'")
-        .execute(&pool).await.unwrap();
-    sqlx::query("UPDATE transactions SET quantity = CAST(quantity_old AS TEXT) WHERE id = 1")
-        .execute(&pool).await.unwrap();
-    // note: quantity_old still present -> simulates crash before DROP.
-
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-    let info: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(transactions)").fetch_all(&pool).await.unwrap();
-    assert!(!info.iter().any(|r| r.1.ends_with("_old")), "no _old columns should remain");
-}
-
-#[tokio::test]
-async fn migration_recovers_text_plus_old_that_was_never_copied() {
-    // simulate crash between ADD and UPDATE: column is TEXT with '0' defaults,
-    // `_old` still holds the real data. Dropping `_old` without re-copying would
-    // lose the user's values.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_schema(&pool).await;
-    sqlx::query("ALTER TABLE transactions RENAME COLUMN quantity TO quantity_old")
-        .execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transactions ADD COLUMN quantity TEXT NOT NULL DEFAULT '0'")
-        .execute(&pool).await.unwrap();
-    // note: no UPDATE ran, so `quantity` is '0' and `quantity_old` has the data.
-
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-
-    let (qty,): (String,) = sqlx::query_as("SELECT quantity FROM transactions WHERE id = 1")
-        .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&qty), rust_decimal::Decimal::from_str("100.0").unwrap());
-
-    let info: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(transactions)").fetch_all(&pool).await.unwrap();
-    assert!(!info.iter().any(|r| r.1.ends_with("_old")), "no _old columns should remain");
-}
-
-#[tokio::test]
-async fn migration_recovers_non_text_plus_stray_old() {
-    // simulate a crash that left both the original non-TEXT column and a stray
-    // `_old` leftover (the `(Some(_), true)` branch of migrate_one_column):
-    // the leftover must be dropped, then the column migrated to TEXT.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_schema(&pool).await;
-    sqlx::query("ALTER TABLE transactions RENAME COLUMN quantity TO quantity_old")
-        .execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transactions ADD COLUMN quantity REAL")
-        .execute(&pool).await.unwrap();
-    sqlx::query("UPDATE transactions SET quantity = quantity_old WHERE id = 1")
-        .execute(&pool).await.unwrap();
-
-    backend_rust::migrate_decimal_columns(&pool).await.unwrap();
-
-    assert_eq!(column_affinity(&pool, "transactions", "quantity").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "price").await, "TEXT");
-    assert_eq!(column_affinity(&pool, "transactions", "fee").await, "TEXT");
-
-    let (qty,): (String,) = sqlx::query_as("SELECT quantity FROM transactions WHERE id = 1")
-        .fetch_one(&pool).await.unwrap();
-    assert_eq!(str_to_decimal(&qty), rust_decimal::Decimal::from_str("100.0").unwrap());
-
-    let info: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(transactions)").fetch_all(&pool).await.unwrap();
-    assert!(!info.iter().any(|r| r.1.ends_with("_old")), "no _old columns should remain");
+    assert_eq!(str_to_decimal(&qty), Decimal::from_str("3.14159").unwrap());
+    assert_eq!(str_to_decimal(&price), Decimal::from_str("9.99").unwrap());
+    assert_eq!(str_to_decimal(&fee), Decimal::from_str("0.0075").unwrap());
 }

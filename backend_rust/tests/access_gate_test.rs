@@ -32,22 +32,22 @@ const BAD_HANDLER: &str = r#"use crate::access::require;
 use crate::auth::guard::AuthedUser;
 
 #[get("/late")]
-pub async fn late_guard(user: AuthedUser, pool: &State<SqlitePool>) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM portfolios WHERE id = ?").bind(1);
+pub async fn late_guard(user: AuthedUser, pool: &State<DbPool>) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE id = $1").bind(1);
     require(&pool, user.id, 1, Access::Owner).await;
     Json(json!({}))
 }
 
 #[post("/comment")]
-pub async fn comment_only(pool: &State<SqlitePool>) -> Json<Value> {
+pub async fn comment_only(pool: &State<DbPool>) -> Json<Value> {
     // AuthedUser mentioned in a comment must not satisfy Rule C
-    let row = sqlx::query("SELECT * FROM assets WHERE id = ?").bind(1);
+    let row = sqlx::query("SELECT * FROM assets WHERE id = $1").bind(1);
     Json(json!({}))
 }
 
 #[options("/sneaky")]
-pub async fn sneaky(pool: &State<SqlitePool>) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM transactions WHERE id = ?").bind(1);
+pub async fn sneaky(pool: &State<DbPool>) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM transactions WHERE id = $1").bind(1);
     Json(json!({}))
 }
 "#;
@@ -142,8 +142,8 @@ pub async fn capabilities(user: AuthedUser) -> Json<Value> {
 }
 
 #[get("/by-id/<id>")]
-pub async fn by_id(user: AuthedUser, pool: &State<SqlitePool>, id: i32) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM portfolios WHERE id = ?").bind(id);
+pub async fn by_id(user: AuthedUser, pool: &State<DbPool>, id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE id = $1").bind(id);
     Json(json!({}))
 }
 "#;
@@ -179,8 +179,8 @@ const CONTRADICTORY_MARKER: &str = r#"use crate::auth::guard::AuthedUser;
 
 // access-gate: global-config (no caller-supplied id)
 #[get("/export/<portfolio_id>")]
-pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, portfolio_id: i32) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = ?").bind(portfolio_id);
+pub async fn export(user: AuthedUser, pool: &State<DbPool>, portfolio_id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = $1").bind(portfolio_id);
     Json(json!({}))
 }
 "#;
@@ -192,8 +192,8 @@ const ID_LESS_PARAMETER: &str = r#"use crate::auth::guard::AuthedUser;
 
 // access-gate: global-config (no caller-supplied id)
 #[get("/backup/export/<portfolio>")]
-pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, portfolio: i32) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = ?").bind(portfolio);
+pub async fn export(user: AuthedUser, pool: &State<DbPool>, portfolio: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE portfolio_id = $1").bind(portfolio);
     Json(json!({}))
 }
 "#;
@@ -207,8 +207,8 @@ const WRAPPED_ATTRIBUTE: &str = r#"use crate::auth::guard::AuthedUser;
 #[get(
     "/export/<id>"
 )]
-pub async fn export(user: AuthedUser, pool: &State<SqlitePool>, id: i32) -> Json<Value> {
-    let row = sqlx::query("SELECT * FROM portfolios WHERE id = ?").bind(id);
+pub async fn export(user: AuthedUser, pool: &State<DbPool>, id: i32) -> Json<Value> {
+    let row = sqlx::query("SELECT * FROM portfolios WHERE id = $1").bind(id);
     Json(json!({}))
 }
 "#;

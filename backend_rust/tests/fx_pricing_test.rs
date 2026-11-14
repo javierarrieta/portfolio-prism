@@ -8,19 +8,21 @@
 
 mod common;
 
-use common::{offline_pricing_service, seed_asset_currency, seed_portfolio, seed_transaction_at, DEFAULT_USER};
-use backend_rust::auth::StartupConfig;
+use common::{
+    disabled_config, offline_pricing_service, seed_asset_currency, seed_portfolio,
+    seed_transaction_at, setup_db, DEFAULT_USER,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
-use sqlx::sqlite::SqlitePool;
+use backend_rust::db::DbPool;
 use std::str::FromStr;
 
 use backend_rust::services::currency_service::{no_rate_error, PricingError};
 
-async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+async fn seed_pair(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
     for (date, price) in rows {
         sqlx::query(
-            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
                  ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
         )
         .bind(symbol)
@@ -32,12 +34,15 @@ async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
     }
 }
 
-async fn pool_with_prices() -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    let cfg = StartupConfig::from_env_with(&|key| (key == "AUTH_MODE").then(|| "disabled".to_string()))
-        .expect("AUTH_MODE=disabled parses in a debug build");
-    backend_rust::init_db(&pool, &cfg).await.unwrap();
-    pool
+/// A migrated database **with the placeholder owner in it**.
+///
+/// `setup_db` rather than `test_pool`: every fixture here seeds a portfolio, and
+/// `portfolios.owner_id` is a foreign key to `users`, so the row `DEFAULT_USER` names
+/// has to exist. A bare migrated database has an empty `users` table — that is what an
+/// OIDC startup with no bootstrap subject leaves behind — and the seed dies on the
+/// foreign key instead of testing anything.
+async fn pool_with_prices() -> DbPool {
+    setup_db(&disabled_config()).await
 }
 
 fn ts(date: &str) -> DateTime<Utc> {
@@ -143,9 +148,9 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     seed_pair(&pool, "AAPL", &[(today_str.as_str(), "130.00")]).await;
 
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
-        "SELECT * FROM transactions WHERE asset_id = ?",
+        "SELECT * FROM transactions WHERE asset_id = $1",
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .fetch_all(&pool)
     .await
     .unwrap();
@@ -210,9 +215,9 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     .await;
 
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
-        "SELECT * FROM transactions WHERE asset_id = ?",
+        "SELECT * FROM transactions WHERE asset_id = $1",
     )
-    .bind(asset_id)
+    .bind(asset_id as i64)
     .fetch_all(&pool)
     .await
     .unwrap();

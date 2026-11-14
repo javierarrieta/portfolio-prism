@@ -106,10 +106,15 @@ async fn a_database_failure_is_a_server_error_not_a_denial() {
     let asset = common::seed_asset(&pool, pid, "AAA", "AAA").await;
     let tx = common::seed_transaction(&pool, asset, "BUY", 1.0, 100.0, 0.0).await;
 
-    // Drop in foreign-key-safe order so SQLite allows each statement, leaving all
-    // three helpers facing "no such table".
+    // `CASCADE`, because Postgres refuses to drop a table another object depends on
+    // (`2BP01`) and `split_sync` has a foreign key onto `assets`. The order is kept
+    // anyway so the statement sequence is the same one the test has always run; what
+    // it must not lose is all three helpers facing "no such table".
     for table in ["transactions", "assets", "portfolios"] {
-        sqlx::query(&format!("DROP TABLE {table}")).execute(&pool).await.unwrap();
+        sqlx::query(&format!("DROP TABLE {table} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     assert_eq!(

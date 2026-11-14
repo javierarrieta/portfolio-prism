@@ -482,29 +482,32 @@ sqlx::migrate!("./migrations")
 
 `refuse` returns `ExitCode`, so adjust each call site to `return Err(...)`/`std::process::exit` to match the existing `main` shape rather than inventing a new one.
 
-- [ ] **Step 6: Point the test harness at Postgres**
-
-`tests/common/mod.rs:137` currently does `SqlitePool::connect(":memory:")`. Replace it with a shared-database version that Task 5 replaces:
+**The bootstrap owner step survives — the first draft of this step omitted it, and the implementer caught it.** Deleting `init_db` deletes the only creator of the placeholder user (`issuer='local'`, `subj='bootstrap'`) and of `backfill_ownership`, and three things depend on them: `auth/mod.rs::finalise_auth` in `AUTH_MODE=disabled` looks that row up and bails if it is absent (spec §10 requires `AUTH_MODE=disabled` to keep working), `tests/common::setup_db` relies on it because `DEFAULT_USER = 1` **is** that row across 16 test files, and `tests/startup_test.rs` asserts the orphan-refusal rule through it. Keep the identity half as an explicit post-migration step:
 
 ```rust
-/// Provisional: one shared Postgres database, truncated between tests.
-/// Task 5 replaces this with a freshly migrated private database per test;
-/// this exists so the suite can run at all the moment the driver switches.
-pub async fn test_pool() -> DbPool {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-    let pool = backend_rust::db::connect(&url).await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    for t in ["transactions", "split_sync", "assets", "historical_prices", "portfolios", "users"] {
-        sqlx::query(&format!("TRUNCATE {t} RESTART IDENTITY CASCADE"))
-            .execute(&pool).await.unwrap();
-    }
-    pool
-}
+// The bootstrap owner is data, not schema, so it cannot live in a migration
+// (and 0001 is frozen). Idempotent, and a no-op on a fresh database.
+db::ensure_bootstrap_owner(&pool, &cfg)
+    .await
+    .map_err(|e| refuse(anyhow::anyhow!("bootstrap owner step failed: {e}")))?;
 ```
 
-`RESTART IDENTITY` is what keeps the `DEFAULT_USER`-style assumptions from breaking
-in a new way: without it, identity sequences keep climbing across tests and any
-test that hard-codes an id fails only when it runs second.
+Conditions on it: it runs **after** `sqlx::migrate!`, never before; it stays idempotent; it preserves the refusal rule exactly (orphans present and no bootstrap owner means refuse to start — not a warning); it is quiet when it changes nothing, because it runs on every boot; and its doc comment names both duties and the three dependents, because the next reader will ask why a Postgres app has a bootstrap row at all. The provisional `test_pool(caller)` calls it after the `TRUNCATE … RESTART IDENTITY CASCADE`, which is what makes `DEFAULT_USER = 1` come back as 1 on every test. `startup_test.rs` points at the renamed function, and at least one assertion proves the placeholder row exists after a normal startup.
+
+- [ ] **Step 6: Point the test harness at Postgres — per-test databases, not a shared one**
+
+`tests/common/mod.rs:137` currently does `SqlitePool::connect(":memory:")`, and every `src/` unit test module gets its isolation the same way. A single shared database truncated between tests **cannot work**: `cargo test` runs the tests inside one binary on parallel threads, so one test's `TRUNCATE … RESTART IDENTITY CASCADE` lands while another is mid-flight and its seeded rows vanish. That is a suite that passes by scheduling luck, which is worse than one that fails.
+
+So the isolation Task 5 was going to introduce arrives here, because the engine switch is what destroyed it. `test_pool(caller: &str)`:
+
+1. Creates `prism_t_<pid>_<caller>` and migrates it, per test. A `prism_template` database was tried first on the assumption that migrating ~470 times would dominate the suite; it does not. `0001_init.sql` takes ~15 ms, and the measured suite is **faster without a template** (119 s per-test-migration vs 130 s template, against a 114 s SQLite baseline). The template also cost a global sweep of every `prism_t_%` database at process start, which made two concurrent `cargo test` runs destroy each other. The measurement this step asked for was made, it came back the other way, and per the instruction written here the measurement wins.
+2. Refuses a duplicate `caller`. Keep a process-wide registry (`Mutex<HashSet<String>>`) and panic naming both callers. Drop-if-exists plus a repeated caller name is the same interference, just rarer, and a silent cross-test data leak is the one outcome this helper exists to make impossible.
+3. `TRUNCATE … RESTART IDENTITY CASCADE`, then `db::ensure_bootstrap_owner(&pool, &cfg)`, which is what makes `DEFAULT_USER = 1` come back as 1 on every test. `RESTART IDENTITY` is load-bearing: without it the identity sequences climb across tests and any test hard-coding an id fails only when it runs second.
+4. Drops its database when the test finishes: the next `create_database` in the process drops any of its own databases that now has zero backends, using `DROP DATABASE … WITH (FORCE)` with retries. A run that is killed mid-suite leaves its last few behind, and the first `create_database` of a later run reaps any harness database whose embedded pid is gone from `/proc` **and** which has zero backends, printing one line about what it took. Drop-if-exists at creation still covers a crashed run poisoning the next.
+
+Give the same helper to the `#[cfg(test)]` modules inside `src/` as `#[cfg(test)] pub(crate)` in `src/db.rs`: `access.rs`, `engines/stats_engine.rs`, `engines/tax_engine.rs` and `services/currency_service.rs` all relied on `:memory:` and Task 5 only touches `tests/`. Check `currency_service.rs`'s split tests specifically — they hard-code `asset_id = 1` and are the ones most likely to fail confusingly rather than obviously.
+
+Keep the signature `test_pool(caller: &str)` exactly; Task 5 builds on it.
 
 - [ ] **Step 7: Make the suite pass**
 
@@ -650,6 +653,8 @@ git commit -m "refactor(db): ids are i64 to match int8, and the date boundary is
 ---
 
 ### Task 5: Per-test databases
+
+**Scope note — this task shrank.** Task 3 discovered that a shared database cannot work at all: `cargo test` parallelises inside a binary, so truncating between tests deletes rows another test is using. Per-test databases therefore arrived in Task 3, together with the template-database trick, the duplicate-`caller` guard, and the `src/` unit-test half (`access.rs`, `stats_engine.rs`, `tax_engine.rs`, `currency_service.rs`), which this task could not have reached because it only touches `tests/`. What is left here is consolidation, not invention: fold the duplicated helper into one place, convert the remaining `tests/*.rs` call sites, retire `setup_db(&cfg)` and `DEFAULT_USER`, and prove isolation rather than assert it. The `CREATE DATABASE` sketch below is superseded by Task 3's shipped harness — per-test freshly migrated databases, no template (see Step 6 above for the measurement), and keep the uniqueness guard.
 
 **Files:**
 - Modify: `backend_rust/tests/common/mod.rs` (`test_pool`, `seed_*`)
@@ -1028,12 +1033,16 @@ git commit -m "build(db): compile-time checked queries with a committed prepare 
 ### Task 9: CI
 
 **Files:**
-- Modify: `.github/workflows/ci.yml` (`build-and-test` job)
+- Modify: `.github/workflows/ci.yml` — **every job that touches the backend**, not just `build-and-test`: `build-and-test`, `e2e-smoke`, and anything else that starts the app or runs `cargo test`.
 - Modify: `AGENTS.md` (gate list)
 
 **Interfaces:**
 - Consumes: `migrations/`, `.sqlx/`, `scripts/check_sqlx_cache.sh`.
-- Produces: a green `build-and-test` that cannot pass without a real Postgres at head.
+- Produces: a green workflow in which no job can pass without a real Postgres at head.
+
+**Scope note — this task owns the whole workflow.** Task 3 fixed `frontend/e2e/run.sh` to require Postgres and discovered that `e2e-smoke` (`ci.yml:251-264`) runs it with no `DATABASE_URL` and no service, so it dies demanding `initdb` on PATH. That job was not in any task's file list, which is how a green-on-merge claim gets made in error. Any job that boots the backend needs the service and the DSN; check them all rather than the two named here.
+
+**This is also why the branch cannot be merged before this task lands.** From Task 3 onward, `test_db.rs` hard-requires `DATABASE_URL`, so `cargo test` in `build-and-test` is red until the service exists. That is deliberate and known: a branch with Task 3 but not Task 9 has a red pipeline by construction, and must not be turned into a PR until Task 9 closes it.
 
 - [ ] **Step 1: Add the service and reorder the steps**
 
@@ -1071,6 +1080,10 @@ and in `steps`, before `Run Tests`:
 ```
 
 and add `DATABASE_URL` to the env of the existing `Run Tests` step.
+
+Then do the same for `e2e-smoke`: the same `postgres` service and `DATABASE_URL`, and fix the job description, which still says it drives "a real SQLite file". The backend runs `sqlx::migrate!` at startup, so that job needs no separate migrate step — the service database is empty and the app fills it.
+
+**One trap when you do.** The two smokes must not share a database. `statement.smoke.mjs:100` records that the app auto-selects the first portfolio it is given, and `GET /api/portfolios` has no `ORDER BY`, so if the sell-pnl run's portfolio exists when the statement run starts, the statement renders *that* portfolio, prints a plausible document, and passes without testing its own fixture. Task 3's stopgap gives the two steps different databases (`prism` and the image's own empty `postgres`) because the runner is not promised a `psql` to `createdb` with. Prefer the real fix: one scratch database per invocation, created and dropped by `run.sh`, which also restores the isolation the throwaway SQLite file used to provide for free.
 
 - [ ] **Step 2: Update the documented gate list**
 

@@ -3,9 +3,23 @@ use chrono::{DateTime, Utc, NaiveDate};
 use serde::{Serialize, Deserialize};
 use utoipa::ToSchema;
 
+// Every id here is `i64` because every id in the schema is `BIGINT GENERATED ALWAYS
+// AS IDENTITY` (`migrations/0001_init.sql`). `sqlx-postgres` decides compatibility by
+// comparing declared type OIDs, so an `int8` column will not decode into an `i32` —
+// and it decides at run time, when the row is read, not at compile time. The API
+// types in `schemas.rs` are the narrowing point, not these.
+//
+// The same width rule governs *binds*, and there the failure is worse than a decode
+// error. `sqlx::Pool` caches prepared statements by SQL text, so two call sites that
+// write the same query with different Rust widths share one server-side statement,
+// and whichever prepared it first fixes `$1`'s type. The other then sends the wrong
+// number of bytes and Postgres answers `22P03 incorrect binary data format in bind
+// parameter 1` (or `08P01 insufficient data left in message`) — a 500 that depends on
+// which route ran first. Path parameters stay `i32` so the OpenAPI surface does not
+// move, so every bind of one of these ids narrows no further than `i64`.
 #[derive(Debug, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Portfolio {
-    pub id: i32,
+    pub id: i64,
     pub name: String,
     pub description: Option<String>,
     pub currency: String,
@@ -14,8 +28,8 @@ pub struct Portfolio {
 
 #[derive(Debug, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Asset {
-    pub id: i32,
-    pub portfolio_id: i32,
+    pub id: i64,
+    pub portfolio_id: i64,
     pub symbol: String,
     pub name: String,
     pub asset_type: String,
@@ -26,8 +40,8 @@ pub struct Asset {
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Transaction {
-    pub id: i32,
-    pub asset_id: i32,
+    pub id: i64,
+    pub asset_id: i64,
     pub r#type: String,
     pub quantity: String,
     pub price: String,

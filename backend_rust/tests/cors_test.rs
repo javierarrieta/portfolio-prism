@@ -7,16 +7,13 @@ mod common;
 use common::offline_pricing_service;
 
 use backend_rust::auth::finalise_auth;
-use backend_rust::init_db;
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
-use sqlx::SqlitePool;
 
 #[tokio::test]
 async fn test_cors_allowed_origin() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
     let cfg = common::disabled_config();
-    init_db(&pool, &cfg).await.unwrap();
+    let pool = common::setup_db(&cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -85,9 +82,8 @@ async fn a_disallowed_origin_is_answered_before_authentication_gets_a_turn() {
 
 #[tokio::test]
 async fn test_cors_disallowed_origin() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
     let cfg = common::disabled_config();
-    init_db(&pool, &cfg).await.unwrap();
+    let pool = common::setup_db(&cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -112,9 +108,8 @@ async fn test_cors_disallowed_origin() {
 
 #[tokio::test]
 async fn test_cors_multiple_origins() {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
     let cfg = common::disabled_config();
-    init_db(&pool, &cfg).await.unwrap();
+    let pool = common::setup_db(&cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -160,9 +155,8 @@ async fn test_cors_multiple_origins() {
 async fn test_cors_trailing_comma_origin_is_allowed() {
     // Regression: "https://app,": used to yield an empty entry, rocket_cors
     // rejected it, and get_cors_options panicked before the server bound a port.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
     let cfg = common::disabled_config();
-    init_db(&pool, &cfg).await.unwrap();
+    let pool = common::setup_db(&cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 
@@ -187,9 +181,8 @@ async fn test_cors_trailing_comma_origin_is_allowed() {
 async fn test_cors_blank_env_falls_back_to_dev_defaults() {
     // An empty allowlist would answer 403 to every browser while the process
     // looked healthy, so a blank value must restore the dev defaults instead.
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
     let cfg = common::disabled_config();
-    init_db(&pool, &cfg).await.unwrap();
+    let pool = common::setup_db(&cfg).await;
     let auth = finalise_auth(&pool, &cfg).await.unwrap();
     let currency_service = offline_pricing_service();
 

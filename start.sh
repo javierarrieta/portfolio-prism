@@ -7,6 +7,15 @@ echo "================================================"
 echo "🚀 Starting Portfolio Prism..."
 echo "================================================"
 
+# The backend requires DATABASE_URL and has no default: without one it refuses to start
+# and names the variable. This is the same URL `backend_rust/scripts/dev-db.sh` prints,
+# so an already-exported DATABASE_URL always wins (a shared cluster, a non-default port,
+# a managed instance) and this line only fills the gap. It does not start the cluster —
+# if nothing is listening, the backend fails its connection and this script reports it.
+#   nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
+export DATABASE_URL="${DATABASE_URL:-postgres://postgres@127.0.0.1:${PRISM_PG_PORT:-55432}/prism}"
+echo "🗄️  DATABASE_URL=$DATABASE_URL"
+
 # 1. Start Backend Rust
 echo "⚙️  Starting Backend API on http://127.0.0.1:8000..."
 cd backend_rust

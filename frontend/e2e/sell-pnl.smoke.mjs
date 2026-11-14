@@ -1,14 +1,20 @@
 // Headless browser smoke for the sell P&L breakdown.
 //
 // This is the only test in the repo that exercises the real seam: a real browser,
-// the real Rocket API, and a real SQLite file. The vitest suite mocks this
+// the real Rocket API, and a real Postgres database. The vitest suite mocks this
 // endpoint with MSW; the cargo tests never render anything. Neither can see a
 // broken fetch URL, a proxy that is not configured, or a column that is too
 // narrow to hold a date.
 //
 // It seeds its own fixture through the REST API, so nothing here depends on
-// demo data. Point DATABASE_URL at a throwaway file (run.sh does) and it never
-// touches your real portfolio.db.
+// demo data. Everything it writes lives in the database its backend was pointed
+// at, in a portfolio named `E2E Smoke <timestamp>` that nothing else creates.
+// With no DATABASE_URL, run.sh brings up the dev cluster via scripts/dev-db.sh
+// and uses its `prism` database -- the same one start.sh uses. So this is
+// additive to your dev data, not isolated from it: it will not delete or change
+// anything you made, but the smoke portfolio does show up in your portfolio list
+// afterwards. Point DATABASE_URL at a scratch database if you want it gone
+// cleanly; CI gives each smoke its own (see .github/workflows/ci.yml).
 //
 // Required env:
 //   CHROMIUM   path to a chromium-compatible browser binary

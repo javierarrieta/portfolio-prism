@@ -10,7 +10,7 @@ use rocket::response::{Redirect, Responder};
 use rocket::serde::json::Json;
 use rocket::{Request, Response, State};
 use serde_json::json;
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use super::guard::{AuthedUser, Unauthenticated};
 use super::{AuthMode, oidc, session};
@@ -225,7 +225,7 @@ pub async fn login(
 pub async fn callback(
     wants_html: WantsHtml,
     mode: &State<AuthMode>,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     cookies: &CookieJar<'_>,
     code: Option<&str>,
     state: Option<&str>,
@@ -314,7 +314,7 @@ pub async fn logout(mode: &State<AuthMode>, cookies: &CookieJar<'_>) -> Redirect
 #[post("/logout-all")]
 pub async fn logout_all(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     cookies: &CookieJar<'_>,
 ) -> Result<Redirect, Status> {
     oidc::bump_token_version(pool.inner(), user.id)

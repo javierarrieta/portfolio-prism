@@ -47,6 +47,11 @@ services:
       # authentication, so a mismatch is a 403 on writes, not a 401.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
       ROCKET_SECRET_KEY: ${ROCKET_SECRET_KEY:?set ROCKET_SECRET_KEY in .auth-test.env}
+      # PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE: the backend is Postgres-only and
+      # refuses a `sqlite:` DSN, so this compose file cannot bring the stack up until the
+      # cutover (Task 10) replaces it with a Postgres service. The OIDC harness is run
+      # today with `backend_rust/scripts/dev-db.sh` plus `scripts/auth_smoke.sh`, which
+      # take DATABASE_URL from the environment.
       DATABASE_URL: sqlite:///data/portfolio.db?mode=rwc
     ports:
       - "8000:8000"
