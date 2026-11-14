@@ -329,15 +329,16 @@ job mechanical. Every SQL statement in `src/backup/` must:
 - use `RETURNING` for allocated ids.
 - use `ON CONFLICT (cols) DO NOTHING` where an upsert is needed.
 - avoid SQLite-only constructs: `PRAGMA`, `pragma_table_info`, `INSERT OR REPLACE`,
-  `INSERT OR IGNORE`, `AUTOINCREMENT`, `last_insert_rowid`, `strftime`, `julianday`,
-  `datetime()`, `IFNULL`, `GROUP_CONCAT`.
+  `INSERT OR IGNORE`, `INSERT OR ROLLBACK`, `INSERT OR ABORT`, `INSERT OR FAIL`,
+  `AUTOINCREMENT`, `last_insert_rowid`, `strftime`, `julianday`, `datetime()`,
+  `IFNULL`, `GROUP_CONCAT`.
 - store and read decimals and dates as strings, as the format already dictates.
 
 Enforced by `backend_rust/scripts/check_backup_portability.sh`, a static grep gate in the
-style of `check_access_gate.sh`, failing on any of the banned constructs in a statement
-under `src/backup/` — in either keyword spelling, because SQLite keywords are
-case-insensitive — and on any `INSERT INTO` whose column list does not immediately follow
-the table name, however the string literal wraps. Prose is not a statement: comment lines
+style of `check_access_gate.sh`, failing case-insensitively — SQLite keywords are —
+on any of the banned constructs in a statement under `src/backup/`, and on any
+`INSERT INTO` whose column list does not immediately follow the table name, however the
+string literal wraps. Prose is not a statement: comment lines
 are skipped, since the rule is about SQL the module sends to the engine, and
 `restore.rs` names `PRAGMA foreign_keys` in a comment to explain a schema fact. The
 expected diff when the engine spec lands is the pool type in this module's signatures and

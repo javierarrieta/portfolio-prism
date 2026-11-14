@@ -22,6 +22,29 @@ const SCRIPT: &str = concat!(
     "/scripts/check_backup_portability.sh"
 );
 
+/// Every construct Rule 1 must ban, spelled the way the script's array spells it.
+///
+/// Pinned from two sides: `every_banned_construct_is_reported` requires a report
+/// line for each of these, and `the_script_bans_exactly_the_pinned_set` requires
+/// the script's own array to hold exactly this set. Before both, eleven of the
+/// fourteen had no fixture at all and deleting one from the array was invisible.
+const BANNED: [&str; 14] = [
+    "PRAGMA",
+    "pragma_",
+    "INSERT OR REPLACE",
+    "INSERT OR IGNORE",
+    "INSERT OR ROLLBACK",
+    "INSERT OR ABORT",
+    "INSERT OR FAIL",
+    "AUTOINCREMENT",
+    "last_insert_rowid",
+    "strftime",
+    "julianday",
+    "datetime(",
+    "IFNULL",
+    "GROUP_CONCAT",
+];
+
 fn run(dir: &Path) -> (i32, String) {
     let out = Command::new("bash")
         .arg(dir.join("scripts/check_backup_portability.sh"))
@@ -32,20 +55,26 @@ fn run(dir: &Path) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
-/// Build a throwaway tree holding `src/backup/<label>.rs`, run the real script
+/// Build a throwaway tree holding `src/backup/fixture.rs`, run the real script
 /// against it, and report what it said. The script resolves its own directory, so
 /// copying it next to a fake `src/backup` is enough to redirect it.
 fn run_tree(label: &str, source: &str) -> (i32, String) {
-    let root = std::env::temp_dir().join(format!("portability-gate-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("scripts")).unwrap();
-    fs::create_dir_all(root.join("src/backup")).unwrap();
-    fs::copy(SCRIPT, root.join("scripts/check_backup_portability.sh")).unwrap();
+    let root = tree(label);
     fs::write(root.join("src/backup/fixture.rs"), source).unwrap();
 
     let out = run(&root);
     let _ = fs::remove_dir_all(&root);
     out
+}
+
+/// An empty throwaway tree: `scripts/` holding the real script, and `src/backup/`.
+fn tree(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("portability-gate-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("src/backup")).unwrap();
+    fs::copy(SCRIPT, root.join("scripts/check_backup_portability.sh")).unwrap();
+    root
 }
 
 #[test]
@@ -64,11 +93,88 @@ fn the_real_tree_passes_the_gate() {
         text.contains("INSERT statements inspected: 4"),
         "the gate should account for the module's four INSERTs, said:\n{text}"
     );
+    // Per file, not just in total: a scanner that silently produced nothing for
+    // three of the four files would still add up to four here.
+    assert!(
+        text.contains("inspected src/backup/restore.rs: 4 INSERT statement(s)"),
+        "restore.rs holds the module's four INSERTs, said:\n{text}"
+    );
+    for file in ["export.rs", "mod.rs", "schema.rs"] {
+        assert!(
+            text.contains(&format!("inspected src/backup/{file}: 0 INSERT statement(s)")),
+            "the scanner reported nothing for {file}, said:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn the_gate_counts_the_statements_it_inspected() {
+    let (code, text) = run_tree(
+        "counted",
+        r#"pub const A: &str = "INSERT INTO assets (symbol) VALUES (?)";
+pub const B: &str = "INSERT INTO portfolios (name) VALUES (?)";
+"#,
+    );
+    assert_eq!(code, 0, "two well-formed INSERTs must pass:\n{text}");
+    assert!(
+        text.contains("inspected src/backup/fixture.rs: 2 INSERT statement(s)")
+            && text.contains("INSERT statements inspected: 2"),
+        "the count does not match the fixture:\n{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Rule 1 — no banned construct in SQL the module can send
 // ---------------------------------------------------------------------------
+
+/// One fixture, one statement per banned construct, in the upper-case spelling the
+/// module's SQL actually uses. Every entry of the array has to show up in the
+/// output: a construct that is in the array but not reported is a construct the
+/// gate does not ban, whatever the array claims.
+#[test]
+fn every_banned_construct_is_reported() {
+    let mut source = String::new();
+    for (i, pattern) in BANNED.iter().enumerate() {
+        source.push_str(&format!(
+            "pub const C{i}: &str = \"SELECT {} FROM t\";\n",
+            pattern.to_uppercase()
+        ));
+    }
+    let (code, text) = run_tree("all-banned", &source);
+    assert_eq!(code, 1, "a fixture holding every banned construct must fail:\n{text}");
+    for pattern in BANNED {
+        assert!(
+            text.contains(&format!("'{pattern}' has no cross-engine spelling")),
+            "the gate did not report {pattern}:\n{text}"
+        );
+    }
+}
+
+/// The array is the rule. If it drifts from the set this file pins — an entry
+/// deleted, a new one added without a fixture — the gate's verdict stops meaning
+/// what the spec says it means, so say so loudly here instead.
+#[test]
+fn the_script_bans_exactly_the_pinned_set() {
+    let script = fs::read_to_string(SCRIPT).expect("the gate script is readable");
+    let body = script
+        .split("BANNED=(")
+        .nth(1)
+        .expect("the script declares a BANNED array")
+        .split(')')
+        .next()
+        .expect("the BANNED array is closed");
+    let mut found: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('"')?.strip_suffix('"').map(str::to_owned))
+        .collect();
+    let mut expected: Vec<String> = BANNED.iter().map(|s| s.to_string()).collect();
+    found.sort();
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "the script's BANNED array and this file's pinned set have diverged"
+    );
+}
 
 /// The pair that makes the comment-line skip honest. `restore.rs` explains a real
 /// schema fact with the word `PRAGMA` in prose; the rule is about statements the
@@ -93,21 +199,27 @@ fn a_banned_construct_in_a_sql_string_fails() {
 }
 
 #[test]
-fn a_banned_construct_in_a_sql_string_fails_whatever_its_spelling() {
-    // SQLite keywords are case-insensitive, so a gate keyed on the upper-case
-    // spelling is a gate on one spelling of the bypass.
+fn a_banned_construct_is_caught_whatever_its_spelling() {
+    // SQLite keywords are case-insensitive, so a gate keyed on one spelling is a
+    // gate on one spelling of the bypass. The module's house style is upper-case
+    // SQL keywords, so `STRFTIME` is the spelling real code writes and `Pragma`
+    // is the one a case-sensitive grep on a lower-case list would wave through.
     let (code, text) = run_tree(
-        "pragma-lower-case",
-        r#"pub async fn leak(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("pragma foreign_keys = ON").execute(pool).await
-}
+        "spellings",
+        r#"pub const LOWER: &str = "pragma foreign_keys = ON";
+pub const MIXED: &str = "Pragma foreign_keys = ON";
+pub const UPPER: &str = "SELECT STRFTIME('%Y-%m', date) FROM historical_prices";
+pub const MIXED2: &str = "SELECT IfNull(close_price, 0) FROM historical_prices";
+pub const UPPER2: &str = "SELECT LAST_INSERT_ROWID(), JULIANDAY(date), DATETIME(date)";
 "#,
     );
-    assert_eq!(code, 1, "a lower-case pragma is the same statement:\n{text}");
-    assert!(
-        text.contains("'pragma' has no cross-engine spelling"),
-        "the lower-case spelling was not matched:\n{text}"
-    );
+    assert_eq!(code, 1, "one construct, five spellings:\n{text}");
+    for pattern in ["PRAGMA", "strftime", "IFNULL", "last_insert_rowid", "julianday", "datetime("] {
+        assert!(
+            text.contains(&format!("'{pattern}' has no cross-engine spelling")),
+            "{pattern} slipped through on its spelling:\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -139,6 +251,28 @@ fn a_banned_construct_sharing_a_line_with_code_still_fails() {
         text.contains("'PRAGMA' has no cross-engine spelling"),
         "the token was skipped because the line also holds a comment:\n{text}"
     );
+}
+
+/// `INSERT OR ROLLBACK` is the same SQLite-only family as `INSERT OR REPLACE` and
+/// was missing from both the spec's list and the array. It is invisible to Rule 2
+/// as well: `INSERT OR ROLLBACK INTO t VALUES (...)` holds no `INSERT INTO`, so
+/// before this the whole statement passed.
+#[test]
+fn the_other_insert_or_variants_are_banned() {
+    let (code, text) = run_tree(
+        "insert-or-family",
+        r#"pub const A: &str = "INSERT OR ROLLBACK INTO assets VALUES (?, ?)";
+pub const B: &str = "INSERT OR ABORT INTO assets VALUES (?, ?)";
+pub const C: &str = "INSERT OR FAIL INTO assets VALUES (?, ?)";
+"#,
+    );
+    assert_eq!(code, 1, "the INSERT OR family is SQLite-only:\n{text}");
+    for pattern in ["INSERT OR ROLLBACK", "INSERT OR ABORT", "INSERT OR FAIL"] {
+        assert!(
+            text.contains(&format!("'{pattern}' has no cross-engine spelling")),
+            "{pattern} was not reported:\n{text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +354,7 @@ fn an_insert_that_names_no_table_is_refused() {
 
 #[test]
 fn a_tree_with_nothing_to_inspect_fails() {
-    let root = std::env::temp_dir().join(format!("portability-gate-empty-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("scripts")).unwrap();
-    fs::create_dir_all(root.join("src/backup")).unwrap();
-    fs::copy(SCRIPT, root.join("scripts/check_backup_portability.sh")).unwrap();
+    let root = tree("empty-dir");
 
     let (code, text) = run(&root);
     let _ = fs::remove_dir_all(&root);
@@ -237,11 +367,8 @@ fn a_tree_with_nothing_to_inspect_fails() {
 
 #[test]
 fn a_tree_without_a_backup_module_fails() {
-    let root =
-        std::env::temp_dir().join(format!("portability-gate-missing-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("scripts")).unwrap();
-    fs::copy(SCRIPT, root.join("scripts/check_backup_portability.sh")).unwrap();
+    let root = tree("missing-dir");
+    fs::remove_dir_all(root.join("src/backup")).unwrap();
 
     let (code, text) = run(&root);
     let _ = fs::remove_dir_all(&root);
@@ -249,5 +376,56 @@ fn a_tree_without_a_backup_module_fails() {
     assert!(
         text.contains("src/backup does not exist"),
         "the missing directory was not reported: {text}"
+    );
+}
+
+/// A path named `*.rs` that is not a file. `awk` warns and skips it while still
+/// exiting 0, so without the guard it contributes zero statements and the gate
+/// prints `passed`.
+#[test]
+fn a_path_named_rs_that_is_not_a_file_fails_the_gate() {
+    let root = tree("not-a-file");
+    fs::create_dir(root.join("src/backup/not_a_file.rs")).unwrap();
+
+    let (code, text) = run(&root);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(code, 1, "a directory is not a source file:\n{text}");
+    assert!(
+        text.contains("is not a readable regular file"),
+        "the non-file path was not reported:\n{text}"
+    );
+}
+
+/// A regular file the scanner cannot open, which is the same failure one step on:
+/// `awk` never reads it, so it must not be allowed to look like a file with no
+/// INSERTs in it.
+#[test]
+fn a_file_the_scanner_cannot_read_fails_the_gate() {
+    let root = tree("unreadable-file");
+    let path = root.join("src/backup/unreadable.rs");
+    fs::write(&path, "pub const Q: &str = \"INSERT INTO assets (a) VALUES (?)\";\n").unwrap();
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    if fs::read_to_string(&path).is_ok() {
+        // Running as root, where no file is unreadable and there is nothing to
+        // assert. The guard above is not skipped, and the mutation evidence in the
+        // task report covers this branch.
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+
+    let (code, text) = run(&root);
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        code, 1,
+        "a file the scanner produced no verdict for must not pass:\n{text}"
+    );
+    assert!(
+        text.contains("the INSERT scanner produced no verdict"),
+        "the missing sentinel was not reported:\n{text}"
     );
 }
