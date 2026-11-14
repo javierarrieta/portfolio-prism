@@ -40,7 +40,7 @@ The spec's own tests will not cover these; each line gets a test in the task tha
 **Files:**
 - Create: `backend_rust/scripts/dev-db.sh`
 - Create: `backend_rust/scripts/dev-db-stop.sh`
-- Modify: `AGENTS.md` (the *Commands* and *Backend gates* sections)
+- Modify: `AGENTS.md` (the *Commands → Backend* list only; the *Backend gates* section is Task 9's, and *Architecture* / *Database* are Task 3's)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -72,10 +72,18 @@ else
          -l "$DATA/log" -w start
 fi
 
-psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "alter role postgres createdb"
-psql "postgres://postgres@127.0.0.1:$PORT/postgres" -tAc \
-  "select 1 from pg_database where datname='prism'" | grep -q 1 \
-  || psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "create database prism"
+URI="postgres://postgres@127.0.0.1:$PORT/postgres"
+V=$(psql "$URI" -tAc 'show server_version')
+case "$V" in
+  18.*) ;;
+  *) echo "need PostgreSQL 18.x, got $V — run inside: nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'"; exit 1;;
+esac
+echo "server $V"
+
+psql "$URI" -qc "alter role postgres createdb"
+if [ "$(psql "$URI" -tAc "select 1 from pg_database where datname='prism'")" != "1" ]; then
+  psql "$URI" -qc "create database prism"
+fi
 
 echo "DATABASE_URL=postgres://postgres@127.0.0.1:$PORT/prism"
 ```
@@ -86,6 +94,9 @@ echo "DATABASE_URL=postgres://postgres@127.0.0.1:$PORT/prism"
 #!/usr/bin/env bash
 set -euo pipefail
 DATA="${PRISM_PG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/prism-pg}"
+# Idempotent: stopping an already-stopped cluster is not an error, because the
+# gate sequences in Task 9 stop unconditionally under `set -e`.
+pg_ctl -D "$DATA" status >/dev/null 2>&1 || exit 0
 pg_ctl -D "$DATA" -m fast -w stop
 ```
 
@@ -98,7 +109,9 @@ psql "postgres://postgres@127.0.0.1:55432/prism" -tAc 'select current_setting($$
 nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db-stop.sh'
 ```
 
-Expected: the start line prints `DATABASE_URL=...`, the `psql` prints `18.7`, the stop prints nothing and exits 0. Run the start script **twice** — the second run must print `already running` rather than failing.
+Expected: the start line prints `server 18.7` and `DATABASE_URL=...`, the stop exits 0, and a **second** stop prints nothing and exits 0. Run the start script **twice** — the second run must print `already running` rather than failing.
+
+The version guard is not decoration: the `postgresql` baked into the workspace image is 18.6 and its `initdb` is broken (spec §9.1), and running this script without `nix-shell` against an existing cluster would otherwise start 18.6 on an 18.7 data directory in silence.
 
 - [ ] **Step 4: Document it**
 
@@ -295,6 +308,7 @@ This is one atomic change: `sqlx`'s `sqlite` and `postgres` features cannot both
 - Create: `backend_rust/src/db.rs`
 - Modify: `backend_rust/src/lib.rs` (delete `init_db` and the startup migrations, `:138-560`)
 - Modify: `backend_rust/src/main.rs:53-88`
+- Modify: `AGENTS.md` (the *Architecture* line and the *Database* bullet under *Key Context*)
 - Modify: the 13 files that reference `SqlitePool` — `access.rs`, `api_routes/{analytics,portfolios,transactions}.rs`, `auth/{guard,mod,oidc}.rs`, `backup/{export,restore}.rs`, `engines/{stats_engine,tax_engine}.rs`, `lib.rs`, `services/currency_service.rs`
 - Modify: `backend_rust/src/engines/stats_engine.rs:433,539`, `backend_rust/src/services/currency_service.rs:997,1469` (`INSERT OR REPLACE`)
 - Test: the existing suite, unchanged in intent
@@ -459,9 +473,15 @@ nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
 cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
 ```
 
-Expected: the suite runs against Postgres. Expect failures in three families, and fix each at its cause rather than by editing the assertion: `i32`/`i64` mismatches (Task 4 handles the type surface; fix only what the compiler reports here), date parsing, and `DEFAULT_USER` assumptions from the SQLite `id = 1` placeholder row.
+Expected: the suite runs against Postgres. Expect failures in three families, and fix each at its cause rather than by editing the assertion: `i32`/`i64` mismatches, date parsing, and `DEFAULT_USER` assumptions from the SQLite `id = 1` placeholder row.
 
-- [ ] **Step 8: Commit**
+On the id mismatches: **any `query_as` / `query_scalar` that binds an id to `i32` is a runtime error under `sqlx-postgres`, not a compile error** — an `int8` column will not decode into `i32`. Those row reads belong to this task, because this task cannot finish green with them in place. Task 4 keeps the *API surface*: `schemas.rs`, path parameters, and the test seed helpers. Fix the reads here; do not paper over one with a cast.
+
+- [ ] **Step 8: Correct the parts of AGENTS.md that describe SQLite**
+
+Task 1 added a *Commands* bullet saying the engine is Postgres only, which left `AGENTS.md` contradicting itself: *Architecture* still says "Uses SQLite" and the *Database* bullet under *Key Context* still documents `sqlite:../portfolio.db?mode=rwc`. This is the task that makes those lines false, so this is the task that rewrites them. Say what the code now does — `DATABASE_URL` is required and names a Postgres DSN, the schema comes from `migrations/`, and there is no `portfolio.db` — and delete the macOS `127.0.0.1`-versus-`localhost` note if it was only ever about the SQLite file path.
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -876,7 +896,7 @@ bash scripts/check_backup_portability.sh
 
 Expected: PASS. The portability gate must still pass — it bans engine-specific constructs, and `SET statement_timeout` is portable enough to be allowed, but if the gate objects, fix the gate deliberately and say why in the commit message.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A
