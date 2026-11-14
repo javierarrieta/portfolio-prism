@@ -1093,7 +1093,7 @@ git commit -m "ci(db): postgres service container, migrate, prepare --check, the
 
 **Files:**
 - Create: `docs/postgres-cutover.md`
-- Modify: `docs/backup-walkthrough.md` (SQLite lock and `PRAGMA` steps rewritten)
+- Modify: `docs/walkthrough.md` §3 — **`docs/backup-walkthrough.md` does not exist**; the plan named a file that was never written, and Task 6 found this while adding the pre-cutover audit section. `README.md:48` names `docs/walkthrough.md` as the manual walkthrough, and that is where the backup steps live. Rewrite its SQLite lock and `PRAGMA` steps here.
 - Modify: `docs/walkthrough.md` — referenced twice from `README.md` (`:48`, `:170`), and still tells the reader to `export DATABASE_URL='sqlite:/tmp/second.db?mode=rwc'` and to query the store with `sqlite3` (`:305`, `:367-405`). Every command in it now fails. Decide deliberately whether to rewrite it or delete it and drop the README references; do not leave a README pointing at instructions that cannot run. (`docs/migration_python_to_rust.md` and `docs/implementation_plan.md` also mention SQLite, but they are dated historical records and should stay as they are.)
 - Modify: `AGENTS.md` (Roadmap: the GitOps follow-up named)
 - Create: `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`
