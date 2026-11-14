@@ -109,6 +109,42 @@ function asCapabilities(body: unknown): Capabilities | null {
   return c as Capabilities;
 }
 
+/** One set of the three counts a plan carries, read off an untrusted body. */
+function isCounts(value: unknown): value is Counts {
+  const c = value as Partial<Counts> | null;
+  return !!c && typeof c === 'object'
+    && Number.isFinite(c.portfolios) && Number.isFinite(c.assets) && Number.isFinite(c.transactions);
+}
+
+/** The preview body, or `null` when it is not a plan for the mode that was asked for.
+ *
+ * The reason `asCapabilities` gives for existing applies harder here: a `200` that is
+ * valid JSON but not a plan — a proxy envelope, a renamed field, a truncated body —
+ * reaches `plan.delete.portfolios` and throws during render, and with no error
+ * boundary anywhere in this app a thrown render is a blank page at the exact moment
+ * the user is deciding whether to destroy their data. A body that is not a plan is
+ * refused, which leaves the card standing with nothing to restore against.
+ *
+ * The echoed `mode` has to be the mode that was asked for, because the two halves of
+ * one operation are read from two places: the delete sentence is rendered from the
+ * plan and the write is sent from the component's own mode. If they ever disagree the
+ * card would be describing one operation while performing the other, and that is the
+ * one disagreement a user cannot see. */
+function asPlan(body: unknown, askedFor: RestoreMode): Plan | null {
+  const p = body as Partial<Plan> | null;
+  if (!p || typeof p !== 'object') return null;
+  if (p.mode !== askedFor) return null;
+  if (!isCounts(p.delete) || !isCounts(p.insert)) return null;
+  if (!Number.isFinite(p.prices)) return null;
+  if (!Array.isArray(p.warnings) || !p.warnings.every((w) => typeof w === 'string')) return null;
+  return p as Plan;
+}
+
+/** What the card says when a restore went out and its outcome cannot be read — no
+ * answer, or an answer that is not the outcome. It cannot promise nothing was written,
+ * so it says what is true and where to look instead. */
+const UNCONFIRMED_RESTORE = 'The restore could not be confirmed, so it cannot be tried again from this page. Reload the page to see what it wrote.';
+
 /** The bundle's text.
  *
  * `FileReader` rather than `file.text()`: the latter is missing from jsdom's `File`,
@@ -180,6 +216,11 @@ export default function BackupPanel({ portfolios }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<RestoreMode>('copy');
   const [confirm, setConfirm] = useState('');
+  // Which plan the words were typed against. A plan that gets replaced — by a retry, a
+  // mode switch, a new file — has to be confirmed again, because the counts on screen
+  // are what the words were read against and a fresh answer can count more to delete
+  // than the one that was.
+  const [confirmFor, setConfirmFor] = useState<Plan | null>(null);
   const [plan, setPlan] = useState<Plan | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -199,6 +240,14 @@ export default function BackupPanel({ portfolios }: Props) {
     const seq = ++previewSeq.current;
     setPreviewing(true);
     setRestoreError(null);
+    // The words belong to the plan on screen, so they go with the plan this request is
+    // about to replace. Retrying a preview is not a no-op: the second answer can count
+    // more to delete than the first, and a confirmation carried across it is one the
+    // user never re-read.
+    if (plan) {
+      setConfirm('');
+      setConfirmFor(null);
+    }
     try {
       const res = await apiFetch(`${API_BASE}/backup/preview?mode=${forMode}`, {
         method: 'POST',
@@ -213,9 +262,15 @@ export default function BackupPanel({ portfolios }: Props) {
         setRestoreError(describeFailure(await readFailure(res)));
         return;
       }
-      const body = (await res.json()) as Plan;
+      const body = await res.json();
       if (seq !== previewSeq.current) return;
-      setPlan(body);
+      const read = asPlan(body, forMode);
+      if (!read) {
+        setPlan(null);
+        setRestoreError('The preview answer was not a plan this app could read, so there is nothing to restore against.');
+        return;
+      }
+      setPlan(read);
     } catch {
       if (seq !== previewSeq.current) return;
       setPlan(null);
@@ -236,7 +291,17 @@ export default function BackupPanel({ portfolios }: Props) {
     setMode(next);
     setPlan(null);
     setConfirm('');
+    setConfirmFor(null);
     if (file) void runPreview(file, next);
+  };
+
+  // Take the card apart at the end of a write: no plan and no words, so there is
+  // nothing left to press. Both callers are the end of a restore — one that wrote, and
+  // one whose outcome cannot be read.
+  const disarmRestore = () => {
+    setPlan(null);
+    setConfirm('');
+    setConfirmFor(null);
   };
 
   async function runRestore() {
@@ -261,7 +326,21 @@ export default function BackupPanel({ portfolios }: Props) {
         setRestoreError(describeFailure(await readFailure(res)));
         return;
       }
-      setRestoreResult((await res.json()) as { inserted: Counts });
+      const written = ((await res.json()) as { inserted?: unknown } | null)?.inserted;
+      if (!isCounts(written)) {
+        // A 200 whose body is not the outcome is an answer that cannot be read, which
+        // is the same unknown as no answer at all.
+        disarmRestore();
+        setRestoreError(UNCONFIRMED_RESTORE);
+        return;
+      }
+      // The write is done, and the plan and the words are over: a second restore is not
+      // a retry of the first, it is a second write. In `replace` that would delete
+      // everything again on the strength of a word typed a minute ago, and in `copy` it
+      // would duplicate the portfolios with nothing in the way. The result line stays as
+      // the record, and Preview arms the card again for anyone who means to go on.
+      disarmRestore();
+      setRestoreResult({ inserted: written });
     } catch {
       // No answer. The write may have committed, may have rolled back, or may never
       // have arrived, and nothing this client can observe tells it which, so no
@@ -269,12 +348,16 @@ export default function BackupPanel({ portfolios }: Props) {
       // someone restores the same bundle twice. The plan goes with the promise: with
       // no plan there is no restore to press, because a second write is not a retry of
       // a failed one, it is a second write. What is actually there is one reload away.
-      setPlan(null);
-      setRestoreError('The restore could not be confirmed, so it cannot be tried again from this page. Reload the page to see what it wrote.');
+      disarmRestore();
+      setRestoreError(UNCONFIRMED_RESTORE);
     } finally {
       setRestoring(false);
     }
   }
+
+  // The words only count while they are bound to the plan on screen. `plan` itself is
+  // required by the button too, so words typed before any plan existed bind to nothing.
+  const replaceConfirmed = confirm === 'REPLACE' && confirmFor === plan;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -295,6 +378,7 @@ export default function BackupPanel({ portfolios }: Props) {
             className="form-control"
             type="file"
             accept="application/json,.json"
+            disabled={restoring}
             onChange={(e) => {
               // Everything the old file and the old mode were true about goes with
               // them, including the confirmation: a plan beside a different file is
@@ -308,6 +392,7 @@ export default function BackupPanel({ portfolios }: Props) {
               setRestoreError(null);
               setRestoreResult(null);
               setConfirm('');
+              setConfirmFor(null);
               if (chosen) void runPreview(chosen, mode);
             }}
           />
@@ -317,13 +402,13 @@ export default function BackupPanel({ portfolios }: Props) {
           <legend>Mode</legend>
           <label>
             <input type="radio" name="mode" value="copy" checked={mode === 'copy'}
-              onChange={() => chooseMode('copy')} />
+              disabled={restoring} onChange={() => chooseMode('copy')} />
             {' '}New copy — add these portfolios alongside what you already have
           </label>
           <br />
           <label>
             <input type="radio" name="mode" value="replace" checked={mode === 'replace'}
-              onChange={() => chooseMode('replace')} />
+              disabled={restoring} onChange={() => chooseMode('replace')} />
             {' '}Replace — delete every portfolio you own, then restore this bundle
           </label>
         </fieldset>
@@ -335,7 +420,12 @@ export default function BackupPanel({ portfolios }: Props) {
               data-testid="replace-confirm"
               className="form-control"
               value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
+              onChange={(e) => {
+                // Bound to the plan on screen at the moment the words were typed, not
+                // to whatever plan happens to be on screen when the button is read.
+                setConfirm(e.target.value);
+                setConfirmFor(plan);
+              }}
             />
           </label>
         )}
@@ -355,6 +445,14 @@ export default function BackupPanel({ portfolios }: Props) {
                 : 'Will delete nothing.'}
             </p>
             <p>{`Will insert ${countList(plan.insert)}.`}</p>
+            {/* The card never sends `apply_prices`, so a bundle carrying price history
+                restores without it. That is a decision the user should not have to guess
+                at, and `prices` is the server's own count of what is being left out. */}
+            {plan.prices > 0 && (
+              <p data-testid="preview-prices" className="text-muted">
+                {`${plan.prices} price row${plan.prices === 1 ? '' : 's'} in this bundle will be left alone — this panel does not restore price history.`}
+              </p>
+            )}
             {plan.warnings.map((w) => (
               <p key={w} data-testid="preview-warning" style={{ color: 'var(--color-warning)' }}>{w}</p>
             ))}
@@ -364,7 +462,7 @@ export default function BackupPanel({ portfolios }: Props) {
         <button
           className="btn btn-primary"
           data-testid="restore-button"
-          disabled={!plan || (mode === 'replace' && confirm !== 'REPLACE') || restoring}
+          disabled={!plan || (mode === 'replace' && !replaceConfirmed) || restoring}
           onClick={() => void runRestore()}
         >
           {restoring ? 'Restoring…' : 'Restore'}

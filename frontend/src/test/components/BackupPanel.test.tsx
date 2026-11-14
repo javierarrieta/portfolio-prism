@@ -17,17 +17,38 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const CAPS = { schema_versions: [1], allow_price_restore: false, max_bytes: 8388608, max_rows: 50000 }
 
+/** A plan body. The echoed `mode` is the mode that was asked for, because the card now
+ * refuses a plan whose echo disagrees with the request — and a mock that always said
+ * `copy` would hide that check, and would have the summary reading "Will delete
+ * nothing." at the moment the write sends `mode=replace`. */
+function planBody(over: {
+  mode?: string
+  insert?: { portfolios: number; assets: number; transactions: number }
+  delete?: { portfolios: number; assets: number; transactions: number }
+  prices?: number
+  warnings?: string[]
+} = {}) {
+  const mode = over.mode ?? 'copy'
+  return {
+    schema_version: 1,
+    mode,
+    delete: over.delete ?? (mode === 'replace'
+      ? { portfolios: 2, assets: 4, transactions: 6 }
+      : { portfolios: 0, assets: 0, transactions: 0 }),
+    insert: over.insert ?? { portfolios: 1, assets: 2, transactions: 3 },
+    prices: over.prices ?? 0,
+    warnings: over.warnings ?? [],
+  }
+}
+
 let fetchMock: ReturnType<typeof vi.fn>
 beforeEach(() => {
   fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
-    if (url.includes('/backup/preview')) return jsonResponse({
-      schema_version: 1, mode: 'copy',
-      delete: { portfolios: 0, assets: 0, transactions: 0 },
-      insert: { portfolios: 1, assets: 2, transactions: 3 },
-      prices: 0, warnings: [],
-    })
+    if (url.includes('/backup/preview')) {
+      return jsonResponse(planBody({ mode: url.includes('mode=replace') ? 'replace' : 'copy' }))
+    }
     return jsonResponse({}, 404)
   })
   vi.stubGlobal('fetch', fetchMock)
@@ -376,11 +397,11 @@ describe('export download', () => {
   })
 })
 
-function bundleFile(name = 'bundle.json') {
+function bundleFile(name = 'bundle.json', portfolioName = 'Restored') {
   return new File([JSON.stringify({
     format: 'portfolio-prism-backup', schema_version: 1,
     created_at: '2026-11-13T00:00:00Z',
-    portfolios: [{ ref: 'p1', name: 'Restored', description: null, currency: 'USD',
+    portfolios: [{ ref: 'p1', name: portfolioName, description: null, currency: 'USD',
       base_currency: 'USD', assets: [] }],
   })], name, { type: 'application/json' })
 }
@@ -395,11 +416,7 @@ interface Counts {
 /** A preview answer whose insert counts the test names, so the plan on screen can be
  * told apart from the plan of the file that is no longer on screen. */
 function planResponse(insert: Counts, mode = 'copy'): Response {
-  return jsonResponse({
-    schema_version: 1, mode,
-    delete: { portfolios: 0, assets: 0, transactions: 0 },
-    insert, prices: 0, warnings: [],
-  })
+  return jsonResponse(planBody({ mode, insert }))
 }
 
 /** Refuses every `/backup/preview` from here on with the server's own validation
@@ -435,6 +452,22 @@ function gatedPreviews(): Array<(res: Response) => void> {
   return pending
 }
 
+/** Answers a successful restore, and a preview of either mode, so a test can watch
+ * what a write leaves behind. */
+function restoreSucceeds(insert: Counts = { portfolios: 1, assets: 2, transactions: 3 }) {
+  fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+    if (url.includes('/backup/preview')) {
+      return jsonResponse(planBody({ mode: url.includes('mode=replace') ? 'replace' : 'copy' }))
+    }
+    if (url.includes('/backup/restore')) {
+      return jsonResponse({ inserted: insert, portfolio_ids: [7], prices_inserted: 0 })
+    }
+    return jsonResponse({}, 404)
+  })
+}
+
 /** Settles a held preview and lets every hop of the response land. */
 async function answer(pending: Array<(res: Response) => void>, index: number, res: Response) {
   await act(async () => {
@@ -459,6 +492,8 @@ describe('restore card', () => {
     expect(screen.getByTestId('preview-summary')).toHaveTextContent('1 portfolio')
     expect(screen.getByTestId('preview-summary')).toHaveTextContent('2 assets')
     expect(screen.getByTestId('preview-summary')).toHaveTextContent('3 transactions')
+    // A bundle with no price section is not told to have one.
+    expect(screen.queryByTestId('preview-prices')).toBeNull()
   })
 
   it('requires typing REPLACE before a replace restore is allowed', async () => {
@@ -466,11 +501,14 @@ describe('restore card', () => {
     await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
     await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
     await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    // Wait for the replace plan, so the disabled below is about the missing word and
+    // not about a plan that had not landed yet.
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
     expect(screen.getByTestId('restore-button')).toBeDisabled()
     await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLAC')
     expect(screen.getByTestId('restore-button')).toBeDisabled()
     await userEvent.type(screen.getByTestId('replace-confirm'), 'E')
-    expect(screen.getByTestId('restore-button')).toBeEnabled()
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
   })
 
   it('re-previews when the mode changes, so the counts match the mode', async () => {
@@ -618,6 +656,11 @@ describe('restore card', () => {
     await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
     await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
     await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    // The delete sentence and the write have to be about the same operation: the mock
+    // echoes the mode that was asked for and counts what `replace` would really
+    // delete, so the line below is the plan for the request about to be sent.
+    await waitFor(() => expect(screen.getByTestId('preview-summary'))
+      .toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.'))
     await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
     await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
 
@@ -685,6 +728,28 @@ describe('restore card', () => {
     expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 
+  it('treats a 200 that is not the outcome as an unknown, not a success', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) return jsonResponse({ ok: true })
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    // A 200 whose body is not the outcome is an answer that cannot be read, which is
+    // the same unknown as no answer: the write may have landed, so nothing may be
+    // claimed about it and nothing may be offered on top of it.
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('could not be confirmed'))
+    expect(screen.queryByTestId('restore-result')).toBeNull()
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
   it('asks for the typed confirmation again after a mode switch back to replace', async () => {
     render(<BackupPanel portfolios={portfolios} />)
     await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
@@ -700,4 +765,226 @@ describe('restore card', () => {
     expect(screen.getByTestId('replace-confirm')).toHaveValue('')
     expect(screen.getByTestId('restore-button')).toBeDisabled()
   })
+  it('discards the typed words on a mode switch even with no file chosen', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    // No preview runs when there is no file, so this is the mode switch on its own: the
+    // words were typed about an operation that has just been walked away from, and a
+    // box that still reads REPLACE on the way back is Ruling 3 broken in plain sight.
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await userEvent.click(screen.getByRole('radio', { name: /copy/i }))
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    expect(screen.getByTestId('replace-confirm')).toHaveValue('')
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('disarms the card after a restore, so a second write needs a fresh look', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    restoreSucceeds()
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+
+    // One restore is one write. An armed button makes the next click a second write:
+    // a silent duplicate in `copy`, and in `replace` a second deletion of everything,
+    // on the strength of a word typed before the first restore had landed.
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    // The record of what was written stays, and the read-only way back is offered.
+    expect(screen.getByTestId('restore-result')).toHaveTextContent('Restored 1 portfolio, 2 assets, 3 transactions.')
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+
+    // A fresh preview re-arms it, so this is friction and not a dead end.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+  })
+
+  it('takes the typed words with a restore that succeeded', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+
+    restoreSucceeds()
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+
+    // The box still says what was deleted last time, which is not a promise about the
+    // next time. Empty is the only honest value once the write is done.
+    expect(screen.getByTestId('replace-confirm')).toHaveValue('')
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('takes the typed words with a re-preview of the same file', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+
+    // The retry Ruling 1 mandates is not a no-op: the second answer is a different set
+    // of counts -- it can count more to delete than the first -- and the words were
+    // read against the first. They go, and the box says so by going empty.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('preview-button')).toBeEnabled())
+    expect(screen.getByTestId('replace-confirm')).toHaveValue('')
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+  })
+
+  it('refuses a preview answer whose echoed mode is not the one it asked for', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    // The delete sentence is rendered from the plan and the write is sent from the
+    // component's own mode, so a plan that answers a different question than the one
+    // asked would have the card describing one operation while performing the other.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ mode: 'copy' }))
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('refuses a preview answer that is not a plan at all', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      // The right mode, the right prices, and an `insert` that is not three counts: a
+      // proxy that echoed the request and mangled the body on the way past it. The
+      // failure this prevents is the quiet one: `countList(plan.insert)` reading
+      // `portfolios` off the string 'two' throws during render, and with no error
+      // boundary anywhere in this app the page would go blank at the moment the user is
+      // deciding whether to destroy their data.
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          mode: 'copy', prices: 0, warnings: [], ok: true,
+          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          insert: 'two',
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.getByTestId('restore-card')).toBeInTheDocument()
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('refuses a plan with no warnings to render', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      // Every count on it is fine; the array the summary maps over is simply not there.
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          schema_version: 1, mode: 'copy', prices: 0,
+          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          insert: { portfolios: 1, assets: 2, transactions: 3 },
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('locks the file and the mode while a write is in flight', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+
+    let release!: (res: Response) => void
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return new Promise<Response>((resolve) => { release = resolve })
+      }
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(release).toBeDefined())
+
+    // The summary describes the write that is in flight. Choosing a different file or a
+    // different mode now would leave the card reading one operation and performing
+    // another — the mismatch every other guard here exists to prevent.
+    expect(screen.getByTestId('bundle-file')).toBeDisabled()
+    expect(screen.getByRole('radio', { name: /copy/i })).toBeDisabled()
+    expect(screen.getByRole('radio', { name: /replace/i })).toBeDisabled()
+
+    await act(async () => {
+      release(jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
+        portfolio_ids: [7], prices_inserted: 0 }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
+    expect(screen.getByTestId('bundle-file')).toBeEnabled()
+    expect(screen.getByRole('radio', { name: /copy/i })).toBeEnabled()
+  })
+
+  it('says what it leaves out of a bundle that carries price history', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ prices: 4200 }))
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    // The card never sends `apply_prices`, so these rows are not coming. Saying so is
+    // the difference between a bundle restored and a bundle restored except for the
+    // part nobody mentioned.
+    await waitFor(() => expect(screen.getByTestId('preview-prices'))
+      .toHaveTextContent('4200 price rows in this bundle will be left alone'))
+    // Still a plan, still restorable: naming what is left out is not a refusal.
+    expect(screen.getByTestId('preview-summary')).toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeEnabled()
+  })
+
+  it('posts the bytes of the file that was chosen, to both routes', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile('mine.json', 'The Chosen One'))
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+    restoreSucceeds()
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+
+    // Both bodies are the file's own bytes, not a body the component assembled: a
+    // preview of one bundle and a write of another is the mismatch every other guard
+    // here is built to rule out.
+    const bodies = fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/backup/preview') || String(url).includes('/backup/restore'))
+      .map(([, init]) => String((init as { body: string }).body))
+    expect(bodies).toHaveLength(2)
+    for (const body of bodies) {
+      expect(JSON.parse(body).portfolios[0].name).toBe('The Chosen One')
+    }
+  })
+
 })
+
