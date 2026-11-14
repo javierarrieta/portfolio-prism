@@ -73,7 +73,7 @@ CREATE TABLE users (
     email         TEXT,
     name          TEXT,
     is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-    token_version INTEGER NOT NULL DEFAULT 0,
+    token_version BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL,
     last_login_at TIMESTAMPTZ
 );
@@ -134,13 +134,29 @@ CREATE TABLE historical_prices (
 
 CREATE TABLE split_sync (
     asset_id       BIGINT NOT NULL REFERENCES assets(id),
-    last_synced_at TIMESTAMPTZ NOT NULL,
+    last_synced_at DATE NOT NULL,
     covered_from   DATE,
     PRIMARY KEY (asset_id)
 );
 ```
 
 Notes on what changed and why:
+
+- **`users.token_version` is `BIGINT`, not `INTEGER`.** It is read as `i64` on every
+  authenticated request (`auth/guard.rs:31`, `:82`, `:119`; `auth/oidc.rs:236`, `:275`,
+  `:316`), and `sqlx-postgres` will not decode `INT4` into `i64` — an `INTEGER`
+  column would fail every guard in the app with a mismatched-types error. An
+  earlier draft of this section said `INTEGER`.
+- **`split_sync.last_synced_at` is `DATE`, not `TIMESTAMPTZ`.** It is written as
+  `Utc::now().date_naive()` (`currency_service.rs:894`, bound `:999`) and read back
+  as a `String` parsed with `%Y-%m-%d` (`:916`, `:924`), then surfaced verbatim as
+  `splits_last_synced_at` (`api_routes/portfolios.rs:71`, `:91`). A `timestamptz`
+  comes back as `2026-11-14 00:00:00+00`, which no `%Y-%m-%d` parse accepts, and
+  under `sqlx-postgres` the read fails even earlier: `String` is not a decodable
+  target for a date column at all, so it is a loud mismatched-types error rather
+  than the silent throttle failure first predicted. Either way the column is
+  `DATE`, and the Rust side must decode `NaiveDate` and format the API string
+  explicitly.
 
 - **`split_sync`'s key.** `init_db` migrated this table's key over the course of
   several releases (`migrate_split_key`, `migrate_split_sync_key`). The Postgres
@@ -171,30 +187,43 @@ Notes on what changed and why:
 These are not rewrites. They are places where Postgres is not SQLite and the
 difference reaches the API.
 
-### 5.1 Foreign keys were never enforced, and now they are
+### 5.1 Foreign keys: two of them are new, and those are the ones to audit
 
-`PRAGMA foreign_keys` is **never set anywhere in the codebase** — the only
-occurrences of the string are in a comment (`backup/restore.rs:255,258`). SQLite
-foreign keys are off unless that pragma is on per connection, so every
-`FOREIGN KEY` clause in `init_db` has been decorative since the day it was
-written. Postgres enforces them always.
+An earlier draft of this section claimed `PRAGMA foreign_keys` was never set and
+that every `FOREIGN KEY` in `init_db` had therefore been decorative. **That was
+wrong.** `sqlx-sqlite` sets `foreign_keys=ON` on every connection by default
+(`sqlx-sqlite-0.8.6/src/options/mod.rs:183-185`), so `backup/restore.rs:258`
+("`foreign_keys` is ON in this app") was the accurate statement and the draft was
+not. `assets.portfolio_id` and `transactions.asset_id` are enforced today, so
+making them `REFERENCES` in Postgres changes nothing.
 
-Two consequences, and the second is the dangerous one:
+What is genuinely new in `0001_init.sql` is two relationships SQLite never
+constrained:
+
+1. `portfolios.owner_id → users(id)`. SQLite added the column by a bare `ALTER`
+   (`lib.rs:259`) with no foreign key, so an orphaned `owner_id` is possible.
+2. `split_sync.asset_id → assets(id)`. Lower risk than it looks: `split_sync` is
+   not part of the backup bundle at all — `backup/restore.rs` only ever `DELETE`s
+   from it (`:262`) and `export.rs` never writes it — so nothing crosses the
+   cutover boundary through this table.
+
+Postgres enforces all of them always, so:
 
 1. Writes that today create an orphan row will now fail with a constraint
    violation. That is an improvement, but it is a new 500/400 path that no test
    covers yet.
-2. **Existing SQLite data may already contain orphans, and the export will drop
-   them silently.** The bundle is nested — portfolio → assets → transactions — so
-   a transaction whose `asset_id` no longer exists is not under any asset and is
-   therefore never exported. Nothing reports it. Same for an asset whose
-   `portfolio_id` points at a deleted portfolio.
+2. **Existing SQLite data may already contain orphans, and the export would drop
+   them silently.** The bundle is nested — portfolio → assets → transactions — so a
+   transaction whose `asset_id` no longer exists is not under any asset and is
+   therefore never exported. Nothing reports it. This is now much less likely for
+   `assets`/`transactions` than the first draft claimed, because those two were
+   already enforced; it remains a live possibility for `owner_id`.
 
    **Required before cutover:** run the orphan audit (§11 step 2) against the live
-   database and record the counts. If any are non-zero, the cutover does not
-   proceed until they are either repaired or explicitly accepted as loss, in
-   writing, by the operator. This is the one place in the spec where silent data
-   loss is possible.
+   database across all four relationships and record the counts. If any are
+   non-zero, the cutover does not proceed until they are either repaired or
+   explicitly accepted as loss, in writing, by the operator. This is the one place
+   in the spec where silent data loss is possible.
 
 ### 5.2 `i32` → `i64` everywhere an id crosses the boundary
 
