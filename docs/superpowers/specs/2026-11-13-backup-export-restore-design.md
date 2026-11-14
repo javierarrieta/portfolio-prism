@@ -145,8 +145,10 @@ be worse than leaving it clean.
 - `schema_version` — integer. See *Versioning*.
 - `created_at` — RFC 3339 UTC, informational. Excluded from the round-trip equality test.
 - `portfolios[]` — one entry per selected portfolio. `ref` is a bundle-local label
-  (`p1`, `p2`, …), unique within the bundle, used only to rewire parent/child links during
-  restore. It is never a database id and is never persisted.
+  (`p1`, `p2`, …), unique within the bundle, so validation can refuse two rows that
+  claim the same label. It is never a database id, it is never persisted, and the write
+  path never reads one: the parent/child link comes from the bundle's nesting, and each
+  stored link comes from the freshly allocated id of the insert that made the row.
 - `assets[]` — nested in its portfolio. `ref` as above (`a1`, …).
 - `transactions[]` — nested in its asset. No `ref`: nothing references a transaction.
 - `prices[]` — optional, absent unless requested at export time. Flat, keyed
