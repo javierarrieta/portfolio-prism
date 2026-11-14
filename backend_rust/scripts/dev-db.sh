@@ -21,9 +21,21 @@ else
          -l "$DATA/log" -w start
 fi
 
-psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "alter role postgres createdb"
-psql "postgres://postgres@127.0.0.1:$PORT/postgres" -tAc \
-  "select 1 from pg_database where datname='prism'" | grep -q 1 \
-  || psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "create database prism"
+URI="postgres://postgres@127.0.0.1:$PORT/postgres"
+
+# `command -v initdb` cannot tell the two toolchains apart: the image's 18.6 is on
+# PATH and its server will open a cluster built by 18.7 (spec §9.1). Ask what is
+# actually answering instead.
+V=$(psql "$URI" -tAc 'show server_version')
+case "$V" in
+  18.*) ;;
+  *) echo "need PostgreSQL 18.x, got $V — run inside: nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'"; exit 1;;
+esac
+echo "server $V"
+
+psql "$URI" -qc "alter role postgres createdb"
+if [ "$(psql "$URI" -tAc "select 1 from pg_database where datname='prism'")" != "1" ]; then
+  psql "$URI" -qc "create database prism"
+fi
 
 echo "DATABASE_URL=postgres://postgres@127.0.0.1:$PORT/prism"
