@@ -203,6 +203,15 @@ CREATE TABLE transactions (
 );
 CREATE INDEX transactions_asset_date_idx ON transactions (asset_id, date);
 
+-- Split dedupe, carried over from SQLite's partial unique index of the same name.
+-- apply_split_events has no read-based check; the conflict IS the dedupe, so
+-- without this index bug #50 (doubled split adjustments, corrupted cost basis)
+-- returns silently. Expression-wrapped because date_trunc('day', …) is STABLE
+-- and unindexable; AT TIME ZONE 'UTC' is IMMUTABLE. Key = the UTC calendar day.
+CREATE UNIQUE INDEX uq_split_asset_date
+    ON transactions (asset_id, ((date at time zone 'UTC')::date))
+    WHERE type = 'SPLIT';
+
 CREATE TABLE historical_prices (
     symbol      TEXT NOT NULL,
     date        DATE NOT NULL,
@@ -218,24 +227,29 @@ CREATE TABLE split_sync (
 );
 ```
 
-- [ ] **Step 2: Check `split_sync` against the live shape before trusting it**
+- [ ] **Step 2: Confirm `split_sync`'s key against the code**
 
-The spec flags this as the most reshaped table (§4 note). Read what the SQLite code actually leaves behind:
+The spec flags this as the most reshaped table (§4 note). Read what the SQLite code actually leaves behind — `migrate_split_sync_key` and `enforce_split_uniqueness` in `backend_rust/src/lib.rs`, and the readers in `currency_service.rs`.
 
-```bash
-grep -n "split_sync" backend_rust/src/lib.rs | head -20
-```
+Resolved before this plan ran, on a workspace with no `portfolio.db` to inspect: the key **is `asset_id` alone**. Evidence: no `effective_date` column exists anywhere in the tree; `currency_service.rs:916` does a `fetch_optional` on `WHERE asset_id = ?`, which would raise `MultipleRowsFound` under a composite key; `transactions.rs:175` and `backup/restore.rs:262` delete by `asset_id` alone. Re-check that chain rather than trusting it blindly, and say in your report whether the deployed production database could still differ — it is the only real authority, and that check belongs in Task 10's cutover runbook.
 
-Read `migrate_split_sync_key` and `enforce_split_uniqueness` in full. If the deployed shape's unique key is `(asset_id, effective_date)` rather than `asset_id` alone, change the `PRIMARY KEY` above to match and record the reason in a comment. Do not guess: the queries in `currency_service.rs:997,1469` are written against one of the two shapes and Task 3 will not compile against the wrong one.
+Do not confuse this with `uq_split_asset_date`, which is on `transactions`, not `split_sync`; an earlier draft of the spec note conflated them.
+
+- [ ] **Step 2b: Confirm the split-dedupe index is in the migration**
+
+`uq_split_asset_date` is the one constraint the spec's §4 draft omitted and the app depends on. `apply_split_events` (`currency_service.rs:120-140`) inserts with `ON CONFLICT DO NOTHING` and has no read-based check of its own, so if the index is missing nothing conflicts and duplicated splits corrupt cost basis in silence. It must be in `0001_init.sql` — not a later migration: `0001` has been applied to nothing but your throwaway database, so §7's no-editing-shipped-migrations rule does not apply to it yet.
 
 - [ ] **Step 3: Apply it to a throwaway database**
 
 ```bash
 nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
-createdb "postgres://postgres@127.0.0.1:55432/postgres" prism_migrations
-sqlx migrate run --database-url "postgres://postgres@127.0.0.1:55432/prism_migrations" \
-  --migrations backend_rust/migrations
+psql "postgres://postgres@127.0.0.1:55432/postgres" -qc "create database prism_migrations"
+nix-shell -p sqlx-cli --run 'sqlx migrate run --no-dotenv \
+  --database-url "postgres://postgres@127.0.0.1:55432/prism_migrations" \
+  --source backend_rust/migrations'
 ```
+
+Measured against sqlx-cli 0.9, not copied from the first draft of this step: the flag is `--source`, **not** `--migrations`, and the CLI reads a `.env` unless you pass `--no-dotenv`. `createdb` is not usable here — the client in this workspace (18.6) has no `-d/--dbname`, so a URI in the first position is not accepted; create the database with `psql -qc "create database …"` instead.
 
 Expected: `Applied 0001_init.sql`. If `sqlx` CLI is absent, `cargo install sqlx-cli --no-default-features --features postgres` once, or use `nix-shell -p sqlx-cli`.
 
@@ -268,6 +282,15 @@ want transactions       price         text
 want historical_prices  date          date
 want historical_prices  close_price   text
 want users              is_active     boolean
+
+has_index() { # index name — presence only, so a renamed index still fails
+  psql "$DATABASE_URL" -tAc \
+    "select count(*) from pg_indexes
+      where schemaname='public' and indexname='$1'" | tr -d '[:space:]'
+}
+[ "$(has_index uq_split_asset_date)" = "1" ] \
+  || { echo "FAIL uq_split_asset_date missing — split dedupe is enforced by this index alone (bug #50)"; exit 1; }
+echo "ok   uq_split_asset_date present"
 echo "schema shape ok"
 ```
 
@@ -290,7 +313,17 @@ bundle rule that ids are never trusted from the file.
 DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism_migrations" bash backend_rust/scripts/check_migrations.sh
 ```
 
-Expected: a line of `ok` per column and `schema shape ok`. Then temporarily change `date TIMESTAMPTZ` to `date TEXT` in the migration, re-apply to a fresh database, re-run, and confirm it FAILS with `FAIL transactions.date is 'text', expected 'timestamp with time zone'`. Revert the migration. A gate that has never been seen to fail is not a gate.
+Expected: a line of `ok` per column, `ok uq_split_asset_date present`, and `schema shape ok`. Then break it, on fresh databases, and record every failure with its real output.
+
+The mutation this step originally prescribed — `date TIMESTAMPTZ` → `date TEXT` — **cannot produce the expected gate message**, and that is worth knowing rather than working around: `uq_split_asset_date` is an expression index over that column, so changing its type makes the migration itself refuse to apply (`function pg_catalog.timezone(unknown, text) does not exist`) and the gate never reaches its own verdict. It still fails closed, and the schema turns out to pin its own types for free. Use mutations that apply, and say so in the report:
+
+1. `historical_prices.date DATE` → `TIMESTAMPTZ` (a column nothing else depends on) → expect the type `FAIL` line.
+2. `transactions.price TEXT` → `NUMERIC(18,8)` → expect the money-is-TEXT `FAIL` line.
+3. Drop `GENERATED ALWAYS AS IDENTITY` from one id → expect the identity `FAIL`.
+4. Delete the `uq_split_asset_date` index → expect the index `FAIL`. This is the mutation that matters most: a gate that checked only tables and column types would have shipped the schema that reopens bug #50.
+5. Weaken the index three ways — make it non-unique, drop the `WHERE type = 'SPLIT'` predicate, and change the expression off the UTC day — and confirm each is caught separately.
+
+Revert the migration after each. A gate that has never been seen to fail is not a gate.
 
 - [ ] **Step 6: Commit**
 
@@ -406,7 +439,7 @@ sqlx::query(
 )
 ```
 
-`currency_service.rs:997` becomes:
+`currency_service.rs:997` becomes (this `ON CONFLICT` target was a guess in the first draft of this plan; Task 2 confirmed `PRIMARY KEY (asset_id)` against the readers and the delete sites):
 
 ```rust
 "INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) \
@@ -961,7 +994,7 @@ env -u DATABASE_URL cargo check --all-targets
 set -euo pipefail
 : "${DATABASE_URL:?run scripts/dev-db.sh and export DATABASE_URL}"
 cd "$(dirname "$0")/.."
-sqlx migrate run || { echo "migrations must be applied before --check"; exit 1; }
+sqlx migrate run --no-dotenv || { echo "migrations must be applied before --check"; exit 1; }
 cargo sqlx prepare --check -- --all-targets
 ```
 
@@ -1013,7 +1046,7 @@ and in `steps`, before `Run Tests`:
 
       - name: Migrate
         env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
-        run: sqlx migrate run
+        run: sqlx migrate run --no-dotenv
         working-directory: backend_rust
 
       - name: Prepare cache is current
@@ -1027,7 +1060,7 @@ and add `DATABASE_URL` to the env of the existing `Run Tests` step.
 
 - [ ] **Step 2: Update the documented gate list**
 
-In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it.
+In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it. Say explicitly that `check_migrations.sh` inspects a **database**, not the migration file — it will happily pass against a stale schema — so it is only meaningful after `sqlx migrate run` on a database nobody has touched since.
 
 - [ ] **Step 3: Verify locally in the same order**
 

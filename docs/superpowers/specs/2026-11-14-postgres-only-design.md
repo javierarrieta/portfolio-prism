@@ -112,6 +112,17 @@ CREATE TABLE transactions (
 );
 CREATE INDEX transactions_asset_date_idx ON transactions (asset_id, date);
 
+-- Split dedupe. SQLite enforced this with a partial unique index
+-- (`uq_split_asset_date`, added after bug #50: a duplicated split adjustment
+-- silently corrupts cost basis). `apply_split_events` has no read-based check of
+-- its own — it inserts and lets the conflict do the dedupe — so dropping this
+-- index reopens that bug. The expression is wrapped because `date_trunc('day', …)`
+-- is STABLE and cannot be indexed; `AT TIME ZONE 'UTC'` is IMMUTABLE. The dedupe
+-- key is therefore the UTC calendar day, matching what SQLite's `date(date)`
+-- produced from the stored value.
+CREATE UNIQUE INDEX uq_split_asset_date ON transactions (asset_id, ((date at time zone 'UTC')::date))
+    WHERE type = 'SPLIT';
+
 -- No owner_id, deliberately: same as today, and the reason price restore stays
 -- flag-gated. Composite PK replaces the unique index SQLite needed.
 CREATE TABLE historical_prices (
@@ -132,11 +143,19 @@ CREATE TABLE split_sync (
 Notes on what changed and why:
 
 - **`split_sync`'s key.** `init_db` migrated this table's key over the course of
-  several releases (`migrate_split_key`, `enforce_split_uniqueness`,
-  `uq_split_asset_date`). The Postgres schema states the intended end state once.
-  Confirm the live shape against the deployed SQLite database before writing
-  `0001` — the migration file must match what the app's queries assume, and
-  `split_sync` is the table that has been reshaped most.
+  several releases (`migrate_split_key`, `migrate_split_sync_key`). The Postgres
+  schema states the intended end state once: `PRIMARY KEY (asset_id)`. That was
+  confirmed against the code, not guessed — no `effective_date` column exists
+  anywhere in the tree, `currency_service.rs:916` does a `fetch_optional` on
+  `WHERE asset_id = ?` (a composite key would raise `MultipleRowsFound`), and both
+  `transactions.rs:175` and `backup/restore.rs:262` delete by `asset_id` alone.
+  An earlier draft of this note listed `enforce_split_uniqueness` and
+  `uq_split_asset_date` as part of that history; they are not — that index is on
+  `transactions` and is reproduced above.
+- **`uq_split_asset_date` is load-bearing.** A schema review that only compares
+  tables and column types will miss it, which is why the migration shape gate
+  asserts the index exists, is unique, is partial on `type = 'SPLIT'`, and is
+  expressed on the UTC day.
 - **Three new indexes** (`portfolios_owner_idx`, `assets_portfolio_idx`,
   `transactions_asset_date_idx`). SQLite has none beyond the three unique indexes,
   because its rowid tables made some lookups cheap enough. Every authorisation
