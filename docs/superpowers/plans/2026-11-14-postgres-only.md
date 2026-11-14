@@ -1,0 +1,1096 @@
+# Postgres-only backend Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Replace SQLite with Postgres as the only database engine, with the schema under versioned migrations and the data path unchanged for users.
+
+**Architecture:** One engine, Postgres, with the schema in numbered `.sql` files compiled into the binary by `sqlx::migrate!`. The hand-written `init_db` and its `PRAGMA`-based startup migrations are deleted. Queries keep their `?`-free Postgres placeholders and move to compile-time-checked macros with a committed prepare cache. Existing SQLite data arrives through the backup bundle (#64), not through a converter.
+
+**Tech Stack:** Rust 2024, Rocket 0.5, sqlx 0.8 (`postgres`), `rust_decimal` (unchanged), PostgreSQL 18.x (production 18.6 on CloudNativePG, local 18.7 via nix-shell, CI `postgres:18`).
+
+**Spec:** `docs/superpowers/specs/2026-11-14-postgres-only-design.md` — every task below argues from it; §-references in this plan are that file's sections.
+
+## Global Constraints
+
+- **Postgres only.** No engine flag, no dialect abstraction, no `sqlite` feature in `Cargo.toml`. SQLite is a historical fact, not a supported engine (§2).
+- **Money stays `TEXT`.** No `NUMERIC`/`DECIMAL` column in this work (§3).
+- **Dates are native.** `TIMESTAMPTZ` for timestamps, `DATE` for `historical_prices.date` (§3).
+- **Ids are `BIGINT GENERATED ALWAYS AS IDENTITY`, Rust `i64`.** `sqlx-postgres` refuses `int8`→`i32` (§3, §5.2).
+- **Foreign keys are enforced.** Do not add `PRAGMA`-equivalent workarounds; do not add `ON DELETE CASCADE` (§4, §5.1).
+- **Test output must be pristine** — no warnings, no ignored tests left behind.
+- **Any task that changes a route regenerates `docs/openapi/openapi.json` and `frontend/src/types/api.d.ts` in the same commit** (`cd backend_rust && cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json`, then `cd frontend && npm run generate-types`).
+- **Branch per feature; never work on `main`.** Commits are local; do not push or open a PR without explicit operator confirmation.
+- **Commands run from `backend_rust/`** unless a step says otherwise.
+- **Local database:** `bash scripts/dev-db.sh` (Task 1). `DATABASE_URL` must be exported in every shell that builds or tests.
+
+## Review Focus
+
+The spec's own tests will not cover these; each line gets a test in the task that owns the code.
+
+1. **Orphan rows in pre-existing SQLite data.** A transaction whose `asset_id` no longer exists is invisible to the nested bundle and is silently dropped at cutover (§5.1). Expected behavior: the cutover audit reports the count and a non-zero count stops the cutover — Task 6.
+2. **Two restores running at once under `SERIALIZABLE`.** Postgres answers `40001`, SQLite answered `SQLITE_BUSY`; the client must still see `503` with `Retry-After`, never a 500 (§5.4) — Task 7.
+3. **A stale `.sqlx` prepare cache.** It compiles and lies: the query is checked against the schema as it was when the cache was generated (§8). Expected behavior: CI fails before compilation, naming the drifted query — Task 8, Task 9.
+4. **A transaction date that is not a full RFC 3339 timestamp.** `TIMESTAMPTZ` will reject what `TEXT` accepted, and the CSV import path is where that arrives. Expected behavior: a `422` naming the row, not a 500 — Task 4.
+5. **Pool exhaustion during a long export.** Export holds a connection for its whole duration (#64 follow-up 3) and `statement_timeout` is the only backstop (§10). Expected behavior: `503` with `Retry-After` after `acquire_timeout`, not a hung request — Task 7.
+
+---
+
+### Task 1: The local database script
+
+**Files:**
+- Create: `backend_rust/scripts/dev-db.sh`
+- Create: `backend_rust/scripts/dev-db-stop.sh`
+- Modify: `AGENTS.md` (the *Commands* and *Backend gates* sections)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: a running PostgreSQL 18.x on `127.0.0.1:55432`, database `prism`, role `postgres` with `CREATEDB`, and the exported `DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism`. Every later task assumes these exact values.
+
+- [ ] **Step 1: Write the start script**
+
+```bash
+#!/usr/bin/env bash
+# Local PostgreSQL for development and tests. Postgres-only since the engine
+# switch: there is no SQLite path to fall back to.
+#
+# nix-shell rather than a container because rootless podman cannot create a
+# usable user namespace in this workspace (spec §9.2: the kernel refuses a
+# multi-range uid_map even with the setuid helper installed). nixpkgs'
+# postgresql_18 is 18.7; production is 18.6. Same major, and nothing in the
+# schema depends on the difference.
+set -euo pipefail
+PORT="${PRISM_PG_PORT:-55432}"
+DATA="${PRISM_PG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/prism-pg}"
+
+if [ -s "$DATA/PG_VERSION" ] && pg_ctl -D "$DATA" status >/dev/null 2>&1; then
+  echo "already running on 127.0.0.1:$PORT (data: $DATA)"
+else
+  command -v initdb >/dev/null || { echo "initdb not on PATH — run inside: nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'"; exit 1; }
+  [ -s "$DATA/PG_VERSION" ] || { mkdir -p "$DATA"; initdb -D "$DATA" -U postgres -A trust --no-sync; }
+  mkdir -p "$DATA/sock"
+  pg_ctl -D "$DATA" -o "-p $PORT -k $DATA/sock -c listen_addresses=127.0.0.1" \
+         -l "$DATA/log" -w start
+fi
+
+psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "alter role postgres createdb"
+psql "postgres://postgres@127.0.0.1:$PORT/postgres" -tAc \
+  "select 1 from pg_database where datname='prism'" | grep -q 1 \
+  || psql "postgres://postgres@127.0.0.1:$PORT/postgres" -qc "create database prism"
+
+echo "DATABASE_URL=postgres://postgres@127.0.0.1:$PORT/prism"
+```
+
+- [ ] **Step 2: Write the stop script**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+DATA="${PRISM_PG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/prism-pg}"
+pg_ctl -D "$DATA" -m fast -w stop
+```
+
+- [ ] **Step 3: Make both executable and prove the cycle**
+
+```bash
+chmod +x backend_rust/scripts/dev-db.sh backend_rust/scripts/dev-db-stop.sh
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
+psql "postgres://postgres@127.0.0.1:55432/prism" -tAc 'select current_setting($$server_version$$)'
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db-stop.sh'
+```
+
+Expected: the start line prints `DATABASE_URL=...`, the `psql` prints `18.7`, the stop prints nothing and exits 0. Run the start script **twice** — the second run must print `already running` rather than failing.
+
+- [ ] **Step 4: Document it**
+
+In `AGENTS.md`, under *Commands → Backend*, add:
+
+```
+- **Local database**: `nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'`
+  (from `backend_rust/`). Prints the `DATABASE_URL` to export. Stop with
+  `scripts/dev-db-stop.sh`. There is no SQLite fallback: the engine is Postgres
+  only, and the tests run against the same engine as production.
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend_rust/scripts/dev-db.sh backend_rust/scripts/dev-db-stop.sh AGENTS.md
+git commit -m "chore(db): local postgres 18 harness for the postgres-only switch"
+```
+
+---
+
+### Task 2: The schema as a migration
+
+**Files:**
+- Create: `backend_rust/migrations/0001_init.sql`
+- Create: `backend_rust/scripts/check_migrations.sh`
+
+**Interfaces:**
+- Consumes: the running database from Task 1.
+- Produces: `migrations/0001_init.sql`, applied by `sqlx migrate` in Task 3 and by `sqlx::migrate!` at runtime. Table and column names here are what every later query is written against.
+
+Policy, from spec §7, because it is the kind of rule that gets broken by accident
+later: `0001_init.sql` is the whole schema and there is no historical replay — the
+data arrives as a bundle into a fresh database, so there is nothing to migrate
+incrementally. Every change after this is a new numbered file. **Never edit a
+shipped migration**; `_sqlx_migrations` is the ledger and the migrator creates it.
+
+- [ ] **Step 1: Write the migration**
+
+Copy the DDL from spec §4 verbatim, with one change to make after Step 3: the `split_sync` key.
+
+```sql
+-- 0001_init.sql
+CREATE TABLE users (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    issuer        TEXT NOT NULL,
+    subj          TEXT NOT NULL,
+    email         TEXT,
+    name          TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    token_version INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL,
+    last_login_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX uq_users_issuer_subj ON users (issuer, subj);
+
+CREATE TABLE portfolios (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id      BIGINT REFERENCES users(id),
+    name          TEXT NOT NULL,
+    description   TEXT,
+    currency      TEXT NOT NULL DEFAULT 'USD',
+    base_currency TEXT NOT NULL DEFAULT 'USD'
+);
+CREATE INDEX portfolios_owner_idx ON portfolios (owner_id);
+
+CREATE TABLE assets (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    portfolio_id BIGINT NOT NULL REFERENCES portfolios(id),
+    symbol       TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    asset_type   TEXT NOT NULL,
+    sector       TEXT,
+    currency     TEXT NOT NULL DEFAULT 'USD',
+    isin         TEXT
+);
+CREATE INDEX assets_portfolio_idx ON assets (portfolio_id);
+
+CREATE TABLE transactions (
+    id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    asset_id BIGINT NOT NULL REFERENCES assets(id),
+    type     TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    price    TEXT NOT NULL,
+    fee      TEXT NOT NULL,
+    date     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX transactions_asset_date_idx ON transactions (asset_id, date);
+
+CREATE TABLE historical_prices (
+    symbol      TEXT NOT NULL,
+    date        DATE NOT NULL,
+    close_price TEXT NOT NULL,
+    PRIMARY KEY (symbol, date)
+);
+
+CREATE TABLE split_sync (
+    asset_id       BIGINT NOT NULL REFERENCES assets(id),
+    last_synced_at TIMESTAMPTZ NOT NULL,
+    covered_from   DATE,
+    PRIMARY KEY (asset_id)
+);
+```
+
+- [ ] **Step 2: Check `split_sync` against the live shape before trusting it**
+
+The spec flags this as the most reshaped table (§4 note). Read what the SQLite code actually leaves behind:
+
+```bash
+grep -n "split_sync" backend_rust/src/lib.rs | head -20
+```
+
+Read `migrate_split_sync_key` and `enforce_split_uniqueness` in full. If the deployed shape's unique key is `(asset_id, effective_date)` rather than `asset_id` alone, change the `PRIMARY KEY` above to match and record the reason in a comment. Do not guess: the queries in `currency_service.rs:997,1469` are written against one of the two shapes and Task 3 will not compile against the wrong one.
+
+- [ ] **Step 3: Apply it to a throwaway database**
+
+```bash
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
+createdb "postgres://postgres@127.0.0.1:55432/postgres" prism_migrations
+sqlx migrate run --database-url "postgres://postgres@127.0.0.1:55432/prism_migrations" \
+  --migrations backend_rust/migrations
+```
+
+Expected: `Applied 0001_init.sql`. If `sqlx` CLI is absent, `cargo install sqlx-cli --no-default-features --features postgres` once, or use `nix-shell -p sqlx-cli`.
+
+- [ ] **Step 4: Write the shape gate**
+
+A Rust test cannot do this yet: `Cargo.toml` still carries the `sqlite` feature
+until Task 3, so `sqlx::PgConnection` does not exist. The gate is a shell script
+over `psql`, which is why it is `scripts/check_migrations.sh` and not a test file.
+
+```bash
+#!/usr/bin/env bash
+# The migration is the schema. This pins the column types the rest of the codebase
+# is written against, so 0001_init.sql cannot drift silently into something the
+# queries disagree with. Shell rather than a Rust test because it has to run
+# during the engine switch, before sqlx's postgres feature exists.
+set -euo pipefail
+: "${DATABASE_URL:?run scripts/dev-db.sh and export DATABASE_URL}"
+want() { # table column type
+  local t
+  t=$(psql "$DATABASE_URL" -tAc \
+    "select data_type from information_schema.columns
+      where table_schema='public' and table_name='$1' and column_name='$2'")
+  [ "$t" = "$3" ] || { echo "FAIL $1.$2 is '$t', expected '$3'"; exit 1; }
+  echo "ok   $1.$2 = $3"
+}
+want portfolios         id            bigint
+want transactions       id            bigint
+want transactions       date          "timestamp with time zone"
+want transactions       price         text
+want historical_prices  date          date
+want historical_prices  close_price   text
+want users              is_active     boolean
+echo "schema shape ok"
+```
+
+Identity is checked separately, because `information_schema` reports it as a
+default rather than a type:
+
+```bash
+psql "$DATABASE_URL" -tAc \
+  "select is_identity from information_schema.columns
+    where table_name='portfolios' and column_name='id'" | grep -q YES \
+  || { echo "FAIL portfolios.id must be GENERATED ALWAYS AS IDENTITY"; exit 1; }
+```
+
+That matters: identity refuses a supplied id, which is the SQL expression of the
+bundle rule that ids are never trusted from the file.
+
+- [ ] **Step 5: Run it, and run it once with a deliberate break**
+
+```bash
+DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism_migrations" bash backend_rust/scripts/check_migrations.sh
+```
+
+Expected: a line of `ok` per column and `schema shape ok`. Then temporarily change `date TIMESTAMPTZ` to `date TEXT` in the migration, re-apply to a fresh database, re-run, and confirm it FAILS with `FAIL transactions.date is 'text', expected 'timestamp with time zone'`. Revert the migration. A gate that has never been seen to fail is not a gate.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend_rust/migrations backend_rust/scripts/check_migrations.sh
+git commit -m "feat(db): postgres schema as migration 0001, with a shape gate"
+```
+
+---
+
+### Task 3: The engine switch
+
+This is one atomic change: `sqlx`'s `sqlite` and `postgres` features cannot both serve the same `Pool` type, so the crate does not compile until every reference moves. It is the largest task in the plan and it is deliberately not split — a half-converted tree that compiles is worse than one commit that is reviewed as a whole.
+
+**Files:**
+- Modify: `backend_rust/Cargo.toml:9`
+- Create: `backend_rust/src/db.rs`
+- Modify: `backend_rust/src/lib.rs` (delete `init_db` and the startup migrations, `:138-560`)
+- Modify: `backend_rust/src/main.rs:53-88`
+- Modify: the 13 files that reference `SqlitePool` — `access.rs`, `api_routes/{analytics,portfolios,transactions}.rs`, `auth/{guard,mod,oidc}.rs`, `backup/{export,restore}.rs`, `engines/{stats_engine,tax_engine}.rs`, `lib.rs`, `services/currency_service.rs`
+- Modify: `backend_rust/src/engines/stats_engine.rs:433,539`, `backend_rust/src/services/currency_service.rs:997,1469` (`INSERT OR REPLACE`)
+- Test: the existing suite, unchanged in intent
+
+**Interfaces:**
+- Consumes: `migrations/0001_init.sql` (Task 2).
+- Produces: `pub type DbPool = sqlx::PgPool;` and `pub async fn connect(url: &str) -> Result<DbPool, sqlx::Error>;` in `src/db.rs`. Every later task writes `DbPool`, never `PgPool` directly, so a future change stays one file.
+
+- [ ] **Step 1: Switch the dependency and add the alias module**
+
+`Cargo.toml:9` becomes:
+
+```toml
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate"] }
+```
+
+`src/db.rs`:
+
+```rust
+//! The single place the engine is named. Everything else takes `DbPool`.
+use sqlx::postgres::{PgPoolOptions, PgPoolingOptions};
+use sqlx::Pool;
+
+pub type DbPool = Pool<sqlx::postgres::Postgres>;
+
+/// Build the pool the way `main` does. `acquire_timeout` is what a saturated pool
+/// turns into: a 503 with Retry-After, not a hung request (spec §5.4, §10).
+pub async fn connect(url: &str) -> Result<DbPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(5)
+        .min_connections(0)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .max_lifetime(std::time::Duration::from_secs(4 * 60 * 60))
+        .connect(url)
+        .await
+}
+```
+
+Add `pub mod db;` to `src/lib.rs`.
+
+- [ ] **Step 2: Rename the pool type everywhere**
+
+```bash
+cd backend_rust
+grep -rl "SqlitePool" src | xargs sed -i 's/sqlx::sqlite::SqlitePool/backend_rust::db::DbPool/g; s/\bSqlitePool\b/DbPool/g'
+grep -rn "SqlitePool" src | wc -l   # expect 0
+```
+
+Inside `src/` itself the `backend_rust::` prefix is wrong; fix those to `crate::db::DbPool`. Check with `cargo check` and correct the handful of paths it names.
+
+- [ ] **Step 3: Convert placeholders statement by statement**
+
+`?` is a runtime error under the Postgres driver, not a compile error, so this step is verified by the tests, not the compiler. Convert every `?` to `$n` by its position **within one statement**:
+
+```bash
+python3 - <<'PY'
+import re, pathlib
+# Convert `?` to $n per SQL statement. A statement is one string literal passed to
+# sqlx::query / query_as; placeholders never span statements, so numbering restarts
+# at each literal. Comments are stripped first so a `?` in prose is not counted.
+pat = re.compile(r'(sqlx::query(?:_as)?(?:::<[^>]*>)?\s*\(\s*)("(?:[^"\\]|\\.)*")', re.S)
+def fix(m):
+    head, lit = m.group(1), m.group(2)
+    n = 0
+    out, i = [], 0
+    while i < len(lit):
+        if lit[i] == '?' and not lit[i-1] == '\\':
+            n += 1; out.append(f'${n}')
+        else:
+            out.append(lit[i])
+        i += 1
+    return head + ''.join(out)
+for p in pathlib.Path('src').rglob('*.rs'):
+    s = p.read_text()
+    new = pat.sub(fix, s)
+    if new != s:
+        p.write_text(new)
+        print(p)
+PY
+grep -rn 'sqlx::query' src | grep -c '?'   # expect 0 outside comments
+```
+
+Then read every hit `grep -n '?' src/**/*.rs` still reports and confirm each is prose in a comment, not a live placeholder. The script cannot know the difference; you can.
+
+- [ ] **Step 4: Replace `INSERT OR REPLACE`**
+
+`stats_engine.rs:433` and `:539` become:
+
+```rust
+sqlx::query(
+    "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) \
+     ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+)
+```
+
+`currency_service.rs:997` becomes:
+
+```rust
+"INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) \
+ ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, \
+                                      covered_from   = EXCLUDED.covered_from"
+```
+
+`currency_service.rs:1469` becomes the same with `covered_from` left out of both the column list and the `DO UPDATE` — leaving it in the update clause would null out a value the two-column call does not know about, which is exactly the silent-drop behaviour `INSERT OR REPLACE` had and this port exists to remove.
+
+- [ ] **Step 5: Delete `init_db` and wire the migrator**
+
+Delete `init_db`, `column_exists`, `migrate_decimal_columns`, `migrate_split_key`, `migrate_split_sync_key`, `enforce_price_uniqueness`, `enforce_split_uniqueness`, `add_owner_id_column` from `src/lib.rs` (`:138-560`). In `main.rs`, replace the `SqliteConnectOptions` block, the `busy_timeout` commentary, the WAL/restic commentary and the `init_db` call with:
+
+```rust
+let database_url = std::env::var("DATABASE_URL")
+    .ok()
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| refuse(anyhow::anyhow!(
+        "DATABASE_URL is required. Postgres-only: there is no SQLite fallback. \
+         Local: nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh'"
+    )));
+
+let pool = db::connect(&database_url)
+    .await
+    .map_err(|e| refuse(anyhow::anyhow!("cannot connect to DATABASE_URL: {e}")))?;
+
+// Migrations run on one connection, before the pool serves anything else. This
+// replaces init_db, whose PRAGMA table_info guards were a hand-rolled migrator
+// and the source of the split_sync bug documented at lib.rs:513-519.
+sqlx::migrate!("./migrations")
+    .run(&pool)
+    .await
+    .map_err(|e| refuse(anyhow::anyhow!("migrations failed: {e}")))?;
+```
+
+`refuse` returns `ExitCode`, so adjust each call site to `return Err(...)`/`std::process::exit` to match the existing `main` shape rather than inventing a new one.
+
+- [ ] **Step 6: Point the test harness at Postgres**
+
+`tests/common/mod.rs:137` currently does `SqlitePool::connect(":memory:")`. Replace it with a shared-database version that Task 5 replaces:
+
+```rust
+/// Provisional: one shared Postgres database, truncated between tests.
+/// Task 5 replaces this with a freshly migrated private database per test;
+/// this exists so the suite can run at all the moment the driver switches.
+pub async fn test_pool() -> DbPool {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    let pool = backend_rust::db::connect(&url).await.unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    for t in ["transactions", "split_sync", "assets", "historical_prices", "portfolios", "users"] {
+        sqlx::query(&format!("TRUNCATE {t} RESTART IDENTITY CASCADE"))
+            .execute(&pool).await.unwrap();
+    }
+    pool
+}
+```
+
+`RESTART IDENTITY` is what keeps the `DEFAULT_USER`-style assumptions from breaking
+in a new way: without it, identity sequences keep climbing across tests and any
+test that hard-codes an id fails only when it runs second.
+
+- [ ] **Step 7: Make the suite pass**
+
+```bash
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
+```
+
+Expected: the suite runs against Postgres. Expect failures in three families, and fix each at its cause rather than by editing the assertion: `i32`/`i64` mismatches (Task 4 handles the type surface; fix only what the compiler reports here), date parsing, and `DEFAULT_USER` assumptions from the SQLite `id = 1` placeholder row.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add -A
+git commit -m "feat(db): switch the engine from sqlite to postgres
+
+Cargo feature, the pool type behind src/db.rs, \$n placeholders, INSERT OR
+REPLACE to ON CONFLICT, init_db deleted in favour of sqlx::migrate!,
+DATABASE_URL required. One commit because the crate cannot compile half
+way."
+```
+
+---
+
+### Task 4: `i64` ids and date parsing at the boundary
+
+**Files:**
+- Modify: `backend_rust/src/schemas.rs` (every `pub id: i32`, `portfolio_id`, `asset_id`, `owner_id`)
+- Modify: `backend_rust/src/api_routes/*.rs` (path parameters `web::Path<i32>` → `web::Path<i64>`)
+- Modify: `backend_rust/src/api_routes/portfolios.rs:66,85,106` (`split_sync_age`, `split_sync_ages`, `fetch_assets_for_portfolio`)
+- Modify: `backend_rust/src/backup/{export,restore}.rs`
+- Modify: `backend_rust/src/engines/{stats_engine,tax_engine}.rs`
+- Test: `backend_rust/tests/date_boundary_test.rs` (create)
+
+**Interfaces:**
+- Consumes: Task 3's `DbPool`.
+- Produces: `i64` ids in every public struct in `schemas.rs`. JSON is unchanged — these are numbers either way — so `openapi.json` and `api.d.ts` should show no diff; Step 6 proves that rather than assuming it.
+
+- [ ] **Step 1: Write the failing date test**
+
+`tests/date_boundary_test.rs`:
+
+```rust
+//! `transactions.date` became TIMESTAMPTZ. What TEXT accepted, a real date
+//! column can reject — and the CSV import is where odd shapes arrive. The
+//! expected behaviour is a 422 naming the row, never a 500.
+use backend_rust::schemas::TransactionIn;
+
+#[test]
+fn a_date_only_string_is_rejected_before_it_reaches_the_database() {
+    // serde parses "2026-11-14" into a DateTime<Utc>? Decide by running it, then
+    // pin the answer here either way — this test exists to make the answer
+    // explicit rather than to assert a guess.
+    let parsed = serde_json::from_str::<TransactionIn>(
+        r#"{"asset_id":1,"type":"BUY","quantity":"1","price":"1.0","fee":"0","date":"2026-11-14"}"#,
+    );
+    assert!(parsed.is_err(), "a bare date must not silently become midnight UTC");
+}
+
+#[test]
+fn a_full_rfc3339_timestamp_is_accepted() {
+    let ok = serde_json::from_str::<TransactionIn>(
+        r#"{"asset_id":1,"type":"BUY","quantity":"1","price":"1.0","fee":"0","date":"2026-11-14T00:00:00Z"}"#,
+    );
+    assert!(ok.is_ok(), "{:?}", ok.err());
+}
+```
+
+- [ ] **Step 2: Run it and read the answer**
+
+```bash
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test --test date_boundary_test
+```
+
+If the first test fails because serde *does* accept `2026-11-14`, that is a decision to make explicitly, not to inherit silently: either reject date-only input at the API (add a `DateTime<Utc>` deserializer that requires a time component) or accept it and document that a bare date means midnight UTC. Record the choice in the commit message and in `docs/`.
+
+- [ ] **Step 3: Widen the ids**
+
+```bash
+cd backend_rust
+grep -rn "i32" src/schemas.rs | grep -iE "id|portfolio|asset|owner"
+```
+
+Change each to `i64`. Then the path parameters:
+
+```bash
+grep -rn "Path<i32>\|web::Path<i32>" src/api_routes
+```
+
+Then the row reads that the whole-branch review of #64 flagged — `query_as::<_, (i32,)>` against `RETURNING id`, which `sqlx-postgres` refuses because `int8` is not `i32`:
+
+```bash
+grep -rn "query_as::<_, (i32" src
+grep -rn "(i32,)" src
+```
+
+- [ ] **Step 4: Fix what the compiler reports**
+
+```bash
+cd backend_rust && cargo check --all-targets 2>&1 | grep "^error" | head -20
+```
+
+Work the list. Expect `HashMap<i32, _>` in `split_sync_ages`, the `DEFAULT_USER` constant in `tests/common/mod.rs`, and the seed helpers' signatures.
+
+- [ ] **Step 5: Run the suite**
+
+```bash
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
+```
+
+Expected: PASS, no warnings.
+
+- [ ] **Step 6: Prove the generated artifacts did not change**
+
+```bash
+cd backend_rust && cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
+cd ../frontend && npm run generate-types
+cd .. && git status --porcelain docs/openapi/openapi.json frontend/src/types/api.d.ts
+```
+
+Expected: no output — `i64` and `i32` are both `integer` in JSON Schema. If there *is* a diff, read it before committing; a format change here would be a frontend-visible change and needs saying so.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "refactor(db): ids are i64 to match int8, and the date boundary is pinned by tests"
+```
+
+---
+
+### Task 5: Per-test databases
+
+**Files:**
+- Modify: `backend_rust/tests/common/mod.rs` (`test_pool`, `seed_*`)
+- Modify: every `tests/*.rs` that assumed a shared database
+
+**Interfaces:**
+- Consumes: `DATABASE_URL` with a role that has `CREATEDB` (Task 1 grants it).
+- Produces: `pub async fn test_pool(caller: &str) -> DbPool` returning a **private, freshly migrated** database per test, named `prism_t_<pid>_<caller>` and dropped at the end of the test.
+
+- [ ] **Step 1: Replace `test_pool`**
+
+```rust
+/// One database per test, migrated from zero, dropped on drop.
+///
+/// The SQLite suite shared one `:memory:` database through a process-wide cache,
+/// which is how a stale-schema flake and a mutant that hung instead of failing
+/// both got as far as a review. Per-test databases remove the class rather than
+/// papering over it.
+pub async fn test_pool(caller: &str) -> DbPool {
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    // Unique per test process AND per test fn: the caller passes its own name,
+    // because two tests in one binary would otherwise collide on the pid alone.
+    let name = format!("prism_t_{}_{}", std::process::id(), caller);
+    let admin = sqlx::PgConnection::connect(&base).await.unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin).await.unwrap();
+    let mut url = base.clone();
+    url.push('/');
+    url.push_str(&name);
+    let pool = backend_rust::db::connect(&url).await.unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    pool
+}
+```
+
+Name each database after the test — `env!("CARGO_PKG_NAME")` plus a counter, or the `#[test]` function name passed in — and drop it at the end of the test with `sqlx::query("DROP DATABASE ... ")` outside a transaction (Postgres refuses `DROP DATABASE` inside one). If a test fails and leaves its database behind, that is a feature: the leftover is the evidence.
+
+- [ ] **Step 2: Convert the suite file by file**
+
+For each file in `tests/`: replace the shared-pool call with `test_pool("<file>")`, and replace `DEFAULT_USER` (which was `id = 1` because SQLite's placeholder user was always the first row) with the id returned by `seed_user`. Run that file alone before moving on:
+
+```bash
+DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test --test portfolios_test
+```
+
+Do not convert two files at once. A failure in a file you did not just touch is a leak from the one you did.
+
+- [ ] **Step 3: Prove isolation**
+
+Add to `tests/common/mod.rs`:
+
+```rust
+#[tokio::test]
+async fn two_tests_do_not_see_each_others_rows() {
+    let a = test_pool("iso_a").await;
+    let b = test_pool("iso_b").await;
+    seed_portfolio(&a, 1, "only in a", "USD").await;
+    let n: (i64,) = sqlx::query_as("SELECT count(*) FROM portfolios").fetch_one(&b).await.unwrap();
+    assert_eq!(n.0, 0, "test databases are not isolated");
+}
+```
+
+- [ ] **Step 4: Full suite, twice**
+
+```bash
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
+DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
+```
+
+Expected: PASS both times. The second run catches a test that left a database behind and a later test reusing it.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "test(db): one migrated database per test instead of a shared sqlite cache"
+```
+
+---
+
+### Task 6: Foreign keys, and the orphan audit
+
+**Files:**
+- Create: `backend_rust/tests/foreign_keys_test.rs`
+- Create: `backend_rust/scripts/pre_cutover_audit.sh`
+- Modify: `docs/backup-walkthrough.md` (a new section: what to run before an export)
+
+**Interfaces:**
+- Consumes: Task 5's `test_pool`.
+- Produces: `scripts/pre_cutover_audit.sh`, the stop condition in the cutover runbook (Task 10).
+
+- [ ] **Step 1: Write the failing FK tests**
+
+```rust
+//! SQLite never set `PRAGMA foreign_keys`, so every FOREIGN KEY in init_db was
+//! decorative. Postgres enforces them. These tests pin the new behaviour before
+//! anything in production depends on it — spec §5.1.
+#[tokio::test]
+async fn a_transaction_for_a_missing_asset_is_refused() {
+    let pool = common::test_pool("fk_orphan").await;
+    let err = sqlx::query(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
+         VALUES ($1, 'BUY', '1', '1', '0', '2026-11-14T00:00:00Z')",
+    )
+    .bind(999_999_i64)
+    .execute(&pool)
+    .await
+    .expect_err("an orphan transaction must not insert");
+    assert!(format!("{err:?}").contains("foreign key"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_portfolio_with_assets_cannot_be_deleted_underneath_them() {
+    let pool = common::test_pool("fk_delete").await;
+    let pid = common::seed_portfolio(&pool, 1, "keep", "USD").await;
+    common::seed_asset(&pool, pid, "VTI", "Vanguard").await;
+    let err = sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .expect_err("cascade was deliberately not added; the app deletes in order");
+    assert!(format!("{err:?}").contains("foreign key"), "{err:?}");
+}
+```
+
+- [ ] **Step 2: Run them**
+
+```bash
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test --test foreign_keys_test
+```
+
+Expected: PASS. If the first fails, the FK is missing from `0001_init.sql` — fix the migration, do not weaken the test.
+
+- [ ] **Step 3: Write the audit script**
+
+`scripts/pre_cutover_audit.sh` runs against the **SQLite** file, because that is where the orphans are:
+
+```bash
+#!/usr/bin/env bash
+# Pre-cutover audit. Run against the live SQLite database BEFORE the export.
+#
+# The bundle is nested (portfolio -> assets -> transactions), so a row whose
+# parent is gone is not under any parent and is therefore never exported. Nothing
+# in the export path can report it, because from the export's point of view those
+# rows do not exist. This script is the only thing that sees them. Spec §5.1.
+set -euo pipefail
+DB="${1:?usage: pre_cutover_audit.sh /path/to/portfolio.db}"
+command -v sqlite3 >/dev/null || { echo "sqlite3 required to audit the source database"; exit 1; }
+
+q() { sqlite3 "$DB" "$1"; }
+echo "orphan transactions : $(q "select count(*) from transactions t left join assets a on a.id=t.asset_id where a.id is null")"
+echo "orphan assets       : $(q "select count(*) from assets a left join portfolios p on p.id=a.portfolio_id where p.id is null")"
+echo "portfolios, no owner: $(q "select count(*) from portfolios p left join users u on u.id=p.owner_id where p.owner_id is not null and u.id is null")"
+echo "price rows          : $(q "select count(*) from historical_prices")"
+echo "transactions        : $(q "select count(*) from transactions")"
+```
+
+- [ ] **Step 4: Prove it finds an orphan**
+
+```bash
+cp portfolio.db /tmp/audit.db && sqlite3 /tmp/audit.db "insert into transactions (asset_id,type,quantity,price,fee,date) values (999999,'BUY','1','1','0','2026-11-14T00:00:00Z')"
+bash backend_rust/scripts/pre_cutover_audit.sh /tmp/audit.db
+```
+
+Expected: `orphan transactions : 1`. A non-zero line is the stop condition; say so in the script's header comment, which Step 3 already does.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "test(db): foreign keys are enforced, and the orphan audit that guards the cutover"
+```
+
+---
+
+### Task 7: Locks, timeouts, and the 503
+
+**Files:**
+- Modify: `backend_rust/src/api_routes/backup.rs` (the busy → `503` mapping)
+- Modify: `backend_rust/src/backup/restore.rs` (extended busy-code classification deleted)
+- Modify: `backend_rust/src/db.rs` (`statement_timeout`)
+- Test: `backend_rust/tests/restore_concurrency_test.rs` (create)
+
+**Interfaces:**
+- Consumes: Task 3's `db::connect`.
+- Produces: the rule `pool timeout | statement timeout | serialization failure → 503 + Retry-After`, and nothing else maps to 503.
+
+- [ ] **Step 1: Delete the SQLite busy classification**
+
+Remove the extended-busy-code matching added in #64 (`7facddb`) and the `busy_timeout` references. Replace the error mapping with:
+
+```rust
+// Postgres has no SQLITE_BUSY. Three conditions mean "try later" and they are the
+// only things that produce a 503 here (spec §5.4):
+//   * the pool had no connection within acquire_timeout
+//   * statement_timeout fired
+//   * SERIALIZABLE gave up after the retry policy
+// Everything else is a 500, because it is a bug and a retry will not help.
+fn is_retryable(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(db) => matches!(
+            db.code().as_deref(),
+            Some("40001") | Some("40P01") | Some("55P03") // serialization, deadlock, lock wait
+        ),
+        _ => false,
+    }
+}
+```
+
+- [ ] **Step 2: Set `statement_timeout` on the connection**
+
+In `db::connect`, add:
+
+```rust
+        // A runaway analytics query must not pin a pool connection forever; export
+        // holds one for its whole duration (#64 follow-up 3) and this is the backstop.
+        .after_connect(|conn, _meta| Box::pin(async move {
+            sqlx::query("SET statement_timeout = '30s'").execute(conn).await.map(|_| ())
+        }))
+```
+
+- [ ] **Step 3: Write the concurrency test the SQLite engine never allowed**
+
+```rust
+//! Two restores at once. Under SQLite the second waited on a file lock and then
+//! got SQLITE_BUSY; under SERIALIZABLE Postgres aborts one with 40001. The client
+//! contract is the same either way: 503 with Retry-After, never a 500.
+use rocket::http::Status;
+
+#[tokio::test]
+async fn a_concurrent_restore_gets_503_not_500() {
+    let (client, pool) = common::client().await;
+    let bundle = common::bundle_with_one_portfolio(&pool).await;
+
+    // Two restores, same bundle, fired together. `POST /api/backup/restore` in
+    // copy mode takes a SERIALIZABLE transaction, so one of them must abort.
+    let (a, b) = tokio::join!(
+        common::post_restore(&client, &bundle),
+        common::post_restore(&client, &bundle),
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+
+    // Exactly one success. If BOTH are 2xx the restore is not SERIALIZABLE, and
+    // that is a finding about the engine switch, not a test to relax.
+    assert_eq!(codes[1], Status::Ok, "second restore must not also succeed: {codes:?}");
+    assert!(
+        matches!(codes[0], Status::ServiceUnavailable),
+        "the loser must be 503, got {:?} — a 500 here means the new error \
+         mapping in is_retryable missed the sqlx error variant Postgres produced",
+        codes[0]
+    );
+}
+```
+
+`common::post_restore` returns `(Status, HeaderMap)`; add it next to the existing
+restore helpers in `tests/common/mod.rs` rather than duplicating the request
+building. Assert `Retry-After` on the 503 in the same test — the header is part
+of the contract #64 shipped and the remapping must not silently drop it.
+
+- [ ] **Step 4: Pin the pool-timeout half of the rule**
+
+Review Focus 5 is a saturated pool, which is hard to provoke end to end and easy
+to pin at the mapping:
+
+```rust
+#[test]
+fn pool_timeout_is_retryable_but_a_syntax_error_is_not() {
+    // PoolTimedOut carries no database error code, so it is matched by variant.
+    assert!(is_retryable(&sqlx::Error::PoolTimedOut));
+    // A real database error with an unrelated code must NOT be retried: a 42601
+    // syntax error retried forever is an outage with a Retry-After header on it.
+    let err = sqlx::postgres::PgDatabaseError::default(); // if not constructible,
+    // drive the mapping through a query that fails (SELECT from a missing table)
+    // and assert is_retryable(&err) is false on the resulting sqlx::Error.
+    assert!(!is_retryable(&err));
+}
+```
+
+If `PgDatabaseError` is not constructible in sqlx 0.8 — it may not be — use the
+comment's fallback and drive a real failing query. The point is that the false
+case is exercised, not that the test is elegant.
+
+- [ ] **Step 5: Run the suite and the gate scripts**
+
+```bash
+cd backend_rust && DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo test
+bash scripts/check_backup_portability.sh
+```
+
+Expected: PASS. The portability gate must still pass — it bans engine-specific constructs, and `SET statement_timeout` is portable enough to be allowed, but if the gate objects, fix the gate deliberately and say why in the commit message.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "fix(db): 503 means pool timeout, statement timeout, or serialization failure"
+```
+
+---
+
+### Task 8: Compile-time checked queries and the prepare cache
+
+**Files:**
+- Create: `backend_rust/.sqlx/` (generated, committed)
+- Modify: all 13 query files — `sqlx::query` → `sqlx::query!`, `query_as::<_, T>` → `sqlx::query_as!`
+- Create: `backend_rust/scripts/check_sqlx_cache.sh`
+
+**Interfaces:**
+- Consumes: a database at head (Task 1 + Task 2 migrations).
+- Produces: `.sqlx/` and the rule that `cargo sqlx prepare --check` runs before `cargo build` in CI.
+
+- [ ] **Step 1: Convert one file and see the payoff**
+
+Start with `src/engines/stats_engine.rs`, the heaviest SQL user. Convert its queries to macros and run:
+
+```bash
+cd backend_rust
+DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo check
+```
+
+Expect the compiler to reject at least the `i32`-vs-`int8` shapes this port is designed to catch. Fix them at the query, not by casting the column.
+
+- [ ] **Step 2: Convert the remaining files, one per commit**
+
+Order: `tax_engine.rs`, `api_routes/portfolios.rs`, `api_routes/transactions.rs`, `api_routes/analytics.rs`, `api_routes/backup.rs`, `backup/export.rs`, `backup/restore.rs`, `auth/guard.rs`, `auth/mod.rs`, `auth/oidc.rs`, `access.rs`, `services/currency_service.rs`, `lib.rs`.
+
+Where a query is built with `format!` (the `init_db` leftovers and any dynamic table names), the macro cannot take it; leave those as runtime `sqlx::query` and add a `// macro-exempt: dynamic table name` comment so the count of remaining runtime queries is greppable and can go to zero deliberately rather than by accident.
+
+- [ ] **Step 3: Generate and commit the cache**
+
+```bash
+cd backend_rust
+nix-shell -p sqlx-cli --run 'DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism" cargo sqlx prepare'
+ls .sqlx | head -3
+```
+
+Expected: `query.json` files appear. Commit them. Confirm the crate compiles with **no** `DATABASE_URL` set — that is the whole point of the cache:
+
+```bash
+env -u DATABASE_URL cargo check --all-targets
+```
+
+- [ ] **Step 4: Write the freshness gate**
+
+`scripts/check_sqlx_cache.sh`:
+
+```bash
+#!/usr/bin/env bash
+# The prepare cache is checked against the schema as it was when it was
+# generated. A stale cache compiles and lies, which is worse than no cache:
+# CI would be green against a schema nobody runs. Spec §8.
+set -euo pipefail
+: "${DATABASE_URL:?run scripts/dev-db.sh and export DATABASE_URL}"
+cd "$(dirname "$0")/.."
+sqlx migrate run || { echo "migrations must be applied before --check"; exit 1; }
+cargo sqlx prepare --check -- --all-targets
+```
+
+- [ ] **Step 5: Prove the gate fails on drift**
+
+Add a column to a copy of the schema, regenerate nothing, run the gate, and confirm it fails naming the query. Then revert. Record the exact failure text in the script's comment so the next person knows what a real failure looks like.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "build(db): compile-time checked queries with a committed prepare cache"
+```
+
+---
+
+### Task 9: CI
+
+**Files:**
+- Modify: `.github/workflows/ci.yml` (`build-and-test` job)
+- Modify: `AGENTS.md` (gate list)
+
+**Interfaces:**
+- Consumes: `migrations/`, `.sqlx/`, `scripts/check_sqlx_cache.sh`.
+- Produces: a green `build-and-test` that cannot pass without a real Postgres at head.
+
+- [ ] **Step 1: Add the service and reorder the steps**
+
+In the `build-and-test` job:
+
+```yaml
+    services:
+      postgres:
+        # Same major as production (CloudNativePG ghcr.io/cloudnative-pg/postgresql:18.6).
+        # The local harness runs 18.7 via nix-shell; patch drift is accepted and
+        # documented in the spec, §9.1.
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: prism }
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 20
+```
+
+and in `steps`, before `Run Tests`:
+
+```yaml
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres --locked
+
+      - name: Migrate
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: sqlx migrate run
+        working-directory: backend_rust
+
+      - name: Prepare cache is current
+        # Before build, not after: a stale cache compiles and lies.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: cargo sqlx prepare --check -- --all-targets
+        working-directory: backend_rust
+```
+
+and add `DATABASE_URL` to the env of the existing `Run Tests` step.
+
+- [ ] **Step 2: Update the documented gate list**
+
+In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it.
+
+- [ ] **Step 3: Verify locally in the same order**
+
+```bash
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/dev-db.sh'
+cd backend_rust
+export DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism"
+sqlx migrate run && cargo sqlx prepare --check -- --all-targets \
+  && cargo test && cargo clippy --all-targets && cargo build --release
+```
+
+Expected: all green, no warnings.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "ci(db): postgres service container, migrate, prepare --check, then test"
+```
+
+---
+
+### Task 10: Cutover runbook, docs, and the deferred half
+
+**Files:**
+- Create: `docs/postgres-cutover.md`
+- Modify: `docs/backup-walkthrough.md` (SQLite lock and `PRAGMA` steps rewritten)
+- Modify: `AGENTS.md` (Roadmap: the GitOps follow-up named)
+- Create: `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`
+
+**Interfaces:**
+- Consumes: everything above.
+- Produces: the procedure an operator follows on the day, and the named follow-up spec so the `k8s-titan` half is not rediscovered from scratch.
+
+- [ ] **Step 1: Write the runbook from spec §11**
+
+Copy §11's seven steps, and make step 2 executable rather than described:
+
+```markdown
+2. **Audit for orphans.** `bash backend_rust/scripts/pre_cutover_audit.sh /path/to/portfolio.db`.
+   Every count on the first three lines must be 0. A non-zero count is a stop
+   condition: the bundle cannot represent a row whose parent is gone, so it will
+   be dropped without the export reporting anything. Repair or accept the loss in
+   writing before continuing.
+```
+
+Include the rollback note verbatim: after the restore, anything written to Postgres is in no bundle until you export again.
+
+- [ ] **Step 2: Rewrite the walkthrough's SQLite-specific steps**
+
+`docs/backup-walkthrough.md` currently teaches SQLite lock behaviour — the `503` from a held write lock, `PRAGMA integrity_check`, the rollback-journal explanation. Replace each with the Postgres equivalent, and re-run the whole walkthrough against the local cluster, changing nothing but the commands as you go. A walkthrough that has not been executed since the engine changed is a walkthrough that is wrong.
+
+- [ ] **Step 3: Write the follow-up spec stub**
+
+`docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — spec §14 verbatim, plus the deploy-ordering warning as its own numbered section, because it is the part that causes an outage if it is missed: the Postgres build refuses to start without `DATABASE_URL`, so the `Database`, `DatabaseRole` and Secret must exist before the image rolls out, and with `replicas: 1` and `Recreate` a badly ordered apply means no serving replica.
+
+- [ ] **Step 4: Full gate run**
+
+```bash
+cd backend_rust && export DATABASE_URL="postgres://postgres@127.0.0.1:55432/prism"
+sqlx migrate run && cargo sqlx prepare --check -- --all-targets \
+  && cargo test && bash scripts/check_access_gate.sh && bash scripts/check_pricing_seam.sh \
+  && bash scripts/check_backup_portability.sh && cargo clippy --all-targets && cargo build --release
+cd ../frontend && npm run lint && npx vitest run
+```
+
+Expected: everything green, no warnings, `260` frontend tests passing.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "docs(db): cutover runbook, rewritten walkthrough, named GitOps follow-up"
+```
+
+---
+
+## Deferred, with source
+
+Not in this plan, each with where it came from:
+
+- The `k8s-titan` half — Task 10 writes the stub; the work is its own change in that repo (spec §14).
+- `stats_engine.rs:108-110,323-325` returns volatility, Sharpe, beta and correlation as **constants**. Pre-existing; the metrics engine is the heaviest SQL user, so fixing it after the port is cheaper than during (spec §15).
+- Multi-replica `CurrencyService` cache and rate limiter — the reason more than one replica is not free (spec §15).
+- Fold the export's N+1 per-asset reads into one join (#64 follow-up 3).
+- No abort/timeout on frontend `apiFetch` (#64 follow-up 6).
+- `create_asset` accepts any uppercased string (#64 follow-up 1).
+- `NUMERIC` for money, if it is ever wanted. `TEXT` was a decision, not an oversight (spec §3).
