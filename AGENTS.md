@@ -139,4 +139,9 @@ From root:
   declares no `spec.strategy`, so confirm `.spec.strategy.type` on the live deployment
   before the apply rather than assuming which rollout behaviour you are about to cause. The
   data procedure an operator follows on the day is `docs/postgres-cutover.md`.
+- **Stock dividends have no transaction type**: `KNOWN_TRANSACTION_TYPES` is `BUY`/`SELL`/`SPLIT`, so
+  shares received for free can only be encoded as a zero-cost `BUY` — and a type invented to do it
+  properly is accepted by the write path and then refused by the backup restore. Write-up, the
+  demonstrated round-trip failure, and what a fix touches (including a backup schema `v2`):
+  `docs/roadmap/stock-dividend-transactions.md`.
 - **Multi-Currency Support**: Implementing asset currency tracking and exchange rate conversion for tax and stats (see `docs/implementation_plan.md`).
