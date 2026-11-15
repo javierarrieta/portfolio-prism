@@ -1,7 +1,13 @@
 # Follow-up: the `k8s-titan` half of the Postgres move
 
-Status: **not started, deliberately.** This is a stub, and it exists so the next person
-does not rediscover the reasoning from scratch.
+Status: **done — 2026-11-15.** The `k8s-titan` half landed as two PRs, split on purpose: **#296**
+created the CNPG `Database`, the `DatabaseRole` and the credential Secret, and **#297** rolled the
+image and deleted the inline SQLite `DATABASE_URL`. Merging #296 started no clock; merging #297 was
+the cutover. The live app is Postgres-backed as of `6c0f7de` in that repo, and the record of what
+actually happened — including the audit exiting 2 on a schema assumption — is in
+`docs/postgres-cutover.md`, *Execution record*. What follows is kept as the reasoning, not as a
+task list; where it says “not started” or “has no cluster to point at”, that was true when it was
+written.
 
 Source: §14 of `docs/superpowers/specs/2026-11-14-postgres-only-design.md`. That spec
 deliberately stopped at the application: the portfolio-prism Postgres-only build is merged
