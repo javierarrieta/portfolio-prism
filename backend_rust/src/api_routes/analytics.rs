@@ -131,7 +131,9 @@ async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError
 }
 
 async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, ReportError> {
-    sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1", portfolio_id)
+    // `ORDER BY id` so a report lists assets in the order they were created, as the
+    // file-backed build did; see the note on `portfolios::fetch_assets_for_portfolio`.
+    sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id", portfolio_id)
         .fetch_all(pool)
         .await
         .map_err(|e| ReportError::internal(e.to_string()))
@@ -171,7 +173,7 @@ async fn undated_summary(
 
         let transactions = sqlx::query_as!(
             Transaction,
-            "SELECT * FROM transactions WHERE asset_id = $1",
+            "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
             asset.id
         )
         .fetch_all(pool)
@@ -320,7 +322,7 @@ pub async fn get_portfolio_performance(
     .map_err(|_| Status::InternalServerError)?
     .ok_or(Status::NotFound)?;
 
-    let assets = sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1", id)
+    let assets = sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id", id)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -333,7 +335,7 @@ pub async fn get_portfolio_performance(
 
     let transactions = sqlx::query_as!(
         Transaction,
-        "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1)",
+        "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1) ORDER BY id",
         id
     )
     .fetch_all(pool.inner())
@@ -431,7 +433,7 @@ pub async fn get_transaction_sell_pnl(
     // Same query and same scope as get_portfolio_tax_summary.
     let transactions = sqlx::query_as!(
         Transaction,
-        "SELECT * FROM transactions WHERE asset_id = $1",
+        "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
         asset.id
     )
     .fetch_all(pool.inner())
@@ -915,7 +917,7 @@ pub async fn build_tax_report(
     for asset in assets {
         let txs = sqlx::query_as!(
             Transaction,
-            "SELECT * FROM transactions WHERE asset_id = $1",
+            "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
             asset.id
         )
         .fetch_all(pool)

@@ -289,7 +289,7 @@ pub async fn create_transaction(
 #[get("/portfolios/<portfolio_id>/transactions")]
 pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i64, pool: &State<DbPool>) -> Result<Json<Vec<TransactionOut>>, Status> {
     require(pool.inner(), user.id, portfolio_id, Access::Viewer).await?;
-    let asset_ids = sqlx::query_scalar!("SELECT id FROM assets WHERE portfolio_id = $1", portfolio_id)
+    let asset_ids = sqlx::query_scalar!("SELECT id FROM assets WHERE portfolio_id = $1 ORDER BY id", portfolio_id)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -302,7 +302,12 @@ pub async fn list_portfolio_transactions(user: AuthedUser, portfolio_id: i64, po
     for id in asset_ids {
         let txs = sqlx::query_as!(
             Transaction,
-            "SELECT * FROM transactions WHERE asset_id = $1",
+            // `ORDER BY id` is what makes the sort below total. The handler re-sorts by
+            // date descending with a *stable* sort, so same-day transactions keep
+            // whatever order the database returned — and with no `ORDER BY` that was
+            // whatever the planner produced, which moves when a row is updated. `id` is
+            // insertion order, which is the order the file-backed build returned.
+            "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
             id
         )
         .fetch_all(pool.inner())

@@ -267,7 +267,21 @@ The `503 + Retry-After` response shape stays — clients already handle it — b
 trigger becomes: pool exhaustion (timeout acquiring a connection), statement
 timeout, and a transaction asked to give up — `40001` serialisation failure, `40P01`
 deadlock detected, `55P03` lock wait. Nothing else maps to `503`: anything else is a
-bug, and a retry will not help. `55P03` is named rather than left to the `500` catch-all,
+bug, and a retry will not help.
+
+**Scoped to the backup module, and that is a correction rather than a narrowing.**
+Everything above describes `src/backup/` and `api_routes/backup.rs`, which is where the
+rule was written and where it has always applied; it is not a whole-API contract, and an
+earlier reading of this section treated it as one. `api_routes/backup::lock_response` is
+the only emitter of `Retry-After` in the crate. Every other route answers a database
+failure with a plain 500 — the auth outage responder, `AuthedUser`'s guard failure
+(`auth::guard`), `access::outcome` and `ReportError::internal` all do — so a saturated
+pool or a cancelled statement is a retryable 503 on `/api/backup/*` and a permanent 500
+on `/api/portfolios/`. Deciding which routes *should* become retryable is a product API
+decision, not an engine-migration detail, and it is a named follow-up on this branch
+rather than a change made here. The follow-up is not hypothetical: the statement timeout
+below is what introduced `57014 query_canceled`, a transient error by definition, and
+outside the backup module every route currently reports it as a permanent 500. `55P03` is named rather than left to the `500` catch-all,
 and it is worth saying plainly that nothing in this repository can raise it today: no
 `lock_timeout` is set at any level the app controls, so that arm fires only if an
 operator sets one at role, database or server level. There is no unbounded wait either

@@ -936,6 +936,78 @@ async fn a_bundle_that_fails_validation_names_its_paths() {
 }
 
 #[tokio::test]
+async fn two_splits_on_one_utc_day_are_a_422_naming_the_asset_and_the_day() {
+    // `uq_split_asset_date` allows one SPLIT per asset per UTC calendar day, and it is
+    // the only thing that enforces that — `apply` inserts plainly, so the second row of
+    // a pair raised `23505 unique_violation`, `classify` mapped it to `Other`, and the
+    // caller got a 500 for a row in their own file *after* `preview` had said the bundle
+    // was fine. The two answers now agree because `collect` refuses the pair.
+    //
+    // It failed safe before this check, and still does: `apply` is one SERIALIZABLE
+    // transaction, so the `23505` rolled back every row the bundle had already written.
+    // That property is kept and is not what the 422 replaces — a rollback is the right
+    // outcome for a bundle that cannot be applied, but it is a `500` telling a user their
+    // own data is a server bug, and `preview` had already promised otherwise.
+    let (pool, user) = db_with_user("two_splits_on_one_utc_day").await;
+    let c = client(pool, user).await;
+    let mut b = bundle_value("x");
+    // Same UTC day, different instants, so this is not merely the same row twice.
+    b["portfolios"][0]["assets"][0]["transactions"] = json!([
+        { "type": "SPLIT", "quantity": "2.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T00:00:00Z" },
+        { "type": "SPLIT", "quantity": "3.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T18:00:00Z" },
+    ]);
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity, "a duplicate SPLIT day is a client data error, never a 500");
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["error"], "the bundle failed validation");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "exactly the second split is at fault: {body}");
+    // Names the asset (which one, by path) and the day (which day, in the reason).
+    assert_eq!(errors[0]["path"], "portfolios[0].assets[0].transactions[1].date");
+    let reason = errors[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("2024-01-15"), "the reason must name the day: {reason}");
+    assert!(reason.contains("SPLIT"), "the reason must name what collided: {reason}");
+}
+
+#[tokio::test]
+async fn two_splits_on_different_utc_days_are_accepted_even_in_the_same_local_date() {
+    // The control, and the half that a naive date comparison gets wrong: the rule is the
+    // UTC calendar day because that is what `(date AT TIME ZONE 'UTC')::date` buckets
+    // on. These two share a local date but not a UTC one, so the index does not see a
+    // collision and neither may `collect` — otherwise a valid bundle becomes unrestorable.
+    let (pool, user) = db_with_user("two_splits_different_utc_days").await;
+    let c = client(pool, user).await;
+    let mut b = bundle_value("x");
+    b["portfolios"][0]["assets"][0]["transactions"] = json!([
+        { "type": "SPLIT", "quantity": "2.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T01:00:00+05:00" },
+        { "type": "SPLIT", "quantity": "3.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T20:00:00+05:00" },
+    ]);
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    let status = res.status();
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(status, Status::Ok, "2024-01-14T20:00Z and 2024-01-15T15:00Z are different UTC days: {body}");
+    assert_eq!(body["insert"]["transactions"], 2);
+}
+
+#[tokio::test]
 async fn an_upload_over_the_byte_cap_is_the_module_s_413() {
     // Rocket never refuses a `Data` upload of its own accord, so the ceiling is only
     // real if the route that opens the stream enforces it. The probes above pin the

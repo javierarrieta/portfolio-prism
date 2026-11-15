@@ -8,7 +8,10 @@
 //! takes no row locks, so the export still cannot block a writer.
 //!
 //! Pinned the way `tests/statement_timeout_test.rs` pins the timeout: by asking the
-//! server what it is actually doing, not by trusting the SQL in `export.rs`.
+//! server what it is actually doing, not by trusting the SQL in `export.rs`. The third
+//! test pins the other half of the same statement — that the transaction is `READ ONLY`
+//! as far as the server is concerned, so a write attempted inside it is refused rather
+//! than quietly performed.
 
 mod common;
 
@@ -108,4 +111,62 @@ async fn name(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: i64) -> String
         .await
         .unwrap()
         .0
+}
+
+#[tokio::test]
+async fn the_export_transaction_is_read_only_as_far_as_the_server() {
+    // The other half of `EXPORT_ISOLATION`, read back from the server for the same
+    // reason the isolation level is: what matters is what Postgres is doing, not the
+    // string in `export.rs`. `READ ONLY` is what turns "`build_in` contains only reads"
+    // from a property of the Rust code into one the server enforces.
+    let url = test_pool_url("export_read_only").await;
+    let pool = pool_options().connect(&url).await.unwrap();
+
+    let mut tx = begin_read_tx(&pool).await.unwrap();
+    let (read_only,): (String,) = sqlx::query_as("SHOW transaction_read_only")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_only, "on",
+        "`export::begin_read_tx` must open a transaction the server itself forbids writing in"
+    );
+
+    // The consequence rather than the setting: a write attempted inside the export is
+    // refused. Before `READ ONLY` this statement succeeded, and an export that writes is
+    // not an export — which is the drift the setting exists to make impossible. The
+    // statement is refused whether or not the row exists, so nothing needs seeding.
+    let err = sqlx::query("UPDATE portfolios SET name = 'mutated' WHERE id = 1")
+        .execute(&mut *tx)
+        .await
+        .expect_err("a write inside the export transaction must not be allowed to succeed");
+    let code = match &err {
+        sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+        other => panic!("expected a database error, got {other:?}"),
+    };
+    assert_eq!(
+        code.as_deref(),
+        Some("25006"),
+        "must be read_only_sql_transaction, and therefore DbFailure::Other and a 500 if \
+         it ever reached classify: a refused write is a bug in the route, not a condition \
+         a client can fix. Got: {err}"
+    );
+
+    // The refused statement aborts the transaction, so it rolls back rather than commits.
+    // Nothing was written either way, which is the whole point.
+    tx.rollback().await.unwrap();
+
+    // Control: outside the export transaction a pooled connection can still write, so the
+    // assertion inside is about this transaction and not about the role or the session.
+    let (outside,): (String,) = sqlx::query_as("SHOW transaction_read_only")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outside, "off",
+        "only the export transaction is read-only; every other statement runs at the \
+         server default, or the assertion inside would be passing for the wrong reason"
+    );
+
+    pool.close().await;
 }

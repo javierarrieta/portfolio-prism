@@ -303,3 +303,86 @@ async fn test_portfolio_id_above_i32_max_round_trips() {
         .count();
     assert_eq!(hits, 1, "the list route must carry the same id");
 }
+
+#[tokio::test]
+async fn editing_an_asset_does_not_move_it_in_the_list() {
+    // The regression this pins: under SQLite an unordered scan returned rows in rowid
+    // order, so an asset stayed where it was however often it was edited. Postgres writes
+    // an UPDATE as a new tuple at the end of the heap, so an unordered scan returns the
+    // edited row last — every edit moved an asset to the bottom of the user's list. The
+    // list routes now say `ORDER BY id`, which is insertion order, which is what the old
+    // order was.
+    //
+    // The middle asset is the one under test on purpose: first and last are indistinguishable
+    // between "stayed put" and "the sort happens to agree", and moving the middle one to the
+    // end is the visible breakage.
+    let (pool, user) = db_with_user("editing_an_asset_does_not_move_it").await;
+    let pid = seed_portfolio(&pool, user, "Order Test", "USD").await;
+    let first = seed_asset(&pool, pid, "AAA", "First").await;
+    let second = seed_asset(&pool, pid, "BBB", "Second").await;
+    let third = seed_asset(&pool, pid, "CCC", "Third").await;
+    let rocket = build_rocket(pool.clone(), user);
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let res = client
+        .patch(format!("/api/portfolios/{pid}/assets/{second}"))
+        .header(rocket::http::ContentType::JSON)
+        .body(r#"{"currency":"EUR"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok, "the edit itself must succeed");
+
+    // The edit landed, so the tuple really moved and the assertions below are about the
+    // ordering rather than about an UPDATE that did nothing.
+    let edited = sqlx::query_scalar::<_, String>("SELECT currency FROM assets WHERE id = $1")
+        .bind(second)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(edited, "EUR");
+
+    let expected = [first, second, third];
+
+    let resp = client.get(format!("/api/portfolios/{pid}")).dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: serde_json::Value = resp.into_json().await.unwrap();
+    assert_eq!(
+        body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["symbol"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["AAA", "BBB", "CCC"],
+        "the edited asset must sit between its neighbours, not after both of them"
+    );
+    assert_eq!(
+        body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    // The dashboard list is the other route that groups assets by portfolio, and it
+    // reaches them through a different statement, so it needs pinning separately.
+    let resp = client.get("/api/portfolios/").dispatch().await;
+    assert_eq!(resp.status(), Status::Ok);
+    let body: Vec<serde_json::Value> = resp.into_json().await.unwrap();
+    let portfolio = body
+        .iter()
+        .find(|p| p["id"].as_i64().unwrap() == pid)
+        .expect("the seeded portfolio is listed");
+    assert_eq!(
+        portfolio["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        expected,
+        "GET /api/portfolios/ must order assets the same way GET /api/portfolios/<id> does"
+    );
+}

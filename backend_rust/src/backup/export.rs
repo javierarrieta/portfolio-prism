@@ -94,12 +94,13 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 /// authorised for. Order follows the order requested, so the file matches what the
 /// user ticked.
 ///
-/// **Every read `build` itself issues runs inside one `REPEATABLE READ` transaction**
-/// ([`begin_read_tx`]), because the product is a point-in-time copy. Scope matters
-/// here: the route does other reads before this function is reached — the auth guard's
-/// read of `users`, and `require`'s per-id authorisation check in `api_routes::backup` —
-/// and those run outside it, at the server default. What is one snapshot is the bundle's
-/// own data, which is the thing that must not straddle two states. On the pool each query
+/// **Every read `build` itself issues runs inside one `READ ONLY REPEATABLE READ`
+/// transaction** ([`begin_read_tx`]), because the product is a point-in-time copy. Scope
+/// matters here: the route does other reads before this function is reached — the auth
+/// guard's read of `users`, and `require`'s per-id authorisation check in
+/// `api_routes::backup` — and those run outside it, at the server default. What is one
+/// snapshot is the bundle's own data, which is the thing that must not straddle two
+/// states. On the pool each query
 /// is its own implicit transaction, so a commit landing between the portfolio read and
 /// the per-asset transaction reads yields a bundle that straddles two database states —
 /// a portfolio row from one moment and its transactions from a later one.
@@ -117,10 +118,12 @@ pub fn classify(e: sqlx::Error) -> DbFailure {
 ///
 /// Not `SERIALIZABLE`, which the write path needs and a read does not: predicate locking
 /// on an export that writes nothing would make a read-only route pay for a serialiser it
-/// has nothing to serialise against. Not `BEGIN READ ONLY FOR UPDATE` either, because a
-/// read transaction that takes no row lock is what lets a writer keep working while an
-/// export runs — `a_read_only_export_does_not_queue_behind_a_writer` is what fails if
-/// someone "hardens" it into a lock.
+/// has nothing to serialise against. And `READ ONLY` is sent without `FOR UPDATE`, which
+/// is the half that matters for concurrency: a read transaction that takes no row lock is
+/// what lets a writer keep working while an export runs —
+/// `a_read_only_export_does_not_queue_behind_a_writer` is what fails if someone
+/// "hardens" it into a lock. `READ ONLY` on its own takes no lock of any kind; it only
+/// forbids writing, which is what [`EXPORT_ISOLATION`] is for.
 pub async fn build(
     pool: &DbPool,
     portfolio_ids: &[i64],
@@ -148,7 +151,22 @@ pub async fn begin_read_tx(
 /// The statement [`begin_read_tx`] sends, verbatim, through `Pool::begin_with`. Named so
 /// the isolation level is stated once, where it takes effect, and so that grepping
 /// `REPEATABLE READ` finds the code rather than only the docs.
-pub const EXPORT_ISOLATION: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
+///
+/// `READ ONLY` is not decoration. `REPEATABLE READ` alone buys the snapshot but still
+/// lets a statement write, so "this transaction writes nothing" was a property of the
+/// Rust code — true while `build_in` contained only reads, and silently false the moment
+/// someone added one. With `READ ONLY` the server enforces it: a write attempt inside the
+/// export raises `25006 read_only_sql_transaction`, which `classify` maps to a `500`
+/// rather than letting the export mutate the tenant's rows from a route that documents
+/// itself as a read. `tests/export_snapshot_test.rs` reads `transaction_read_only` back
+/// from the server for the same reason it reads `transaction_isolation`.
+///
+/// The two clauses are different kinds of thing and only one of them is a lock: `READ
+/// ONLY` is the transaction's access mode, `FOR UPDATE` is a lock strength, and sending
+/// the first without the second is the whole point — see the note on [`build`] about
+/// `a_read_only_export_does_not_queue_behind_a_writer`. `BEGIN READ ONLY FOR UPDATE` is
+/// not even valid syntax, so nobody can typo one into the other by accident.
+pub const EXPORT_ISOLATION: &str = "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ";
 
 /// The reads themselves, on a transaction [`build`] opened. Separate from `build` so
 /// the transaction's scope is three lines and impossible to widen by accident.

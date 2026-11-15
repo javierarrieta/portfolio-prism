@@ -132,9 +132,20 @@ pub async fn split_sync_ages(pool: &DbPool) -> Result<HashMap<i64, Option<String
 }
 
 async fn fetch_assets_for_portfolio(pool: &DbPool, portfolio_id: i64) -> Result<Vec<AssetOut>, sqlx::Error> {
-    let assets = sqlx::query_as!(DbAsset, "SELECT * FROM assets WHERE portfolio_id = $1", portfolio_id)
-        .fetch_all(pool)
-        .await?;
+    // `ORDER BY id`, and it is not decoration. Under SQLite these rows came back in
+    // rowid order, which is insertion order, so the asset list was stable and an edit
+    // left a row where it was. Postgres puts an updated tuple at the end of the heap,
+    // so with no `ORDER BY` every `update_asset` moved that asset to the bottom of the
+    // list — a user-visible change from the engine switch, caused only by the planner
+    // being free. `id` is the ordering that reproduces the old behaviour: it is the
+    // insertion order, and it is a total order, so there is no tie left to break.
+    let assets = sqlx::query_as!(
+        DbAsset,
+        "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id",
+        portfolio_id
+    )
+    .fetch_all(pool)
+    .await?;
 
     let asset_ids: Vec<i64> = assets.iter().map(|a| a.id).collect();
 
@@ -147,7 +158,10 @@ async fn fetch_assets_for_portfolio(pool: &DbPool, portfolio_id: i64) -> Result<
         let placeholders: Vec<String> =
             (1..=asset_ids.len()).map(|n| format!("${n}")).collect();
         // macro-exempt: dynamic placeholder list (the IN (...) arity is runtime)
-        let sql = format!("SELECT * FROM transactions WHERE asset_id IN ({})", placeholders.join(","));
+        // `ORDER BY id` for the reason on `fetch_assets_for_portfolio`: without it the
+        // same-day ties in this list are whatever the planner decided, and an updated
+        // transaction moves.
+        let sql = format!("SELECT * FROM transactions WHERE asset_id IN ({}) ORDER BY id", placeholders.join(","));
         let mut query = sqlx::query_as::<_, DbTransaction>(&sql);
         for id in &asset_ids {
             query = query.bind(id);
@@ -199,10 +213,12 @@ pub async fn list_portfolios(
     pool: &State<DbPool>) -> Result<Json<Vec<PortfolioOut>>, Status> {
     // Both queries are scoped. Filtering only the portfolios would still return
     // every other user's asset rows, because the assets query had no filter at
-    // all and the handler groups them by portfolio_id afterwards.
+    // all and the handler groups them by portfolio_id afterwards. Both are ordered by
+    // `id` for the reason on `fetch_assets_for_portfolio`: the dashboard's list is the
+    // one an edit would otherwise reshuffle.
     let portfolios = sqlx::query_as!(
         DbPortfolio,
-        "SELECT id, name, description, currency, base_currency FROM portfolios WHERE owner_id = $1",
+        "SELECT id, name, description, currency, base_currency FROM portfolios WHERE owner_id = $1 ORDER BY id",
         user.id
     )
     .fetch_all(pool.inner())
@@ -211,7 +227,7 @@ pub async fn list_portfolios(
 
     let all_assets = sqlx::query_as!(
         DbAsset,
-        "SELECT * FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = $1)",
+        "SELECT * FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = $1) ORDER BY id",
         user.id
     )
     .fetch_all(pool.inner())

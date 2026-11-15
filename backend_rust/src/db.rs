@@ -19,8 +19,28 @@ pub fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(5)
         .min_connections(0)
-        // What a saturated pool turns into: a 503 with Retry-After, not a hung
-        // request (spec §5.4, §10).
+        // What a saturated pool turns into *in the backup module*: a 503 with
+        // `Retry-After`, not a hung request (spec §5.4, §10). That qualifier is the
+        // whole scope of the rule, and it is worth stating because the sentence
+        // without it is a promise the app does not make. `api_routes::backup::lock_response`
+        // is the only emitter of `Retry-After` in the crate. Everywhere else a database
+        // failure is answered one of two ways, neither shaped for a retry: a failure
+        // while *resolving the caller* (`auth::guard::resolve_caller`, which the auth
+        // outage fairing turns into `503 {"error":"service_unavailable"}` — see
+        // `tests/auth_test.rs::a_database_failure_is_not_reported_as_a_denial`) is a 503
+        // with no `Retry-After`; a failure on the route's *own* query (`access::outcome`,
+        // `ReportError::internal`) is a plain 500. So an exhausted pool makes
+        // `GET /api/backup/export` a retryable 503 and `GET /api/portfolios/` a 503
+        // without `Retry-After`, while a route whose own statement fails — `57014` from
+        // the timeout below, say — answers 500.
+        //
+        // Which routes *should* become retryable is a product API decision rather
+        // than a migration detail, so it is a named follow-up and not something this
+        // branch invents. It matters more than it looks: Task 7's `statement_timeout`
+        // below introduced `57014 query_canceled`, which is transient by definition —
+        // a statement that ran too long says nothing about the next one — and which
+        // every route outside the backup module currently reports as a permanent 500.
+        // That mismatch is the reason the follow-up exists.
         .acquire_timeout(std::time::Duration::from_secs(5))
         .max_lifetime(std::time::Duration::from_secs(4 * 60 * 60))
         // A runaway query must not pin a pool connection forever: `30s` per *statement*,

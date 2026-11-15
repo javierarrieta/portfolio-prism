@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id FROM assets WHERE portfolio_id = $1",
+  "query": "SELECT id FROM assets WHERE portfolio_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "ec4e66cea45ffb1e801aa701457a76fa5bd29444be8cbc5594d6212603e24dda"
+  "hash": "9eee309a22bdff34fa8a57f4e69d1549b3d35ea05b08288b9b8eb933e2bf66e9"
 }

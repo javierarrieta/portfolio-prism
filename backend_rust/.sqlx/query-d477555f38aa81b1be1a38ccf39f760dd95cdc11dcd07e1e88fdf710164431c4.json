@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, currency, base_currency FROM portfolios WHERE owner_id = $1",
+  "query": "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -10,23 +10,33 @@
       },
       {
         "ordinal": 1,
-        "name": "name",
-        "type_info": "Text"
+        "name": "asset_id",
+        "type_info": "Int8"
       },
       {
         "ordinal": 2,
-        "name": "description",
+        "name": "type",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "currency",
+        "name": "quantity",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "base_currency",
+        "name": "price",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "fee",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "date",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -37,10 +47,12 @@
     "nullable": [
       false,
       false,
-      true,
+      false,
+      false,
+      false,
       false,
       false
     ]
   },
-  "hash": "942ba6298f135dc1d675e27dcacfa93aa666081af51d49313588c64a79361044"
+  "hash": "d477555f38aa81b1be1a38ccf39f760dd95cdc11dcd07e1e88fdf710164431c4"
 }
