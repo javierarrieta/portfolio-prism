@@ -1,7 +1,7 @@
 use rocket::{State, serde::json::Json, http::{ContentType, Status}};
 use rocket::request::Request;
 use rocket::response::{Responder, Response};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 use chrono::{NaiveDate, Utc};
@@ -51,8 +51,8 @@ use crate::auth::guard::AuthedUser;
 #[get("/<id>/tax-summary?<strategy>&<threshold_days>&<from>&<to>&<format>")]
 pub async fn get_portfolio_tax_summary(
     user: AuthedUser,
-    id: i32,
-    pool: &State<SqlitePool>,
+    id: i64,
+    pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
@@ -116,18 +116,24 @@ pub async fn get_portfolio_tax_summary(
     }
 }
 
-async fn load_portfolio(pool: &SqlitePool, id: i32) -> Result<Portfolio, ReportError> {
-    sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| ReportError::internal(e.to_string()))?
-        .ok_or_else(ReportError::not_found)
+async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError> {
+    // Column list, not `SELECT *`: `owner_id` is an authorization column and is not a
+    // field of `models::Portfolio`.
+    sqlx::query_as!(
+        Portfolio,
+        "SELECT id, name, description, currency, base_currency FROM portfolios WHERE id = $1",
+        id
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ReportError::internal(e.to_string()))?
+    .ok_or_else(ReportError::not_found)
 }
 
-async fn load_assets(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<Asset>, ReportError> {
-    sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = ?")
-        .bind(portfolio_id)
+async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, ReportError> {
+    // `ORDER BY id` so a report lists assets in the order they were created, as the
+    // file-backed build did; see the note on `portfolios::fetch_assets_for_portfolio`.
+    sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id", portfolio_id)
         .fetch_all(pool)
         .await
         .map_err(|e| ReportError::internal(e.to_string()))
@@ -139,7 +145,7 @@ async fn load_assets(pool: &SqlitePool, portfolio_id: i32) -> Result<Vec<Asset>,
 /// sync splits (issue #50). `strategy` is the normalized value the handler chose, so
 /// this response can never name a matching method the engine did not use.
 async fn undated_summary(
-    pool: &SqlitePool,
+    pool: &DbPool,
     currency_service: &CurrencyService,
     portfolio: &Portfolio,
     assets: &[Asset],
@@ -165,11 +171,14 @@ async fn undated_summary(
         // path is what `App.tsx` hits on every portfolio open, so leaving the write
         // here would have kept the whole problem while a new endpoint looked tidy.
 
-        let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
-            .bind(asset.id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| ReportError::internal(e.to_string()))?;
+        let transactions = sqlx::query_as!(
+            Transaction,
+            "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
+            asset.id
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ReportError::internal(e.to_string()))?;
 
         // A pricing failure is still exactly what it was on this path: a zero, and a 200
         // response. This endpoint is undated, so the type change must not move a number
@@ -241,8 +250,8 @@ async fn undated_summary(
 #[post("/<id>/sync-splits")]
 pub async fn sync_portfolio_splits(
     user: AuthedUser,
-    id: i32,
-    pool: &State<SqlitePool>,
+    id: i64,
+    pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
 ) -> Result<Json<SyncSplitsOut>, ReportError> {
     // Editor, not Viewer: this writes rows that change cost basis.
@@ -294,24 +303,26 @@ pub async fn sync_portfolio_splits(
 #[get("/<id>/performance")]
 pub async fn get_portfolio_performance(
     user: AuthedUser,
-    id: i32,
-    pool: &State<SqlitePool>,
+    id: i64,
+    pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
 ) -> Result<Json<serde_json::Value>, Status> {
-    // Before the `WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = ?)`
+    // Before the `WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1)`
     // subquery: that shape is invisible to the gate script's grep, so this call is
     // the only thing keeping it honest.
     require(pool.inner(), user.id, id, Access::Viewer).await?;
 
-    let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
+    let portfolio = sqlx::query_as!(
+        Portfolio,
+        "SELECT id, name, description, currency, base_currency FROM portfolios WHERE id = $1",
+        id
+    )
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|_| Status::InternalServerError)?
+    .ok_or(Status::NotFound)?;
 
-    let assets = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = ?")
-        .bind(id)
+    let assets = sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id", id)
         .fetch_all(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?;
@@ -322,10 +333,11 @@ pub async fn get_portfolio_performance(
     // `POST /api/portfolios/<id>/sync-splits`, which the UI calls explicitly and which
     // reports what it did.
 
-    let transactions = sqlx::query_as::<_, Transaction>(
-        "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = ?)"
+    let transactions = sqlx::query_as!(
+        Transaction,
+        "SELECT * FROM transactions WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1) ORDER BY id",
+        id
     )
-    .bind(id)
     .fetch_all(pool.inner())
     .await
     .map_err(|_| Status::InternalServerError)?;
@@ -345,7 +357,7 @@ pub async fn get_portfolio_performance(
     get,
     path = "/api/transactions/<id>/pnl",
     params(
-        ("id" = i32, Path, description = "Sell transaction id"),
+        ("id" = i64, Path, description = "Sell transaction id"),
         ("strategy" = Option<String>, Query, description = "FIFO, LIFO or HYBRID (default FIFO)"),
         ("threshold_days" = Option<i64>, Query, description = "HYBRID short-term threshold (default 30)")
     ),
@@ -358,8 +370,8 @@ pub async fn get_portfolio_performance(
 #[get("/transactions/<id>/pnl?<strategy>&<threshold_days>")]
 pub async fn get_transaction_sell_pnl(
     user: AuthedUser,
-    id: i32,
-    pool: &State<SqlitePool>,
+    id: i64,
+    pool: &State<DbPool>,
     currency_service: &State<CurrencyService>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
@@ -368,8 +380,7 @@ pub async fn get_transaction_sell_pnl(
 
     // The three lookups below (transaction -> asset -> portfolio) stay: they are the
     // response's data source, not the authorization decision.
-    let tx = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = ?")
-        .bind(id)
+    let tx = sqlx::query_as!(Transaction, "SELECT * FROM transactions WHERE id = $1", id)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?
@@ -381,19 +392,21 @@ pub async fn get_transaction_sell_pnl(
 
     // The base currency comes from the portfolio that owns the asset, never from
     // a path parameter, so this answer cannot disagree with the portfolio on screen.
-    let asset = sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = ?")
-        .bind(tx.asset_id)
+    let asset = sqlx::query_as!(Asset, "SELECT * FROM assets WHERE id = $1", tx.asset_id)
         .fetch_optional(pool.inner())
         .await
         .map_err(|_| Status::InternalServerError)?
         .ok_or(Status::NotFound)?;
 
-    let portfolio = sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
-        .bind(asset.portfolio_id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
+    let portfolio = sqlx::query_as!(
+        Portfolio,
+        "SELECT id, name, description, currency, base_currency FROM portfolios WHERE id = $1",
+        asset.portfolio_id
+    )
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|_| Status::InternalServerError)?
+    .ok_or(Status::NotFound)?;
 
     // Normalized once, then used for both the engine call and the response, so
     // the modal can never name a matching method the engine did not use.
@@ -418,11 +431,14 @@ pub async fn get_transaction_sell_pnl(
     // test_sell_pnl_sums_to_tax_summary_realized_pnl.
     //
     // Same query and same scope as get_portfolio_tax_summary.
-    let transactions = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
-        .bind(asset.id)
-        .fetch_all(pool.inner())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
+    let transactions = sqlx::query_as!(
+        Transaction,
+        "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
+        asset.id
+    )
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|_| Status::InternalServerError)?;
 
     let breakdown = TaxLotEngine::sell_breakdown(
         tx.id,
@@ -835,7 +851,7 @@ enum CloseFailure {
 /// Goal 4 requires: the layer returns a series, not where it came from.
 async fn resolve_close(
     currency_service: &CurrencyService,
-    pool: &SqlitePool,
+    pool: &DbPool,
     symbol: &str,
     to: NaiveDate,
 ) -> Result<(Decimal, NaiveDate, PriceSource), CloseFailure> {
@@ -882,7 +898,7 @@ async fn resolve_close(
 /// still returns 503 or 422 rather than a partial payload.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_tax_report(
-    pool: &SqlitePool,
+    pool: &DbPool,
     currency_service: &CurrencyService,
     portfolio: &Portfolio,
     assets: &[Asset],
@@ -899,11 +915,14 @@ pub async fn build_tax_report(
     // cloned: `Asset` is not `Clone` and the caller owns the rows for the whole call.
     let mut loaded: Vec<(&Asset, Vec<Transaction>)> = Vec::with_capacity(assets.len());
     for asset in assets {
-        let txs = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE asset_id = ?")
-            .bind(asset.id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| ReportError::internal(e.to_string()))?;
+        let txs = sqlx::query_as!(
+            Transaction,
+            "SELECT * FROM transactions WHERE asset_id = $1 ORDER BY id",
+            asset.id
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ReportError::internal(e.to_string()))?;
         loaded.push((asset, txs));
     }
 

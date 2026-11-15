@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE assets SET currency = $1 WHERE id = $2 AND portfolio_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4d36fc4650bfa849256caca68e3243b5b1d80a19bf9a771f22209a9b2585d56a"
+}

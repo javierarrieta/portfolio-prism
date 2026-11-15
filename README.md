@@ -2,7 +2,7 @@
 
 Full-stack portfolio management application with tax lot tracking (FIFO/LIFO/Hybrid) and analytics.
 
-- **Backend**: Rust (Rocket) + SQLite (SQLx)
+- **Backend**: Rust (Rocket) + PostgreSQL (SQLx)
 - **Frontend**: React 19 + Vite + TypeScript + Recharts
 
 ---
@@ -95,11 +95,20 @@ Replace `<org>` with your GitHub username or organization.
 
 ### Single-File Deployment
 
-Apply all resources in one step:
-
 ```bash
 kubectl apply -f k8s/
 ```
+
+**Only while the app still speaks the storage these manifests describe.** It does not any
+more: the current image is Postgres-only and `k8s/configmap.yaml` still ships a `sqlite:`
+DSN, so this one command is exactly the outage `docs/postgres-cutover.md` documents — the
+new pod refuses its configuration and there is no serving replica. Read that document's
+*What changed in the manifests, and in which order* before applying any of these files, and
+note that the atomic cutover apply is deliberately **not** `kubectl apply -f k8s/`: the CNPG
+`Database`, the `DatabaseRole` and the Secret must already exist and be Ready. Also confirm
+`.spec.strategy.type` on the live deployment first — `k8s/app-deployment.yaml` declares no
+`spec.strategy`, so the manifest does not tell you whether you are about to cause a
+`Recreate` outage or a silently crash-looping rollout.
 
 ### Resource Overview
 
@@ -108,7 +117,7 @@ k8s/
   namespace.yaml          # Namespace
   storageclass.yaml       # StorageClass
   configmap.yaml          # Backend configuration
-  pv.yaml                 # Persistent volume for SQLite database
+  pv.yaml                 # Persistent volume for the (pre-cutover) file-backed database
   pvc.yaml                # Persistent volume claim
   app-deployment.yaml     # Single pod: frontend + backend containers
   app-service.yaml        # ClusterIP service (:80)
@@ -127,7 +136,7 @@ Single Pod
   │   └── proxies /api/* and /api-docs → 127.0.0.1:8000
   │
   └── backend (Rocket, :8000)
-      └── SQLite via PVC → /app/data/portfolio.db
+      └── DATABASE_URL → Postgres (the ConfigMap still names a SQLite file; see Storage)
 ```
 
 Both containers run in the same pod and communicate over `127.0.0.1`. The frontend nginx proxies all API requests (`/api/*`, `/api-docs/*`) to the backend. The browser only talks to the frontend — no cross-service calls are needed.
@@ -141,17 +150,30 @@ retries, which is cheaper than a probe that cannot succeed by construction.
 
 ### Storage
 
-The backend uses a SQLite database (`portfolio.db`). A persistent volume and claim are included to retain data across pod restarts. The volume is mounted at `/app/data/`.
+The backend connects to **PostgreSQL** and nothing else: `DATABASE_URL` is required, has
+no default, and the process refuses to start without it. In development
+`backend_rust/scripts/dev-db.sh` brings up a local cluster on `127.0.0.1:55432` and
+prints the URL to export; `./start.sh` does that for you if the environment does not
+already set one. Schema comes from `backend_rust/migrations/` at startup.
 
-For production, use block-backed storage (e.g. `gp2`, `ssd`, `azure-disk`) or a managed database.
+Only `k8s/configmap.yaml` still ships a `sqlite:` DSN, and it does so on purpose: a running
+deployment consumes that manifest, so changing it is an ordered cutover step — database and
+Secret first, image last — rather than a commit. See `docs/postgres-cutover.md` (*What
+changed in the manifests, and in which order*) and
+`docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`. `backend_rust/Dockerfile`
+no longer ships one: it has no `DATABASE_URL`, no `libsqlite3`, and no `/app/data` volume,
+so a container started without an injected URL exits immediately and names the variable.
+Until the cutover the persistent volume below is unused by the current image.
 
 > **The manifests in `k8s/` are stale and do not describe the running deployment.** The
 > StorageClass is *named* `nfs-client`, but its provisioner is
 > `k8s.io/minikube-hostpath` — the name is a copied convention, not a description, and
 > nothing here has ever been NFS. The live app runs in the `apps` namespace against a
-> `local-path-retain` PVC on the node filesystem, with `replicas: 1` and `Recreate`.
-> Reconciling or deleting these manifests is tracked in #61. Do not infer the storage
-> backend from a StorageClass name; check `spec.provisioner` and the PV's volume source.
+> `local-path-retain` PVC on the node filesystem, with `replicas: 1` and a `Recreate`
+> strategy. Confirm `.spec.strategy.type` on the live deployment before relying on that: the
+> manifests declare no `spec.strategy`, whose default is `RollingUpdate`. Reconciling or
+> deleting these manifests is tracked in #61. Do not infer the storage backend from a
+> StorageClass name; check `spec.provisioner` and the PV's volume source.
 
 ### Environment Variables
 
@@ -159,14 +181,17 @@ Backend environment variables are configured in the ConfigMap:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `sqlite:///app/data/portfolio.db?mode=rwc` | SQLite connection string |
+| `DATABASE_URL` | *none — required* | Postgres connection string. There is no default and no SQLite support; a `sqlite:` URL is refused at startup. Development: `postgres://postgres@127.0.0.1:55432/prism`, printed by `backend_rust/scripts/dev-db.sh`. |
 | `BACKUP_ALLOW_PRICE_RESTORE` | `false` | Let `POST /api/backup/restore` write the bundle's `prices` section. **Security-relevant:** `historical_prices` has no `owner_id`, so a restore that writes it is one tenant writing market data every other tenant's dated reports read. `1/true/yes` enable, `0/false/no` disable, anything else stays off and logs a warning, and the backend prints a `WARN` on every start with it on. Deliberately **absent** from `k8s/configmap.yaml`, so the deployed app has it off. See `docs/backup-schema/README.md` and `docs/walkthrough.md` §4 step 6. |
 
 ### Scaling
 
-The backend is a single replica against one SQLite file, and SQLite is not a
-client/server database — horizontal scaling means changing the storage engine, not
-adding replicas.
+The backend is stateless now that it talks to a Postgres server, so replicas are a
+matter of pointing every pod at the same `DATABASE_URL`. What still holds it to one
+replica is the deployment: `k8s/` ships a file-backed volume and a `sqlite:` DSN in its
+ConfigMap (see *Storage* and `docs/postgres-cutover.md`), and a `Recreate` rollout strategy
+— confirm `.spec.strategy.type` on the live deployment, because `k8s/app-deployment.yaml`
+declares no `spec.strategy` and the default is `RollingUpdate`.
 
 > **Do not follow the previous advice in this section**, which suggested "SQLite with WAL
 > mode and NFS". SQLite's own WAL documentation rules that out: *"All processes using a
@@ -178,21 +203,20 @@ adding replicas.
 The supported path is migration to PostgreSQL (or another managed RDBMS). The manifests
 are written to be adaptable for a stateless backend against a managed database.
 
+The default deployment runs a single pod, and `--replicas=3` is still not meaningful until
+the cutover has happened: a Postgres service or managed instance in the cluster, the
+`sqlite:` DSN in `k8s/configmap.yaml` replaced by the Secret's `DATABASE_URL`, and the
+file-backed `pv.yaml`/`pvc.yaml` retired. That is
+`docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`, and the data side is
+`docs/postgres-cutover.md`. The nginx proxy pass in the frontend container already makes
+horizontal scaling straightforward once those are done.
+
 ```bash
-# Not a supported configuration — see above. Kept here only to record that it was tried
-# and why it is wrong.
+# Not a supported configuration yet — see above. Kept here only to record that it was tried
+# and why it is wrong, and so that nobody re-derives it: scaling the deployment while the
+# ConfigMap still names a file database gives every replica its own empty file.
 # kubectl scale deployment backend -n investment-portfolio-manager --replicas=3
 ```
-
-### Scaling
-
-The default deployment runs a single pod. For higher availability, increase replicas:
-
-```bash
-kubectl scale deployment app -n investment-portfolio-manager --replicas=3
-```
-
-Note: scaling beyond 1 replica with SQLite requires migration to a shared database (e.g., PostgreSQL). The nginx proxy pass in the frontend container makes horizontal scaling straightforward once the storage layer is externalized.
 
 ### Cleanup
 

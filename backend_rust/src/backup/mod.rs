@@ -249,10 +249,10 @@ fn transaction_type_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sc
 /// Price rows are included because a restore inserts them too, in the same
 /// transaction as everything else. A cap that counted only the caller's own rows
 /// would let a bundle under it carry ~120k single-row `INSERT`s into
-/// `historical_prices` — enough to hold the SQLite write lock past the 5s
-/// `busy_timeout` in `main.rs` and turn concurrent traffic into 503s. The ceiling is
-/// a promise about how much work one restore may do, so it counts every row the
-/// restore writes.
+/// `historical_prices` — enough to hold one pool connection, and the row locks those
+/// inserts take, for the whole of one long transaction while every other request waits
+/// for a connection. The ceiling is a promise about how much work one restore may do,
+/// so it counts every row the restore writes.
 pub fn row_count(bundle: &Bundle) -> usize {
     let owned: usize = bundle.portfolios.iter().fold(0usize, |acc, p| {
         acc + 1 + p.assets.iter().fold(0usize, |a, ast| a + 1 + ast.transactions.len())
@@ -443,6 +443,24 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
                 push(format!("{ap}.isin"), format!("{isin:?} is not a valid ISIN"));
             }
 
+            // One SPLIT per asset per UTC calendar day, and the check has to happen
+            // here rather than at `apply`: `uq_split_asset_date` is a partial unique
+            // index on `(asset_id, (date AT TIME ZONE 'UTC')::date) WHERE type =
+            // 'SPLIT'`, `apply` inserts plainly, and the second row of a pair raises
+            // `23505 unique_violation` — which `classify` maps to `Other`, so the
+            // caller got a `500` for a row in their own file, after `preview` had
+            // already said the bundle was fine. The day is derived exactly the way the
+            // index derives it (UTC, not the row's own offset) or the two would
+            // disagree about what "the same day" means.
+            //
+            // It fails safe today — the whole restore is one SERIALIZABLE transaction,
+            // so the `23505` rolls back every row the bundle had already written — and
+            // that property is kept, not relied upon: a rollback is the right outcome
+            // for a bundle that cannot be applied, but it is not an answer to give a
+            // user who asked a question `collect` was able to answer.
+            let mut split_days: std::collections::HashSet<chrono::NaiveDate> =
+                std::collections::HashSet::new();
+
             for (ti, t) in a.transactions.iter().enumerate() {
                 let tp = format!("{ap}.transactions[{ti}]");
                 if !KNOWN_TRANSACTION_TYPES.contains(&t.r#type.as_str()) {
@@ -483,6 +501,16 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
                         if day < min || day > max {
                             push(format!("{tp}.date"),
                                 format!("{:?} is outside the supported range 1900-01-01 to 2100-01-01", t.date));
+                        }
+                        if t.r#type == "SPLIT" {
+                            let utc_day = dt.with_timezone(&chrono::Utc).date_naive();
+                            if !split_days.insert(utc_day) {
+                                push(format!("{tp}.date"), format!(
+                                    "{:?} is a second SPLIT for this asset on {utc_day}; \
+                                     one asset may hold at most one split per UTC day, \
+                                     so the second would be rejected on restore",
+                                    t.date));
+                            }
                         }
                     }
                     Err(_) => push(format!("{tp}.date"),
@@ -649,9 +677,9 @@ mod tests {
 
     /// The rows a restore writes into `historical_prices` count toward the same
     /// ceiling as the caller's own rows. Excluding them is what let a bundle under the
-    /// cap drive ~120k single-row `INSERT`s inside one write transaction — long
-    /// enough to hold the SQLite write lock past the 5s `busy_timeout` and answer every
-    /// concurrent request with a 503.
+    /// cap drive ~120k single-row `INSERT`s inside one transaction — long enough to
+    /// hold that connection and the locks those rows take while every concurrent
+    /// request waited for a connection.
     #[test]
     fn price_rows_count_toward_the_row_ceiling() {
         let mut b = bundle(vec![port("p1", vec![asset("a1", vec![])])]);

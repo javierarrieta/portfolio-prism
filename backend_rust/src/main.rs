@@ -1,10 +1,8 @@
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::SqlitePool;
 use backend_rust::services::currency_service::CurrencyService;
 use backend_rust::{get_cors_options, parse_allowed_origins};
 use backend_rust::auth::{finalise_auth, StartupConfig};
 use backend_rust::build_rocket;
-use backend_rust::init_db;
+use backend_rust::db;
 
 /// Print the OpenAPI document and exit, before touching configuration, the
 /// database, or the network.
@@ -50,40 +48,36 @@ async fn main() -> Result<(), rocket::Error> {
         Err(e) => refuse(e),
     };
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:../portfolio.db?mode=rwc".to_string());
-
-    // `busy_timeout` only; the journal mode is left alone. An earlier version of this
-    // comment justified that by calling the production volume NFS. That was wrong — it
-    // read the StorageClass *name* (`nfs-client`) without checking its provisioner, and
-    // the manifests it cited are not what is deployed. Measured against the live
-    // cluster: the database is on `local-path-retain`, a node filesystem, RWO, with
-    // `replicas: 1` and `Recreate`. WAL would be safe on it.
-    //
-    // WAL is still not enabled, for a different reason (#61): the PVC is opted into
-    // daily restic backups, and the backup Job copies the mounted volume with a plain
-    // `restic backup /volume` — no `sqlite3 .backup`, no checkpoint, nothing that
-    // understands SQLite. On rollback-journal mode a snapshot taken mid-transaction can
-    // restore corrupt, which is at least detectable with `PRAGMA integrity_check`. With
-    // WAL, committed data can sit in `-wal` uncheckpointed, so copying `portfolio.db`
-    // alone restores an older but internally consistent database — silently stale, and
-    // it passes `integrity_check`. Enabling WAL before the backup is SQLite-aware would
-    // turn a detectable failure into an invisible one.
-    //
-    // What is unchanged by all of this: correctness here does not rest on locking or on
-    // journal mode at all. It rests on the unique index `enforce_split_uniqueness`
-    // installs. `busy_timeout` just decides how long a writer waits for a lock instead
-    // of erroring.
-    let opts = match database_url.parse::<SqliteConnectOptions>() {
-        Ok(o) => o.busy_timeout(std::time::Duration::from_secs(5)),
-        Err(e) => refuse(anyhow::anyhow!("invalid DATABASE_URL: {e}")),
+    // Postgres only: there is no default and no SQLite fallback. A default that
+    // silently opened a file database is the opposite of this configuration's purpose,
+    // so a missing value names what is missing and stops.
+    let Some(database_url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        refuse(anyhow::anyhow!(
+            "DATABASE_URL is required. Postgres-only: there is no SQLite fallback. \
+             Local: nix-shell -p postgresql_18 --run 'bash scripts/dev-db.sh', then \
+             export DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism"
+        ));
     };
 
-    let pool = SqlitePool::connect_with(opts)
-        .await
-        .expect("Failed to connect to database");
+    let pool = match db::connect(&database_url).await {
+        Ok(pool) => pool,
+        Err(e) => refuse(anyhow::anyhow!("cannot connect to DATABASE_URL: {e}")),
+    };
 
-    if let Err(e) = init_db(&pool, &cfg).await {
+    // Migrations run before the pool serves anything else. This replaces `init_db`,
+    // whose `PRAGMA table_info` guards were a hand-rolled migrator, and whose
+    // `CREATE TABLE IF NOT EXISTS` could never alter a table it had already made —
+    // which is why `migrate_split_sync_key` had to detect shape by column instead.
+    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
+        refuse(anyhow::anyhow!("migrations failed: {e}"));
+    }
+
+    // After the migrator, because both of its statements name tables the migrator
+    // creates. See the function's doc comment for what depends on it.
+    if let Err(e) = backend_rust::ensure_bootstrap_owner(&pool, &cfg).await {
         refuse(e);
     }
 

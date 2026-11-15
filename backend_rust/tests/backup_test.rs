@@ -13,10 +13,21 @@
 
 mod common;
 
+use backend_rust::ensure_bootstrap_owner;
 use common::{
-    build_rocket, disabled_config, seed_asset, seed_daily_prices, seed_portfolio, seed_transaction,
-    setup_db,
+    build_rocket,
+    bundle_json,
+    db_with_user,
+    disabled_config,
+    placeholder_id,
+    pool_options,
+    seed_asset,
+    seed_daily_prices,
+    seed_portfolio,
+    seed_transaction,
+    test_pool_url,
 };
+use sqlx::Connection as _;
 use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::http::{Header, Status};
 use rocket::local::asynchronous::Client;
@@ -25,21 +36,22 @@ use rocket::{get, post, routes};
 use serde_json::{json, Value};
 
 use backend_rust::api_routes::backup::{BackupError, lock_response};
+use backend_rust::db::DbPool;
 use backend_rust::backup::export::{self as backup_export, DbFailure};
 use backend_rust::backup::restore::{self as backup_restore, ApplyError, Mode};
 use backend_rust::backup::{BackupConfig, MAX_BUNDLE_BYTES, MAX_BUNDLE_ROWS, parse_and_validate};
 
-/// The session header the existing tests use to run as the placeholder user.
-async fn client(pool: sqlx::SqlitePool) -> Client {
-    Client::tracked(build_rocket(pool, common::DEFAULT_USER)).await.unwrap()
+/// The session header the existing tests use to run as the caller they seeded.
+async fn client(pool: DbPool, user: i64) -> Client {
+    Client::tracked(build_rocket(pool, user)).await.unwrap()
 }
 
 /// The same, with the price-restore flag on — the only thing a test can do about it:
 /// `build_rocket_with_backup_config` documents why the flag is injected, not exported.
-async fn price_restore_client(pool: sqlx::SqlitePool) -> Client {
+async fn price_restore_client(pool: DbPool, user: i64) -> Client {
     Client::tracked(common::build_rocket_with_backup_config(
         pool,
-        common::DEFAULT_USER,
+        user,
         BackupConfig { allow_price_restore: true },
     ))
     .await
@@ -47,14 +59,13 @@ async fn price_restore_client(pool: sqlx::SqlitePool) -> Client {
 }
 
 fn session() -> Header<'static> {
-    let (name, value) = common::session_cookie(1, 0);
-    Header::new(name, value)
+    common::session_header()
 }
 
 #[tokio::test]
 async fn capabilities_reports_the_limits_the_ui_must_respect() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("capabilities_reports_the_limits_the_ui_must_respect").await;
+    let c = client(pool, user).await;
 
     let res = c.get("/api/backup/capabilities").header(session()).dispatch().await;
     assert_eq!(res.status(), Status::Ok);
@@ -67,7 +78,7 @@ async fn capabilities_reports_the_limits_the_ui_must_respect() {
 
 #[tokio::test]
 async fn capabilities_requires_a_session() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("capabilities_requires_a_session").await;
     let rocket = common::build_rocket_oidc(pool);
     let c = Client::tracked(rocket).await.unwrap();
     let res = c.get("/api/backup/capabilities").dispatch().await;
@@ -83,9 +94,9 @@ async fn the_managed_backup_config_is_the_one_build_rocket_was_given() {
     // parameter now, and this asserts the value that comes out the other side
     // through the handler: re-introducing a default-managed config fails a test
     // here instead of the release binary at boot.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("the_managed_backup_config_is_the_one_build_rocket_was_given").await;
     let on = BackupConfig { allow_price_restore: true };
-    let rocket = common::build_rocket_with_backup_config(pool, common::DEFAULT_USER, on);
+    let rocket = common::build_rocket_with_backup_config(pool, user, on);
     let c = Client::tracked(rocket).await.unwrap();
 
     assert!(
@@ -129,8 +140,8 @@ async fn probe_data(body: Data<'_>) -> String {
     format!("{}:{}", capped.value.len(), capped.is_complete())
 }
 
-async fn probe_client(pool: sqlx::SqlitePool) -> Client {
-    let rocket = build_rocket(pool, common::DEFAULT_USER).mount("/probe", routes![probe_data]);
+async fn probe_client(pool: DbPool, user: i64) -> Client {
+    let rocket = build_rocket(pool, user).mount("/probe", routes![probe_data]);
     Client::tracked(rocket).await.unwrap()
 }
 
@@ -141,8 +152,8 @@ fn body_of(len: usize) -> String {
 
 #[tokio::test]
 async fn a_body_of_exactly_max_bundle_bytes_arrives_whole() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = probe_client(pool).await;
+    let (pool, user) = db_with_user("a_body_of_exactly_max_bundle_bytes_arrives_whole").await;
+    let c = probe_client(pool, user).await;
 
     let res = c
         .post("/probe/data")
@@ -162,8 +173,8 @@ async fn one_byte_more_arrives_capped_for_the_handler_to_refuse() {
     // The cap is exact, and Rocket does not refuse this request: the handler is
     // handed `MAX_BUNDLE_BYTES` with `is_complete() == false` and must answer with
     // the module's `413` rather than restoring a truncated bundle.
-    let pool = setup_db(&disabled_config()).await;
-    let c = probe_client(pool).await;
+    let (pool, user) = db_with_user("one_byte_more_arrives_capped_for_the_handler_to_refuse").await;
+    let c = probe_client(pool, user).await;
 
     let res = c
         .post("/probe/data")
@@ -189,9 +200,9 @@ async fn one_byte_more_arrives_capped_for_the_handler_to_refuse() {
 // ---------------------------------------------------------------------------
 
 /// Seed: portfolio "One" with one asset and one buy; portfolio "Two" with nothing.
-async fn seed_two_portfolios(pool: &sqlx::SqlitePool) -> (i32, i32) {
-    let one = seed_portfolio(pool, common::DEFAULT_USER, "One", "USD").await;
-    let two = seed_portfolio(pool, common::DEFAULT_USER, "Two", "EUR").await;
+async fn seed_two_portfolios(pool: &DbPool, user: i64) -> (i64, i64) {
+    let one = seed_portfolio(pool, user, "One", "USD").await;
+    let two = seed_portfolio(pool, user, "Two", "EUR").await;
     let asset = seed_asset(pool, one, "AAPL", "Apple").await;
     seed_transaction(pool, asset, "BUY", 10.0, 150.0, 1.0).await;
     (one, two)
@@ -199,9 +210,9 @@ async fn seed_two_portfolios(pool: &sqlx::SqlitePool) -> (i32, i32) {
 
 #[tokio::test]
 async fn export_contains_only_the_selected_portfolios() {
-    let pool = setup_db(&disabled_config()).await;
-    let (one, two) = seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("export_contains_only_the_selected_portfolios").await;
+    let (one, two) = seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}");
     let res = c.get(&path).header(session()).dispatch().await;
@@ -219,9 +230,9 @@ async fn export_contains_only_the_selected_portfolios() {
 async fn export_is_a_download_and_is_never_cached() {
     // A cached bundle is a silent data-loss bug: the user restores last week's
     // file believing it is today's.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("export_is_a_download_and_is_never_cached").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
     let path = format!("/api/backup/export?portfolio_ids={one}");
     let res = c.get(&path).header(session()).dispatch().await;
     assert_eq!(res.headers().get_one("Cache-Control"), Some("no-store"));
@@ -234,8 +245,8 @@ async fn export_is_a_download_and_is_never_cached() {
 async fn an_empty_selection_is_a_422_not_an_empty_bundle() {
     // Review Focus #5. An empty bundle must never be produced, because someone
     // will eventually restore it.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("an_empty_selection_is_a_422_not_an_empty_bundle").await;
+    let c = client(pool, user).await;
     // The whitespace case is percent-encoded on purpose: a raw space in the request
     // target is refused by Rocket's URI parser with a `400` before any route runs,
     // so it would test the parser rather than this rule. `%20` decodes to the same
@@ -248,17 +259,17 @@ async fn an_empty_selection_is_a_422_not_an_empty_bundle() {
 
 #[tokio::test]
 async fn a_malformed_id_list_is_a_422() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_malformed_id_list_is_a_422").await;
+    let c = client(pool, user).await;
     let res = c.get("/api/backup/export?portfolio_ids=1,abc").header(session()).dispatch().await;
     assert_eq!(res.status(), Status::UnprocessableEntity);
 }
 
 #[tokio::test]
 async fn a_duplicate_id_is_exported_once() {
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_duplicate_id_is_exported_once").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
     let path = format!("/api/backup/export?portfolio_ids={one},{one}");
     let res = c.get(&path).header(session()).dispatch().await;
     let body: Value = res.into_json().await.unwrap();
@@ -268,7 +279,7 @@ async fn a_duplicate_id_is_exported_once() {
 /// Price rows for two symbols, only one of which `seed_two_portfolios` puts in the
 /// selection. The unheld one is what makes "prices are for the selection, not for the
 /// whole `historical_prices` table" a checked claim rather than an assumption.
-async fn seed_two_symbols(pool: &sqlx::SqlitePool) {
+async fn seed_two_symbols(pool: &DbPool) {
     seed_daily_prices(pool, "AAPL", "2024-01-01", "2024-01-03", "150.00").await;
     seed_daily_prices(pool, "MSFT", "2024-01-01", "2024-01-02", "90.00").await;
 }
@@ -278,10 +289,10 @@ async fn every_on_spelling_includes_only_the_prices_the_selection_holds() {
     // Rocket's own `bool` form field accepts neither `1` (what the UI sends) nor a
     // value it would report as an error, so these spellings used to arrive as `None`
     // and answer a 200 with the requested section missing.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, two) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("every_on_spelling_includes_only_the_prices_the_selection_holds").await;
+    let (one, two) = seed_two_portfolios(&pool, user).await;
     seed_two_symbols(&pool).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     for spelling in ["1", "true", "yes", "TRUE"] {
         let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
@@ -318,10 +329,10 @@ async fn every_on_spelling_includes_only_the_prices_the_selection_holds() {
 async fn every_off_spelling_omits_the_price_section() {
     // The mirror half: an explicit no must stay a no, and an omitted section is
     // skipped rather than serialised as `[]`.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("every_off_spelling_omits_the_price_section").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     seed_two_symbols(&pool).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     for spelling in ["0", "false", "no"] {
         let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
@@ -337,9 +348,9 @@ async fn an_unrecognised_include_prices_is_a_422_not_a_quiet_omission() {
     // A value in neither accepted set is the caller's error, said out loud. `on` and
     // `off` are rocket's spellings, not this flag's: one rule for both flags means the
     // accepted set is `1/true/yes` and `0/false/no` here and in the environment.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("an_unrecognised_include_prices_is_a_422_not_a_quiet_omission").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
 
     for spelling in ["maybe", "2", "on", "off", "truest", ""] {
         let path = format!("/api/backup/export?portfolio_ids={one}&include_prices={spelling}");
@@ -360,12 +371,12 @@ async fn a_repeated_query_parameter_is_refused_not_half_read() {
     // reaches the handler as if it had not been sent. For `portfolio_ids` that reads as
     // "no selection"; for `include_prices` it reads as "off", which is the same silent
     // omission as a value that fails to parse. Both are refused outright.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, two) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_repeated_query_parameter_is_refused_not_half_read").await;
+    let (one, two) = seed_two_portfolios(&pool, user).await;
     // Seeded so the duplicate's stakes are real: the failure refused here is a 200 with
     // a section missing, and there has to be a section that could go missing.
     seed_two_symbols(&pool).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}&portfolio_ids={two}");
     let res = c.get(&path).header(session()).dispatch().await;
@@ -403,11 +414,11 @@ async fn a_repeated_query_parameter_is_refused_not_half_read() {
 
 /// `n` transactions on one asset in a single statement. A loop of 50k inserts would
 /// dominate the suite; a recursive CTE is one round trip.
-async fn seed_many_transactions(pool: &sqlx::SqlitePool, asset_id: i32, n: usize) {
+async fn seed_many_transactions(pool: &DbPool, asset_id: i64, n: usize) {
     sqlx::query(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
-         WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < ?) \
-         SELECT ?, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
+         WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < $1) \
+         SELECT $2, 'BUY', '1', '10.0', '0.0', '2024-06-15T00:00:00+00:00' FROM cnt",
     )
     .bind(n as i64)
     .bind(asset_id)
@@ -421,11 +432,11 @@ async fn a_selection_over_the_row_ceiling_is_refused_by_the_route() {
     // The ceiling only protects anyone if the *route* refuses: a function that can
     // name the cap is not the same as a caller being told, and a bundle over it is one
     // restore will reject after the download.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_selection_over_the_row_ceiling_is_refused_by_the_route").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     let asset = seed_asset(&pool, one, "AAPL", "Apple").await;
     seed_many_transactions(&pool, asset, MAX_BUNDLE_ROWS).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}");
     let res = c.get(&path).header(session()).dispatch().await;
@@ -443,10 +454,10 @@ async fn a_bundle_over_the_byte_ceiling_is_refused_by_the_route() {
     // size. The serialised bundle is checked against the same byte ceiling the upload
     // enforces. A long asset name is the cheapest way to be big on this axis; what is
     // under test is the check, not which field made the bundle large.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_bundle_over_the_byte_ceiling_is_refused_by_the_route").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     seed_asset(&pool, one, "BIG", &"x".repeat(MAX_BUNDLE_BYTES + 1)).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}");
     let res = c.get(&path).header(session()).dispatch().await;
@@ -462,8 +473,8 @@ async fn a_bundle_over_the_byte_ceiling_is_refused_by_the_route() {
 async fn no_global_body_limit_is_raised_for_the_bundle() {
     // The other half of the ruling: because the cap is per route, every other
     // guard in the app still runs under Rocket's own defaults.
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, common::DEFAULT_USER)
+    let (pool, user) = db_with_user("no_global_body_limit_is_raised_for_the_bundle").await;
+    let rocket = build_rocket(pool, user)
         .ignite()
         .await
         .expect("rocket ignites");
@@ -485,9 +496,9 @@ async fn no_global_body_limit_is_raised_for_the_bundle() {
 // responder is pinned the way the size cap above is — the module's own value, mounted
 // on a probe route outside `/api`, asserted as what a client receives. The real routes
 // reach this exact code through `lock_response()`, which is the only way to build a
-// `BackupError` with a `503` at all (`BackupError`'s fields are private). The route
-// that writes drives this same code from a real `SQLITE_BUSY` in
-// `a_locked_database_is_a_503_with_retry_after_from_the_restore_route` below.
+// `BackupError` with a `503` at all (`BackupError`'s fields are private). The route that
+// writes reaches it from a real serialisation failure, proven end to end in
+// `tests/restore_concurrency_test.rs::a_concurrent_replace_restore_is_a_503_with_retry_after`.
 // ---------------------------------------------------------------------------
 
 /// The module's lock failure, answered verbatim.
@@ -500,8 +511,8 @@ async fn probe_lock() -> Result<Json<Value>, BackupError> {
 async fn a_lock_is_a_503_that_says_when_to_retry() {
     // A `503` without `Retry-After` tells a client nothing about whether the
     // failure was permanent, and the header can only be checked on a real response.
-    let pool = setup_db(&disabled_config()).await;
-    let rocket = build_rocket(pool, common::DEFAULT_USER).mount("/probe", routes![probe_lock]);
+    let (pool, user) = db_with_user("a_lock_is_a_503_that_says_when_to_retry").await;
+    let rocket = build_rocket(pool, user).mount("/probe", routes![probe_lock]);
     let c = Client::tracked(rocket).await.unwrap();
 
     let res = c.get("/probe/lock").dispatch().await;
@@ -518,32 +529,51 @@ async fn a_lock_is_a_503_that_says_when_to_retry() {
 // Two arms turn a `DbFailure::Lock` into the response, and they are not equally
 // reachable from a test:
 //
-// * `restore`'s arm is driven for real below, by a second connection holding a write
-//   transaction open against a file-backed database. A write is the one thing SQLite
-//   refuses with `SQLITE_BUSY` here.
-// * `export`'s arm still cannot be driven. `export` only reads, and under the
-//   rollback journal this app uses a writer does not block readers, so the lock that
-//   a test can actually provoke never reaches a read-only route; the one failure that
-//   would (`PoolTimedOut`) is met by `access::require` — or by the auth guard, which
-//   reads `users` on every request — and answered a 500 there before this arm is
-//   reached. Its two halves are pinned where they can be: `build()` producing `Lock`
-//   below, and the response a `Lock` becomes in `a_lock_is_a_503_that_says_when_to_retry`.
+// * `build()` producing a `Lock` at all is driven below, by a pool with no free
+//   connection. `PoolTimedOut` is the retryable database condition a test can actually
+//   provoke here.
+// * The response a `Lock` becomes is pinned by `a_lock_is_a_503_that_says_when_to_retry`
+//   on a probe route.
+//
+// What *is* now pinned, and what is not, about `restore`'s arm:
+//
+// * `restore`'s `ApplyError::Db(DbFailure::Lock) => lock_response()` arm is driven over
+//   HTTP for real by `tests/restore_concurrency_test.rs`, which races two `replace`
+//   restores and requires the loser to answer `503` with `Retry-After`. That is the
+//   Postgres replacement for the SQLite test the engine switch deleted: two writers on
+//   the same rows abort with `40001`, because `restore::apply` runs `SERIALIZABLE`.
+// * The pool-timeout half of the same arm is **not** reachable over HTTP, and the reason
+//   is specific rather than incidental: the auth guard reads `users` before the handler
+//   runs, so a pool with nothing free is answered a `500` by the guard and never reaches
+//   `apply`. Proving it would mean holding a connection at an instant *between* the
+//   guard and the handler, which no test can observe. A `40P01` deadlock cannot be
+//   provoked on purpose either: the victim is whichever transaction's wait completes the
+//   cycle, and a restore that blocks on its first statement holds nothing yet.
+//
+// TODO(Task 7, accepted gap): the two bullets above are the whole of what is proven.
+// `restore`'s `Lock` arm is proven for a serialisation failure and permanently unproven
+// for `PoolTimedOut`, for the reason in the previous paragraph — do not re-derive it, and
+// do not "fix" it by softening the guard, which answers a database failure as a `500`
+// exactly as `src/access.rs` requires. The `PoolTimedOut` half of the rule is pinned
+// where it can be: `classify` maps it (unit test `pool_exhaustion_is_busy_and_a_plain_
+// error_is_not`), and `build()` produces the `Lock` (below).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_exhausted_pool_is_a_lock_not_an_outage() {
-    // Under SQLite a reader rarely lives long enough to meet `SQLITE_BUSY`; the
-    // likelier way to be kept out is every connection in the pool being checked out.
-    // That is just as retryable, so it must arrive as the same failure the busy
-    // timeout does rather than a bare 500 with no `Retry-After`.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    // The likeliest way to be kept out of a healthy Postgres is every connection in the
+    // pool being checked out. That is just as retryable as a lock wait, so it must
+    // arrive as the same failure rather than a bare 500 with no `Retry-After`.
+    let url = test_pool_url("an_exhausted_pool_is_a_lock").await;
+    let pool = pool_options()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_millis(50))
-        .connect(":memory:")
+        .connect(&url)
         .await
         .unwrap();
-    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
-    let pid = seed_portfolio(&pool, common::DEFAULT_USER, "One", "USD").await;
+    ensure_bootstrap_owner(&pool, &disabled_config()).await.unwrap();
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner");
+    let pid = seed_portfolio(&pool, owner, "One", "USD").await;
 
     // The pool's only connection, held: nothing else can reach the database.
     let held = pool.acquire().await.unwrap();
@@ -559,137 +589,39 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
     assert_eq!(bundle.portfolios.len(), 1);
 }
 
-/// The same options for both halves of the lock test: the app's pool and the
-/// connection that locks it out must describe the same database.
-fn file_opts(path: &std::path::Path) -> sqlx::sqlite::SqliteConnectOptions {
-    sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        // Production waits five seconds for the lock (`main.rs`); this test only needs
-        // the wait to end, and a 5s busy_timeout would cost the suite five seconds.
-        .busy_timeout(std::time::Duration::from_millis(250))
-}
-
-/// A database on disk. `:memory:` cannot host this test: every connection of an
-/// in-memory pool is the *same* shared-cache database, and shared-cache writers
-/// collide at table level (`SQLITE_LOCKED`) rather than the `SQLITE_BUSY` a second
-/// connection — in production, a second process — meets against the file.
-async fn file_pool(path: &std::path::Path) -> sqlx::SqlitePool {
-    // One connection, deliberately: `init_db` runs its migrations statement by statement
-    // against the pool, and a file-backed pool with several connections can hand a later
-    // statement a stale per-connection schema — the same class of bug
-    // `tests/decimal_migration_test.rs` guards. The lock under test comes from a *second*
-    // pool, so a single connection here costs nothing.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(file_opts(path))
-        .await
-        .unwrap();
-    backend_rust::init_db(&pool, &disabled_config()).await.unwrap();
-    pool
-}
-
-#[tokio::test]
-async fn a_locked_database_is_a_503_with_retry_after_from_the_restore_route() {
-    // Every other lock test here pins one part: `classify` on a fake error, the
-    // responder on a probe route, `build()` against an exhausted pool. This is the
-    // whole path over HTTP — a real `SQLITE_BUSY` from a real second writer, through
-    // `classify`, through `ApplyError::Db(DbFailure::Lock)`, out of `lock_response()`
-    // — and it is the only one that can fail if a future change routes a lock to a
-    // bare 500.
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_backup_lock_test_{}_{}.db",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let pool = file_pool(&tmp).await;
-    seed_two_portfolios(&pool).await;
-    let before = rows(&pool).await;
-
-    // A second connection holding a write transaction open. Reads still succeed — a
-    // RESERVED writer does not block readers under the rollback journal this app uses,
-    // which is also why the auth guard's read of `users` gets through — but the
-    // restore's first INSERT cannot be granted the write lock and waits out
-    // `busy_timeout`.
-    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp))
-        .await
-        .unwrap();
-    let mut holder = holder_pool.acquire().await.unwrap();
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *holder)
-        .await
-        .unwrap();
-
-    let c = client(pool.clone()).await;
-    // Built twice rather than dispatched twice: a `LocalRequest` is consumed by
-    // `dispatch`, and the second request must be identical to the first for "it was
-    // the lock" to mean anything.
-    let restore = || {
-        c.post("/api/backup/restore?mode=copy")
-            .header(session())
-            .header(rocket::http::ContentType::JSON)
-            .body(bundle_json("Locked out"))
-    };
-    let res = restore().dispatch().await;
-    assert_eq!(res.status(), Status::ServiceUnavailable, "a busy database is retryable, not an outage");
-    assert_eq!(
-        res.headers().get_one("Retry-After"),
-        Some("2"),
-        "a 503 that does not say when to retry is a 503 a client will not retry"
-    );
-    let body: Value = res.into_json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
-    assert_eq!(rows(&pool).await, before, "the refused restore wrote nothing");
-
-    // And it was the lock rather than something else about the file: release it and
-    // the identical request succeeds.
-    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
-    let res = restore().dispatch().await;
-    assert_eq!(res.status(), Status::Ok);
-    assert_eq!(rows(&pool).await, (before.0 + 1, before.1 + 1, before.2 + 1));
-
-    drop(holder);
-    holder_pool.close().await;
-    pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
-}
-
 #[tokio::test]
 async fn a_read_only_export_does_not_queue_behind_a_writer() {
-    // `export::build` wraps its reads in a **deferred** transaction, and this pins the
-    // deferred half of that choice: a writer holding a write transaction open (RESERVED
-    // under the rollback journal this app runs, `main.rs`) must not turn a read-only
-    // export into a 503. Changing `pool.begin()` to `pool.begin_with("BEGIN IMMEDIATE")`
-    // — the "hardening" this exists to prevent — makes the export wait out
-    // `busy_timeout` for a write lock no read needs, and fails here.
+    // `export::build` wraps its reads in a `REPEATABLE READ` transaction, and the claim
+    // this test makes is the one about locking rather than visibility: an open writer
+    // blocks nothing. A reader neither waits for the lock nor sees the uncommitted write.
     //
-    // What this test cannot pin, said plainly rather than glossed: that the reads are in
-    // a transaction at all. Uncommitted data is invisible to a reader either way, and no
-    // test can commit at a chosen moment *between* two of `build`'s queries. The
-    // snapshot is a property of the transaction `build` opens, and it is the transaction
-    // that carries it, not anything observable from outside.
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_export_reader_{}_{}.db",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let pool = file_pool(&tmp).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    // Changing `backup_export::EXPORT_ISOLATION`, or `begin_read_tx`, to anything
+    // that takes a write lock no read needs — `BEGIN READ ONLY FOR UPDATE`, or a `BEGIN`
+    // that acquires one — fails here.
+    //
+    // What this test cannot pin, said plainly rather than glossed: that every read in
+    // `build` shares one snapshot. Uncommitted data is invisible to a reader at any
+    // isolation level, and no test can commit at a chosen moment *between* two of
+    // `build`'s own queries. That half is pinned from inside the transaction instead, in
+    // `tests/export_snapshot_test.rs`.
+    let url = test_pool_url("a_read_only_export_does_not_queue").await;
+    let pool = pool_options().connect(&url).await.unwrap();
+    ensure_bootstrap_owner(&pool, &disabled_config()).await.unwrap();
+    let owner = placeholder_id(&pool).await.expect("the placeholder owner");
+    seed_two_portfolios(&pool, owner).await;
+    let (one, _) = seed_two_portfolios(&pool, owner).await;
 
-    let holder_pool = sqlx::SqlitePool::connect_with(file_opts(&tmp)).await.unwrap();
+    // A second pool, because the point is that a *different* session is mid-write.
+    let holder_pool = pool_options().connect(&url).await.unwrap();
     let mut holder = holder_pool.acquire().await.unwrap();
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *holder).await.unwrap();
-    sqlx::query("UPDATE portfolios SET name = 'Renamed mid-flight' WHERE id = ?")
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query("UPDATE portfolios SET name = 'Renamed mid-flight' WHERE id = $1")
         .bind(one)
-        .execute(&mut *holder)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), owner).await;
     let path = format!("/api/backup/export?portfolio_ids={one}");
     let res = c.get(&path).header(session()).dispatch().await;
     let status = res.status();
@@ -700,11 +632,10 @@ async fn a_read_only_export_does_not_queue_behind_a_writer() {
         "and an uncommitted rename must not be half-visible"
     );
 
-    sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+    tx.rollback().await.unwrap();
     drop(holder);
     holder_pool.close().await;
     pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -719,28 +650,8 @@ async fn a_read_only_export_does_not_queue_behind_a_writer() {
 // end in a refusal, and the one mode whose whole subject is deletion.
 // ---------------------------------------------------------------------------
 
-/// The smallest bundle that passes validation: one portfolio, one asset, one
-/// transaction. `name` is the only string in it a test can point at.
-fn bundle_json(name: &str) -> String {
-    json!({
-        "format": "portfolio-prism-backup",
-        "schema_version": 1,
-        "created_at": "2026-11-13T00:00:00Z",
-        "portfolios": [{
-            "ref": "p1", "name": name, "description": null,
-            "currency": "USD", "base_currency": "USD",
-            "assets": [{
-                "ref": "a1", "symbol": "AAPL", "name": "Apple", "asset_type": "STOCK",
-                "sector": null, "currency": "USD", "isin": null,
-                "transactions": [{ "type": "BUY", "quantity": "10.0", "price": "150.00",
-                                   "fee": "1.00", "date": "2024-01-15T00:00:00Z" }]
-            }]
-        }]
-    })
-    .to_string()
-}
-
-/// The same bundle as a mutable `Value`, for a test that needs one field changed.
+/// The smallest bundle that passes validation, as a mutable `Value`, for a test that
+/// needs one field changed.
 ///
 /// Parsed rather than wrapped: `json!(bundle_json(..))` turns the *string* into a
 /// `Value::String`, and editing a field on that panics in serde before the request is
@@ -766,9 +677,9 @@ fn bundle_priced(name: &str, symbol: &str) -> String {
 
 #[tokio::test]
 async fn preview_counts_what_replace_would_delete_and_insert() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("preview_counts_what_replace_would_delete_and_insert").await;
+    seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
 
     let res = c
         .post("/api/backup/preview?mode=replace")
@@ -790,9 +701,9 @@ async fn preview_counts_what_replace_would_delete_and_insert() {
 
 #[tokio::test]
 async fn preview_in_copy_mode_deletes_nothing() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("preview_in_copy_mode_deletes_nothing").await;
+    seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
     let res = c
         .post("/api/backup/preview?mode=copy")
         .header(session())
@@ -811,13 +722,13 @@ async fn preview_in_copy_mode_deletes_nothing() {
 
 #[tokio::test]
 async fn preview_writes_nothing() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("preview_writes_nothing").await;
+    seed_two_portfolios(&pool, user).await;
     let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
     let res = c
         .post("/api/backup/preview?mode=replace")
         .header(session())
@@ -840,7 +751,7 @@ async fn preview_writes_nothing() {
 /// one tenant writing the market data every other tenant's dated reports read. The
 /// id sum is there because counts alone would miss a delete-and-reinsert of the same
 /// number of rows.
-async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
+async fn snapshot(pool: &DbPool) -> Vec<(String, i64)> {
     let mut out: Vec<(String, i64)> = Vec::new();
     for table in ["portfolios", "assets", "transactions", "historical_prices"] {
         let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
@@ -849,7 +760,12 @@ async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
             .unwrap();
         out.push((table.to_string(), n));
     }
-    let (sum,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(id), 0) FROM portfolios")
+    // `::bigint` because `SUM` of a `BIGINT` column is `NUMERIC` in Postgres, and
+    // `NUMERIC` does not decode into `i64`. The sum is a fingerprint, not a money
+    // amount, so narrowing it back is the point rather than a shortcut.
+    let (sum,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(id), 0)::bigint FROM portfolios",
+    )
         .fetch_one(pool)
         .await
         .unwrap();
@@ -864,11 +780,11 @@ async fn no_preview_writes_anything_whether_it_succeeds_or_refuses() {
     // one from a newer build, the one that is not JSON, and the one too big to read.
     // A refusal that wrote is the worst possible failure here, because the user has
     // been told the answer is "look at the plan first".
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("no_preview_writes_anything_whether_it_succeeds_or_refuses").await;
+    seed_two_portfolios(&pool, user).await;
     seed_daily_prices(&pool, "AAPL", "2024-01-01", "2024-01-02", "150.00").await;
     let before = snapshot(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let mut newer = bundle_value("Restored");
     newer["schema_version"] = json!(2);
@@ -903,8 +819,8 @@ async fn no_preview_writes_anything_whether_it_succeeds_or_refuses() {
 
 #[tokio::test]
 async fn an_unknown_mode_is_a_422() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("an_unknown_mode_is_a_422").await;
+    let c = client(pool, user).await;
     let res = c
         .post("/api/backup/preview?mode=merge")
         .header(session())
@@ -921,8 +837,8 @@ async fn an_unknown_mode_is_a_422() {
 async fn an_absent_mode_is_a_422_naming_the_two_that_exist() {
     // There is no default mode. Guessing one would answer a question the caller did
     // not ask, and the two answers differ by "delete everything you own".
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("an_absent_mode_is_a_422_naming_the_two_that_exist").await;
+    let c = client(pool, user).await;
     for path in ["/api/backup/preview", "/api/backup/preview?mode="] {
         let res = c
             .post(path)
@@ -944,8 +860,8 @@ async fn a_repeated_mode_is_refused_not_half_read() {
     // export: rocket collapses a repeated `Option` field into `None`, so
     // `?mode=copy&mode=replace` would otherwise arrive as "no mode at all" and be
     // answered as a missing parameter rather than as the contradiction it is.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_repeated_mode_is_refused_not_half_read").await;
+    let c = client(pool, user).await;
     let res = c
         .post("/api/backup/preview?mode=copy&mode=replace")
         .header(session())
@@ -961,8 +877,8 @@ async fn a_repeated_mode_is_refused_not_half_read() {
 #[tokio::test]
 async fn a_non_json_upload_is_a_422_not_a_500() {
     // Review Focus #4.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_non_json_upload_is_a_422_not_a_500").await;
+    let c = client(pool, user).await;
     let res = c
         .post("/api/backup/preview?mode=copy")
         .header(session())
@@ -978,8 +894,8 @@ async fn a_non_json_upload_is_a_422_not_a_500() {
 #[tokio::test]
 async fn a_bundle_from_a_newer_build_is_refused_by_preview() {
     // Review Focus #2: preview is where the user learns it, before anything is written.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_bundle_from_a_newer_build_is_refused_by_preview").await;
+    let c = client(pool, user).await;
     let mut b = bundle_value("x");
     b["schema_version"] = json!(2);
     let res = c
@@ -999,8 +915,8 @@ async fn a_bundle_that_fails_validation_names_its_paths() {
     // The plan is the user's last look before a write, so a refusal has to say which
     // field is wrong — the same body shape the restore route will produce, so a
     // client parses validation failures the same way whichever route answered.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_bundle_that_fails_validation_names_its_paths").await;
+    let c = client(pool, user).await;
     let mut b = bundle_value("x");
     b["portfolios"][0]["assets"][0]["transactions"][0]["price"] = json!("not-a-number");
     let res = c
@@ -1020,12 +936,84 @@ async fn a_bundle_that_fails_validation_names_its_paths() {
 }
 
 #[tokio::test]
+async fn two_splits_on_one_utc_day_are_a_422_naming_the_asset_and_the_day() {
+    // `uq_split_asset_date` allows one SPLIT per asset per UTC calendar day, and it is
+    // the only thing that enforces that — `apply` inserts plainly, so the second row of
+    // a pair raised `23505 unique_violation`, `classify` mapped it to `Other`, and the
+    // caller got a 500 for a row in their own file *after* `preview` had said the bundle
+    // was fine. The two answers now agree because `collect` refuses the pair.
+    //
+    // It failed safe before this check, and still does: `apply` is one SERIALIZABLE
+    // transaction, so the `23505` rolled back every row the bundle had already written.
+    // That property is kept and is not what the 422 replaces — a rollback is the right
+    // outcome for a bundle that cannot be applied, but it is a `500` telling a user their
+    // own data is a server bug, and `preview` had already promised otherwise.
+    let (pool, user) = db_with_user("two_splits_on_one_utc_day").await;
+    let c = client(pool, user).await;
+    let mut b = bundle_value("x");
+    // Same UTC day, different instants, so this is not merely the same row twice.
+    b["portfolios"][0]["assets"][0]["transactions"] = json!([
+        { "type": "SPLIT", "quantity": "2.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T00:00:00Z" },
+        { "type": "SPLIT", "quantity": "3.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T18:00:00Z" },
+    ]);
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::UnprocessableEntity, "a duplicate SPLIT day is a client data error, never a 500");
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(body["error"], "the bundle failed validation");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "exactly the second split is at fault: {body}");
+    // Names the asset (which one, by path) and the day (which day, in the reason).
+    assert_eq!(errors[0]["path"], "portfolios[0].assets[0].transactions[1].date");
+    let reason = errors[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("2024-01-15"), "the reason must name the day: {reason}");
+    assert!(reason.contains("SPLIT"), "the reason must name what collided: {reason}");
+}
+
+#[tokio::test]
+async fn two_splits_on_different_utc_days_are_accepted_even_in_the_same_local_date() {
+    // The control, and the half that a naive date comparison gets wrong: the rule is the
+    // UTC calendar day because that is what `(date AT TIME ZONE 'UTC')::date` buckets
+    // on. These two share a local date but not a UTC one, so the index does not see a
+    // collision and neither may `collect` — otherwise a valid bundle becomes unrestorable.
+    let (pool, user) = db_with_user("two_splits_different_utc_days").await;
+    let c = client(pool, user).await;
+    let mut b = bundle_value("x");
+    b["portfolios"][0]["assets"][0]["transactions"] = json!([
+        { "type": "SPLIT", "quantity": "2.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T01:00:00+05:00" },
+        { "type": "SPLIT", "quantity": "3.0", "price": "1.0", "fee": "0.00",
+          "date": "2024-01-15T20:00:00+05:00" },
+    ]);
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(b.to_string())
+        .dispatch()
+        .await;
+    let status = res.status();
+    let body: Value = res.into_json().await.unwrap();
+    assert_eq!(status, Status::Ok, "2024-01-14T20:00Z and 2024-01-15T15:00Z are different UTC days: {body}");
+    assert_eq!(body["insert"]["transactions"], 2);
+}
+
+#[tokio::test]
 async fn an_upload_over_the_byte_cap_is_the_module_s_413() {
     // Rocket never refuses a `Data` upload of its own accord, so the ceiling is only
     // real if the route that opens the stream enforces it. The probes above pin the
     // read; this pins the route doing the conversion.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("an_upload_over_the_byte_cap_is_the_module_s_413").await;
+    let c = client(pool, user).await;
     let res = c
         .post("/api/backup/preview?mode=copy")
         .header(session())
@@ -1043,9 +1031,9 @@ async fn preview_reports_the_price_section_and_warns_about_a_replace() {
     // The warnings are the two things a user is least likely to have thought of:
     // that `replace` deletes portfolios the bundle says nothing about, and that a
     // bundle carrying prices is carrying shared market data rather than their own.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("preview_reports_the_price_section_and_warns_about_a_replace").await;
+    seed_two_portfolios(&pool, user).await;
+    let c = client(pool, user).await;
 
     let res = c
         .post("/api/backup/preview?mode=replace")
@@ -1089,11 +1077,11 @@ async fn a_replace_plan_names_the_split_sync_rows_it_clears() {
     // key, so they are deleted explicitly rather than cascaded. A plan that
     // under-reports what it is about to delete is the one thing a preview must not do,
     // and the delete set is not visible in the counts (`restore::plan_for`).
-    let pool = setup_db(&disabled_config()).await;
-    let one = seed_portfolio(&pool, common::DEFAULT_USER, "One", "USD").await;
+    let (pool, user) = db_with_user("a_replace_plan_names_the_split_sync_rows_it_clears").await;
+    let one = seed_portfolio(&pool, user, "One", "USD").await;
     let asset = seed_asset(&pool, one, "AAPL", "Apple").await;
     common::seed_split_sync(&pool, asset).await;
-    let c = client(pool).await;
+    let c = client(pool, user).await;
 
     let res = c.post("/api/backup/preview?mode=replace").header(session())
         .header(rocket::http::ContentType::JSON).body(bundle_json("Restored")).dispatch().await;
@@ -1112,8 +1100,8 @@ async fn a_preview_describes_only_the_caller_s_own_rows() {
     // and never database ids, so a bundle cannot address another user's rows — and
     // the counts it is answered with are its own. `replace` describing a foreign
     // portfolio would be a promise to delete what the caller does not own.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_preview_describes_only_the_caller_s_own_rows").await;
+    seed_two_portfolios(&pool, user).await;
     let other = common::seed_user(&pool, "user-b").await;
     let theirs = seed_portfolio(&pool, other, "Theirs", "USD").await;
     let their_asset = seed_asset(&pool, theirs, "BBB", "Asset B").await;
@@ -1136,7 +1124,7 @@ async fn a_preview_describes_only_the_caller_s_own_rows() {
     })
     .to_string();
 
-    let c = client(pool).await; // runs as DEFAULT_USER, who owns none of B's rows
+    let c = client(pool, user).await; // runs as user, who owns none of B's rows
     let res = c
         .post("/api/backup/preview?mode=replace")
         .header(session())
@@ -1158,7 +1146,7 @@ async fn a_preview_describes_only_the_caller_s_own_rows() {
 
 #[tokio::test]
 async fn preview_requires_a_session() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("preview_requires_a_session").await;
     let rocket = common::build_rocket_oidc(pool);
     let c = Client::tracked(rocket).await.unwrap();
     let res = c
@@ -1183,7 +1171,7 @@ async fn preview_requires_a_session() {
 // ---------------------------------------------------------------------------
 
 /// Row counts for the three tables a restore writes.
-async fn rows(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
+async fn rows(pool: &DbPool) -> (i64, i64, i64) {
     let p: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios").fetch_one(pool).await.unwrap();
     let a: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM assets").fetch_one(pool).await.unwrap();
     let t: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions").fetch_one(pool).await.unwrap();
@@ -1193,7 +1181,7 @@ async fn rows(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
 /// Rows in the one table a restore writes that no user owns. Separate from `rows`
 /// because a refusal that writes no portfolios can still have written market data,
 /// and only this count can see it.
-async fn price_rows(pool: &sqlx::SqlitePool) -> i64 {
+async fn price_rows(pool: &DbPool) -> i64 {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM historical_prices")
         .fetch_one(pool)
         .await
@@ -1203,10 +1191,10 @@ async fn price_rows(pool: &sqlx::SqlitePool) -> i64 {
 
 #[tokio::test]
 async fn copy_mode_adds_alongside_and_assigns_new_ids() {
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("copy_mode_adds_alongside_and_assigns_new_ids").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c.post("/api/backup/restore?mode=copy").header(session())
         .header(rocket::http::ContentType::JSON).body(bundle_json("Restored")).dispatch().await;
@@ -1221,40 +1209,40 @@ async fn copy_mode_adds_alongside_and_assigns_new_ids() {
     // The new portfolio is owned by the caller, and its asset and transaction are
     // reachable through it — that is the ref rewiring, not merely the row counts.
     let new_id = body["portfolio_ids"][0].as_i64().unwrap();
-    assert_ne!(new_id, one as i64, "a bundle ref must never become a database id");
+    assert_ne!(new_id, one, "a bundle ref must never become a database id");
     let chain: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)")
-        .bind(new_id as i32).fetch_one(&pool).await.unwrap();
+         (SELECT id FROM assets WHERE portfolio_id = $1)")
+        .bind(new_id).fetch_one(&pool).await.unwrap();
     assert_eq!(chain.0, 1, "the transaction must hang off the new asset under the new portfolio");
 
-    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
-        .bind(new_id as i32).fetch_one(&pool).await.unwrap();
-    assert_eq!(owner.0, Some(common::DEFAULT_USER as i64));
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
+        .bind(new_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(owner.0, Some(user));
 }
 
 #[tokio::test]
 async fn a_round_trip_through_export_and_restore_is_lossless() {
     // The test that proves the format is sufficient — what backup features most
     // often fail at.
-    let source = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&source).await;
+    let (source, user) = db_with_user("a_round_trip_through_export_and_restore_is_lossless").await;
+    let (one, _) = seed_two_portfolios(&source, user).await;
     let exported: String = {
-        let c = Client::tracked(build_rocket(source.clone(), common::DEFAULT_USER)).await.unwrap();
+        let c = Client::tracked(build_rocket(source.clone(), user)).await.unwrap();
         let path = format!("/api/backup/export?portfolio_ids={one}");
         let res = c.get(&path).header(session()).dispatch().await;
         res.into_string().await.unwrap()
     };
 
-    let target = setup_db(&disabled_config()).await;
-    let c = Client::tracked(build_rocket(target.clone(), common::DEFAULT_USER)).await.unwrap();
+    let (target, target_user) = db_with_user("target_a_round_trip_through_export_and_restore").await;
+    let c = Client::tracked(build_rocket(target.clone(), target_user)).await.unwrap();
     let res = c.post("/api/backup/restore?mode=copy").header(session())
         .header(rocket::http::ContentType::JSON).body(exported.clone()).dispatch().await;
     assert_eq!(res.status(), Status::Ok, "{:?}", res.into_string().await);
 
     // Re-export from the target and compare, ignoring the informational timestamp
     // and the ids that are target-local by construction.
-    let new_id: (i32,) = sqlx::query_as("SELECT id FROM portfolios WHERE name = 'One'")
+    let new_id: (i64,) = sqlx::query_as("SELECT id FROM portfolios WHERE name = 'One'")
         .fetch_one(&target).await.unwrap();
     let path = format!("/api/backup/export?portfolio_ids={}", new_id.0);
     let res = c.get(&path).header(session()).dispatch().await;
@@ -1275,15 +1263,15 @@ async fn a_round_trip_through_export_and_restore_is_lossless() {
 /// says `STOCK` — which is exactly how the suite stayed green while restore refused the
 /// two asset types the application produces.
 async fn seed_asset_type(
-    pool: &sqlx::SqlitePool,
-    portfolio_id: i32,
+    pool: &DbPool,
+    portfolio_id: i64,
     symbol: &str,
     name: &str,
     asset_type: &str,
-) -> i32 {
-    let (id,): (i32,) = sqlx::query_as(
+) -> i64 {
+    let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
-         VALUES (?, ?, ?, ?, 'USD') RETURNING id",
+         VALUES ($1, $2, $3, $4, 'USD') RETURNING id",
     )
     .bind(portfolio_id)
     .bind(symbol)
@@ -1292,6 +1280,8 @@ async fn seed_asset_type(
     .fetch_one(pool)
     .await
     .unwrap();
+    // The row id, undiminished: `common::seed_asset` returns `i64` too, and so
+    // does every caller now.
     id
 }
 
@@ -1305,15 +1295,15 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
     // (`frontend/src/App.tsx`). Export copies `asset_type` out of the database without
     // checking it, so the failure surfaced as a `422` on **restore** — after the user
     // was already holding the file, which is the one moment a backup must not fail.
-    let source = setup_db(&disabled_config()).await;
-    let pid = seed_portfolio(&source, common::DEFAULT_USER, "Mixed", "USD").await;
+    let (source, user) = db_with_user("a_round_trip_carries_the_asset_types_the_app_actually_produces").await;
+    let pid = seed_portfolio(&source, user, "Mixed", "USD").await;
     let crypto = seed_asset_type(&source, pid, "BTC-USD", "Bitcoin", "CRYPTO").await;
     let fund = seed_asset_type(&source, pid, "VWRL", "Vanguard Global Stock", "MUTUAL_FUND").await;
     seed_transaction(&source, crypto, "BUY", 0.5, 40000.0, 0.0).await;
     seed_transaction(&source, fund, "BUY", 10.0, 100.0, 1.0).await;
 
     let exported: String = {
-        let c = Client::tracked(build_rocket(source.clone(), common::DEFAULT_USER)).await.unwrap();
+        let c = Client::tracked(build_rocket(source.clone(), user)).await.unwrap();
         let path = format!("/api/backup/export?portfolio_ids={pid}");
         c.get(&path).header(session()).dispatch().await.into_string().await.unwrap()
     };
@@ -1328,8 +1318,8 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
         .collect();
     assert_eq!(exported_types, vec!["CRYPTO", "MUTUAL_FUND"], "{exported}");
 
-    let target = setup_db(&disabled_config()).await;
-    let c = Client::tracked(build_rocket(target.clone(), common::DEFAULT_USER)).await.unwrap();
+    let (target, target_user) = db_with_user("target_a_round_trip_carries_asset_types").await;
+    let c = Client::tracked(build_rocket(target.clone(), target_user)).await.unwrap();
     let res = c.post("/api/backup/restore?mode=copy").header(session())
         .header(rocket::http::ContentType::JSON).body(exported).dispatch().await;
     let status = res.status();
@@ -1339,11 +1329,11 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
     // And the types survived the write rather than being coerced to something safe.
     // The new portfolio's id comes from the response: a restore mints ids, and the
     // target's numbering is the target's own.
-    let new_id: i32 = serde_json::from_str::<Value>(&text).unwrap()["portfolio_ids"][0]
+    let new_id: i64 = serde_json::from_str::<Value>(&text).unwrap()["portfolio_ids"][0]
         .as_i64()
-        .expect("the outcome names the portfolio it created") as i32;
+        .expect("the outcome names the portfolio it created");
     let stored: Vec<String> = sqlx::query_as::<_, (String,)>(
-        "SELECT asset_type FROM assets WHERE portfolio_id = ? ORDER BY symbol",
+        "SELECT asset_type FROM assets WHERE portfolio_id = $1 ORDER BY symbol",
     )
     .bind(new_id)
     .fetch_all(&target)
@@ -1359,9 +1349,9 @@ async fn a_round_trip_carries_the_asset_types_the_app_actually_produces() {
 async fn a_restored_portfolio_produces_the_same_tax_result() {
     // Proves the rewiring is semantically right, not just present: the tax engine
     // reaches transactions through assets through portfolios.
-    let source = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&source).await;
-    let c = Client::tracked(build_rocket(source.clone(), common::DEFAULT_USER)).await.unwrap();
+    let (source, user) = db_with_user("a_restored_portfolio_produces_the_same_tax_result").await;
+    let (one, _) = seed_two_portfolios(&source, user).await;
+    let c = Client::tracked(build_rocket(source.clone(), user)).await.unwrap();
     let path = format!("/api/portfolios/{one}/tax-summary");
     let original: Value = c.get(&path)
         .header(session()).dispatch().await.into_json().await.unwrap();
@@ -1369,16 +1359,16 @@ async fn a_restored_portfolio_produces_the_same_tax_result() {
     // The bundle has to come from the source, which is the side that owns portfolio
     // `one`; the target owns nothing yet.
     let exported: String = {
-        let sc = Client::tracked(build_rocket(source, common::DEFAULT_USER)).await.unwrap();
+        let sc = Client::tracked(build_rocket(source, user)).await.unwrap();
         let path = format!("/api/backup/export?portfolio_ids={one}");
         sc.get(&path).header(session()).dispatch().await.into_string().await.unwrap()
     };
-    let target = setup_db(&disabled_config()).await;
-    let c = Client::tracked(build_rocket(target, common::DEFAULT_USER)).await.unwrap();
+    let (target, target_user) = db_with_user("target_a_restored_portfolio_tax_result").await;
+    let c = Client::tracked(build_rocket(target, target_user)).await.unwrap();
     let res = c.post("/api/backup/restore?mode=copy").header(session())
         .header(rocket::http::ContentType::JSON).body(exported).dispatch().await;
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let path = format!("/api/portfolios/{new_id}/tax-summary");
     let restored: Value = c.get(&path)
@@ -1393,10 +1383,10 @@ async fn restore_refuses_a_split_the_ordinary_write_path_refuses() {
     // path would reject — and the impact of *not* refusing is silent: `tax_engine::replay`
     // guards `tx_qty > 0 && denominator > 0`, so a zero-quantity SPLIT is a no-op on
     // the lots and nothing downstream would ever report it.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("restore_refuses_a_split_the_ordinary_write_path_refuses").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let split = |qty: &str, price: &str| -> String {
         let mut v = bundle_value("Split");
@@ -1436,8 +1426,8 @@ async fn a_split_is_stored_with_no_fee_as_the_write_path_stores_it() {
     // bundle must not be able to store a value the application itself cannot produce.
     // Normalised rather than refused: refusing it would reject a bundle the write path
     // accepts, which is the mirror image of the rule above.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool.clone()).await;
+    let (pool, user) = db_with_user("a_split_is_stored_with_no_fee_as_the_write_path_stores_it").await;
+    let c = client(pool.clone(), user).await;
 
     let mut v = bundle_value("Split fee");
     v["portfolios"][0]["assets"][0]["transactions"] = json!([{
@@ -1448,11 +1438,11 @@ async fn a_split_is_stored_with_no_fee_as_the_write_path_stores_it() {
         .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let fee: (String,) = sqlx::query_as(
         "SELECT t.fee FROM transactions t WHERE t.asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)",
+         (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
     .bind(new_id)
     .fetch_one(&pool)
@@ -1473,8 +1463,8 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
     // to store the bundle's bytes verbatim. A hand-authored bundle could therefore
     // create a row the ordinary path would never have produced, and one that slips past
     // the ISIN uniqueness check at `transactions.rs:50-56`: two rows for one security.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool.clone()).await;
+    let (pool, user) = db_with_user("a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it").await;
+    let c = client(pool.clone(), user).await;
 
     let mut v = bundle_value("Lowercase isin");
     v["portfolios"][0]["assets"][0]["isin"] = json!("us0378331005");
@@ -1482,10 +1472,10 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
         .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
     assert_eq!(res.status(), Status::Ok, "a lowercase ISIN is a valid ISIN");
     let body: Value = res.into_json().await.unwrap();
-    let new_id = body["portfolio_ids"][0].as_i64().unwrap() as i32;
+    let new_id = body["portfolio_ids"][0].as_i64().unwrap();
 
     let isin: (Option<String>,) = sqlx::query_as(
-        "SELECT isin FROM assets WHERE portfolio_id = ?",
+        "SELECT isin FROM assets WHERE portfolio_id = $1",
     )
     .bind(new_id)
     .fetch_one(&pool)
@@ -1497,10 +1487,10 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
 #[tokio::test]
 async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
     // Review Focus #5, on the write path this time.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_bundle_with_no_portfolios_is_refused_by_restore").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
     let empty = json!({ "format": "portfolio-prism-backup", "schema_version": 1,
         "created_at": "2026-11-13T00:00:00Z", "portfolios": [] }).to_string();
     let res = c.post("/api/backup/restore?mode=replace").header(session())
@@ -1532,35 +1522,42 @@ async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
 /// `split_sync` row is stranded on a deleted asset. `split_sync` belongs in here for
 /// that reason — its `asset_id` has no foreign key to `assets`, so nothing in the
 /// schema would notice and nothing else in the suite would either.
-async fn owned_fingerprint(pool: &sqlx::SqlitePool, user: i32) -> Vec<String> {
-    // One `?` each, bound to the caller's id, and nothing else: the same scoping rule
+async fn owned_fingerprint(pool: &DbPool, user: i64) -> Vec<String> {
+    // One `$1` each, bound to the caller's id, and nothing else: the same scoping rule
     // the deletes under test claim to follow.
+    //
+    // The `::text` casts are not decoration. SQLite stored `transactions.date`,
+    // `split_sync.last_synced_at` and `split_sync.covered_from` as text, so `||` took
+    // them as-is; Postgres has them as `timestamptz`/`DATE` and has no implicit
+    // concatenation from those. Casting explicitly also *pins the spelling* the
+    // fingerprint compares: a date rendered `2024-01-02` on both sides of a restore is
+    // the assertion, and leaving the cast out would compare two different renderings.
     let queries = [
         "SELECT 'portfolios|' || id || '|' || name || '|' || COALESCE(description, '') || \
                 '|' || currency || '|' || base_currency || '|owner=' || COALESCE(owner_id, -1) \
-         FROM portfolios WHERE owner_id = ? ORDER BY id",
+         FROM portfolios WHERE owner_id = $1 ORDER BY id",
         "SELECT 'assets|' || id || '|' || portfolio_id || '|' || symbol || '|' || name || '|' \
                 || asset_type || '|' || COALESCE(sector, '') || '|' || currency || '|' \
                 || COALESCE(isin, '') \
-         FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = ?) \
+         FROM assets WHERE portfolio_id IN (SELECT id FROM portfolios WHERE owner_id = $1) \
          ORDER BY id",
         "SELECT 'transactions|' || id || '|' || asset_id || '|' || type || '|' || quantity || \
-                '|' || price || '|' || fee || '|' || date \
+                '|' || price || '|' || fee || '|' || date::text \
          FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+              (SELECT id FROM portfolios WHERE owner_id = $1)) \
          ORDER BY id",
-        "SELECT 'split_sync|' || asset_id || '|' || last_synced_at || '|' || \
-                COALESCE(covered_from, '') \
+        "SELECT 'split_sync|' || asset_id || '|' || last_synced_at::text || '|' || \
+                COALESCE(covered_from::text, '') \
          FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?)) \
+              (SELECT id FROM portfolios WHERE owner_id = $1)) \
          ORDER BY asset_id",
     ];
     let mut out: Vec<String> = Vec::new();
     for sql in queries {
         let rows: Vec<(String,)> = sqlx::query_as(sql)
-            .bind(user as i64)
+            .bind(user)
             .fetch_all(pool)
             .await
             .unwrap();
@@ -1574,9 +1571,9 @@ async fn replace_removes_everything_the_caller_owns() {
     // Spec: replace means "make my data equal this bundle", one rule, and the
     // preview is the safety mechanism. The other two portfolios go too — the bundle
     // names "Only" and says nothing about "One" or "Two", and both are gone.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let c = client(pool.clone()).await;
+    let (pool, user) = db_with_user("replace_removes_everything_the_caller_owns").await;
+    seed_two_portfolios(&pool, user).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c
         .post("/api/backup/restore?mode=replace")
@@ -1605,8 +1602,8 @@ async fn replace_leaves_other_users_data_alone() {
     // and a `split_sync` row that a delete which forgot its filter would happily
     // sweep up. A `DELETE` missing any one of its four `WHERE owner_id = ?` filters
     // fails this test.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("replace_leaves_other_users_data_alone").await;
+    seed_two_portfolios(&pool, user).await;
     let other = common::seed_user(&pool, "someone-else").await;
     let theirs = seed_portfolio(&pool, other, "Only", "USD").await;
     let their_asset = seed_asset(&pool, theirs, "AAPL", "Apple").await;
@@ -1622,7 +1619,7 @@ async fn replace_leaves_other_users_data_alone() {
     );
     let before = rows(&pool).await;
 
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
     let res = c
         .post("/api/backup/restore?mode=replace")
         .header(session())
@@ -1656,9 +1653,9 @@ async fn replacing_twice_in_a_row_is_still_exactly_the_bundle() {
     // "Make my data equal this bundle" is a rule, not a one-shot: the second call
     // must delete what the first one wrote and leave the same three rows, rather
     // than doubling them or stranding a row from the first pass.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let c = client(pool.clone()).await;
+    let (pool, user) = db_with_user("replacing_twice_in_a_row_is_still_exactly_the_bundle").await;
+    seed_two_portfolios(&pool, user).await;
+    let c = client(pool.clone(), user).await;
     for round in 1..=2 {
         let res = c
             .post("/api/backup/restore?mode=replace")
@@ -1681,9 +1678,9 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
     // mid-write failure is driven through `Mode::Replace`, over a caller who owns
     // real rows, and the assertion is their whole fingerprint: a rolled-back delete
     // has to give back the same ids, not merely the same count.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
-    let mine_before = owned_fingerprint(&pool, common::DEFAULT_USER).await;
+    let (pool, user) = db_with_user("a_replace_that_fails_partway_deletes_nothing_either").await;
+    seed_two_portfolios(&pool, user).await;
+    let mine_before = owned_fingerprint(&pool, user).await;
     assert_eq!(
         mine_before.len(),
         4,
@@ -1699,7 +1696,7 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
 
     let err = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &bundle,
         Mode::Replace,
         false,
@@ -1709,7 +1706,7 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
     .expect_err("a date no parser accepts stops the write");
     assert!(matches!(err, ApplyError::Db(DbFailure::Other)), "{err:?}");
     assert_eq!(
-        owned_fingerprint(&pool, common::DEFAULT_USER).await,
+        owned_fingerprint(&pool, user).await,
         mine_before,
         "a replace that failed must not have deleted anything either"
     );
@@ -1721,7 +1718,7 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
         .expect("the fixture is a valid bundle");
     backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &clean,
         Mode::Replace,
         false,
@@ -1729,7 +1726,7 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
     )
     .await
     .expect("the uncorrupted bundle applies");
-    let mine_after = owned_fingerprint(&pool, common::DEFAULT_USER).await;
+    let mine_after = owned_fingerprint(&pool, user).await;
     assert!(
         mine_after.len() < mine_before.len(),
         "a replace that succeeds must leave the caller holding fewer rows than before: \
@@ -1750,8 +1747,8 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
 
 #[tokio::test]
 async fn every_apply_prices_on_spelling_applies_the_price_section() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = price_restore_client(pool.clone()).await;
+    let (pool, user) = db_with_user("every_apply_prices_on_spelling_applies_the_price_section").await;
+    let c = price_restore_client(pool.clone(), user).await;
 
     // A distinct symbol per spelling: two rows for one `(symbol, date)` is one row,
     // so a repeated symbol would make three of these four calls answer exactly like
@@ -1781,8 +1778,8 @@ async fn every_apply_prices_on_spelling_applies_the_price_section() {
 async fn every_apply_prices_off_spelling_and_an_absent_parameter_write_no_prices() {
     // The mirror half, including the default: an absent parameter means off, because
     // writing shared `historical_prices` is opt-in and never a guess.
-    let pool = setup_db(&disabled_config()).await;
-    let c = price_restore_client(pool.clone()).await;
+    let (pool, user) = db_with_user("every_apply_prices_off_spelling_and_an_absent_parameter_write_no_prices").await;
+    let c = price_restore_client(pool.clone(), user).await;
 
     let mut paths: Vec<String> = ["0", "false", "no"]
         .iter()
@@ -1814,8 +1811,8 @@ async fn every_apply_prices_off_spelling_and_an_absent_parameter_write_no_prices
 
 #[tokio::test]
 async fn an_unrecognised_apply_prices_is_a_422_not_a_quiet_ignore() {
-    let pool = setup_db(&disabled_config()).await;
-    let c = price_restore_client(pool).await;
+    let (pool, user) = db_with_user("an_unrecognised_apply_prices_is_a_422_not_a_quiet_ignore").await;
+    let c = price_restore_client(pool, user).await;
 
     for spelling in ["maybe", "2", "on", "off", "truest", ""] {
         let path = format!("/api/backup/restore?mode=copy&apply_prices={spelling}");
@@ -1840,8 +1837,8 @@ async fn a_repeated_restore_parameter_is_refused_not_half_read() {
     // Both parameters, for the reason `only_once` documents: a repeated `Option`
     // field arrives as `None`, and on this route `None` means "no mode" for one and
     // "do not touch prices" for the other. Neither is what the caller asked.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool).await;
+    let (pool, user) = db_with_user("a_repeated_restore_parameter_is_refused_not_half_read").await;
+    let c = client(pool, user).await;
 
     let res = c
         .post("/api/backup/restore?mode=copy&mode=replace")
@@ -1871,9 +1868,9 @@ async fn a_repeated_restore_parameter_is_refused_not_half_read() {
 async fn asking_to_apply_prices_while_the_flag_is_off_is_a_422() {
     // Never a silently ignored request: the caller asked for something this server
     // refuses to do, and a 200 would tell them it happened.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("asking_to_apply_prices_while_the_flag_is_off_is_a_422").await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await; // `build_rocket`'s config: the flag is off
+    let c = client(pool.clone(), user).await; // `build_rocket`'s config: the flag is off
     let path = "/api/backup/restore?mode=copy&apply_prices=1";
 
     let res = c
@@ -1915,11 +1912,11 @@ async fn a_replace_that_asks_for_prices_while_the_flag_is_off_deletes_nothing() 
     // data, and the flag check is the first thing `apply` does, before the transaction
     // that would delete is even opened. Move that check after the deletes and this
     // answers the same 422 over an empty portfolio list.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_replace_that_asks_for_prices_while_the_flag_is_off_deletes_nothing").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a refusal that deletes must have something to delete");
-    let c = client(pool.clone()).await; // the flag is off
+    let c = client(pool.clone(), user).await; // the flag is off
 
     let res = c
         .post("/api/backup/restore?mode=replace&apply_prices=1")
@@ -1959,16 +1956,16 @@ async fn a_replace_that_asks_for_prices_while_the_flag_is_off_deletes_nothing() 
 
 /// `common::seed_price` with the date spelled the way `prices[].date` spells it.
 /// `seed_daily_prices` is the dense-range form, and a gap is the thing under test here.
-async fn seed_price_on(pool: &sqlx::SqlitePool, symbol: &str, day: &str, close: &str) {
+async fn seed_price_on(pool: &DbPool, symbol: &str, day: &str, close: &str) {
     let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").expect("a YYYY-MM-DD date");
     common::seed_price(pool, symbol, day, close).await;
 }
 
 #[tokio::test]
 async fn a_price_restore_fills_gaps_and_never_overwrites_an_existing_close() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_price_restore_fills_gaps_and_never_overwrites_an_existing_close").await;
     seed_price_on(&pool, "AAPL", "2024-01-15", "149.50").await;
-    let c = price_restore_client(pool.clone()).await;
+    let c = price_restore_client(pool.clone(), user).await;
 
     let mut bundle = bundle_value("Priced");
     bundle["prices"] = json!([
@@ -1997,7 +1994,7 @@ async fn a_price_restore_fills_gaps_and_never_overwrites_an_existing_close() {
     );
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT date, close_price FROM historical_prices ORDER BY date",
+        "SELECT date::text, close_price FROM historical_prices ORDER BY date",
     )
     .fetch_all(&pool)
     .await
@@ -2018,8 +2015,8 @@ async fn a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it() {
     // opens, so the only caller that can put a failure *after* the portfolio rows is
     // one that skipped validation — the same caller the module's other rollback tests
     // drive, for the same reason.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
 
@@ -2029,7 +2026,7 @@ async fn a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it() {
 
     let err = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &bundle,
         Mode::Copy,
         true,
@@ -2052,7 +2049,7 @@ async fn a_price_row_that_cannot_be_written_rolls_the_restore_back_with_it() {
         .expect("the fixture is a valid bundle");
     let out = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &clean,
         Mode::Copy,
         true,
@@ -2073,17 +2070,32 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     // test passes just as happily if the loop executes on the pool, which in production
     // would commit shared `historical_prices` rows and then roll back the caller's
     // bundle, leaving market data every other tenant reads from a restore that
-    // reported failure. A trigger is the only way to make SQLite refuse a price row
-    // that the Rust side already approved.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    // reported failure. A trigger is the only way to make the database refuse a price
+    // row that the Rust side already approved.
+    let (pool, user) = db_with_user("a_price_row_the_database_refuses_rolls_back_the_price_rows_written_before_it").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
 
+    // A trigger, because a row the *database* refuses is the only failure the Rust
+    // side cannot have already caught. Postgres needs a function for it; SQLite's
+    // inline `BEGIN SELECT RAISE(ABORT, ...) END` has no equivalent.
+    sqlx::query(
+        "CREATE FUNCTION refuse_the_second_price() RETURNS trigger AS $$ \
+         BEGIN \
+             IF NEW.date = '2024-01-02' THEN \
+                 RAISE EXCEPTION 'boom'; \
+             END IF; \
+             RETURN NEW; \
+         END \
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "CREATE TRIGGER refuse_the_second_price BEFORE INSERT ON historical_prices \
-         WHEN NEW.date = '2024-01-02' \
-         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+         FOR EACH ROW EXECUTE FUNCTION refuse_the_second_price()",
     )
     .execute(&pool)
     .await
@@ -2099,18 +2111,19 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     let bundle = parse_and_validate(bundle.to_string().as_bytes())
         .expect("the fixture is a valid bundle");
 
-    // Bounded on purpose. The mutation this test exists to catch — the price loop
-    // running on the **pool** instead of on `&mut *tx` — does not fail, it *hangs*: the
-    // insert waits on the write lock the still-open transaction holds, and shared-cache
-    // unlock-notify is not bounded by `busy_timeout`. A guard that fails by hanging gets
-    // retried and skimmed rather than read, so the wait is bounded and the mutant fails
-    // with the message below instead. Far longer than two price rows ever need.
+    // Bounded on purpose, as a belt to the assertion's braces. Under SQLite the
+    // mutation this test exists to catch — the price loop running on the **pool**
+    // instead of on `&mut *tx` — did not fail, it *hung* on the file write lock. Under
+    // Postgres MVCC a second connection simply inserts and commits, so the mutation is
+    // caught by `price_rows` below rather than by the timeout; the guard stays because a
+    // future change that makes the two paths contend on a row lock should fail loudly
+    // and quickly, not on a CI timeout nobody reads. Far longer than two rows need.
     const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     let err = tokio::time::timeout(
         HANG_GUARD,
         backup_restore::apply(
             &pool,
-            common::DEFAULT_USER,
+            user,
             &bundle,
             Mode::Copy,
             true,
@@ -2138,13 +2151,14 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
     // Positive control: with the trigger gone the same bundle writes both halves, so
     // the assertions above are a rollback and not a restore that never reached the
     // price section at all.
-    sqlx::query("DROP TRIGGER refuse_the_second_price")
+    // Postgres scopes a trigger to its table, so the drop names both.
+    sqlx::query("DROP TRIGGER refuse_the_second_price ON historical_prices")
         .execute(&pool)
         .await
         .unwrap();
     let out = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &bundle,
         Mode::Copy,
         true,
@@ -2161,8 +2175,8 @@ async fn a_price_row_the_database_refuses_rolls_back_the_price_rows_written_befo
 async fn a_restored_price_row_is_market_data_every_other_tenant_reads() {
     // The stakes of the flag, shown from the other side: user B never asked for
     // anything here, and user A's price restore still lands in B's export.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await; // user A, holding AAPL
+    let (pool, user) = db_with_user("a_restored_price_row_is_market_data_every_other_tenant_reads").await;
+    seed_two_portfolios(&pool, user).await; // user A, holding AAPL
     let other = common::seed_user(&pool, "user-b").await;
     let theirs = seed_portfolio(&pool, other, "Theirs", "USD").await;
     seed_asset(&pool, theirs, "AAPL", "Apple").await; // and so does B
@@ -2178,7 +2192,7 @@ async fn a_restored_price_row_is_market_data_every_other_tenant_reads() {
 
     // Flag off: refused out loud, and B's view is untouched — the refusal writes no
     // shared rows at all, not even the one the caller asked for.
-    let off = client(pool.clone()).await;
+    let off = client(pool.clone(), user).await;
     let res = off
         .post(restore)
         .header(session())
@@ -2197,7 +2211,7 @@ async fn a_restored_price_row_is_market_data_every_other_tenant_reads() {
 
     // Flag on: the row lands, and it lands in B's export too, because there is no
     // owner column to keep it out of.
-    let on = price_restore_client(pool.clone()).await;
+    let on = price_restore_client(pool.clone(), user).await;
     let res = on
         .post(restore)
         .header(session())
@@ -2225,11 +2239,11 @@ async fn the_price_section_round_trips_byte_for_byte() {
     // back verbatim. A helpful re-scale — `149.5070` to `149.51`, `0.010000` to `0.01`
     // — is a silently different price, and a re-formatted date is a different day to
     // every reader that parses this column.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("the_price_section_round_trips_byte_for_byte").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     seed_price_on(&pool, "AAPL", "2024-02-29", "149.5070").await; // a leap day
     seed_price_on(&pool, "AAPL", "2024-03-01", "0.010000").await; // trailing zeros
-    let c = price_restore_client(pool.clone()).await;
+    let c = price_restore_client(pool.clone(), user).await;
 
     let path = format!("/api/backup/export?portfolio_ids={one}&include_prices=1");
     let res = c.get(&path).header(session()).dispatch().await;
@@ -2259,7 +2273,7 @@ async fn the_price_section_round_trips_byte_for_byte() {
     assert_eq!(body["prices_inserted"], 2, "{body}");
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT date, close_price FROM historical_prices ORDER BY date",
+        "SELECT date::text, close_price FROM historical_prices ORDER BY date",
     )
     .fetch_all(&pool)
     .await
@@ -2304,10 +2318,10 @@ fn two_portfolio_bundle() -> String {
 
 #[tokio::test]
 async fn a_bundle_whose_second_portfolio_is_invalid_writes_nothing() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_bundle_whose_second_portfolio_is_invalid_writes_nothing").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let mut bundle = bundle_value("Two portfolios");
     let mut second = bundle_value("Second")["portfolios"][0].clone();
@@ -2354,11 +2368,11 @@ fn bundle_with_bad_last_row() -> String {
 
 #[tokio::test]
 async fn a_bundle_that_fails_on_the_last_row_writes_nothing() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_bundle_that_fails_on_the_last_row_writes_nothing").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c
         .post("/api/backup/restore?mode=copy")
@@ -2382,8 +2396,8 @@ async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
     // assertion, and only one of them is the guarantee — so the database starts with
     // rows to roll back over, and the positive control at the bottom proves this
     // exact fixture is capable of writing.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_write_that_fails_after_the_first_portfolio_rolls_everything_back").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
     assert_ne!(before, (0, 0, 0), "a rollback needs something to roll back over");
     // Parsed as a real bundle first, so the only thing wrong with it is the one field
@@ -2394,7 +2408,7 @@ async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
 
     let err = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &bundle,
         Mode::Copy,
         false,
@@ -2417,7 +2431,7 @@ async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
         .expect("the fixture is a valid bundle");
     let out = backup_restore::apply(
         &pool,
-        common::DEFAULT_USER,
+        user,
         &clean,
         Mode::Copy,
         false,
@@ -2447,8 +2461,8 @@ async fn a_write_that_fails_after_the_first_portfolio_rolls_everything_back() {
 
 #[tokio::test]
 async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_restore_writes_the_caller_and_never_another_user_s_rows").await;
+    seed_two_portfolios(&pool, user).await;
     let other = common::seed_user(&pool, "user-b").await;
     let theirs = seed_portfolio(&pool, other, "Theirs", "USD").await;
     let their_asset = seed_asset(&pool, theirs, "BBB", "Asset B").await;
@@ -2474,7 +2488,7 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
     })
     .to_string();
 
-    let c = client(pool.clone()).await; // runs as DEFAULT_USER, who owns none of B's rows
+    let c = client(pool.clone(), user).await; // runs as user, who owns none of B's rows
     let res = c
         .post("/api/backup/restore?mode=copy")
         .header(session())
@@ -2485,29 +2499,29 @@ async fn a_restore_writes_the_caller_and_never_another_user_s_rows() {
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
     let new_id = body["portfolio_ids"][0].as_i64().unwrap();
-    assert_ne!(new_id, theirs as i64, "a foreign ref must not become an id");
+    assert_ne!(new_id, theirs, "a foreign ref must not become an id");
 
     // The caller owns what the caller restored...
-    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = ?")
-        .bind(new_id as i32)
+    let owner: (Option<i64>,) = sqlx::query_as("SELECT owner_id FROM portfolios WHERE id = $1")
+        .bind(new_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(owner.0, Some(common::DEFAULT_USER as i64));
+    assert_eq!(owner.0, Some(user));
 
     // ...and B's rows are untouched, in count and in owner.
     let theirs_now: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
-         (SELECT COUNT(*) FROM portfolios WHERE owner_id = ?), \
+         (SELECT COUNT(*) FROM portfolios WHERE owner_id = $1), \
          (SELECT COUNT(*) FROM assets WHERE portfolio_id IN \
-          (SELECT id FROM portfolios WHERE owner_id = ?)), \
+          (SELECT id FROM portfolios WHERE owner_id = $2)), \
          (SELECT COUNT(*) FROM transactions WHERE asset_id IN \
           (SELECT id FROM assets WHERE portfolio_id IN \
-           (SELECT id FROM portfolios WHERE owner_id = ?)))",
+           (SELECT id FROM portfolios WHERE owner_id = $3)))",
     )
-    .bind(other as i64)
-    .bind(other as i64)
-    .bind(other as i64)
+    .bind(other)
+    .bind(other)
+    .bind(other)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -2522,12 +2536,12 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
     // most one portfolio and one asset in a bundle can be blank, and this is that
     // bundle. It restores, because the write path never reads a ref: every link comes
     // from the id the insert that made the row returned.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_bundle_ref_never_reaches_a_row_even_when_it_is_blank").await;
     let before = rows(&pool).await;
     let mut bundle = bundle_value("Blank refs");
     bundle["portfolios"][0]["ref"] = json!("");
     bundle["portfolios"][0]["assets"][0]["ref"] = json!("   ");
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c
         .post("/api/backup/restore?mode=copy")
@@ -2544,16 +2558,16 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
     // blank ref used as a key would have hung the transaction off nothing.
     let chain: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id = ?)",
+         (SELECT id FROM assets WHERE portfolio_id = $1)",
     )
-    .bind(new_id as i32)
+    .bind(new_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(chain.0, 1);
     // And no column holds a ref: the name is what the bundle's `name` said.
-    let (name,): (String,) = sqlx::query_as("SELECT name FROM portfolios WHERE id = ?")
-        .bind(new_id as i32)
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM portfolios WHERE id = $1")
+        .bind(new_id)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2563,13 +2577,16 @@ async fn a_bundle_ref_never_reaches_a_row_even_when_it_is_blank() {
 
 #[tokio::test]
 async fn replace_leaves_no_orphan_split_sync_rows() {
-    // `split_sync.asset_id` is a plain INTEGER PRIMARY KEY with **no** foreign key to
-    // `assets`, so `PRAGMA foreign_keys` does not reach it: a delete that forgot it
-    // would leave one row per deleted asset forever, and the next asset handed that id
-    // would inherit a stranger's split-sync throttle. The delete order is the other
-    // half — `foreign_keys` is ON and no FK here cascades, so children go first.
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    // `split_sync.asset_id` is a foreign key to `assets` in `0001_init.sql` with no
+    // cascade — it was a plain INTEGER PRIMARY KEY with no foreign key in the SQLite
+    // table, which is why this delete used to be merely tidy rather than required.
+    // A replace that forgot it could not even delete the asset now; the row is dropped
+    // first so it does not outlive the asset, and so the next asset handed that id
+    // cannot inherit a stranger's split-sync throttle. The delete order is the other
+    // half — no FK here cascades, so children go first.
+    // `tests/foreign_keys_test.rs` pins the constraint itself.
+    let (pool, user) = db_with_user("replace_leaves_no_orphan_split_sync_rows").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     let asset = seed_asset(&pool, one, "MSFT", "Microsoft").await;
     common::seed_split_sync(&pool, asset).await;
     let (before,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM split_sync")
@@ -2578,7 +2595,7 @@ async fn replace_leaves_no_orphan_split_sync_rows() {
         .unwrap();
     assert_eq!(before, 1, "the fixture must actually have a row to orphan");
 
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
     let res = c
         .post("/api/backup/restore?mode=replace")
         .header(session())
@@ -2599,7 +2616,7 @@ async fn replace_leaves_no_orphan_split_sync_rows() {
 
 #[tokio::test]
 async fn restore_requires_a_session() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, _) = db_with_user("restore_requires_a_session").await;
     let rocket = common::build_rocket_oidc(pool);
     let c = Client::tracked(rocket).await.unwrap();
     let res = c
@@ -2615,10 +2632,10 @@ async fn restore_refuses_an_upload_it_cannot_read_or_parse() {
     // The same two refusals `preview` gives, on the route that writes: an upload cut
     // off by the cap is the module's `413` rather than a truncated bundle restored,
     // and a file that is not JSON is the caller's `422` rather than a `500`.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("restore_refuses_an_upload_it_cannot_read_or_parse").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c
         .post("/api/backup/restore?mode=copy")
@@ -2682,13 +2699,13 @@ fn bundle_of_rows(extra_transactions: usize, prices: usize) -> String {
 
 #[tokio::test]
 async fn the_row_cap_is_exact_on_the_export_side() {
-    let pool = setup_db(&disabled_config()).await;
-    let (one, _) = seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("the_row_cap_is_exact_on_the_export_side").await;
+    let (one, _) = seed_two_portfolios(&pool, user).await;
     let asset = seed_asset(&pool, one, "MSFT", "Microsoft").await;
     // The selection is portfolio `one` alone: itself, the two assets on it, and their
     // transactions — 4 rows before this seed, so this is the cap exactly.
     seed_many_transactions(&pool, asset, MAX_BUNDLE_ROWS - 4).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
     let path = format!("/api/backup/export?portfolio_ids={one}");
 
     let res = c.get(&path).header(session()).dispatch().await;
@@ -2717,10 +2734,10 @@ async fn the_byte_cap_is_exact_on_the_upload_side() {
     // rather than by raising a global Rocket limit (see
     // `no_global_body_limit_is_raised_for_the_bundle`), so an oversized body never
     // reaches validation to be answered as a bad bundle.
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("the_byte_cap_is_exact_on_the_upload_side").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     // The pad is the shortfall against the cap, and `x` needs no JSON escaping, so the
     // serialised bundle is exactly `MAX_BUNDLE_BYTES` long rather than roughly it.
@@ -2758,10 +2775,10 @@ async fn the_byte_cap_is_exact_on_the_upload_side() {
 
 #[tokio::test]
 async fn a_bundle_over_the_row_cap_is_refused_before_any_write() {
-    let pool = setup_db(&disabled_config()).await;
-    seed_two_portfolios(&pool).await;
+    let (pool, user) = db_with_user("a_bundle_over_the_row_cap_is_refused_before_any_write").await;
+    seed_two_portfolios(&pool, user).await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     // Both routes that read a bundle, and in particular the one that can write: a cap
     // enforced only by `preview` would be a suggestion, and the refusal on the write route
@@ -2793,9 +2810,9 @@ async fn a_bundle_at_exactly_the_row_cap_is_restored() {
     // The other side of the same boundary, on the route that writes: a bundle the
     // ceiling allows must actually restore, or the ceiling is a quiet refusal to back
     // up a legal portfolio.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_bundle_at_exactly_the_row_cap_is_restored").await;
     let before = rows(&pool).await;
-    let c = client(pool.clone()).await;
+    let c = client(pool.clone(), user).await;
 
     let res = c
         .post("/api/backup/restore?mode=copy")
@@ -2825,8 +2842,8 @@ async fn price_rows_count_toward_the_row_cap_on_the_restore_side() {
     // and ~120k single-row INSERTs under a cap that only counted portfolios is how a
     // restore comes to hold the write lock past the 5s `busy_timeout` and answer every
     // concurrent request with a 503.
-    let pool = setup_db(&disabled_config()).await;
-    let c = client(pool.clone()).await;
+    let (pool, user) = db_with_user("price_rows_count_toward_the_row_cap_on_the_restore_side").await;
+    let c = client(pool.clone(), user).await;
 
     let at_cap = bundle_of_rows(0, MAX_BUNDLE_ROWS - 3);
     let over_cap = bundle_of_rows(0, MAX_BUNDLE_ROWS - 2);

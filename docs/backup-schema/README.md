@@ -39,6 +39,14 @@ it lives:
 - **A SPLIT must have a positive quantity and a positive price**, mirroring the
   ordinary write path (`api_routes/transactions.rs`). `"0"` is a perfectly valid
   `"type": "string"`.
+- **At most one SPLIT per asset per UTC calendar day.** `uq_split_asset_date` is a
+  partial unique index on `(asset_id, (date AT TIME ZONE 'UTC')::date)` restricted to
+  `type = 'SPLIT'`, and it is the only thing that stops two splits landing on one asset
+  on one day — the bug it was written for (#50). `collect()` refuses the second row so
+  that `preview` and `restore` give the same answer: without the check the bundle
+  previews clean and the restore raises `23505`, which arrives as a `500` for a row the
+  caller wrote. JSON Schema cannot see a duplicate *within* an array, let alone one that
+  depends on how a timestamp is bucketed.
 - **An ISIN, when present, must be a valid ISIN** — twelve characters, mod-10 check
   digit (`api_routes::lookup::is_valid_isin`).
 - **Row and byte ceilings** — `MAX_BUNDLE_ROWS` (portfolios + assets + transactions

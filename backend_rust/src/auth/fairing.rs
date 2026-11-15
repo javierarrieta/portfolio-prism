@@ -72,10 +72,10 @@ impl Fairing for AuthFairing {
 
         let (Some(mode), Some(pool)) = (
             req.rocket().state::<AuthMode>(),
-            req.rocket().state::<sqlx::SqlitePool>(),
+            req.rocket().state::<crate::db::DbPool>(),
         ) else {
             // Not wired up: fail closed, and loudly.
-            eprintln!("ERROR: auth fairing ran without AuthMode/SqlitePool managed state");
+            eprintln!("ERROR: auth fairing ran without AuthMode/DbPool managed state");
             deny(req);
             return;
         };

@@ -99,6 +99,15 @@ fn the_real_tree_passes_the_gate() {
         text.contains("inspected src/backup/restore.rs: 4 INSERT statement(s)"),
         "restore.rs holds the module's four INSERTs, said:\n{text}"
     );
+    // Rule 3's count, for the same reason: the module opens exactly two
+    // transactions, the export's read and the restore's write, and both name their
+    // isolation level. A third start here means a new transaction nobody looked at,
+    // and a count of zero would mean the rule stopped scanning — either way this
+    // assertion is what notices.
+    assert!(
+        text.contains("Transaction starts inspected: 2"),
+        "the gate should account for the module's two transaction starts, said:\n{text}"
+    );
     for file in ["export.rs", "mod.rs", "schema.rs"] {
         assert!(
             text.contains(&format!("inspected src/backup/{file}: 0 INSERT statement(s)")),
@@ -185,7 +194,7 @@ fn the_script_bans_exactly_the_pinned_set() {
 fn a_banned_construct_in_a_sql_string_fails() {
     let (code, text) = run_tree(
         "pragma-in-sql",
-        r#"pub async fn leak(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        r#"pub async fn leak(pool: &DbPool) -> Result<(), sqlx::Error> {
     sqlx::query("PRAGMA table_info(assets)").execute(pool).await
 }
 "#,
@@ -345,6 +354,96 @@ fn an_insert_that_names_no_table_is_refused() {
     assert!(
         text.contains("INSERT INTO is not followed by a table name"),
         "the malformed INSERT was not reported:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 3 — every transaction start names its isolation level
+// ---------------------------------------------------------------------------
+
+/// The drift this rule exists for, and the reason a unit test is not enough. The
+/// tests call `begin_read_tx`, so a `build` that went back to `pool.begin()` — the
+/// exact bug Task 7 fixed — leaves every one of them green: the helper still opens
+/// `REPEATABLE READ`, and `a_read_only_export_does_not_queue_behind_a_writer` passes
+/// at READ COMMITTED too because a reader still blocks nothing. Only a rule that
+/// scans the directory sees that the transaction `build` actually opens is bare.
+#[test]
+fn a_module_that_bypasses_its_own_transaction_helper_fails() {
+    let (code, text) = run_tree(
+        "bypass-the-helper",
+        r#"pub const ISOLATION: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
+pub async fn begin_read_tx(pool: &DbPool) -> Result<Tx, DbFailure> {
+    pool.begin_with(ISOLATION).await.map_err(classify)
+}
+pub async fn build(pool: &DbPool) -> Result<Bundle, DbFailure> {
+    let mut tx = pool.begin().await.map_err(classify)?;
+    build_in(&mut tx).await
+}
+"#,
+    );
+    assert_eq!(
+        code, 1,
+        "a bare begin next to a correct helper is still a bare begin:\n{text}"
+    );
+    assert!(
+        text.contains("does not state its isolation level"),
+        "the failure did not say why:\n{text}"
+    );
+    // The right line, not just the right file: the helper is correct and must not be
+    // what the gate points at.
+    assert!(
+        text.contains("fixture.rs:6"),
+        "the gate blamed the wrong line; `build`'s begin is on line 6:\n{text}"
+    );
+    assert!(
+        !text.contains("fixture.rs:3"),
+        "the correct `begin_with` on line 3 was reported:\n{text}"
+    );
+}
+
+/// The other direction, which is what keeps Rule 3 from being decoration that also
+/// refuses correct code: a `begin_with` passes, and so does prose about a bare
+/// `begin` — the sentence in `restore.rs` that explains why its isolation level is
+/// stated on the `BEGIN`. Without this case, the first one could be passing because
+/// the rule rejects the word `begin` anywhere.
+#[test]
+fn a_transaction_start_that_names_its_isolation_level_passes() {
+    let (code, text) = run_tree(
+        "names-its-isolation",
+        r#"// A later `pool.begin()` would run at the server default, so the level is
+// stated on the BEGIN itself rather than in a SET.
+pub async fn apply(pool: &DbPool) -> Result<Tx, DbFailure> {
+    pool.begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE").await.map_err(classify)
+}
+"#,
+    );
+    assert_eq!(
+        code, 0,
+        "a transaction that states its level is correct code:\n{text}"
+    );
+    assert!(
+        text.contains("Transaction starts inspected: 1"),
+        "the prose line must not be counted as a transaction start:\n{text}"
+    );
+}
+
+/// A bare `.begin(` on its own, spelled the way sqlx code writes it. Kept separate
+/// from the bypass case above so a rule that only fires next to a `begin_with` — a
+/// plausible wrong implementation — is still caught.
+#[test]
+fn a_bare_transaction_start_fails_the_gate() {
+    let (code, text) = run_tree(
+        "bare-begin",
+        r#"pub async fn read(pool: &DbPool) -> Result<Bundle, DbFailure> {
+    let mut tx = pool.begin().await.map_err(classify)?;
+    Ok(build_in(&mut tx).await?)
+}
+"#,
+    );
+    assert_eq!(code, 1, "a bare begin inherits the server default:\n{text}");
+    assert!(
+        text.contains("does not state its isolation level") && text.contains("fixture.rs:2"),
+        "the failure named neither the reason nor the line:\n{text}"
     );
 }
 

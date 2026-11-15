@@ -7,7 +7,7 @@ We have successfully built and verified the full-stack **Portfolio Prism**. The 
 ## 🛠️ What Was Built
 
 ### 1. Backend Service (Rust + Rocket)
-- **Database Schema**: Utilizes SQLite via SQLx. The database caches daily price bars (`HistoricalPrice` table) for offline capabilities and rapid computations.
+- **Database Schema**: Postgres via SQLx, and only Postgres — there is no engine flag and no SQLite support in the crate. `DATABASE_URL` is required with no default; the schema comes from `backend_rust/migrations/`, applied by `sqlx::migrate!` at startup. The database caches daily price bars (`historical_prices`) for offline capabilities and rapid computations.
 - **Tax Lot Accounting Engine (`tax_engine.rs`)**:
   - Implements **FIFO** (First-In, First-Out) matching.
   - Implements **LIFO** (Last-In, First-Out) matching.
@@ -110,11 +110,13 @@ To stop both servers, simply press `CTRL+C` in your terminal.
 ## Backup: export and restore
 
 `cargo test` proves the bundle format, the validation errors, the byte and row caps, the
-preview plan, and a copy/replace round trip against an in-memory SQLite database. CI also
+preview plan, and a copy/replace round trip against a real Postgres database — one
+provisioned per test (`backend_rust/src/test_db.rs`), which is why `cargo test` needs
+`DATABASE_URL` and refuses, with a named reason, without it. CI also
 diffs the three generated artifacts (`docs/openapi/openapi.json`,
 `docs/backup-schema/v1.json`, `frontend/src/types/api.d.ts`) and runs the portability and
-access gates. None of that touches a browser, a real identity provider, a file on a disk,
-a second instance, or a locked database.
+access gates. None of that touches a browser, a real identity provider, a second database,
+or a contended one.
 
 The sections below are the manual half, in the order to run them. Each assumes the ones
 before it.
@@ -129,6 +131,10 @@ before anything else works. From the repository root:
 
 ```bash
 cd backend_rust
+# Required, with no default: the backend refuses to start without it and names the
+# variable. `scripts/dev-db.sh` prints this URL and creates the database; run it inside
+# `nix-shell -p postgresql_18` if `initdb` is not on PATH. There is no SQLite fallback.
+export DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism
 export AUTH_MODE=oidc
 export OIDC_ISSUER="https://auth.example/application/o/portfolio-prism/"   # trailing slash
 export OIDC_CLIENT_ID=portfolio-prism
@@ -144,7 +150,9 @@ cd frontend && npm run dev
 ```
 
 Then open **http://localhost:5173**. Expected: the backend prints no `startup refused:`
-line and binds `:8000`; if you exported `BACKUP_ALLOW_PRICE_RESTORE=1` it prints
+line and binds `:8000` (a `startup refused: DATABASE_URL is required` line means the
+export above did not reach the `cargo run` process); if you exported
+`BACKUP_ALLOW_PRICE_RESTORE=1` it prints
 `WARN: BACKUP_ALLOW_PRICE_RESTORE is on; a restore may write shared historical_prices
 rows`, and that warning is the flag working, not a problem.
 
@@ -233,6 +241,33 @@ Sign back in before §3, and re-export `PP` — a new login mints a new cookie.
 
 ### 3. The file is really yours and really complete
 
+**Before the export, audit the source for orphans.** The bundle is nested: `export` reads
+portfolios by id, then `assets WHERE portfolio_id = …`, then `transactions WHERE
+asset_id = …` (`backend_rust/src/backup/export.rs`). A row whose parent is gone is under
+no parent, so it is never read, never mentioned, and never rejected — the export cannot
+report what it cannot reach. After the cutover Postgres will refuse such a row outright,
+so the loss is invisible at both ends: not exported, not restored, and nothing in
+between says a word about it.
+
+`backend_rust/scripts/pre_cutover_audit.sh` runs the four parent checks against the
+**SQLite** file — the source, which is where the orphans still are; there is no Postgres
+query that can find rows Postgres will not accept:
+
+```bash
+bash backend_rust/scripts/pre_cutover_audit.sh /path/to/portfolio.db
+```
+
+It exits **0** with no orphans, **1** with orphans, and **2** when it could not run at all
+(no `sqlite3`, the wrong file, a file that is not this app's schema). The exit code is
+the contract: a non-zero count is the stop condition, and the script enforces that so
+nobody has to read the report line by line to find out whether it is safe to continue.
+The cutover runbook is `docs/postgres-cutover.md`, and its step 1 is this same script with
+the same contract — save the output here, because the row-count block it prints is a baseline
+§6's before-and-after comparison needs (a lower bound: the audit runs before the export).
+
+Run it *before* step 1 below, not after. Once a bundle has been accepted as the complete
+record of a portfolio, an orphan found later has no baseline left to compare against.
+
 1. Sign in and note your portfolios, their assets, and a transaction count you recognise:
    ```bash
    curl -sS --cookie "pp_session=$PP" http://localhost:8000/api/portfolios/ \
@@ -299,13 +334,18 @@ This is the step that justifies the feature, and no automated test has a real se
 instance to restore into.
 
 1. Start an empty instance and sign in as yourself. The easy path is to stop the first
-   instance and restart it against a new file, because the provider matches redirect URIs
-   strictly and a second origin has to be registered to run both at once:
+   instance and restart it against a second database on the same cluster, because the
+   provider matches redirect URIs strictly and a second origin has to be registered to run
+   both at once:
    ```bash
-   export DATABASE_URL='sqlite:/tmp/second.db?mode=rwc'
+   psql "postgres://postgres@127.0.0.1:55432/postgres" -qc 'create database prism_second'
+   export DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism_second
    cargo run
    ```
-   Expected: a fresh, empty database — `GET /api/portfolios/` answers `[]`, not `401`.
+   Expected: a fresh, empty database — the app applies `backend_rust/migrations/` to it at
+   startup, and `GET /api/portfolios/` answers `[]`, not `401`. A second *file* is not the
+   equivalent step any more: the engine is a server, so "another instance" means another
+   database (or another cluster), and `mode=rwc` has no meaning to make.
 2. Restore in **New copy** mode. Choose `/tmp/bundle.json` in *Bundle file*. Expected: the
    card previews on its own and shows `Will delete nothing.` and
    `Will insert N portfolios, M assets, K transactions.` Click **Restore**. Expected:
@@ -361,15 +401,18 @@ instance to restore into.
       gives it any.** §6 step 5 says plainly that a fresh instance has no bars until the
       provider fills them, and §4 has been running on a fresh instance since step 1. Open
       the **Dashboard** for one of the restored portfolios and wait for the value chart to
-      draw — that request is what fills `historical_prices` — then check, with the same
-      `$DB` derivation §5 uses:
+      draw — that request is what fills `historical_prices` — then check it directly. There
+      is no `$DB` path to derive any more; `DATABASE_URL` *is* the connection string and
+      `psql` takes it as it stands:
       ```bash
-      export DB="${DATABASE_URL:-sqlite:../portfolio.db?mode=rwc}"
-      export DB="${DB#sqlite:}"; export DB="${DB%%\?*}"
-      sqlite3 "$DB" 'select symbol, count(*) from historical_prices group by symbol'
+      psql "$DATABASE_URL" -c 'select symbol, count(*) from historical_prices group by symbol'
       ```
       Expected: at least one symbol with rows. If it answers nothing, the provider did not
-      answer either, and every number below depends on that being fixed first.
+      answer either, and every number below depends on that being fixed first. (In a
+      headless run the same rows can be inserted with `insert into historical_prices
+      (symbol, date, close_price) values …`; that is what the executed run of this section
+      had to do, because the provider answered the live quote and rate-limited the history
+      request.)
 
       Then restart the backend with `export BACKUP_ALLOW_PRICE_RESTORE=1`, tick **Include
       price history** on the export card — tick the same portfolio you opened — download,
@@ -398,15 +441,24 @@ instance to restore into.
       bundle through at all: the identical request was a `422` one restart earlier.
    d. Now the write itself, still on this instance. Clear one symbol's bars, and post the
       same file again:
+
+      **This one writes, and not to a scratch database.** The `DELETE` below runs against
+      whatever `$DATABASE_URL` points at, which — if you followed §0 — is the same dev
+      database `./start.sh` starts the app against, the one holding the data every other
+      section of this walkthrough reads. `historical_prices` has no `owner_id`, so
+      `delete from historical_prices where symbol = …` removes those bars for every
+      portfolio in the instance, not just yours, and the dated reports for that symbol read
+      as zero until the restore puts them back. Do it on a database you mean to overwrite.
+
       ```bash
       SYMBOL=$(python3 -c 'import json;print(json.load(open("/tmp/bundle-prices.json"))["prices"][0]["symbol"])')
       IN_BUNDLE=$(python3 -c 'import json,sys; print(sum(1 for p in json.load(open("/tmp/bundle-prices.json"))["prices"] if p["symbol"] == sys.argv[1]))' "$SYMBOL")
       echo "$SYMBOL: $IN_BUNDLE rows in the bundle"
-      sqlite3 "$DB" "delete from historical_prices where symbol = '$SYMBOL'"
+      psql "$DATABASE_URL" -qc "delete from historical_prices where symbol = '$SYMBOL'"
       curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
            --data-binary @/tmp/bundle-prices.json -w 'status=%{http_code}\n' \
            'http://localhost:8000/api/backup/restore?mode=copy&apply_prices=1'
-      sqlite3 "$DB" "select count(*) from historical_prices where symbol = '$SYMBOL'"
+      psql "$DATABASE_URL" -tAc "select count(*) from historical_prices where symbol = '$SYMBOL'"
       ```
       Expected: `prices_inserted` equals `$IN_BUNDLE`, and the last `select` prints
       `$IN_BUNDLE` too — the restore filled the gap it found. Count the rows in the bundle
@@ -438,79 +490,112 @@ instance to restore into.
 If step 2 or 4 disagrees with the preview you were shown, that is a defect in `plan_for`
 versus `apply` — the two must count the same rows by the same rule.
 
-### 5. A locked database answers 503
+### 5. A contended database answers 503
 
-Single-writer SQLite with `replicas: 1` means `SQLITE_BUSY` is reachable in production, and
-the backup module turns it into a `503` with a `Retry-After` rather than a `500`. No test
-can show you what that feels like from the outside.
+Postgres is MVCC, so the SQLite experience this section used to describe is gone: there is
+no `SQLITE_BUSY`, no write lock that keeps everyone else out, and no `.timeout` to set. What
+a `503` means now is narrower, and `backup::export::classify` names the four SQLSTATEs that
+produce it — `40001` serialisation failure, `40P01` deadlock detected, `55P03`
+lock_not_available, and `57014` query cancelled by `statement_timeout` — plus
+`PoolTimedOut`, which is not a database error at all but the pool's own `acquire_timeout`
+(5 s) expiring. Everything else is a `500`, because it is a bug and a retry will not help.
 
-Run this from `backend_rust/`, the directory the backend resolves its relative
-`DATABASE_URL` against — with the dev default, `sqlite3 "$DB"` opens the repository-root
-`portfolio.db` only from there (`main.rs:53-54`). Open the database and take the write
-lock:
+The reachable one you can drive by hand is a **write blocked by another writer**. The
+restore is one `SERIALIZABLE` transaction and a `DELETE` has to take the row lock, so a
+transaction holding `FOR UPDATE` on a portfolio the restore is about to delete keeps it out
+until something gives. Something gives at 30 s: `statement_timeout` is set per connection in
+`db::pool_options`, the statement is cancelled (`57014`), and the route answers the
+retryable failure.
 
-```bash
-export DB="${DATABASE_URL:-sqlite:../portfolio.db?mode=rwc}"
-export DB="${DB#sqlite:}"; export DB="${DB%%\?*}"
-sqlite3 "$DB"
-```
-```
-sqlite> .timeout 0
-sqlite> BEGIN IMMEDIATE;
-```
-
-`BEGIN IMMEDIATE` is the whole trick: it takes the RESERVED write lock and holds it until
-the transaction ends. Nothing needs to happen inside it, and writing something would not
-change the outcome — under the rollback journal (`main.rs:56-76` deliberately does not
-enable WAL) a write statement still only holds RESERVED, and EXCLUSIVE is taken at COMMIT,
-which this transaction never reaches.
-
-Then, from a second terminal, with that transaction still open, drive the **restore**
-route and prove a refused restore writes nothing. Use a portfolio id you actually own on
-this instance — the one you exported in §3, not a literal `1` — because a foreign id is a
-`404`, and a `404` here reads as the lock test failing:
+Run this from `backend_rust/`, against the database the running instance uses. Hold the
+lock in a `psql` session and leave it open:
 
 ```bash
-sqlite3 "$DB" 'select count(*) from portfolios'
-curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
-     --data-binary @/tmp/bundle.json -o /dev/null -w 'status=%{http_code}\n' \
-     'http://localhost:8000/api/backup/restore?mode=copy'
-sqlite3 "$DB" 'select count(*) from portfolios'
+psql "$DATABASE_URL"
+```
+```
+psql> BEGIN;
+psql> SELECT id FROM portfolios WHERE id = <the id you own> FOR UPDATE;
+psql> SELECT pg_sleep(40);
 ```
 
-Expected: the request **hangs for about five seconds** — that is the `busy_timeout` in
-`main.rs`, and it is the honest experience, not a bug — then
-`HTTP/1.1 503 Service Unavailable`, a `Retry-After: 2` header, and
-`{"error":"the database is busy; try again in a moment"}`. The two counts are identical:
-the restore is one transaction, so a refused restore is a restore that never happened.
-This is the manual version of `a_locked_database_is_a_503_with_retry_after_from_the_restore_route`
-in `backend_rust/tests/backup_test.rs`, which holds a write transaction open the same way.
+`FOR UPDATE` is the whole trick: a plain `SELECT` takes no lock a `DELETE` has to wait for,
+and `pg_sleep` keeps the transaction open while you work in the other terminal. Writing
+something instead of sleeping would work too — it is the open transaction and the row lock
+that matter, not what else it does.
 
-Now the export, with the lock **still held**, and expect the opposite:
+Then, from a second terminal, with that transaction still open, drive the **restore** route
+and prove a refused restore writes nothing. Use a portfolio id you actually own on this
+instance — the one you exported in §3, not a literal `1` — because a foreign id is a `404`,
+and a `404` here reads as the lock test failing:
 
 ```bash
-curl -sS --cookie "pp_session=$PP" -o /dev/null -w 'status=%{http_code}\n' \
+psql "$DATABASE_URL" -tAc 'select count(*) from portfolios'
+time curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
+     --data-binary @/tmp/bundle.json -D - -o /dev/null -w 'status=%{http_code}\n' \
+     'http://localhost:8000/api/backup/restore?mode=replace'
+psql "$DATABASE_URL" -tAc 'select count(*) from portfolios'
+```
+
+Expected: the request **hangs for about thirty seconds** — that is `statement_timeout`, and
+it is the honest experience, not a bug — then `HTTP/1.1 503 Service Unavailable`, a
+`Retry-After: 2` header, and `{"error":"the database is busy; try again in a moment"}`. The
+two counts are identical: the restore is one transaction, so a refused restore is a restore
+that never happened. Measured on a local cluster, with portfolio 3 held `FOR UPDATE`:
+
+```
+--- counts before
+portfolios=1
+--- restore (mode=replace) while the lock is held
+{"error":"the database is busy; try again in a moment"}
+status=503
+
+real    0m30.021s
+HTTP/1.1 503 Service Unavailable
+retry-after: 2
+--- counts after (a refused restore is a restore that never happened)
+portfolios=1
+```
+
+Now the read-only routes, with the lock **still held**, and expect the opposite:
+
+```bash
+time curl -sS --cookie "pp_session=$PP" -o /dev/null -w 'status=%{http_code}\n' \
      "http://localhost:8000/api/backup/export?portfolio_ids=<the id you own>"
+time curl -sS -X POST --cookie "pp_session=$PP" -H 'Content-Type: application/json' \
+     --data-binary @/tmp/bundle.json -o /dev/null -w 'status=%{http_code}\n' \
+     'http://localhost:8000/api/backup/preview?mode=replace'
 ```
 
-Expected: **`200`, immediately.** Not a `503`, and not the feature failing. A RESERVED
-writer does not block readers under the rollback journal, and `backup_export::build`
-issues no write, so there is nothing for a read-only route to wait on — the auth guard's
-own read of `users` gets through for the same reason. The consequence is written into the
-route at the `DbFailure::Lock` arm of `export`'s error mapping in
-`src/api_routes/backup.rs`: **the export's `Lock` arm is unreachable from a held lock in
-this journal mode.** The failure that could reach it, pool exhaustion,
-is met earlier by the guard and answered a `500` before that arm. Both halves are pinned by
-tests instead (`an_exhausted_pool_is_a_lock_not_an_outage`, and
-`a_lock_is_a_503_that_says_when_to_retry` for the response shape). So a `200` here is the
-correct answer: the read-only routes are simply not where `SQLITE_BUSY` comes from, and
-this walkthrough must not pretend otherwise.
+Expected: **`200`, immediately** (measured: 15 ms each). Not a `503`, and not the feature
+failing. A writer blocks no reader under MVCC, and neither `export` nor `preview` writes,
+so there is nothing for them to wait on — the auth guard's own read of `users` gets through
+for the same reason. This is the same conclusion the SQLite version of this step reached,
+for a different and much better reason: there it was an accident of the rollback journal,
+here it is the engine's guarantee, and `export` additionally runs its reads in a
+`REPEATABLE READ` transaction, so the bundle is one snapshot rather than a sequence of them.
 
-Finish with `ROLLBACK;` in the sqlite3 prompt and re-run the restore: expected `200` — the
-lock was the only thing refusing it.
+Finish with `ROLLBACK;` in the psql prompt and re-run the restore: expected `200` — the lock
+was the only thing refusing it.
 
-The one way to get a false pass: a plain `BEGIN;` will not do it, because SQLite lets a
-deferred transaction stay a reader and nothing blocks. It has to be `BEGIN IMMEDIATE`.
+Two ways to get a false pass, and both of them are the lock rather than the route:
+
+- a plain `BEGIN; SELECT …;` locks nothing a `DELETE` waits for. It has to be `FOR UPDATE`
+  (or a write);
+- the lock has to be on a row the restore actually touches. A lock on some other portfolio
+  blocks nothing, the restore finishes at once, and the step looks like it passed.
+
+What is pinned by tests rather than by this page: the response shape
+(`a_lock_is_a_503_that_says_when_to_retry`), a saturated pool arriving as a lock and not an
+outage (`an_exhausted_pool_is_a_lock_not_an_outage`), a read-only export that does not queue
+behind a writer (`a_read_only_export_does_not_queue_behind_a_writer`), and the
+concurrent-restore race that produces a real `40001`
+(`tests/restore_concurrency_test.rs::a_concurrent_replace_restore_is_a_503_with_retry_after`).
+The half no test can reach is the pool timeout on `restore` itself: the auth guard reads
+`users` before the handler runs, so a pool with nothing free is answered a `500` by the
+guard and never reaches `apply` — that gap is written into
+`src/api_routes/backup.rs` at the `ApplyError::Db(DbFailure::Lock)` arm and is not this
+walkthrough's to close.
 
 ### 6. Metrics equality before and after a restore — this one is manual
 
@@ -548,7 +633,10 @@ constants as if it were a check.
    ```bash
    diff /tmp/metrics-before.txt /tmp/metrics-after.txt
    ```
-   Expected: no output.
+   Expected: no output. That is what it produced when this walkthrough was re-run after
+   the engine switch — the two readings were identical, `last twr` included — with the
+   bars carried across by §4 step 6, which is the only reason the comparison was
+   comparable at all.
 5. If it differs, rule out the two things that are not the restore's fault before you
    call it a defect:
    - **The window ends today.** `stats_engine.rs:121` sets `end_date = Utc::now()` and the
@@ -563,7 +651,7 @@ constants as if it were a check.
      that writing those rows is one tenant writing market data every other tenant's dated
      reports read, which is why the flag ships off. (Note which count belongs where: §4
      step 6 posts back into the instance the bars were read from and so expects
-     `prices_inserted: 0`; it is a restore into a file with no bars for those symbols —
+     `prices_inserted: 0`; it is a restore into a database with no bars for those symbols —
      the case this bullet is about — that puts a number above zero.)
 6. Record which figures you actually compared, and say that a human did it.
 
@@ -575,8 +663,12 @@ constants as if it were a check.
   confirmation parameter; the gate is authentication plus the `SameSite=Lax` session
   cookie. An authenticated caller can already delete every portfolio one at a time, so
   `replace` adds speed, not capability.
-- **Concurrency.** `replicas: 1`, single-writer SQLite. `mode=replace` under concurrent
-  writes on Postgres probably needs a `SERIALISABLE` restore transaction; see the plan's
-  follow-ups.
+- **Concurrency.** `replicas: 1`. `mode=replace` now runs in a `SERIALIZABLE` transaction,
+  so two restores for one caller abort with `40001` and answer `503` with `Retry-After`
+  (`tests/restore_concurrency_test.rs` proves it, including the mutation that shows the
+  server's default isolation level fails there). What is still unproven is the
+  pool-timeout half of `restore`'s `Lock` arm, for the reason given at the end of §5 — it
+  is a `500` from the auth guard before the handler is ever reached, and no test can put a
+  connection shortage in that gap on purpose.
 - **Price restore is a mitigation, not a model.** `historical_prices` has no `owner_id`;
   the flag is what keeps one tenant from silently rewriting shared market data.

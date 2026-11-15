@@ -1,24 +1,54 @@
+//! The shared toolbox every integration-test binary includes with `mod common;`.
+//!
+//! It is one file serving twenty-odd binaries, so almost every binary leaves some of
+//! it unused; `dead_code` is allowed for the whole module rather than function by
+//! function, which is the only way a helper can be added without hunting down which
+//! of the binaries will not call it.
+//!
+//! What belongs here is only what the integration suite needs and `src/` does not:
+//! Rocket builders, and the `seed_*` fixtures. The database itself is not here —
+//! [`test_pool`] is re-exported from `src/test_db.rs` rather than wrapped, so there is
+//! one implementation of "a database this test owns alone" and one name for it. The
+//! `seed_*` helpers stay here rather than moving into `src/test_db.rs` because no `src/`
+//! unit test calls any of them: each writes its own `INSERT` against its own private
+//! database, so moving them would relocate a single copy, not collapse two.
+#![allow(dead_code)]
+
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::backup::BackupConfig;
+use backend_rust::db::DbPool;
 use backend_rust::services::currency_service::CurrencyService;
-use backend_rust::{build_rocket as lib_build_rocket, get_cors_options, init_db};
+use backend_rust::{build_rocket as lib_build_rocket, ensure_bootstrap_owner, get_cors_options};
 use chrono::{DateTime, NaiveDate, Utc};
+use rocket::http::{Header, HeaderMap, Status};
+use rocket::local::asynchronous::Client;
 use rocket::{Build, Rocket};
-use sqlx::SqlitePool;
+use serde_json::json;
 
 // The mock lives in `src/test_provider.rs` so the library's own unit tests can use
 // it too; this include compiles the same file into the integration-test binary.
 #[path = "../../src/test_provider.rs"]
 mod test_provider;
 
+// Likewise `src/test_db.rs`: one implementation of "a database this test owns alone",
+// shared by the unit suite and the integration suite rather than copied into each.
+#[path = "../../src/test_db.rs"]
+mod test_db;
+
 // Each integration-test binary uses a subset of these; the ones it does not use are
 // not dead code in the file, only in that binary.
 #[allow(unused_imports)]
-pub use test_provider::{mock_pricing_url, MockYahoo};
+pub use test_provider::{MockYahoo, mock_pricing_url};
 
-/// The user every existing test runs as: the placeholder row `init_db` creates
-/// unconditionally, which is `id = 1` on a fresh in-memory database.
-pub const DEFAULT_USER: i32 = 1;
+// Re-exported, not wrapped. These used to be one-line delegates to `test_db::`, each
+// with a doc comment restating the doc comment it delegated to — two places to keep in
+// sync and no behaviour in the middle. `pool_options` is the one the backup tests call
+// directly, because a test that needs a *second* pool against the same database must
+// build it the way the harness builds the first. The fourth delegate, `unique_caller`,
+// is gone rather than re-exported: its only caller was `setup_db`, and a counted name
+// is exactly what the call sites no longer need.
+#[allow(unused_imports)]
+pub use test_db::{pool_options, test_pool, test_pool_url};
 
 /// A `StartupConfig` asking for `disabled` mode, built through the injectable
 /// environment source rather than by mutating the process environment (which is
@@ -54,7 +84,7 @@ pub fn oidc_config() -> StartupConfig {
 
 /// Build the app running as `as_user` (development mode). Tests that need the
 /// cookie path construct `AuthMode::Oidc(oidc_cfg())` themselves.
-pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
+pub fn build_rocket(pool: DbPool, as_user: i64) -> Rocket<Build> {
     rocket_with_service(pool, offline_pricing_service(), as_user)
 }
 
@@ -63,7 +93,7 @@ pub fn build_rocket(pool: SqlitePool, as_user: i32) -> Rocket<Build> {
 /// mock gives. `build_rocket` is already offline; this is for tests that need the
 /// provider to answer *something*.
 #[allow(dead_code)]
-pub fn build_rocket_pricing(pool: SqlitePool, as_user: i32, base_url: &str) -> Rocket<Build> {
+pub fn build_rocket_pricing(pool: DbPool, as_user: i64, base_url: &str) -> Rocket<Build> {
     rocket_with_service(pool, CurrencyService::with_base_url(base_url), as_user)
 }
 
@@ -76,9 +106,9 @@ pub fn offline_pricing_service() -> CurrencyService {
 
 #[allow(dead_code)]
 fn rocket_with_service(
-    pool: SqlitePool,
+    pool: DbPool,
     currency_service: CurrencyService,
-    as_user: i32,
+    as_user: i64,
 ) -> Rocket<Build> {
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
@@ -93,8 +123,8 @@ fn rocket_with_service(
 /// this exercises.
 #[allow(dead_code)]
 pub fn build_rocket_with_backup_config(
-    pool: SqlitePool,
-    as_user: i32,
+    pool: DbPool,
+    as_user: i64,
     backup_cfg: BackupConfig,
 ) -> Rocket<Build> {
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
@@ -105,7 +135,7 @@ pub fn build_rocket_with_backup_config(
 
 /// Build the app in OIDC mode — the mode production runs in, and the only one in
 /// which unauthenticated requests are actually denied.
-pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
+pub fn build_rocket_oidc(pool: DbPool) -> Rocket<Build> {
     let currency_service = offline_pricing_service();
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     lib_build_rocket(
@@ -120,7 +150,7 @@ pub fn build_rocket_oidc(pool: SqlitePool) -> Rocket<Build> {
 /// Build in OIDC mode with an explicit origin allowlist, for the tests that care
 /// about how CORS and authentication are ordered.
 #[allow(dead_code)]
-pub fn build_rocket_oidc_with_cors(pool: SqlitePool, origins: Vec<String>) -> Rocket<Build> {
+pub fn build_rocket_oidc_with_cors(pool: DbPool, origins: Vec<String>) -> Rocket<Build> {
     let currency_service = offline_pricing_service();
     let cors = get_cors_options(origins);
     lib_build_rocket(
@@ -132,11 +162,169 @@ pub fn build_rocket_oidc_with_cors(pool: SqlitePool, origins: Vec<String>) -> Ro
     )
 }
 
-/// Migrate a fresh in-memory database under `cfg`, exactly as `main` does.
-pub async fn setup_db(cfg: &StartupConfig) -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    init_db(&pool, cfg).await.unwrap();
+/// The session header a test sends to be taken as authenticated.
+///
+/// In `disabled` mode the id inside the cookie is ignored — `build_rocket` names the
+/// caller — but the auth fairing still refuses a request that carries no session at all
+/// (`tests/backup_test.rs::capabilities_requires_a_session`), so every request needs one.
+#[allow(dead_code)]
+pub fn session_header() -> Header<'static> {
+    let (name, value) = session_cookie(1, 0);
+    Header::new(name, value)
+}
+
+/// `POST /api/backup/restore?mode=<mode>` with `bundle` as the body, answered with the
+/// two halves of the retry contract kept apart: the status and the headers.
+///
+/// The body is dropped on purpose. What a concurrency test has to assert is that a
+/// `503` came with `Retry-After`, and the only way to hold a header after the status has
+/// been read is to copy it out of the response before it is consumed. The body shape is
+/// pinned by `tests/backup_test.rs::a_lock_is_a_503_that_says_when_to_retry`.
+///
+/// `mode` is a parameter rather than baked in because the two modes race differently:
+/// `replace` deletes the caller's rows and so is the one that can abort, and `copy`
+/// writes disjoint rows and so is the one that must not.
+#[allow(dead_code)]
+pub async fn post_restore(
+    client: &Client,
+    mode: &str,
+    bundle: &str,
+) -> (Status, HeaderMap<'static>) {
+    let res = client
+        .post(format!("/api/backup/restore?mode={mode}"))
+        .header(session_header())
+        .header(rocket::http::ContentType::JSON)
+        // `LocalRequest::body` takes `Into<Vec<u8>>`, which `&str` satisfies directly.
+        .body(bundle)
+        .dispatch()
+        .await;
+    let status = res.status();
+    // A response borrows its own headers, so the map is rebuilt with owned strings —
+    // that is the only way the caller can still hold it after the response is gone.
+    let mut headers: HeaderMap<'static> = HeaderMap::new();
+    for header in res.headers().iter() {
+        headers.add(Header::new(
+            header.name().to_string(),
+            header.value().to_string(),
+        ));
+    }
+    (status, headers)
+}
+
+/// The smallest bundle that passes validation: one portfolio, one asset, one
+/// transaction. `name` is the only string in it a test can point at.
+///
+/// Moved here from `tests/backup_test.rs` when `tests/restore_concurrency_test.rs`
+/// needed the same fixture: two copies of a bundle shape is how one test starts
+/// restoring a file the other one never sends.
+#[allow(dead_code)]
+pub fn bundle_json(name: &str) -> String {
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": [{
+            "ref": "p1", "name": name, "description": null,
+            "currency": "USD", "base_currency": "USD",
+            "assets": [{
+                "ref": "a1", "symbol": "AAPL", "name": "Apple", "asset_type": "STOCK",
+                "sector": null, "currency": "USD", "isin": null,
+                "transactions": [{ "type": "BUY", "quantity": "10.0", "price": "150.00",
+                                   "fee": "1.00", "date": "2024-01-15T00:00:00Z" }]
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// A bundle with `portfolios` portfolios, each carrying `assets` assets of
+/// `transactions` transactions each — the shape a real account has, and the only way to
+/// make two restores overlap long enough for a race to be more than a coincidence.
+///
+/// Refs are unique across the whole bundle (`p{i}`, `a{i}_{j}`) because validation
+/// refuses a repeated ref anywhere in a file, not just within one portfolio.
+#[allow(dead_code)]
+pub fn bundle_with_size(portfolios: usize, assets: usize, transactions: usize) -> String {
+    let portfolios_json: Vec<serde_json::Value> = (0..portfolios)
+        .map(|i| {
+            let assets_json: Vec<serde_json::Value> = (0..assets)
+                .map(|j| {
+                    let txs: Vec<serde_json::Value> = (0..transactions)
+                        .map(|_| {
+                            json!({ "type": "BUY", "quantity": "1.0", "price": "10.00",
+                                    "fee": "0.00", "date": "2024-01-15T00:00:00Z" })
+                        })
+                        .collect();
+                    json!({
+                        "ref": format!("a{i}_{j}"), "symbol": format!("S{i}_{j}"),
+                        "name": "A", "asset_type": "STOCK", "sector": null,
+                        "currency": "USD", "isin": null, "transactions": txs,
+                    })
+                })
+                .collect();
+            json!({
+                "ref": format!("p{i}"), "name": format!("P{i}"), "description": null,
+                "currency": "USD", "base_currency": "USD", "assets": assets_json,
+            })
+        })
+        .collect();
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-11-13T00:00:00Z",
+        "portfolios": portfolios_json,
+    })
+    .to_string()
+}
+
+/// A private, freshly migrated database for one test, and the id of a user in it.
+///
+/// The user is [`seed_user`]'s, not the bootstrap placeholder. A test that owns rows
+/// needs a `users.id` for `portfolios.owner_id` to point at and does not care which;
+/// a test whose subject *is* the startup identity says so with [`db_with_placeholder`].
+///
+/// Replaces `setup_db(&cfg)` plus the `DEFAULT_USER` constant, both of which assumed
+/// the placeholder row was always `id = 1`. Here the id is the one the insert
+/// returned, so the fixture cannot drift from the database.
+pub async fn db_with_user(caller: &str) -> (DbPool, i64) {
+    let pool = test_pool(caller).await;
+    let user = seed_user(&pool, "test-subject").await;
+    (pool, user)
+}
+
+/// A database exactly as `main` leaves one: migrated, then [`ensure_bootstrap_owner`].
+///
+/// For the tests whose subject is that startup step and nothing else: `finalise_auth`
+/// in `disabled` mode reads the placeholder's id, `tests/startup_test.rs` pins the
+/// ownership backfill, and `tests/auth_test.rs` exercises the handover. `cfg` decides
+/// only whether the placeholder is *claimable*, exactly as at startup.
+///
+/// An ordinary test wants [`db_with_user`] instead; a fixture that seeds its own user
+/// has one less piece of startup policy to know about.
+pub async fn db_with_placeholder(caller: &str, cfg: &StartupConfig) -> DbPool {
+    let pool = test_pool(caller).await;
+    ensure_bootstrap_owner(&pool, cfg)
+        .await
+        .expect("bootstrap owner");
     pool
+}
+
+/// The id of the bootstrap placeholder owner, or `None` when the row is not there.
+///
+/// `DEFAULT_USER = 1` was the SQLite suite's assumption: the placeholder was always
+/// the first row of a database whose identity restarted at 1. Postgres gives the same
+/// answer today and nothing guarantees it, so the id comes from the row.
+///
+/// `Option` rather than a panic because "the placeholder is gone" is a state three
+/// tests assert on — a handover consumes the row in place — and not a harness failure.
+pub async fn placeholder_id(pool: &DbPool) -> Option<i64> {
+    sqlx::query_as::<_, (i64,)>("SELECT id FROM users WHERE issuer = $1 AND subj = $2")
+        .bind(backend_rust::PLACEHOLDER_ISSUER)
+        .bind(backend_rust::PLACEHOLDER_SUBJ)
+        .fetch_optional(pool)
+        .await
+        .expect("the users table is readable")
+        .map(|row| row.0)
 }
 
 /// A session cookie pair for `LocalRequest::private_cookie`.
@@ -158,10 +346,10 @@ pub fn expired_session_cookie(uid: i64, tv: i64) -> (&'static str, String) {
 
 /// Create a user row and return its id.
 #[allow(dead_code)]
-pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
+pub async fn seed_user(pool: &DbPool, subj: &str) -> i64 {
     let res = sqlx::query_as::<_, (i64,)>(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
-         VALUES ('https://auth.example.invalid', ?, 'user@example.com', ?, datetime('now')) \
+         VALUES ('https://auth.example.invalid', $1, 'user@example.com', $2, now()) \
          RETURNING id",
     )
     .bind(subj)
@@ -169,20 +357,20 @@ pub async fn seed_user(pool: &SqlitePool, subj: &str) -> i32 {
     .fetch_one(pool)
     .await
     .unwrap();
-    res.0 as i32
+    res.0
 }
 
 /// Create a portfolio owned by `owner_id`.
 #[allow(dead_code)]
-pub async fn seed_portfolio(pool: &SqlitePool, owner_id: i32, name: &str, currency: &str) -> i32 {
-    let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES (?, ?, ?, ?, ?) RETURNING id"
+pub async fn seed_portfolio(pool: &DbPool, owner_id: i64, name: &str, currency: &str) -> i64 {
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id"
     )
     .bind(name)
     .bind(None::<String>)
     .bind(currency)
     .bind(currency)
-    .bind(owner_id as i64)
+    .bind(owner_id)
     .fetch_one(pool)
     .await
     .unwrap();
@@ -190,9 +378,9 @@ pub async fn seed_portfolio(pool: &SqlitePool, owner_id: i32, name: &str, curren
 }
 
 #[allow(dead_code)]
-pub async fn seed_asset(pool: &SqlitePool, portfolio_id: i32, symbol: &str, name: &str) -> i32 {
-    let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES (?, ?, ?, ?, 'USD') RETURNING id"
+pub async fn seed_asset(pool: &DbPool, portfolio_id: i64, symbol: &str, name: &str) -> i64 {
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, $2, $3, $4, 'USD') RETURNING id"
     )
     .bind(portfolio_id)
     .bind(symbol)
@@ -210,14 +398,14 @@ pub async fn seed_asset(pool: &SqlitePool, portfolio_id: i32, symbol: &str, name
 /// no-op. Multi-currency tests use this instead.
 #[allow(dead_code)]
 pub async fn seed_asset_currency(
-    pool: &SqlitePool,
-    portfolio_id: i32,
+    pool: &DbPool,
+    portfolio_id: i64,
     symbol: &str,
     name: &str,
     currency: &str,
-) -> i32 {
-    let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES (?, ?, ?, ?, ?) RETURNING id"
+) -> i64 {
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id"
     )
     .bind(portfolio_id)
     .bind(symbol)
@@ -230,26 +418,45 @@ pub async fn seed_asset_currency(
     res.0
 }
 
+/// The text a fixture stores for a float, computed here rather than by the database.
+///
+/// `quantity`, `price` and `fee` are `text` columns holding a decimal as a string —
+/// that is the whole storage policy (spec §3), and it is why a float has no business
+/// being bound to them. Binding one anyway worked on SQLite only because SQLite applies
+/// the column's TEXT affinity to the incoming REAL, and its float-to-text rule always
+/// keeps a decimal point: `100.0` stored as `"100.0"`. Postgres sends the parameter as
+/// `float8` and takes the implicit assignment cast, whose rule drops it: `100.0`
+/// becomes `"100"`. Same number, different string, and the string is what the API
+/// echoes back — so a fixture that let the database do the conversion changed the
+/// response body while changing engines.
+///
+/// `{:?}` is Rust's shortest round-trip float formatting, which keeps a decimal point on
+/// integral values exactly as SQLite's affinity did, so the stored text — and therefore
+/// the JSON — is unchanged by the switch. `Display` (`{}`) would not: it prints `100`.
+fn dec(value: f64) -> String {
+    format!("{value:?}")
+}
+
 #[allow(dead_code)]
 pub async fn seed_transaction(
-    pool: &SqlitePool,
-    asset_id: i32,
+    pool: &DbPool,
+    asset_id: i64,
     tx_type: &str,
     qty: f64,
     price: f64,
     fee: f64,
-) -> i32 {
+) -> i64 {
     let date = DateTime::parse_from_rfc3339("2024-06-15T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"
     )
     .bind(asset_id)
     .bind(tx_type)
-    .bind(qty)
-    .bind(price)
-    .bind(fee)
+    .bind(dec(qty))
+    .bind(dec(price))
+    .bind(dec(fee))
     .bind(date)
     .fetch_one(pool)
     .await
@@ -258,25 +465,25 @@ pub async fn seed_transaction(
 }
 #[allow(dead_code)]
 pub async fn seed_transaction_at(
-    pool: &SqlitePool,
-    asset_id: i32,
+    pool: &DbPool,
+    asset_id: i64,
     tx_type: &str,
     qty: f64,
     price: f64,
     fee: f64,
     date: &str,
-) -> i32 {
+) -> i64 {
     let date = DateTime::parse_from_rfc3339(date)
         .unwrap()
         .with_timezone(&Utc);
-    let res = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+    let res = sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"
     )
     .bind(asset_id)
     .bind(tx_type)
-    .bind(qty)
-    .bind(price)
-    .bind(fee)
+    .bind(dec(qty))
+    .bind(dec(price))
+    .bind(dec(fee))
     .bind(date)
     .fetch_one(pool)
     .await
@@ -297,9 +504,9 @@ pub async fn seed_transaction_at(
 /// Do not assume the window rule covers a `get_price` call: a row two days old satisfies
 /// the window and still reaches Yahoo.
 #[allow(dead_code)]
-pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close: &str) {
+pub async fn seed_price(pool: &DbPool, symbol: &str, date: NaiveDate, close: &str) {
     sqlx::query(
-        "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+        "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
              ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
     )
     .bind(symbol)
@@ -317,7 +524,7 @@ pub async fn seed_price(pool: &SqlitePool, symbol: &str, date: NaiveDate, close:
 /// weekends for the opposite reason — to exercise the gap — and that is why this one is
 /// shared rather than copied.
 #[allow(dead_code)]
-pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end: &str, close: &str) {
+pub async fn seed_daily_prices(pool: &DbPool, symbol: &str, start: &str, end: &str, close: &str) {
     let mut day = NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap();
     let last = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
     while day <= last {
@@ -343,9 +550,11 @@ pub async fn seed_daily_prices(pool: &SqlitePool, symbol: &str, start: &str, end
 /// and fetches from the provider. Do not "simplify" the bind back to a SQL datetime
 /// function.
 #[allow(dead_code)]
-pub async fn seed_split_sync(pool: &SqlitePool, asset_id: i32) {
+pub async fn seed_split_sync(pool: &DbPool, asset_id: i64) {
     sqlx::query(
-        "INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at, covered_from) VALUES (?, ?, ?)",
+        "INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) \
+         ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, \
+                                              covered_from   = EXCLUDED.covered_from",
     )
     .bind(asset_id)
     .bind(Utc::now().date_naive())

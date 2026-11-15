@@ -1,5 +1,12 @@
 #[macro_use] extern crate rocket;
 
+// `src/test_db.rs` is compiled into the integration-test binaries as well as this
+// crate, and it needs to name `db::pool_options` from both. Inside this crate
+// `backend_rust::` would not resolve without this line; with it, one path works in
+// every build that includes the file, which is the only reason it is here.
+extern crate self as backend_rust;
+
+pub mod db;
 pub mod db_types;
 pub mod models;
 pub mod schemas;
@@ -25,6 +32,20 @@ pub mod api_routes {
 #[path = "test_provider.rs"]
 pub mod test_provider;
 
+/// The same arrangement as [`test_provider`], for the database the tests run on:
+/// one private, freshly migrated Postgres database per test, because Postgres has
+/// no `:memory:` and the tests inside one binary run on parallel threads.
+#[cfg(test)]
+#[path = "test_db.rs"]
+pub mod test_db;
+
+/// The harness's own tests. A sibling file rather than a `mod tests` inside
+/// `test_db.rs`, because that file is included by `tests/common/mod.rs` and would
+/// otherwise re-run every one of these tests in all nineteen integration binaries.
+#[cfg(test)]
+#[path = "test_db_tests.rs"]
+mod test_db_tests;
+
 /// A `CurrencyService` pointed at the local provider stand-in instead of the
 /// internet, for engine unit tests that must not depend on a network. A 404 rather
 /// than a closed port on purpose: a refused connection is retried three times with
@@ -35,8 +56,7 @@ pub(crate) fn offline_pricing_service() -> services::currency_service::CurrencyS
 }
 
 use rocket::{Rocket, Build};
-use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnection;
+use crate::db::DbPool;
 use crate::services::currency_service::CurrencyService;
 use crate::auth::{AuthMode, StartupConfig};
 use crate::auth::fairing::AuthFairing;
@@ -130,164 +150,78 @@ pub fn get_cors_options(origins: Vec<String>) -> Cors {
 pub const PLACEHOLDER_ISSUER: &str = "local";
 pub const PLACEHOLDER_SUBJ: &str = "bootstrap";
 
-/// Create/upgrade the schema and reconcile ownership.
+/// Establish the bootstrap owner, and assign any portfolio that has no owner.
+///
+/// This is the identity half of what `init_db` used to do. The schema half is gone
+/// — `sqlx::migrate!` owns the schema now — but these two duties are not schema,
+/// they are startup policy, and three things depend on them:
+///
+/// 1. [`crate::auth::finalise_auth`] in `AUTH_MODE=disabled` reads the placeholder
+///    row's id to become the caller. Without the row, `AUTH_MODE=disabled` — which
+///    spec §10 of the Postgres design requires, and which `./start.sh` uses — has
+///    nobody to be.
+/// 2. `tests/common::db_with_placeholder` runs this for the tests whose subject *is*
+///    the startup identity, and `tests/common::placeholder_id` reads the row's id back
+///    rather than assuming it. Every test that runs as the placeholder is running as
+///    this row.
+/// 3. `tests/startup_test.rs` pins the orphan rule below: unowned portfolios plus no
+///    configured bootstrap subject is a refusal, not a warning.
+///
+/// So the two duties are:
+///
+/// * **Placeholder upsert.** One row (`issuer='local'`, `subj='bootstrap'`) that
+///   owns anything with no owner yet, created unconditionally — a fresh database
+///   must be startable before any identity exists. It is handed to a real identity
+///   by [`crate::auth::oidc::provision_or_update`] when the configured bootstrap
+///   subject signs in.
+/// * **Ownership backfill.** Portfolios with `owner_id IS NULL` are assigned to that
+///   row, or startup refuses. Silently leaving one unowned would make it invisible
+///   to every user while still consuming the one ISIN lookup quota per symbol.
+///
+/// Must run **after** `sqlx::migrate!`: both statements name tables the migrator
+/// creates. It is idempotent, and on a freshly migrated Postgres database it does
+/// nothing at all — no orphans, and the row already exists after the first run — so
+/// it stays quiet in the normal production path.
 ///
 /// Returns `Err` rather than exiting, so "startup refuses" is testable; `main`
 /// turns an error into `exit(1)`.
-pub async fn init_db(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<()> {
-    sqlx::query("CREATE TABLE IF NOT EXISTS portfolios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        description TEXT,
-        currency TEXT NOT NULL DEFAULT 'USD',
-        base_currency TEXT NOT NULL DEFAULT 'USD'
-    )").execute(pool).await?;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS assets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        portfolio_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        name TEXT NOT NULL,
-        asset_type TEXT NOT NULL,
-        sector TEXT,
-        currency TEXT NOT NULL DEFAULT 'USD',
-        isin TEXT,
-        FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
-    )").execute(pool).await?;
-
-    let column_exists: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name = 'isin'"
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0,));
-
-    if column_exists.0 == 0 {
-        if let Err(e) = sqlx::query("ALTER TABLE assets ADD COLUMN isin TEXT")
-            .execute(pool)
-            .await
-        {
-            eprintln!("WARN: Failed to add isin column to assets table: {}", e);
-        }
-    }
-
-    let _ = sqlx::query("DROP INDEX IF EXISTS idx_assets_isin")
-        .execute(pool)
-        .await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        asset_id INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        quantity TEXT NOT NULL,
-        price TEXT NOT NULL,
-        fee TEXT NOT NULL,
-        date TEXT NOT NULL,
-        FOREIGN KEY (asset_id) REFERENCES assets(id)
-    )").execute(pool).await?;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (
-        symbol TEXT NOT NULL,
-        date DATE NOT NULL,
-        close_price TEXT NOT NULL
-    )").execute(pool).await?;
-
-    migrate_split_sync_key(pool).await?;
-
-    migrate_decimal_columns(pool).await?;
-
-    // After the decimal migration: it renames close_price on this same table, and a
-    // dedupe that runs before it operates on a schema about to change.
-    enforce_price_uniqueness(pool).await?;
-
-    enforce_split_uniqueness(pool).await?;
-
-    // --- identity -------------------------------------------------------------
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            issuer TEXT NOT NULL,
-            subj TEXT NOT NULL,
-            email TEXT,
-            name TEXT,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            token_version INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            last_login_at TEXT
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_issuer_subj ON users(issuer, subj)")
-        .execute(pool)
-        .await?;
-
-    add_owner_id_column(pool).await?;
-
-    // The placeholder row is created **unconditionally**, not only when orphans
-    // exist: `finalise_auth` must be able to name a real row in `disabled` mode on
-    // a fresh database, or `./start.sh` dies on the empty database it just created.
-    sqlx::query(
+pub async fn ensure_bootstrap_owner(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result<()> {
+    sqlx::query!(
         "INSERT INTO users (issuer, subj, email, name, created_at) \
-         VALUES (?1, ?2, NULL, 'Placeholder owner', ?3) \
+         VALUES ($1, $2, NULL, \'Placeholder owner\', $3) \
          ON CONFLICT (issuer, subj) DO NOTHING",
+        PLACEHOLDER_ISSUER,
+        PLACEHOLDER_SUBJ,
+        chrono::Utc::now()
     )
-    .bind(PLACEHOLDER_ISSUER)
-    .bind(PLACEHOLDER_SUBJ)
-    .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
 
-    backfill_ownership(pool, cfg).await?;
-
-    Ok(())
-}
-
-/// Add `portfolios.owner_id`.
-///
-/// Runs on a dedicated connection with `legacy_alter_table = ON`, the same
-/// mitigation `migrate_decimal_columns` uses: the bundled SQLite's stale
-/// per-connection schema makes an `ALTER` that follows a `DROP COLUMN` + `RENAME`
-/// fail on file-backed databases, and a fresh `ALTER` on a pooled connection is
-/// the same class of hazard. `migrate_one_column` is deliberately untouched.
-async fn add_owner_id_column(pool: &SqlitePool) -> anyhow::Result<()> {
-    let mut conn = pool.acquire().await?;
-    sqlx::query("PRAGMA legacy_alter_table = ON").execute(&mut *conn).await?;
-    let result = async {
-        if !column_exists(&mut conn, "portfolios", "owner_id").await? {
-            sqlx::query("ALTER TABLE portfolios ADD COLUMN owner_id INTEGER")
-                .execute(&mut *conn)
-                .await?;
-        }
-        Ok::<(), sqlx::Error>(())
-    }
-    .await;
-    sqlx::query("PRAGMA legacy_alter_table = OFF").execute(&mut *conn).await?;
-    Ok(result?)
+    backfill_ownership(pool, cfg).await
 }
 
 /// Assign portfolios that have no owner, or refuse to start.
 ///
 /// The rule is the spec's: an unowned portfolio is either handed to the
 /// placeholder (development, or OIDC with a designated bootstrap subject) or it
-/// stops the process. Silently leaving it unowned would make it invisible to every
-/// user while still consuming the one ISIN lookup quota per symbol.
-async fn backfill_ownership(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::Result<()> {
-    let (orphans,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id IS NULL")
-            .fetch_one(pool)
-            .await?;
+/// stops the process. See [`ensure_bootstrap_owner`] for why this is a startup step
+/// rather than a migration.
+async fn backfill_ownership(pool: &DbPool, cfg: &StartupConfig) -> anyhow::Result<()> {
+    let orphans: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id IS NULL"#
+    )
+    .fetch_one(pool)
+    .await?;
 
     if orphans == 0 {
         return Ok(());
     }
 
-    let placeholder: (i64,) = sqlx::query_as(
-        "SELECT id FROM users WHERE issuer = ?1 AND subj = ?2",
+    let placeholder: i64 = sqlx::query_scalar!(
+        "SELECT id FROM users WHERE issuer = $1 AND subj = $2",
+        PLACEHOLDER_ISSUER,
+        PLACEHOLDER_SUBJ
     )
-    .bind(PLACEHOLDER_ISSUER)
-    .bind(PLACEHOLDER_SUBJ)
     .fetch_one(pool)
     .await?;
 
@@ -308,259 +242,21 @@ async fn backfill_ownership(pool: &SqlitePool, cfg: &StartupConfig) -> anyhow::R
         );
     }
 
-    sqlx::query("UPDATE portfolios SET owner_id = ? WHERE owner_id IS NULL")
-        .bind(placeholder.0)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "UPDATE portfolios SET owner_id = $1 WHERE owner_id IS NULL",
+        placeholder
+    )
+    .execute(pool)
+    .await?;
     eprintln!(
         "WARN: assigned {orphans} pre-existing portfolio(s) to the placeholder owner \
-         (user {}); they transfer on bootstrap handover", placeholder.0
+         (user {placeholder}); they transfer on bootstrap handover"
     );
     Ok(())
 }
 
-async fn column_type(
-    conn: &mut SqliteConnection,
-    table: &str,
-    column: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as(&format!("PRAGMA table_info({table})")).fetch_all(&mut *conn).await?;
-    Ok(rows.iter().find(|r| r.1 == column).map(|r| r.2.clone()))
-}
-
-async fn column_exists(
-    conn: &mut SqliteConnection,
-    table: &str,
-    column: &str,
-) -> Result<bool, sqlx::Error> {
-    Ok(column_type(conn, table, column).await?.is_some())
-}
-
-async fn migrate_one_column(
-    conn: &mut SqliteConnection,
-    table: &str,
-    column: &str,
-) -> Result<(), sqlx::Error> {
-    let old = format!("{column}_old");
-    let current = column_type(conn, table, column).await?;
-    let old_exists = column_exists(conn, table, &old).await?;
-
-    match (current.as_deref(), old_exists) {
-        (Some("TEXT"), true) => {
-            // add happened, drop-leftover crash happened after ADD: re-copy from
-            // `_old` (idempotent; harmless if the UPDATE already ran, and it
-            // recovers the real values if the crash landed before the UPDATE),
-            // then finish the drop.
-            sqlx::query(&format!("UPDATE {table} SET {column} = CAST({old} AS TEXT)"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {old}"))
-                .execute(&mut *conn).await?;
-            Ok(())
-        }
-        (Some("TEXT"), false) => Ok(()),
-        (None, true) => {
-            // RENAME happened, ADD never did: recreate and repopulate from _old.
-            sqlx::query(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '0'"
-            ))
-            .execute(&mut *conn)
-            .await?;
-            sqlx::query(&format!("UPDATE {table} SET {column} = CAST({old} AS TEXT)"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {old}"))
-                .execute(&mut *conn).await?;
-            Ok(())
-        }
-        (None, false) => Ok(()),
-        (Some(_), true) => {
-            // non-TEXT column plus a stray _old leftover: drop the leftover, then migrate.
-            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {old}"))
-                .execute(&mut *conn).await?;
-            sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {column} TO {old}"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '0'"
-            ))
-            .execute(&mut *conn)
-            .await?;
-            sqlx::query(&format!("UPDATE {table} SET {column} = CAST({old} AS TEXT)"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {old}"))
-                .execute(&mut *conn).await?;
-            Ok(())
-        }
-        (Some(_), false) => {
-            // standard migration of a non-TEXT column.
-            sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {column} TO {old}"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '0'"
-            ))
-            .execute(&mut *conn)
-            .await?;
-            sqlx::query(&format!("UPDATE {table} SET {column} = CAST({old} AS TEXT)"))
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {old}"))
-                .execute(&mut *conn).await?;
-            Ok(())
-        }
-    }
-}
-
-/// Collapse duplicate `historical_prices` rows and make `(symbol, date)` unique.
-///
-/// The table was created with no primary key and only a non-unique index (the
-/// `CREATE TABLE IF NOT EXISTS historical_prices` in `init_db`), so `INSERT OR
-/// REPLACE` always inserted and every fetch
-/// appended. Reads have no `ORDER BY`, which made "the close on date X" an
-/// arbitrary row among N.
-///
-/// The tie-break is `MAX(rowid)`: the table has no write timestamp, so the most
-/// recently written row is the only deterministic survivor available. That is a
-/// deliberate choice about Yahoo's revisions around corporate actions, and it is
-/// what makes an as-of price reproducible from here on.
-///
-/// Must run AFTER `migrate_decimal_columns`, which renames this table's
-/// `close_price` column on a dedicated connection.
-pub async fn enforce_price_uniqueness(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query(
-        "DELETE FROM historical_prices WHERE rowid NOT IN (
-             SELECT MAX(rowid) FROM historical_prices GROUP BY symbol, date
-         )",
-    )
-    .execute(pool)
-    .await?;
-
-    // Superseded by the unique index below; leaving it costs a write for no read.
-    sqlx::query("DROP INDEX IF EXISTS idx_historical_prices_symbol_date")
-        .execute(pool)
-        .await?;
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_historical_prices_symbol_date
-             ON historical_prices(symbol, date)",
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Make a duplicated split row impossible rather than unlikely (#50).
-///
-/// `apply_split_events` used a `SELECT COUNT(*)` and then an `INSERT`, with no
-/// transaction and no constraint behind it. Two concurrent callers could both see
-/// zero and both insert, doubling a split adjustment and silently corrupting cost
-/// basis for that asset. A check-then-write cannot be made safe by tightening the
-/// check; it is safe when a second writer physically cannot land. So the guard is a
-/// partial unique index, and the count check becomes an optimisation.
-///
-/// The index is on `date(date)` rather than `date` because `transactions.date` is
-/// stored as a full timestamp (`2024-06-01T00:00:00Z`) while the dedupe has always
-/// compared calendar days. The expression has to match the one the queries use or
-/// SQLite will not use the index.
-///
-/// Existing duplicates are removed first, keeping the lowest `id`, because a unique
-/// index cannot be created over data that already violates it. That runs
-/// unconditionally rather than assuming any given database is clean.
-pub async fn enforce_split_uniqueness(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM transactions
-         WHERE type = 'SPLIT'
-           AND id NOT IN (
-               SELECT MIN(id) FROM transactions
-               WHERE type = 'SPLIT'
-               GROUP BY asset_id, date(date)
-           )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_split_asset_date
-             ON transactions(asset_id, date(date)) WHERE type = 'SPLIT'",
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Re-key the split-sync throttle from symbol to asset (#38).
-///
-/// Keyed on the symbol, the throttle let the first asset holding a symbol suppress
-/// every other asset holding it for 30 days — while the set of splits actually
-/// inserted is decided by *the calling asset's* earliest transaction date. So the
-/// first asset to sync could succeed, insert nothing relevant, and record the
-/// throttle anyway, leaving a second portfolio priced pre-split on a tax screen.
-///
-/// The table is a throttle cache: every row is re-derivable by fetching again, and a
-/// row written under the old rule means something the new rule cannot use — a
-/// symbol-level timestamp says nothing about whose history was evaluated. So this
-/// drops and recreates rather than transforming. The whole cost of losing the rows is
-/// one extra provider call per asset, once. Rollback is the same shape swap in the
-/// other direction and equally lossless.
-///
-/// Detection is by column rather than a version number, because `CREATE TABLE IF NOT
-/// EXISTS` will not alter an existing table: an old-shaped table left in place would
-/// keep the bug while the code above it looked fixed. `PRAGMA table_info` returns no
-/// rows when the table does not exist, which is the fresh-database case and falls
-/// straight through to the create.
-pub async fn migrate_split_sync_key(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    use sqlx::Row;
-
-    let columns = sqlx::query("PRAGMA table_info(split_sync)")
-        .fetch_all(pool)
-        .await?;
-    if columns
-        .iter()
-        .any(|row| matches!(row.try_get::<String, _>("name").as_deref(), Ok("symbol")))
-    {
-        sqlx::query("DROP TABLE split_sync").execute(pool).await?;
-    }
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS split_sync (
-            asset_id INTEGER PRIMARY KEY,
-            last_synced_at DATE NOT NULL,
-            covered_from DATE
-        )",
-    )
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
-
-pub async fn migrate_decimal_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    // Run all ALTER statements on a single dedicated connection with
-    // `legacy_alter_table` enabled. Bundled SQLite 3.46 has a stale per-connection
-    // schema bug that makes `DROP COLUMN` followed by `RENAME COLUMN` + `ADD COLUMN`
-    // fail on file-backed databases (the brief's original pool-based approach only
-    // works on `:memory:` connections); legacy mode avoids the buggy code path.
-    // The setting is reset before the connection is returned to the pool so it
-    // cannot leak modern `ALTER` semantics into unrelated pooled connections.
-    let mut conn = pool.acquire().await?;
-    sqlx::query("PRAGMA legacy_alter_table = ON").execute(&mut *conn).await?;
-    let result = (async {
-        for column in ["quantity", "price", "fee"] {
-            migrate_one_column(&mut conn, "transactions", column).await?;
-        }
-        migrate_one_column(&mut conn, "historical_prices", "close_price").await
-    })
-    .await;
-    sqlx::query("PRAGMA legacy_alter_table = OFF").execute(&mut *conn).await?;
-    result
-}
-
 pub fn build_rocket(
-    pool: SqlitePool,
+    pool: DbPool,
     currency_service: CurrencyService,
     cors: Cors,
     auth: AuthMode,

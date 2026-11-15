@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.id,\n                (SELECT COUNT(*) FROM assets a WHERE a.portfolio_id = p.id) AS \"total!\",\n                (SELECT COUNT(*) FROM assets a JOIN split_sync s ON s.asset_id = a.id\n                  WHERE a.portfolio_id = p.id) AS \"synced!\",\n                (SELECT MIN(s.last_synced_at) FROM assets a JOIN split_sync s ON s.asset_id = a.id\n                  WHERE a.portfolio_id = p.id) AS oldest\n         FROM portfolios p",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "synced!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "oldest",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b434605f8a3233b660e29f349d874dc34da1188995410650412241eaec0e0042"
+}

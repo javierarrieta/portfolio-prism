@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
+use common::{build_rocket, db_with_user, seed_split_sync};
 use rocket::http::{ContentType, Status};
 use rocket::local::asynchronous::Client;
 use rust_decimal::Decimal;
-use sqlx::sqlite::SqlitePool;
+use backend_rust::db::DbPool;
 use std::str::FromStr;
 
 fn dec(s: &str) -> Decimal {
@@ -50,8 +50,8 @@ fn cell<'a>(header: &[&str], row: &'a [&'a str], column: &str) -> &'a str {
 /// Two buys, a sell that drains both and over-sells, and a later buy fix both while keeping
 /// the brief's anchors: an unmatched tail of exactly 20.0 and `realized_in_window` 1800
 /// (60 x (130-100) + 60 x (130-130)).
-async fn csv_fixture(pool: &SqlitePool) -> i32 {
-    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "=cmd|'/c calc'!A1", "USD").await;
+async fn csv_fixture(pool: &DbPool, user: i64) -> i64 {
+    let port_id = common::seed_portfolio(pool, user, "=cmd|'/c calc'!A1", "USD").await;
     let asset_id = common::seed_asset(pool, port_id, "-SYM", "Minus symbol").await;
     common::seed_transaction_at(pool, asset_id, "BUY", 60.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     common::seed_transaction_at(pool, asset_id, "BUY", 60.0, 130.0, 0.0, "2024-03-01T00:00:00Z").await;
@@ -64,10 +64,10 @@ async fn csv_fixture(pool: &SqlitePool) -> i32 {
 
 /// A client and the CSV body for `query`, over a freshly seeded fixture. The portfolio id
 /// comes back from the seeding helper rather than being assumed.
-async fn csv_body(query: &str) -> String {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+async fn csv_body(caller: &str, query: &str) -> String {
+    let (pool, user) = db_with_user(caller).await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?{query}&format=csv"))
         .dispatch()
@@ -83,9 +83,9 @@ async fn csv_body(query: &str) -> String {
 /// different strings for one field. Pinned here because nothing else would notice.
 #[tokio::test]
 async fn a_date_cell_reads_the_same_text_as_the_json_field_it_projects() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_date_cell_reads_the_same_text_as_the_json_field_it_projects").await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let q = "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30";
 
     let json: serde_json::Value = serde_json::from_str(
@@ -129,7 +129,7 @@ async fn a_date_cell_reads_the_same_text_as_the_json_field_it_projects() {
 
 #[tokio::test]
 async fn the_file_is_csv_with_the_servers_own_filename() {
-    let body = csv_body("strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
+    let body = csv_body("the_file_is_csv_with_the_servers_own_filename", "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30").await;
     // The body assertion is here so the request is real; the headers are asserted on a
     // second dispatch, because `into_string` consumes the response.
     assert!(
@@ -140,9 +140,9 @@ async fn the_file_is_csv_with_the_servers_own_filename() {
 
 #[tokio::test]
 async fn the_headers_are_the_columns_order_and_no_comment_row_precedes_them() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("the_headers_are_the_columns_order_and_no_comment_row_precedes_them").await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01&to=2024-06-30&format=csv"))
         .dispatch()
@@ -165,9 +165,9 @@ async fn a_to_only_filename_names_the_window_applied_not_the_parameters_typed() 
     // `analytics.rs` uses `window.from.or(first_in_scope)`, so the filename carries the
     // portfolio's first transaction on or before `to`. `inception` is the no-transactions
     // case only. This pins the common branch; the next test pins the rare one.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;   // first transaction is 2024-01-01
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_to_only_filename_names_the_window_applied_not_the_parameters_typed").await;
+    let port_id = csv_fixture(&pool, user).await;   // first transaction is 2024-01-01
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?to=2024-06-30&format=csv"))
         .dispatch()
@@ -182,9 +182,9 @@ async fn a_to_only_filename_names_the_window_applied_not_the_parameters_typed() 
 
 #[tokio::test]
 async fn a_window_with_no_transaction_in_scope_is_the_only_inception_filename() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;   // nothing on or before 2023-12-31
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_window_with_no_transaction_in_scope_is_the_only_inception_filename").await;
+    let port_id = csv_fixture(&pool, user).await;   // nothing on or before 2023-12-31
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?to=2023-12-31&format=csv"))
         .dispatch()
@@ -198,9 +198,9 @@ async fn a_window_with_no_transaction_in_scope_is_the_only_inception_filename() 
 
 #[tokio::test]
 async fn the_lot_pnl_column_sums_to_the_assets_realized_in_window() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("the_lot_pnl_column_sums_to_the_assets_realized_in_window").await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let json: serde_json::Value = serde_json::from_str(
         &client
@@ -240,7 +240,7 @@ async fn the_lot_pnl_column_sums_to_the_assets_realized_in_window() {
 
 #[tokio::test]
 async fn every_row_kind_reaches_the_file_and_nulls_are_empty_cells() {
-    let body = csv_body("strategy=FIFO&from=2024-01-01&to=2024-06-30").await;
+    let body = csv_body("every_row_kind_reaches_the_file_and_nulls_are_empty_cells", "strategy=FIFO&from=2024-01-01&to=2024-06-30").await;
     let (header, rows) = parse(&body);
 
     let kinds: Vec<&str> = rows.iter().map(|r| cell(&header, r, "row_type")).collect();
@@ -270,9 +270,9 @@ async fn every_row_kind_reaches_the_file_and_nulls_are_empty_cells() {
 async fn two_dispatches_over_unchanged_data_are_byte_identical() {
     // Goal 4, and the reason the file carries no generated-at column: a timestamp would
     // make this unreachable and would make every regenerated file a different file.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("two_dispatches_over_unchanged_data_are_byte_identical").await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let path = format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&from=2024-01-01&to=2024-06-30&format=csv");
 
     let first = client.get(&path).dispatch().await.into_string().await.unwrap();
@@ -292,9 +292,9 @@ async fn format_csv_without_a_window_is_a_422_naming_format() {
     // The legacy summary shape has no rows to write, and answering with "everything,
     // priced at the latest close" would quietly answer a different question than the file
     // claims to answer.
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = csv_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("format_csv_without_a_window_is_a_422_naming_format").await;
+    let port_id = csv_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?format=csv"))
@@ -342,14 +342,14 @@ async fn format_csv_without_a_window_is_a_422_naming_format() {
 /// on the way in, this test would be comparing two truncated strings and proving nothing.
 #[tokio::test]
 async fn a_sub_second_transaction_date_still_projects_exactly() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = common::seed_portfolio(&pool, DEFAULT_USER, "Sub second", "USD").await;
+    let (pool, user) = db_with_user("a_sub_second_transaction_date_still_projects_exactly").await;
+    let port_id = common::seed_portfolio(&pool, user, "Sub second", "USD").await;
     let asset_id = common::seed_asset(&pool, port_id, "SUBSEC", "sub").await;
     common::seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     common::seed_transaction_at(&pool, asset_id, "SELL", 4.0, 130.0, 0.0, "2024-05-01T00:00:00.123456Z").await;
     common::seed_daily_prices(&pool, "SUBSEC", "2024-01-01", "2024-06-28", "110.0").await;
     seed_split_sync(&pool, asset_id).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let q = "strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30";
 
     let json: serde_json::Value = serde_json::from_str(
@@ -406,15 +406,18 @@ async fn each_rfc4180_trigger_forces_quoting_on_its_own() {
         ("X,Y", "\"X,Y\"", "embedded comma"),
         ("Q\"Z", "\"Q\"\"Z\"", "embedded double quote, doubled"),
     ];
-    for (symbol, expected, trigger) in cases {
-        let pool = setup_db(&disabled_config()).await;
-        let port_id = common::seed_portfolio(&pool, DEFAULT_USER, "Escaping", "USD").await;
+    // One database per case, numbered: the name has to differ per *iteration*, not
+    // just per test, or the second case reuses the first one's database and the
+    // harness's duplicate-`caller` guard stops it.
+    for (i, (symbol, expected, trigger)) in cases.iter().enumerate() {
+        let (pool, user) = db_with_user(&format!("rfc4180_trigger_{i}")).await;
+        let port_id = common::seed_portfolio(&pool, user, "Escaping", "USD").await;
         let asset_id = common::seed_asset(&pool, port_id, symbol, "nasty").await;
         common::seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
         common::seed_transaction_at(&pool, asset_id, "SELL", 4.0, 130.0, 0.0, "2024-05-01T00:00:00Z").await;
         common::seed_daily_prices(&pool, symbol, "2024-01-01", "2024-06-28", "110.0").await;
         seed_split_sync(&pool, asset_id).await;
-        let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+        let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
         let csv = client
             .get(format!(
@@ -448,15 +451,15 @@ async fn each_rfc4180_trigger_forces_quoting_on_its_own() {
 /// rather than an accident someone "fixes" by inventing a fourth row kind.
 #[tokio::test]
 async fn a_window_with_no_rows_is_a_header_and_nothing_else() {
-    let pool = setup_db(&disabled_config()).await;
-    let port_id = common::seed_portfolio(&pool, DEFAULT_USER, "Quiet window", "USD").await;
+    let (pool, user) = db_with_user("a_window_with_no_rows_is_a_header_and_nothing_else").await;
+    let port_id = common::seed_portfolio(&pool, user, "Quiet window", "USD").await;
     let asset_id = common::seed_asset(&pool, port_id, "QUIET", "quiet").await;
     common::seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-01T00:00:00Z").await;
     // Fully sold before the window opens: no sells inside it, and nothing left open.
     common::seed_transaction_at(&pool, asset_id, "SELL", 10.0, 130.0, 0.0, "2024-02-01T00:00:00Z").await;
     common::seed_daily_prices(&pool, "QUIET", "2024-01-01", "2024-06-28", "110.0").await;
     seed_split_sync(&pool, asset_id).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let q = "strategy=FIFO&threshold_days=30&from=2024-03-01&to=2024-06-28";
 
     let csv = client

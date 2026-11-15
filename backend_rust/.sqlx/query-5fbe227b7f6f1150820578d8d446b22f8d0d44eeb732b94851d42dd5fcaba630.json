@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM split_sync WHERE asset_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5fbe227b7f6f1150820578d8d446b22f8d0d44eeb732b94851d42dd5fcaba630"
+}

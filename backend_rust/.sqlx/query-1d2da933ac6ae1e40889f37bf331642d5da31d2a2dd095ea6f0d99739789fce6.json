@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT type, quantity, price, fee, date FROM transactions WHERE asset_id = $1 ORDER BY date, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "quantity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "price",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "fee",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "date",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1d2da933ac6ae1e40889f37bf331642d5da31d2a2dd095ea6f0d99739789fce6"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) ON CONFLICT (symbol, date) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Date",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c12c5c2b489ddb3eeef781b5e73a70e9e3917cf16a9b9984efde6de7bd350d21"
+}

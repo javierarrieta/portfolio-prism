@@ -39,7 +39,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use serde::Serialize;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
@@ -155,15 +155,15 @@ pub async fn capabilities(
 /// Parse `?portfolio_ids=1,2` into a de-duplicated, ordered list.
 /// `None` on anything unparseable, so the handler answers 422 rather than
 /// silently exporting a subset of what was asked for.
-fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
+fn parse_ids(raw: Option<&str>) -> Option<Vec<i64>> {
     let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
-    let mut ids: Vec<i32> = Vec::new();
+    let mut ids: Vec<i64> = Vec::new();
     for part in raw.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let id: i32 = part.parse().ok()?;
+        let id: i64 = part.parse().ok()?;
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -233,7 +233,7 @@ fn parse_query_flag(raw: Option<&str>) -> Option<bool> {
 #[get("/backup/export?<portfolio_ids>&<include_prices>")]
 pub async fn export(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     portfolio_ids: Option<Vec<String>>,
     include_prices: Option<Vec<String>>,
 ) -> Result<BundleDownload, BackupError> {
@@ -277,15 +277,14 @@ pub async fn export(
         .await
         .map_err(|e| match e {
             // This `Lock` arm cannot be driven over HTTP from a test, and the reason is
-            // specific: `export` only reads, and under the rollback journal this app
-            // uses a writer does not block readers, so the lock a test can actually
-            // provoke (a second connection holding a write transaction — see
-            // `tests/backup_test.rs::a_locked_database_is_a_503_with_retry_after_from_the_restore_route`,
-            // which drives the *restore* arm for real) never reaches a read-only route.
-            // The failure that would, `PoolTimedOut`, is met earlier — by the auth guard's
-            // read of `users`, or by `require` below — and answered a 500 there before
-            // this arm is reached. So its two halves are pinned where they can be:
-            // `build()` producing `DbFailure::Lock` for an exhausted pool
+            // specific: `export` only reads, and a Postgres read transaction takes no row
+            // lock, so there is no lock for a test to provoke on a read-only route. The
+            // restore arm is driven for real, by a genuine serialisation failure, in
+            // `tests/restore_concurrency_test.rs::a_concurrent_replace_restore_is_a_503_with_retry_after`.
+            // The failure that would reach this arm, `PoolTimedOut`, is met earlier — by
+            // the auth guard's read of `users`, or by `require` below — and answered a
+            // 500 there before this arm is reached. So its two halves are pinned where
+            // they can be: `build()` producing `DbFailure::Lock` for an exhausted pool
             // (`an_exhausted_pool_is_a_lock_not_an_outage`) and the response a `Lock`
             // becomes (`a_lock_is_a_503_that_says_when_to_retry`).
             DbFailure::Lock => lock_response(),
@@ -369,7 +368,7 @@ fn too_large() -> BackupError {
 #[post("/backup/preview?<mode>", data = "<body>")]
 pub async fn preview(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     mode: Option<Vec<String>>,
     body: Data<'_>,
 ) -> Result<Json<Plan>, BackupError> {
@@ -456,7 +455,7 @@ pub async fn preview(
 #[post("/backup/restore?<mode>&<apply_prices>", data = "<body>")]
 pub async fn restore(
     user: AuthedUser,
-    pool: &State<SqlitePool>,
+    pool: &State<DbPool>,
     backup_cfg: &State<BackupConfig>,
     mode: Option<Vec<String>>,
     apply_prices: Option<Vec<String>>,

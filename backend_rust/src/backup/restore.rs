@@ -13,13 +13,13 @@
 //!
 //! [`plan_for`] is the read half: it is what the user is shown before a restore is
 //! allowed, so its numbers are the promise [`apply`] has to keep. [`apply`] is the
-//! write half, and it keeps that promise inside a single `pool.begin()` — every
-//! insert and every delete commits together or not at all.
+//! write half, and it keeps that promise inside a single `SERIALIZABLE` transaction —
+//! every insert and every delete commits together or not at all.
 
-use serde::Serialize;
-use sqlx::SqlitePool;
+use crate::backup::export::{DbFailure, classify};
 use crate::backup::{BackupConfig, Bundle};
-use crate::backup::export::{classify, DbFailure};
+use crate::db::DbPool;
+use serde::Serialize;
 
 /// What to do with what the caller already owns. Merge is deliberately absent:
 /// "which transaction is a duplicate?" has no clean answer, and a wrong guess
@@ -71,36 +71,38 @@ pub struct Plan {
 /// Scoped by `owner_id` and by nothing else: every count a foreign bundle can
 /// provoke is a count of the caller's own rows, because the caller's id is the
 /// only filter any of these three queries has.
-pub async fn owned_counts(pool: &SqlitePool, user_id: i32) -> Result<Counts, DbFailure> {
-    let portfolios: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolios WHERE owner_id = ?")
-        .bind(user_id as i64)
-        .fetch_one(pool)
-        .await
-        .map_err(classify)?;
-
-    let assets: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM assets WHERE portfolio_id IN \
-         (SELECT id FROM portfolios WHERE owner_id = ?)",
+pub async fn owned_counts(pool: &DbPool, user_id: i64) -> Result<Counts, DbFailure> {
+    let portfolios: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id = $1"#,
+        user_id
     )
-    .bind(user_id as i64)
     .fetch_one(pool)
     .await
     .map_err(classify)?;
 
-    let transactions: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM transactions WHERE asset_id IN \
-         (SELECT id FROM assets WHERE portfolio_id IN \
-          (SELECT id FROM portfolios WHERE owner_id = ?))",
+    let assets: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM assets WHERE portfolio_id IN
+          (SELECT id FROM portfolios WHERE owner_id = $1)"#,
+        user_id
     )
-    .bind(user_id as i64)
+    .fetch_one(pool)
+    .await
+    .map_err(classify)?;
+
+    let transactions: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id IN
+          (SELECT id FROM assets WHERE portfolio_id IN
+           (SELECT id FROM portfolios WHERE owner_id = $1))"#,
+        user_id
+    )
     .fetch_one(pool)
     .await
     .map_err(classify)?;
 
     Ok(Counts {
-        portfolios: portfolios.0 as usize,
-        assets: assets.0 as usize,
-        transactions: transactions.0 as usize,
+        portfolios: portfolios as usize,
+        assets: assets as usize,
+        transactions: transactions as usize,
     })
 }
 
@@ -122,8 +124,8 @@ pub fn bundle_counts(bundle: &Bundle) -> Counts {
 
 /// The plan the user must see before restoring. Reads only; writes nothing.
 pub async fn plan_for(
-    pool: &SqlitePool,
-    user_id: i32,
+    pool: &DbPool,
+    user_id: i64,
     bundle: &Bundle,
     mode: Mode,
 ) -> Result<Plan, DbFailure> {
@@ -147,9 +149,8 @@ pub async fn plan_for(
         // Named here because a plan that under-reports what it is about to delete is
         // the one thing a preview must not do. Gated on owning assets at all, so a
         // caller with nothing to clear is not told about rows they have none of.
-        warnings.push(
-            "replace also clears the split-sync throttle rows for your assets".to_string(),
-        );
+        warnings
+            .push("replace also clears the split-sync throttle rows for your assets".to_string());
     }
     if !bundle.prices.is_empty() {
         warnings.push(
@@ -173,7 +174,7 @@ pub struct RestoreOutcome {
     pub inserted: Counts,
     /// The database ids the restore allocated, in bundle order. Returned so the UI
     /// can link straight to what appeared — and as proof that the ids are new.
-    pub portfolio_ids: Vec<i32>,
+    pub portfolio_ids: Vec<i64>,
     pub prices_inserted: usize,
 }
 
@@ -206,9 +207,25 @@ impl From<DbFailure> for ApplyError {
 
 /// Apply a bundle.
 ///
-/// **One transaction**: every insert and, for `replace`, every delete happens inside
-/// it, so a bundle that fails on row 201 leaves the database exactly as it was.
-/// Partial application is not a state this feature can produce.
+/// **One `SERIALIZABLE` transaction**: every insert and, for `replace`, every delete
+/// happens inside it, so a bundle that fails on row 201 leaves the database exactly as
+/// it was. Partial application is not a state this feature can produce.
+///
+/// `SERIALIZABLE` and not the server default, and that is load-bearing: `replace` reads
+/// the caller's rows to delete them, and under READ COMMITTED two restores for the same
+/// caller interleave. Measured at the server default, the loser either finishes anyway
+/// — the caller silently ends up with both restores' rows — or its `DELETE FROM assets`
+/// runs against a set the winner already replaced and fails `23503` on
+/// `transactions_asset_id_fkey`, which is a `500` for a race the caller cannot see.
+/// Neither is a defensible answer to "two people pressed restore". At `SERIALIZABLE` the
+/// loser instead aborts with `40001`, which `classify` answers as a retryable `503` with
+/// `Retry-After`. `tests/restore_concurrency_test.rs` proves both halves, including the
+/// mutation that shows the default isolation level fails there.
+///
+/// The server does **not** retry the aborted transaction (spec §5.4): the caller is told
+/// when to come back instead, which is the contract #64 shipped. Predicate locking is
+/// the cost, paid by every restore and not only concurrent ones; see the measurement in
+/// the Task 7 report.
 ///
 /// Validation belongs to the caller and the route does it: `parse_and_validate` is
 /// the only path to this function over HTTP, and it refuses an unsupported version,
@@ -218,8 +235,8 @@ impl From<DbFailure> for ApplyError {
 /// `RETURNING id` of the insert that made it, and a value that still cannot be
 /// written fails the whole transaction rather than writing half a bundle.
 pub async fn apply(
-    pool: &SqlitePool,
-    user_id: i32,
+    pool: &DbPool,
+    user_id: i64,
     bundle: &Bundle,
     mode: Mode,
     apply_prices: bool,
@@ -245,50 +262,61 @@ pub async fn apply(
         bundle.prices.len(),
     );
 
-    let mut tx = pool.begin().await.map_err(classify)?;
+    // `SERIALIZABLE`, not the server default — see the module-level note on [`apply`].
+    // `begin_with` sends the statement verbatim, so the isolation level is stated where
+    // it takes effect rather than in a `SET` that a later `pool.begin()` could undo.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .map_err(classify)?;
 
     if mode == Mode::Replace {
         // Reverse dependency order, scoped by `owner_id` and by nothing else: no
         // caller-supplied id is involved, so no bundle value can widen the delete.
         //
-        // `split_sync` goes first and explicitly. Its `asset_id` is a plain INTEGER
-        // PRIMARY KEY with **no** foreign key to `assets`, so `PRAGMA foreign_keys`
-        // does not reach it: a delete that skipped this statement would strand one
-        // orphan row per deleted asset permanently, and nothing would ever notice.
-        // Then the three real foreign keys, children before parents — `foreign_keys`
-        // is ON in this app and none of these FKs declare `ON DELETE CASCADE`, so
-        // deleting a parent with children still attached is an error, not a cascade.
-        sqlx::query(
+        // `split_sync` goes first, and now for the same reason as everything else:
+        // `split_sync.asset_id` is `REFERENCES assets(id)` in `0001_init.sql`, so
+        // under Postgres an asset cannot be deleted while its throttle row exists.
+        // (Under SQLite this row had no foreign key at all and the explicit delete was
+        // the only thing keeping it from being stranded forever; the constraint
+        // arrived with the schema rewrite and the ordering stayed necessary.)
+        //
+        // So this whole block is children before parents, and it has to be: the schema
+        // has four foreign keys — `portfolios.owner_id` to `users`,
+        // `assets.portfolio_id` to `portfolios`, `transactions.asset_id` to `assets`,
+        // and `split_sync.asset_id` to `assets` — and none of them declares
+        // `ON DELETE CASCADE`, so deleting a parent with children still attached is an
+        // error, not a cascade.
+        sqlx::query!(
             "DELETE FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?))",
+              (SELECT id FROM portfolios WHERE owner_id = $1))",
+            user_id
         )
-        .bind(user_id as i64)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
-              (SELECT id FROM portfolios WHERE owner_id = ?))",
+              (SELECT id FROM portfolios WHERE owner_id = $1))",
+            user_id
         )
-        .bind(user_id as i64)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM assets WHERE portfolio_id IN \
-             (SELECT id FROM portfolios WHERE owner_id = ?)",
+             (SELECT id FROM portfolios WHERE owner_id = $1)",
+            user_id
         )
-        .bind(user_id as i64)
         .execute(&mut *tx)
         .await
         .map_err(classify)?;
 
-        sqlx::query("DELETE FROM portfolios WHERE owner_id = ?")
-            .bind(user_id as i64)
+        sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
@@ -300,40 +328,44 @@ pub async fn apply(
     for p in &bundle.portfolios {
         // `RETURNING id` is the house pattern (see `create_portfolio`) and is one
         // of the few constructs SQLite and Postgres already agree on.
-        let (new_portfolio,) = sqlx::query_as::<_, (i32,)>(
+        let new_portfolio: i64 = sqlx::query_scalar!(
             "INSERT INTO portfolios (name, description, currency, base_currency, owner_id) \
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &p.name,
+            p.description.as_deref(),
+            &p.currency,
+            &p.base_currency,
+            user_id
         )
-        .bind(&p.name)
-        .bind(&p.description)
-        .bind(&p.currency)
-        .bind(&p.base_currency)
-        .bind(user_id as i64)
         .fetch_one(&mut *tx)
         .await
         .map_err(classify)?;
+        // The id the database allocated, handed straight through. It used to be
+        // narrowed to `i32` here because the response type was `i32`; both are
+        // `i64` now, so a restore of a portfolio whose id passed `i32::MAX` names
+        // the row it actually wrote.
         portfolio_ids.push(new_portfolio);
         inserted.portfolios += 1;
 
         for a in &p.assets {
-            let (new_asset,) = sqlx::query_as::<_, (i32,)>(
+            let new_asset: i64 = sqlx::query_scalar!(
                 "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+                new_portfolio,
+                &a.symbol,
+                &a.name,
+                &a.asset_type,
+                a.sector.as_deref(),
+                &a.currency,
+                // Upper-cased, because `create_asset` upper-cases (`transactions.rs:78`)
+                // and a hand-authored bundle must not be able to store a spelling the
+                // ordinary write path never produces: a lowercase ISIN would sail past the
+                // uniqueness check at `transactions.rs:50-56` and store a second row for
+                // one security. Validation already proved it is a valid ISIN, and
+                // `is_valid_isin` upper-cases internally, so this only normalises what is
+                // stored.
+                a.isin.as_ref().map(|isin| isin.to_uppercase())
             )
-            .bind(new_portfolio)
-            .bind(&a.symbol)
-            .bind(&a.name)
-            .bind(&a.asset_type)
-            .bind(&a.sector)
-            .bind(&a.currency)
-            // Upper-cased, because `create_asset` upper-cases (`transactions.rs:78`)
-            // and a hand-authored bundle must not be able to store a spelling the
-            // ordinary write path never produces: a lowercase ISIN would sail past the
-            // uniqueness check at `transactions.rs:50-56` and store a second row for
-            // one security. Validation already proved it is a valid ISIN, and
-            // `is_valid_isin` upper-cases internally, so this only normalises what is
-            // stored.
-            .bind(a.isin.as_ref().map(|isin| isin.to_uppercase()))
             .fetch_one(&mut *tx)
             .await
             .map_err(classify)?;
@@ -353,17 +385,21 @@ pub async fn apply(
                 // rather than refused in `collect`, because refusing it would reject a
                 // bundle the write path accepts — the mirror-image of the rule the SPLIT
                 // quantity/price check exists to enforce.
-                let fee = if t.r#type == "SPLIT" { "0" } else { t.fee.as_str() };
-                sqlx::query(
+                let fee = if t.r#type == "SPLIT" {
+                    "0"
+                } else {
+                    t.fee.as_str()
+                };
+                sqlx::query!(
                     "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    new_asset,
+                    &t.r#type,
+                    &t.quantity,
+                    &t.price,
+                    fee,
+                    when
                 )
-                .bind(new_asset)
-                .bind(&t.r#type)
-                .bind(&t.quantity)
-                .bind(&t.price)
-                .bind(fee)
-                .bind(when)
                 .execute(&mut *tx)
                 .await
                 .map_err(classify)?;
@@ -379,14 +415,15 @@ pub async fn apply(
                 .map_err(|_| ApplyError::Db(DbFailure::Other))?;
             // DO NOTHING, not DO UPDATE: existing cached prices stay authoritative,
             // so a bundle can fill gaps but cannot overwrite what is already there.
-            // The unique index `uq_historical_prices_symbol_date` backs this.
-            let res = sqlx::query(
+            // The `PRIMARY KEY (symbol, date)` backs this; it is the constraint that
+            // `enforce_price_uniqueness` used to install on a live SQLite table.
+            let res = sqlx::query!(
                 "INSERT INTO historical_prices (symbol, date, close_price) \
-                 VALUES (?, ?, ?) ON CONFLICT (symbol, date) DO NOTHING",
+                 VALUES ($1, $2, $3) ON CONFLICT (symbol, date) DO NOTHING",
+                &price.symbol,
+                day,
+                &price.close_price
             )
-            .bind(&price.symbol)
-            .bind(day)
-            .bind(&price.close_price)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;

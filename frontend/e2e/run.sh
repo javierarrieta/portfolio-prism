@@ -3,9 +3,11 @@
 #
 #   ./e2e/run.sh [target]   # default sell-pnl.smoke.mjs; npm run e2e:{sell-pnl,statement}
 #
-# Starts the Rust API against a throwaway SQLite file, starts Vite, drives a real
+# Starts the Rust API against a throwaway Postgres database, starts Vite, drives a real
 # Chromium through whichever flow the target drives, then tears everything down. The
-# throwaway DATABASE_URL means this never reads or writes your real portfolio.db.
+# throwaway DATABASE_URL means this never reads or writes the data you work with day to
+# day. The backend is Postgres-only, so "throwaway" now means the dev cluster that
+# `backend_rust/scripts/dev-db.sh` brings up on 127.0.0.1:55432, not a temp file.
 #
 # Needs: a chromium-compatible browser, node with playwright-core installed
 # (npm install in frontend/), and at least one font available to fontconfig.
@@ -87,8 +89,31 @@ fi
 
 # --- servers -----------------------------------------------------------------
 command -v curl >/dev/null || die "curl is required"
-DB="$WORK/e2e.db"
-export DATABASE_URL="sqlite:$DB?mode=rwc"
+# Postgres-only: the backend refuses a `sqlite:` DSN, so this cannot make its own
+# throwaway file any more. An explicit DATABASE_URL wins (CI, a shared cluster, a
+# non-default port); otherwise bring up the dev cluster and use the URL it prints.
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  case "$DATABASE_URL" in
+    sqlite:*|sqlite3:*) die "DATABASE_URL is a SQLite URL ('$DATABASE_URL'); the backend is Postgres-only. Unset it to use scripts/dev-db.sh, or point it at a Postgres." ;;
+  esac
+else
+  command -v initdb >/dev/null || die "no DATABASE_URL and no initdb on PATH: run inside  nix-shell -p postgresql_18 --run './e2e/run.sh'  , or export DATABASE_URL"
+  # dev-db.sh prints its progress *and* its advice ("need PostgreSQL 18.x, got ..." /
+  # "initdb not on PATH — run inside: nix-shell ...") to stdout, the same stream as the
+  # DATABASE_URL line. So capture once, echo the whole thing through, then take the one line
+  # that matters. Piping straight into `sed -n 's/^DATABASE_URL=//p'` would have thrown every
+  # other line away, which is precisely the line that tells you why there is no URL.
+  # The `||` branch must print *before* it dies: `die` exits, so a trailing `die` would
+  # discard $db_out and the message would lie. The likeliest non-zero exit is dev-db.sh's
+  # version check (`need PostgreSQL 18.x, got ...`), which is exactly the line this
+  # capture exists to keep.
+  db_out="$("$REPO_ROOT/backend_rust/scripts/dev-db.sh")" \
+    || { printf '%s\n' "$db_out"; die "scripts/dev-db.sh failed to bring up a cluster; its output is above"; }
+  printf '%s\n' "$db_out"
+  DATABASE_URL="$(printf '%s\n' "$db_out" | sed -n 's/^DATABASE_URL=//p')"
+  [[ -n "$DATABASE_URL" ]] || die "scripts/dev-db.sh printed no DATABASE_URL; its output is above"
+  export DATABASE_URL
+fi
 # Without this the server defaults to OIDC, refuses to launch, and `wait_for backend`
 # burns its whole 420-second budget -- which is why this harness stopped starting. Safe
 # only because run.sh builds debug: `disabled` is compiled out of release builds

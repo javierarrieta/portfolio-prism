@@ -1,5 +1,5 @@
 use chrono::{Datelike, NaiveDate, Utc, TimeZone};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use crate::models::{Asset, Transaction};
 use crate::services::currency_service::CurrencyService;
 use rust_decimal::Decimal;
@@ -94,7 +94,7 @@ impl StatsEngine {
     }
 
     pub async fn calculate_portfolio_performance(
-        pool: &SqlitePool,
+        pool: &DbPool,
         assets: &[Asset],
         transactions: &[Transaction],
         base_currency: &str,
@@ -337,6 +337,13 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
+    /// The migrated schema, in a database this test owns alone. `historical_prices`
+    /// is already there with its `(symbol, date)` primary key, so the fixture is a
+    /// connection and not a `CREATE TABLE`.
+    async fn pool() -> DbPool {
+        crate::test_db::test_pool(&crate::test_db::next_caller("stats_engine")).await
+    }
+
     fn empty_asset() -> Asset {
         Asset {
             id: 1,
@@ -366,7 +373,7 @@ mod tests {
     async fn test_empty_assets_returns_zeroed_metrics() {
         let svc = crate::offline_pricing_service();
         let result = StatsEngine::calculate_portfolio_performance(
-            &SqlitePool::connect(":memory:").await.unwrap(),
+            &pool().await,
             &[],
             &[],
             "USD",
@@ -387,11 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_data_but_no_prices_returns_zero_value() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = pool().await;
         let svc = crate::offline_pricing_service();
         let assets = vec![empty_asset()];
         let txs = vec![empty_tx()];
@@ -411,11 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_split_adjusts_historical_quantity() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = pool().await;
 
         let today = Utc::now().date_naive();
         let split_date = today - chrono::Duration::days(5);
@@ -430,13 +429,16 @@ mod tests {
         let sjson = "50.0";
         let mut curr = start_date;
         while curr <= today {
-            sqlx::query("INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-                .bind(symbol)
-                .bind(curr)
-                .bind(sjson)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query!(
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) \
+                 ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+                symbol,
+                curr,
+                sjson
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             match curr.succ_opt() {
                 Some(next) => curr = next,
                 None => break,
@@ -521,11 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_split_on_same_day_as_buy_splits_first() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = pool().await;
 
         let today = Utc::now().date_naive();
         let day = today - chrono::Duration::days(30);
@@ -536,13 +534,16 @@ mod tests {
         // Split-adjusted close: constant 1.0.
         let mut curr = start_date;
         while curr <= today {
-            sqlx::query("INSERT OR REPLACE INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-                .bind(symbol)
-                .bind(curr)
-                .bind("1.0")
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query!(
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3) \
+                 ON CONFLICT (symbol, date) DO UPDATE SET close_price = EXCLUDED.close_price",
+                symbol,
+                curr,
+                "1.0"
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             match curr.succ_opt() {
                 Some(next) => curr = next,
                 None => break,
@@ -610,11 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_day_range_does_not_panic() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query("CREATE TABLE IF NOT EXISTS historical_prices (symbol TEXT, date DATE, close_price TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = pool().await;
         let svc = crate::offline_pricing_service();
         let assets = vec![empty_asset()];
         let txs = vec![empty_tx()];

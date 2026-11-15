@@ -15,11 +15,17 @@
 # which is the failure mode this repository has already been bitten by twice.
 #
 # USAGE
+#   DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism \
 #   OIDC_ISSUER=https://auth.example.com/application/o/portfolio-prism/ \
 #   OIDC_CLIENT_ID=portfolio-prism \
 #   OIDC_CLIENT_SECRET=... \
 #   OIDC_REDIRECT_URI=http://localhost:8000/auth/callback \
 #   ./scripts/auth_smoke.sh
+#
+# DATABASE_URL is required and must be Postgres. `bash scripts/dev-db.sh` prints one.
+# The script will not invent one for you: it used to create a throwaway SQLite file, and
+# after the engine switch that produced a backend that refused to start and a smoke test
+# that failed for a reason nothing to do with OIDC.
 #
 # OIDC_CLIENT_SECRET may be any non-empty string for the automated checks: nothing
 # here completes a code exchange, so the secret is never sent. It is required because
@@ -84,15 +90,26 @@ else
 fi
 
 echo "== 2. start the backend in oidc mode =="
-DB=$(mktemp /tmp/authsmoke.XXXXXX.db)
+# The database comes from the environment, and it has to be Postgres. Refuse here, with
+# the reason, rather than starting a backend that dies on its own configuration check
+# and leaving the failure to be read out of /tmp/authsmoke.log.
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  echo "FAIL: DATABASE_URL is not set. Run 'bash scripts/dev-db.sh' and export the URL it prints." >&2
+  exit 1
+fi
+case "$DATABASE_URL" in
+  sqlite:*|sqlite3:*)
+    echo "FAIL: DATABASE_URL is a SQLite URL ('$DATABASE_URL'). The backend is Postgres-only;" >&2
+    echo "      run 'bash scripts/dev-db.sh' and export the postgres:// URL it prints." >&2
+    exit 1 ;;
+esac
 export AUTH_MODE=oidc OIDC_ISSUER="$ISSUER" OIDC_CLIENT_ID="$CLIENT_ID" \
        OIDC_CLIENT_SECRET="$CLIENT_SECRET" OIDC_REDIRECT_URI="$REDIRECT_URI" \
-       DATABASE_URL="sqlite://$DB?mode=rwc" \
        ROCKET_SECRET_KEY="$(head -c 32 /dev/urandom | base64)" \
        ALLOWED_ORIGINS="$BASE" ROCKET_PORT="$PORT" ROCKET_ADDRESS=127.0.0.1
 cargo run --quiet 2>/tmp/authsmoke.log &
 SERVER=$!
-trap 'kill $SERVER 2>/dev/null; rm -f "$DB" /tmp/authsmoke.log' EXIT
+trap 'kill $SERVER 2>/dev/null; rm -f /tmp/authsmoke.log' EXIT
 
 for _ in $(seq 1 60); do
   curl -s --max-time 2 "$BASE/" >/dev/null 2>&1 && break

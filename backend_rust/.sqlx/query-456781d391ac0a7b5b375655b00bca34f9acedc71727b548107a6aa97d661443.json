@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, 'SPLITME', 'Split Me', 'STOCK', 'USD') RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "456781d391ac0a7b5b375655b00bca34f9acedc71727b548107a6aa97d661443"
+}

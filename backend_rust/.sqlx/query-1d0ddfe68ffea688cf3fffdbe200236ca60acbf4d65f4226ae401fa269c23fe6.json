@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO users (issuer, subj, email, name, created_at) VALUES ($1, $2, NULL, 'Placeholder owner', $3) ON CONFLICT (issuer, subj) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1d0ddfe68ffea688cf3fffdbe200236ca60acbf4d65f4226ae401fa269c23fe6"
+}

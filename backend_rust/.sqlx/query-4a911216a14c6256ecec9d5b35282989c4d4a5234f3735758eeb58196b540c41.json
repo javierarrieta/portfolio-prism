@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) VALUES ($1, 'A', 'A', 'stock', 'USD') RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4a911216a14c6256ecec9d5b35282989c4d4a5234f3735758eeb58196b540c41"
+}

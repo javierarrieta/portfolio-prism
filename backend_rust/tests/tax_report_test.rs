@@ -16,11 +16,11 @@ use backend_rust::models::{Asset, Portfolio, Transaction};
 use backend_rust::schemas::{DatedLot, LotMatch, PriceSource, ReportRow, RowKind, SellBreakdown};
 use backend_rust::services::currency_service::PricingError;
 use chrono::{DateTime, NaiveDate, Utc};
-use common::{offline_pricing_service, build_rocket, disabled_config, seed_split_sync, setup_db, DEFAULT_USER};
+use common::{build_rocket, db_with_user, offline_pricing_service, seed_split_sync};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rust_decimal::Decimal;
-use sqlx::sqlite::SqlitePool;
+use backend_rust::db::DbPool;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ fn fixture_asset() -> Asset {
     }
 }
 
-fn fixture_sell(id: i32) -> Transaction {
+fn fixture_sell(id: i64) -> Transaction {
     Transaction {
         id,
         asset_id: 1,
@@ -68,7 +68,7 @@ fn fixture_sell(id: i32) -> Transaction {
 /// clean and passes every assertion — while over-reporting on any real multi-lot sell,
 /// because every lot row would carry the whole sell's P&L. `lot_pnl` is the column the
 /// CSV sums. The two sources now differ (1800 vs 2200) and a swap fails.
-fn fixture_breakdown(sell_id: i32) -> SellBreakdown {
+fn fixture_breakdown(sell_id: i64) -> SellBreakdown {
     SellBreakdown {
         sell_transaction_id: sell_id,
         sell_date: ts("2024-12-01"),
@@ -256,8 +256,8 @@ fn an_open_lot_row_maps_every_dated_lot_field_and_leaves_the_sell_side_null() {
 /// an unmatched tail realizes nothing and is a row of its own), so the *fixture* is what
 /// moved: 40 @ 130 puts the May sell's realized at exactly 1800 and leaves the June sell
 /// with nothing to match. See the task-4 report, defects §1.
-async fn fixture(pool: &SqlitePool, through: &str) -> (i32, i32, i32) {
-    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "Dated", "USD").await;
+async fn fixture(pool: &DbPool, user: i64, through: &str) -> (i64, i64, i64) {
+    let port_id = common::seed_portfolio(pool, user, "Dated", "USD").await;
     let sold = common::seed_asset(pool, port_id, "SOLDIT", "Sold it").await;
     let held = common::seed_asset(pool, port_id, "HELDIT", "Held it").await;
 
@@ -283,16 +283,16 @@ fn dec_at(v: &serde_json::Value, path: &str) -> Decimal {
 
 /// The loaded rows `build_tax_report` takes, read back through SQLx: two three-line
 /// helpers, because that function takes the rows rather than the ids.
-async fn load_fixture_portfolio(pool: &SqlitePool, id: i32) -> Portfolio {
-    sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = ?")
+async fn load_fixture_portfolio(pool: &DbPool, id: i64) -> Portfolio {
+    sqlx::query_as::<_, Portfolio>("SELECT * FROM portfolios WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .unwrap()
 }
 
-async fn load_fixture_assets(pool: &SqlitePool, portfolio_id: i32) -> Vec<Asset> {
-    sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = ?")
+async fn load_fixture_assets(pool: &DbPool, portfolio_id: i64) -> Vec<Asset> {
+    sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE portfolio_id = $1")
         .bind(portfolio_id)
         .fetch_all(pool)
         .await
@@ -307,10 +307,10 @@ async fn a_dated_report_sums_its_own_rows_and_agrees_with_the_undated_summary() 
     //     `realized_pnl` on the undated endpoint, which is fully driven here because the
     //     window is the whole history and both calls price from the same seeded rows;
     // (c) the open-lot rows' `unrealized_gain_loss` sums to `unrealized_at_end`.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_dated_report_sums_its_own_rows_and_agrees_with_the_undated_summary").await;
     let through = Utc::now().date_naive().to_string();
-    let (port_id, _, _) = fixture(&pool, &through).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, &through).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     for strategy in ["FIFO", "LIFO", "HYBRID"] {
         let dated = client
@@ -372,10 +372,10 @@ async fn an_undated_call_still_returns_the_shape_the_statement_reads() {
     // `current_shares` and `total_portfolio_value`, none of which the typed report carries.
     // If this test fails because `context` appears and `assets` does not, the typed payload
     // has replaced the legacy response and both shipped screens are broken.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("an_undated_call_still_returns_the_shape_the_statement_reads").await;
     let through = Utc::now().date_naive().to_string();
-    let (port_id, _, _) = fixture(&pool, &through).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, &through).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30"))
@@ -405,10 +405,10 @@ async fn an_undated_call_still_returns_the_shape_the_statement_reads() {
 /// other test noticed. Pinned here so the next person does not rediscover it.
 #[tokio::test]
 async fn an_undated_call_normalizes_the_strategy_it_echoes() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("an_undated_call_normalizes_the_strategy_it_echoes").await;
     let through = Utc::now().date_naive().to_string();
-    let (port_id, _, _) = fixture(&pool, &through).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, &through).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=lifo"))
@@ -439,10 +439,10 @@ async fn the_undated_path_still_names_the_strategy_the_engine_used() {
     // goes through `normalize_strategy` (`analytics.rs:678-684`). Before Task 4 it echoed
     // `average_cost` verbatim while the engine ran FIFO, which is the bug this test exists to
     // keep fixed. See `an_undated_call_normalizes_the_strategy_it_echoes` for the lowercase case.
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("the_undated_path_still_names_the_strategy_the_engine_used").await;
     let through = Utc::now().date_naive().to_string();
-    let (port_id, _, _) = fixture(&pool, &through).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, &through).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=average_cost&threshold_days=30"))
@@ -457,9 +457,9 @@ async fn a_window_end_on_a_non_trading_day_reports_the_close_it_used() {
     // 2024-06-30 is a Sunday and the fixture stops on the Friday before it (2 days, inside
     // `PRICE_WINDOW_FRESH_DAYS = 4`), so the database answers and the file states which
     // close priced the position. Silent substitution is the failure Goal 5 names.
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_window_end_on_a_non_trading_day_reports_the_close_it_used").await;
+    let (port_id, _, _) = fixture(&pool, user, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&to=2024-06-30"))
@@ -488,9 +488,9 @@ async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
     // `realized_in_window`, and still part of `realized_cumulative` — and the buy lots it
     // consumed still show up as open lots (or not) at `end`. Getting this wrong changes a
     // filed quarter.
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("the_window_selects_the_sells_but_not_the_lots_behind_them").await;
+    let (port_id, _, _) = fixture(&pool, user, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&from=2024-06-01&to=2024-06-30"))
@@ -541,8 +541,8 @@ async fn the_window_selects_the_sells_but_not_the_lots_behind_them() {
 /// 10 bought @ 100 USD on 2024-01-02 and 6 sold @ 130 USD on 2024-03-08, so the sell is
 /// matched and 4 units stay open: one fixture covers both the realized leg and the
 /// market-value leg of the conversion.
-async fn fx_fixture(pool: &SqlitePool) -> (i32, i32) {
-    let port_id = common::seed_portfolio(pool, DEFAULT_USER, "FX Dated", "EUR").await;
+async fn fx_fixture(pool: &DbPool, user: i64) -> (i64, i64) {
+    let port_id = common::seed_portfolio(pool, user, "FX Dated", "EUR").await;
     let asset = common::seed_asset_currency(pool, port_id, "AAPL", "Apple", "USD").await;
     common::seed_transaction_at(pool, asset, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
     common::seed_transaction_at(pool, asset, "SELL", 6.0, 130.0, 0.0, "2024-03-08T00:00:00Z").await;
@@ -582,9 +582,9 @@ async fn a_dated_fx_report_converts_to_base_currency_and_reports_the_rate_date_i
     //    `tx_price * get_rate(asset, base, buy_date)` and `proceeds` is
     //    `matched_qty * sell_unit_proceeds_base` (`tax_engine.rs:736`), so a report that
     //    skipped the FX leg would print a 100.0 buy and a 130.0 sell.
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _asset) = fx_fixture(&pool).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_dated_fx_report_converts_to_base_currency_and_reports_the_rate_date_it_used").await;
+    let (port_id, _asset) = fx_fixture(&pool, user).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&to=2024-03-31"))
@@ -642,9 +642,9 @@ async fn a_dated_fx_report_converts_to_base_currency_and_reports_the_rate_date_i
 /// exists and none may be demanded.
 #[tokio::test]
 async fn a_same_currency_asset_never_reports_a_rate_date() {
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_same_currency_asset_never_reports_a_rate_date").await;
+    let (port_id, _, _) = fixture(&pool, user, "2024-06-28").await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?strategy=FIFO&threshold_days=30&from=2024-01-01&to=2024-06-30"))
@@ -667,9 +667,9 @@ async fn a_same_currency_asset_never_reports_a_rate_date() {
 /// server cannot act on, and retrying changes nothing.
 #[tokio::test]
 async fn invalid_windows_are_422s_that_name_the_parameter() {
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("invalid_windows_are_422s_that_name_the_parameter").await;
+    let (port_id, _, _) = fixture(&pool, user, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let today = Utc::now().date_naive();
     let tomorrow = (today + chrono::Duration::days(1)).to_string();
@@ -708,9 +708,9 @@ async fn invalid_windows_are_422s_that_name_the_parameter() {
 /// catch it; only the detail can.
 #[tokio::test]
 async fn a_future_from_alone_blames_from_and_says_future() {
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (pool, user) = db_with_user("a_future_from_alone_blames_from_and_says_future").await;
+    let (port_id, _, _) = fixture(&pool, user, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
     let tomorrow = (Utc::now().date_naive() + chrono::Duration::days(1)).to_string();
 
     let resp = client
@@ -734,10 +734,10 @@ async fn a_future_from_alone_blames_from_and_says_future() {
 /// `to`, so the one-sided branch was only ever exercised in its invalid form.
 #[tokio::test]
 async fn a_from_alone_runs_through_today() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_from_alone_runs_through_today").await;
     let through = Utc::now().date_naive().to_string();
-    let (port_id, _, _) = fixture(&pool, &through).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, &through).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let resp = client
         .get(format!("/api/portfolios/{port_id}/tax-summary?from=2024-01-01"))
@@ -756,12 +756,12 @@ async fn a_from_alone_runs_through_today() {
 
 #[tokio::test]
 async fn a_missing_portfolio_is_404_and_an_unknown_strategy_on_the_undated_path_is_not_an_error() {
-    let pool = setup_db(&disabled_config()).await;
+    let (pool, user) = db_with_user("a_missing_portfolio_is_404_and_an_unknown_strategy_on_the_undated_path_is_not_an_error").await;
     // Today, not a past date: the undated call below prices through `get_price`, which
     // answers only from a row dated exactly today and otherwise asks the provider. A
     // `through` of 2024-06-28 would make this test reach the network.
-    let (port_id, _, _) = fixture(&pool, Utc::now().date_naive().to_string().as_str()).await;
-    let client = Client::tracked(build_rocket(pool, DEFAULT_USER)).await.unwrap();
+    let (port_id, _, _) = fixture(&pool, user, Utc::now().date_naive().to_string().as_str()).await;
+    let client = Client::tracked(build_rocket(pool, user)).await.unwrap();
 
     let missing = client.get("/api/portfolios/9999/tax-summary?strategy=FIFO").dispatch().await;
     assert_eq!(missing.status(), Status::NotFound);
@@ -838,8 +838,8 @@ async fn the_deadline_fails_closed_instead_of_returning_a_partial_report() {
     // The one hermetic route to a 503: the check runs before the first pricing step, so
     // `Duration::ZERO` trips it with no outbound call at all. A test that waited 20 s
     // would not be worth having.
-    let pool = setup_db(&disabled_config()).await;
-    let (port_id, _, _) = fixture(&pool, "2024-06-28").await;
+    let (pool, user) = db_with_user("the_deadline_fails_closed_instead_of_returning_a_partial_report").await;
+    let (port_id, _, _) = fixture(&pool, user, "2024-06-28").await;
     let portfolio = load_fixture_portfolio(&pool, port_id).await;
     let assets = load_fixture_assets(&pool, port_id).await;
     let svc = offline_pricing_service();

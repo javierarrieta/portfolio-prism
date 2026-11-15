@@ -1,249 +1,67 @@
-use std::str::FromStr;
+//! One close per `(symbol, date)`, enforced by the schema.
+//!
+//! This used to be a migration test: SQLite shipped a `historical_prices` with no
+//! primary key and no unique constraint, so `INSERT OR REPLACE` matched on rowid and
+//! appended a second row for every fetch, and `init_db` had a dedupe step to clean up
+//! the mess before adding the index. Postgres has none of that history — the table is
+//! created with `PRIMARY KEY (symbol, date)` in `0001_init.sql` and there is no
+//! pre-existing database to repair.
+//!
+//! What remains worth testing is the part the application depends on: that a duplicate
+//! really is rejected rather than that the code is careful, and that the upsert the
+//! pricing layer uses is an update and not an insert. The *shape* of the constraint is
+//! `scripts/check_migrations.sh`'s job; this file is about behaviour.
 
-// Legacy shape: no primary key, no unique constraint. The fixture stores close_price as
-// TEXT because that is the shape the decimal migration leaves behind; the file-backed boot
-// test below is the one that builds the pre-migration REAL column.
-// Duplicate (symbol, date) rows are the whole point: they are what the current
-// INSERT OR REPLACE has been appending for every fetch since the table was created.
-async fn create_legacy_prices(pool: &sqlx::sqlite::SqlitePool) {
-    sqlx::query(
-        "CREATE TABLE historical_prices (
-            symbol TEXT NOT NULL,
-            date DATE NOT NULL,
-            close_price TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-    // The plain index `init_db` used to create before the unique index superseded it.
-    // Without it the "the old index is gone" assertion below is true whether or not
-    // the drop exists, which is the whole assertion's point.
-    sqlx::query("CREATE INDEX idx_historical_prices_symbol_date ON historical_prices(symbol, date)")
-        .execute(pool)
-        .await
-        .unwrap();
+mod common;
 
-    for (symbol, date, price) in [
-        ("AAPL", "2024-01-02", "100.0"),
-        ("AAPL", "2024-01-02", "101.5"), // duplicate, written later, must survive
-        ("AAPL", "2024-01-03", "102.0"),
-        ("MSFT", "2024-01-02", "300.0"),
-        ("MSFT", "2024-01-02", "301.0"), // duplicate, written later, must survive
-        ("MSFT", "2024-01-02", "302.0"), // duplicate, written latest, must survive
-    ] {
-        sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-            .bind(symbol)
-            .bind(date)
-            .bind(price)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-}
-
-async fn row_count(pool: &sqlx::sqlite::SqlitePool) -> i64 {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM historical_prices")
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    n
-}
+use common::{db_with_user, seed_price, test_pool};
 
 #[tokio::test]
-async fn dedupe_leaves_one_row_per_symbol_and_date() {
-    let pool = sqlx::sqlite::SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_prices(&pool).await;
-    assert_eq!(row_count(&pool).await, 6);
+async fn a_duplicate_insert_is_rejected_by_the_schema() {
+    let (pool, _) = db_with_user("a_duplicate_insert_is_rejected_by_the_schema").await;
+    seed_price(&pool, "AAPL", common::FULLY_COVERED, "100.0").await;
 
-    backend_rust::enforce_price_uniqueness(&pool).await.unwrap();
-
-    // Three distinct pairs survive the six seeded rows: AAPL/2024-01-02 (x2),
-    // AAPL/2024-01-03, MSFT/2024-01-02 (x3).
-    assert_eq!(row_count(&pool).await, 3);
-    let (aapl,): (String,) = sqlx::query_as(
-        "SELECT close_price FROM historical_prices WHERE symbol = 'AAPL' AND date = '2024-01-02'",
+    let dup = sqlx::query(
+        "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)",
     )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(aapl, "101.5");
-    let (msft,): (String,) = sqlx::query_as(
-        "SELECT close_price FROM historical_prices WHERE symbol = 'MSFT' AND date = '2024-01-02'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(msft, "302.0");
-}
-
-#[tokio::test]
-async fn uniqueness_is_idempotent_and_the_index_exists_afterwards() {
-    let pool = sqlx::sqlite::SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_prices(&pool).await;
-
-    backend_rust::enforce_price_uniqueness(&pool).await.unwrap();
-    // Second boot on an already-migrated database must be a no-op, not an error:
-    // init_db runs on every process start.
-    backend_rust::enforce_price_uniqueness(&pool).await.unwrap();
-    assert_eq!(row_count(&pool).await, 3);
-
-    let indexes: Vec<(i64, String, i64)> =
-        sqlx::query_as("PRAGMA index_list(historical_prices)")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert!(
-        indexes.iter().any(|(_, name, unique)| name == "uq_historical_prices_symbol_date" && *unique == 1),
-        "unique index missing; have {:?}",
-        indexes.iter().map(|(_, n, _)| n).collect::<Vec<_>>()
-    );
-    assert!(
-        !indexes.iter().any(|(_, name, _)| name == "idx_historical_prices_symbol_date"),
-        "the redundant plain index should have been dropped"
-    );
-}
-
-#[tokio::test]
-async fn a_duplicate_insert_is_rejected_by_the_index() {
-    let pool = sqlx::sqlite::SqlitePool::connect(":memory:").await.unwrap();
-    create_legacy_prices(&pool).await;
-    backend_rust::enforce_price_uniqueness(&pool).await.unwrap();
-
-    // A bare INSERT of an existing pair must fail. This is what proves the index is
-    // doing the work rather than the application being careful.
-    let dup = sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-        .bind("AAPL")
-        .bind("2024-01-02")
-        .bind("999.0")
-        .execute(&pool)
-        .await;
-    assert!(dup.is_err(), "duplicate (symbol, date) must be rejected");
-}
-
-/// The shape of the owner's real `portfolio.db` before this change, run through the
-/// whole of `init_db` rather than through `enforce_price_uniqueness` on its own.
-///
-/// Three things only meet here: the legacy REAL `close_price` (pre-decimal), duplicate
-/// `(symbol, date)` rows, and the ordering constraint that `migrate_decimal_columns`
-/// renames `close_price` on a dedicated connection under `PRAGMA legacy_alter_table`
-/// *before* the dedupe runs. The rename needs that connection because of a stale
-/// per-connection schema cache that only misbehaves on a file-backed database, which
-/// is why this test cannot be `:memory:` either.
-#[tokio::test]
-async fn init_db_boots_a_legacy_database_that_already_holds_duplicates() {
-    let tmp = std::env::temp_dir().join(format!(
-        "portfolio_price_uniqueness_test_{}.db",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", tmp.display()))
-        .await
-        .unwrap();
-
-    sqlx::query(
-        "CREATE TABLE historical_prices (
-            symbol TEXT NOT NULL,
-            date DATE NOT NULL,
-            close_price REAL NOT NULL
-        )",
-    )
+    .bind("AAPL")
+    .bind(common::FULLY_COVERED)
+    .bind("999.0")
     .execute(&pool)
-    .await
-    .unwrap();
-    // The plain index `init_db` used to create, so the drop is exercised by the real
-    // boot sequence and not only by the fixture in this file.
-    sqlx::query("CREATE INDEX idx_historical_prices_symbol_date ON historical_prices(symbol, date)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    for (symbol, date, price) in [
-        ("AAPL", "2024-01-02", 100.0_f64),
-        ("AAPL", "2024-01-02", 101.5), // duplicate, written later, must survive
-        ("AAPL", "2024-01-03", 102.0),
-        ("MSFT", "2024-01-02", 300.0),
-        ("MSFT", "2024-01-02", 301.0),
-        ("MSFT", "2024-01-02", 302.0), // duplicate, written latest, must survive
-    ] {
-        sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-            .bind(symbol)
-            .bind(date)
-            .bind(price)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
-    let cfg = backend_rust::auth::StartupConfig::from_env_with(&|key| {
-        (key == "AUTH_MODE").then(|| "disabled".to_string())
-    })
-    .expect("AUTH_MODE=disabled parses in a debug build");
-
-    // The spec's mitigation for "a bad dedupe bricks boot": a duplicate the dedupe
-    // misses makes the unique index fail, `init_db` returns `Err`, and the app
-    // refuses to start. Boot succeeding is the assertion, not a precondition.
-    backend_rust::init_db(&pool, &cfg)
-        .await
-        .expect("init_db must boot a legacy database that already holds duplicates");
-
-    let groups: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT symbol, date(date), COUNT(*) FROM historical_prices GROUP BY symbol, date",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(groups.len(), 3, "three distinct (symbol, date) pairs were seeded");
+    .await;
     assert!(
-        groups.iter().all(|(_, _, n)| *n == 1),
-        "exactly one row per (symbol, date) must survive boot; got {groups:?}"
+        dup.is_err(),
+        "a second close for the same (symbol, date) must be rejected by the primary key"
     );
 
-    // The `MAX(rowid)` survivor, readable as a decimal after the column became TEXT.
-    let (aapl,): (String,) = sqlx::query_as(
-        "SELECT close_price FROM historical_prices WHERE symbol = 'AAPL' AND date(date) = '2024-01-02'",
+    // And the row the first write put there is untouched by the rejected second one.
+    let (close,): (String,) = sqlx::query_as(
+        "SELECT close_price FROM historical_prices WHERE symbol = $1 AND date = $2",
     )
+    .bind("AAPL")
+    .bind(common::FULLY_COVERED)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        backend_rust::db_types::str_to_decimal(&aapl),
-        rust_decimal::Decimal::from_str("101.5").unwrap()
-    );
-    let affinity: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as("PRAGMA table_info(historical_prices)")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        affinity.iter().find(|r| r.1 == "close_price").unwrap().2,
-        "TEXT",
-        "the decimal migration and the dedupe must both have run, in that order"
-    );
+    assert_eq!(close, "100.0");
+}
 
-    let indexes: Vec<(i64, String, i64)> = sqlx::query_as("PRAGMA index_list(historical_prices)")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert!(
-        indexes.iter().any(|(_, name, unique)| name == "uq_historical_prices_symbol_date" && *unique == 1),
-        "the unique index must exist after a real boot; have {:?}",
-        indexes.iter().map(|(_, n, _)| n).collect::<Vec<_>>()
-    );
-    assert!(
-        !indexes.iter().any(|(_, name, _)| name == "idx_historical_prices_symbol_date"),
-        "the redundant plain index must be gone after a real boot"
-    );
+#[tokio::test]
+async fn the_upsert_the_pricing_layer_uses_replaces_rather_than_appends() {
+    // `seed_price` is the same `ON CONFLICT (symbol, date) DO UPDATE` the pricing
+    // layer writes with, so this is the write path and not a paraphrase of it.
+    let pool = test_pool("the_upsert_the_pricing_layer_uses").await;
+    seed_price(&pool, "AAPL", common::FULLY_COVERED, "100.0").await;
+    seed_price(&pool, "AAPL", common::FULLY_COVERED, "101.5").await;
 
-    // A second boot on the migrated database is a no-op, not an error.
-    backend_rust::init_db(&pool, &cfg)
-        .await
-        .expect("a second init_db on the migrated database must succeed");
-    let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM historical_prices")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(n.0, 3);
-
-    pool.close().await;
-    let _ = std::fs::remove_file(&tmp);
+    let (rows, close): (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(close_price) FROM historical_prices WHERE symbol = $1 AND date = $2",
+    )
+    .bind("AAPL")
+    .bind(common::FULLY_COVERED)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "an updated fetch must not leave the old one behind");
+    assert_eq!(close, "101.5");
 }

@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use anyhow::{Result, anyhow};
 use crate::models::{Asset, HistoricalPrice};
-use sqlx::sqlite::SqlitePool;
+use crate::db::DbPool;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 
@@ -111,10 +111,10 @@ fn f64_to_decimal(v: f64) -> Decimal {
 /// slip a second row in between a check and this insert. Returns the number of
 /// transactions actually inserted, which is zero when every event was already there.
 pub async fn apply_split_events(
-    asset_id: i32,
+    asset_id: i64,
     earliest_tx_date: Option<NaiveDate>,
     events: &[(NaiveDate, u32, u32)],
-    pool: &SqlitePool,
+    pool: &DbPool,
 ) -> Result<usize, sqlx::Error> {
     // One transaction for the whole set, so a half-applied multi-split event is not
     // observable. The dedupe itself is the unique index `uq_split_asset_date`, not a
@@ -134,15 +134,15 @@ pub async fn apply_split_events(
         }
 
         let dt = split_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        let result = sqlx::query(
+        let result = sqlx::query!(
             "INSERT INTO transactions (asset_id, type, quantity, price, fee, date)
-             VALUES (?, 'SPLIT', ?, ?, '0', ?)
+             VALUES ($1, 'SPLIT', $2, $3, '0', $4)
              ON CONFLICT DO NOTHING",
+            asset_id,
+            numerator.to_string(),
+            denominator.to_string(),
+            dt
         )
-        .bind(asset_id)
-        .bind(numerator.to_string())
-        .bind(denominator.to_string())
-        .bind(dt)
         .execute(&mut *tx)
         .await?;
         inserted += result.rows_affected() as usize;
@@ -425,7 +425,7 @@ impl CurrencyService {
         from_curr: &str,
         to_curr: &str,
         date: DateTime<Utc>,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<RateAt> {
         let date_naive = date.date_naive();
 
@@ -496,21 +496,21 @@ impl CurrencyService {
         symbol: &str,
         window_start: NaiveDate,
         date: NaiveDate,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<Option<RateAt>> {
-        let rows: Vec<(NaiveDate, String)> = sqlx::query_as(
+        let rows = sqlx::query!(
             "SELECT date, close_price FROM historical_prices
-                 WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date",
+                 WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
+            symbol,
+            window_start,
+            date
         )
-        .bind(symbol)
-        .bind(window_start)
-        .bind(date)
         .fetch_all(pool)
         .await?;
 
         let series: Vec<(NaiveDate, Decimal)> = rows
             .into_iter()
-            .map(|(d, p)| (d, crate::db_types::str_to_decimal(&p)))
+            .map(|r| (r.date, crate::db_types::str_to_decimal(&r.close_price)))
             .collect();
 
         // The same coverage rule `get_historical_prices` applies to its stored
@@ -543,14 +543,15 @@ impl CurrencyService {
         &self,
         symbol: &str,
         isin: Option<&str>,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<Decimal, PricingError> {
         let today = chrono::Utc::now().date_naive();
-        let existing = sqlx::query_as::<_, HistoricalPrice>(
-            "SELECT * FROM historical_prices WHERE symbol = ? AND date = ?"
+        let existing = sqlx::query_as!(
+            HistoricalPrice,
+            "SELECT * FROM historical_prices WHERE symbol = $1 AND date = $2",
+            symbol,
+            today
         )
-        .bind(symbol)
-        .bind(today)
         .fetch_optional(pool)
         .await
         .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
@@ -691,14 +692,14 @@ impl CurrencyService {
             .unwrap_or(Decimal::ZERO)
     }
 
-    async fn cache_price(&self, symbol: &str, date: NaiveDate, price: Decimal, pool: &SqlitePool) {
-        let _ = sqlx::query(
-            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+    async fn cache_price(&self, symbol: &str, date: NaiveDate, price: Decimal, pool: &DbPool) {
+        let _ = sqlx::query!(
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
                  ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
+            symbol,
+            date,
+            crate::db_types::decimal_to_str(&price)
         )
-        .bind(symbol)
-        .bind(date)
-        .bind(crate::db_types::decimal_to_str(&price))
         .execute(pool)
         .await;
     }
@@ -734,7 +735,7 @@ impl CurrencyService {
         symbol: &str,
         start_date: NaiveDate,
         end_date: NaiveDate,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<Vec<(NaiveDate, Decimal)>, PricingError> {
         let mut db_prices = self
             .get_historical_prices_from_db(symbol, start_date, end_date, pool)
@@ -829,13 +830,13 @@ impl CurrencyService {
                 .await
                 .map_err(|e| PricingError::ProviderUnavailable(e.to_string()))?;
             for (date, price) in &daily_prices {
-                let _ = sqlx::query(
-                    "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+                let _ = sqlx::query!(
+                    "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
                          ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
+                    symbol,
+                    *date,
+                    crate::db_types::decimal_to_str(price)
                 )
-                .bind(symbol)
-                .bind(*date)
-                .bind(crate::db_types::decimal_to_str(price))
                 .execute(&mut *tx)
                 .await;
             }
@@ -865,14 +866,15 @@ impl CurrencyService {
         symbol: &str,
         start_date: NaiveDate,
         end_date: NaiveDate,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<Vec<(NaiveDate, Decimal)>> {
-        let prices = sqlx::query_as::<_, HistoricalPrice>(
-            "SELECT * FROM historical_prices WHERE symbol = ? AND date >= ? AND date <= ?"
+        let prices = sqlx::query_as!(
+            HistoricalPrice,
+            "SELECT * FROM historical_prices WHERE symbol = $1 AND date >= $2 AND date <= $3",
+            symbol,
+            start_date,
+            end_date
         )
-        .bind(symbol)
-        .bind(start_date)
-        .bind(end_date)
         .fetch_all(pool)
         .await?;
 
@@ -888,19 +890,27 @@ impl CurrencyService {
     pub async fn sync_splits_for_asset(
         &self,
         asset: &Asset,
-        pool: &SqlitePool,
+        pool: &DbPool,
     ) -> Result<usize> {
         let today = Utc::now().date_naive();
 
         // The asset's own earliest transaction, read *before* the throttle check
         // because the throttle now depends on it.
-        let earliest: (Option<NaiveDate>,) = sqlx::query_as(
-            "SELECT MIN(date(date)) FROM transactions WHERE asset_id = ?"
+        // The day must be derived by the *identical* expression
+        // `uq_split_asset_date` is built on — `((date AT TIME ZONE 'UTC')::date)`.
+        // SQLite's `date(date)` is what the index used there; any other Postgres
+        // spelling (including the natural-looking `date_trunc`, which is STABLE and
+        // so could not be the index expression at all) would both stop the index from
+        // being used and move this dedupe boundary away from the constraint that
+        // enforces it.
+        let earliest: Option<NaiveDate> = sqlx::query_scalar!(
+            "SELECT MIN(((date AT TIME ZONE 'UTC')::date)) \
+             FROM transactions WHERE asset_id = $1",
+            asset.id
         )
-        .bind(asset.id)
         .fetch_one(pool)
         .await?;
-        let earliest_date = earliest.0;
+        let earliest_date = earliest;
 
         // Throttle, keyed per asset (#38). Keyed on the symbol, the first asset
         // holding a symbol suppressed every other asset holding it for 30 days, even
@@ -912,17 +922,20 @@ impl CurrencyService {
         //   * the coverage — if the asset gained a transaction older than the last
         //     sync evaluated, splits predating the old earliest are still missing and
         //     a fresh window would not have noticed.
-        let throttle: Option<(String, Option<NaiveDate>)> = sqlx::query_as(
-            "SELECT last_synced_at, covered_from FROM split_sync WHERE asset_id = ?"
+        // `last_synced_at` is a `DATE`, and `String` is not a decodable target for a
+        // Postgres `DATE`, so it arrives as `NaiveDate`. It used to arrive as the
+        // stored text and be parsed back; now it is only ever formatted, never parsed.
+        let throttle = sqlx::query!(
+            "SELECT last_synced_at, covered_from FROM split_sync WHERE asset_id = $1",
+            asset.id
         )
-        .bind(asset.id)
         .fetch_optional(pool)
         .await?;
 
-        if let Some((last, covered_from)) = throttle {
-            let within_window = NaiveDate::parse_from_str(&last, "%Y-%m-%d")
-                .map(|last_date| (today - last_date).num_days() < 30)
-                .unwrap_or(false);
+        if let Some(row) = throttle {
+            let last = row.last_synced_at;
+            let covered_from = row.covered_from;
+            let within_window = (today - last).num_days() < 30;
             let still_covered = match (earliest_date, covered_from) {
                 // No transactions then and none now: there is nothing to cover.
                 (None, None) => true,
@@ -993,12 +1006,18 @@ impl CurrencyService {
 
         let inserted = apply_split_events(asset.id, earliest_date, &events, pool).await?;
 
-        sqlx::query(
-            "INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at, covered_from) VALUES (?, ?, ?)",
+        // `INSERT OR REPLACE` was the wrong tool even on SQLite: it deletes and
+        // re-inserts, so a column the statement does not name is silently reset. The
+        // key is `asset_id` alone — no `effective_date` column exists — which Task 2
+        // confirmed against the readers and both delete sites.
+        sqlx::query!(
+            "INSERT INTO split_sync (asset_id, last_synced_at, covered_from) VALUES ($1, $2, $3) \
+             ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, \
+                                                  covered_from   = EXCLUDED.covered_from",
+            asset.id,
+            today,
+            earliest_date
         )
-        .bind(asset.id)
-        .bind(today)
-        .bind(earliest_date)
         .execute(pool)
         .await?;
 
@@ -1069,16 +1088,11 @@ mod tests {
     }
 
     /// Same-currency requests short-circuit in `get_rate` before any query, so an
-    /// empty in-memory pool is the whole fixture — there are no seeded prices here.
-    async fn empty_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool
+    /// empty database is the whole fixture — there are no seeded prices here. It is a
+    /// real migrated database rather than the old hand-made `historical_prices`,
+    /// because the point of the fixture is "the table exists and holds nothing".
+    async fn empty_pool() -> DbPool {
+        crate::test_db::test_pool(&crate::test_db::next_caller("currency_empty")).await
     }
 
     #[tokio::test]
@@ -1115,15 +1129,23 @@ mod tests {
         Decimal::from_str(s).unwrap()
     }
 
-    async fn seed_prices(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+    /// A database whose `historical_prices` is the migrated one — primary key and
+    /// all — instead of a hand-written copy that could drift from it.
+    async fn priced_pool() -> DbPool {
+        crate::test_db::test_pool(&crate::test_db::next_caller("currency_priced")).await
+    }
+
+    async fn seed_prices(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
         for (d, price) in rows {
-            sqlx::query("INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)")
-                .bind(symbol)
-                .bind(date_of(d))
-                .bind(*price)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query!(
+                "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)",
+                symbol,
+                date_of(d),
+                *price
+            )
+            .execute(pool)
+            .await
+            .unwrap();
         }
     }
 
@@ -1250,27 +1272,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_price_uses_today_cached_price() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = priced_pool().await;
 
         let today = chrono::Utc::now().date_naive();
-        let _ = sqlx::query(
-            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+        let _ = sqlx::query!(
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)",
+            "TEST",
+            today,
+            "42.0"
         )
-        .bind("TEST")
-        .bind(today)
-        .bind("42.0")
         .execute(&pool)
         .await;
 
@@ -1281,27 +1291,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_price_ignores_stale_cache() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE historical_prices (symbol TEXT NOT NULL, date DATE NOT NULL, close_price TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX uq_historical_prices_symbol_date ON historical_prices(symbol, date)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = priced_pool().await;
 
         let stale_date = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
-        let _ = sqlx::query(
-            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)"
+        let _ = sqlx::query!(
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)",
+            "TEST",
+            stale_date,
+            "99.0"
         )
-        .bind("TEST")
-        .bind(stale_date)
-        .bind("99.0")
         .execute(&pool)
         .await;
 
@@ -1314,94 +1312,104 @@ mod tests {
         assert_ne!(price.ok(), Some(Decimal::from_str("99.0").unwrap()));
     }
 
-    async fn make_split_tx_table(pool: &SqlitePool) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asset_id INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                quantity TEXT NOT NULL,
-                price TEXT NOT NULL,
-                fee TEXT NOT NULL,
-                date TEXT NOT NULL
-            )"
+    /// A database plus the id of a real asset in it.
+    ///
+    /// The asset is not decoration: `apply_split_events` writes `transactions` rows,
+    /// and `transactions.asset_id` is a foreign key, so the id the tests pass has to
+    /// name a row that exists. The asset's portfolio is created because `assets
+    /// .portfolio_id` is a foreign key too.
+    ///
+    /// `uq_split_asset_date` — the only dedupe `apply_split_events` has — comes from
+    /// the migration, not from a hand-written copy of the index. A fixture that
+    /// invented its own schema is how this helper once managed to test a shape
+    /// production never runs.
+    async fn split_fixture() -> (DbPool, i64) {
+        let pool = crate::test_db::test_pool(&crate::test_db::next_caller("currency_split")).await;
+        let pid: i64 = sqlx::query_scalar!(
+            "INSERT INTO portfolios (name, currency, base_currency) \
+             VALUES ('split fixture', 'USD', 'USD') RETURNING id"
         )
-        .execute(pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
-
-        // The real migration, not a hand-written copy of the index. `apply_split_events`
-        // now leans on `uq_split_asset_date` for its dedupe, so a test fixture that
-        // omits it is testing a schema production never runs — which is exactly how
-        // this helper failed once the count-then-insert guard was removed.
-        crate::enforce_split_uniqueness(pool).await.unwrap();
+        let aid: i64 = sqlx::query_scalar!(
+            "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency) \
+             VALUES ($1, 'SPLITME', 'Split Me', 'STOCK', 'USD') RETURNING id",
+            pid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (pool, aid)
     }
 
     #[tokio::test]
     async fn test_apply_split_events_inserts_split_transactions() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        make_split_tx_table(&pool).await;
+        let (pool, asset) = split_fixture().await;
 
         let events = vec![
             (NaiveDate::from_ymd_opt(2020, 8, 31).unwrap(), 4u32, 1u32),
             (NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(), 4u32, 1u32),
         ];
         let earliest = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
-        let inserted = apply_split_events(1, Some(earliest), &events, &pool).await.unwrap();
+        let inserted = apply_split_events(asset, Some(earliest), &events, &pool).await.unwrap();
 
         assert_eq!(inserted, 2);
 
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT type, quantity, price, fee FROM transactions WHERE asset_id = 1"
+        let rows = sqlx::query!(
+            "SELECT type, quantity, price, fee FROM transactions WHERE asset_id = $1",
+            asset
         )
         .fetch_all(&pool)
         .await
         .unwrap();
         assert_eq!(rows.len(), 2);
-        for (ty, qty, price, fee) in rows {
-            assert_eq!(ty, "SPLIT");
-            assert_eq!(qty, "4");
-            assert_eq!(price, "1");
-            assert_eq!(fee, "0");
+        for row in rows {
+            assert_eq!(row.r#type, "SPLIT");
+            assert_eq!(row.quantity, "4");
+            assert_eq!(row.price, "1");
+            assert_eq!(row.fee, "0");
         }
     }
 
     #[tokio::test]
     async fn test_apply_split_events_dedupes_manual_split_same_date() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        make_split_tx_table(&pool).await;
+        let (pool, asset) = split_fixture().await;
 
-        let _ = sqlx::query(
-            "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES (1, 'SPLIT', '4', '1', '0', ?)"
+        let _ = sqlx::query!(
+            "INSERT INTO transactions (asset_id, type, quantity, price, fee, date) VALUES ($1, 'SPLIT', '4', '1', '0', $2)",
+            asset,
+            DateTime::from_timestamp(1717200000, 0).unwrap()
         )
-        .bind(DateTime::from_timestamp(1717200000, 0).unwrap())
         .execute(&pool)
         .await
         .unwrap();
 
         let events = vec![(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(), 4u32, 1u32)];
-        let inserted = apply_split_events(1, None, &events, &pool).await.unwrap();
+        let inserted = apply_split_events(asset, None, &events, &pool).await.unwrap();
 
         assert_eq!(inserted, 0);
     }
 
     #[tokio::test]
     async fn test_apply_split_events_skips_splits_before_first_transaction() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        make_split_tx_table(&pool).await;
+        let (pool, asset) = split_fixture().await;
 
         let events = vec![
             (NaiveDate::from_ymd_opt(2019, 1, 1).unwrap(), 2u32, 1u32),
             (NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(), 4u32, 1u32),
         ];
         let earliest = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
-        let inserted = apply_split_events(1, Some(earliest), &events, &pool).await.unwrap();
+        let inserted = apply_split_events(asset, Some(earliest), &events, &pool).await.unwrap();
 
         assert_eq!(inserted, 1);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE asset_id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id = $1"#,
+            asset
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1451,14 +1459,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_splits_skips_fetch_within_throttle_window() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        make_split_tx_table(&pool).await;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS split_sync (asset_id INTEGER PRIMARY KEY, last_synced_at DATE NOT NULL, covered_from DATE)"
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (pool, asset) = split_fixture().await;
 
         // A recent sync record must short-circuit before any network call, so the
         // symbol here can be bogus — the function should not try to resolve it.
@@ -1466,15 +1467,22 @@ mod tests {
         // while there was nothing to cover" is the one state that needs no coverage
         // date. Give it a transaction and the same row no longer suppresses a sync.
         let today = Utc::now().date_naive();
-        sqlx::query("INSERT OR REPLACE INTO split_sync (asset_id, last_synced_at) VALUES (?, ?)")
-            .bind(1)
-            .bind(today)
+        // The two-column form: `covered_from` is left out of the column list *and*
+        // out of the `DO UPDATE`, because naming it in the update clause would null
+        // out a value this call knows nothing about — the silent reset
+        // `INSERT OR REPLACE` existed to avoid and this port exists to remove.
+        sqlx::query!(
+            "INSERT INTO split_sync (asset_id, last_synced_at) VALUES ($1, $2) \
+             ON CONFLICT (asset_id) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at",
+            asset,
+            today
+        )
             .execute(&pool)
             .await
             .unwrap();
 
         let asset = Asset {
-            id: 1,
+            id: asset,
             portfolio_id: 1,
             symbol: "THROTTLETEST".to_string(),
             name: "Throttle".to_string(),
@@ -1489,10 +1497,13 @@ mod tests {
         assert_eq!(inserted, 0);
 
         // No split transaction was created for the asset.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE asset_id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id = $1"#,
+            asset.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 0);
     }
 

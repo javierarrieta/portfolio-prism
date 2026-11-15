@@ -10,7 +10,7 @@
 # Any-style pool rewrites for Postgres.
 #
 # The rule list is the spec's *Portability discipline* section, plus the three
-# `INSERT OR …` variants the spec's list omits. Two rules, both static:
+# `INSERT OR …` variants the spec's list omits. Three rules, all static:
 #   Rule 1 — no banned construct appears in SQL the module can send. Matching is
 #     case-insensitive, because SQLite keywords are: `PRAGMA`, `pragma` and
 #     `Pragma` are one construct, and the module's house style is upper-case SQL
@@ -19,6 +19,15 @@
 #   Rule 2 — every `INSERT INTO` names its columns. A bare `INSERT INTO t
 #     VALUES (...)` silently changes meaning when a column is added, and the
 #     column list must be the thing that follows the table name.
+#   Rule 3 — every transaction this module opens states its isolation level. A bare
+#     `.begin(` sends plain `BEGIN` and inherits whatever the server's default
+#     happens to be, which is how the export lost the snapshot its own doc claimed:
+#     `build` ran at READ COMMITTED while documented as a point-in-time read. No
+#     unit test can catch that drift — the tests exercise `begin_read_tx`, and a
+#     `build` that stopped calling it would leave every one of them green — so the
+#     gate is what catches it, by scanning the whole directory rather than the one
+#     helper. It is in this script rather than a new one because `src/backup/` is
+#     already this gate's scope and the rule is about the same module's SQL.
 #
 # Known limits, stated rather than hidden (same style as `check_access_gate.sh`):
 #   * The rules are about SQL the module sends to the engine, not about English.
@@ -43,6 +52,13 @@
 #     `VALUES` whose table name is on the line above. The join is whole-file, so a
 #     column list may wrap as far as it likes; a quoted table name (`INSERT INTO
 #     "assets"`) is not recognised and fails closed rather than passing quietly.
+#   * Rule 3 matches the literal spellings `.begin(` and `.begin_with(`, so a
+#     transaction opened through a differently-named receiver or a `format!`-built
+#     `SET TRANSACTION` is invisible to it — the same limit Rule 1 accepts. It also
+#     reads `begin_with` as "states its isolation level" without checking that the
+#     statement it passes is a `SET TRANSACTION`/`BEGIN ISOLATION LEVEL` one; the
+#     two call sites in this module do, and `tests/export_snapshot_test.rs` proves
+#     the export's actually reaches the server as REPEATABLE READ.
 #   * `find` matches any path named `*.rs`. One that is not a readable regular
 #     file — a directory, a dangling link, a file the test user cannot open — fails
 #     the gate twice over: the `-f` test refuses it, and the scanner ends every
@@ -85,6 +101,7 @@ BANNED=(
 fail=0
 checked=0
 statements=0
+starts=0
 
 # The comment-line skip (`//`, `//!`, `///` and block-comment continuations) is
 # the `grep -vE` on the second line of each loop: prose is not SQL.
@@ -183,6 +200,28 @@ if [ "$checked" -eq 0 ]; then
   exit 1
 fi
 
+# Rule 3, in its own loop because it reports transaction starts rather than SQL.
+# The comment-line skip is the same one Rule 1 uses, and it is load-bearing here:
+# `restore.rs` explains in prose that a later `pool.begin()` could undo its
+# isolation level, and that sentence is not a transaction.
+while IFS= read -r hit; do
+  [ -z "$hit" ] && continue
+  starts=$((starts + 1))
+  case "$hit" in
+    *".begin_with("*) ;;
+    *)
+      echo "GATE FAILED: a transaction here does not state its isolation level;"
+      echo "  a bare .begin( runs at the server default, which is how the export"
+      echo "  lost the snapshot its doc claimed. Use begin_read_tx (export) or"
+      echo "  begin_with(\"BEGIN ISOLATION LEVEL …\") (restore)."
+      echo "  $hit"
+      fail=1
+      ;;
+  esac
+done < <(grep -rni --include='*.rs' -E '\.begin(_with)?\(' "$DIR" \
+          | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true)
+
+echo "Transaction starts inspected: $starts"
 echo "INSERT statements inspected: $statements"
 
 if [ "$fail" -ne 0 ]; then

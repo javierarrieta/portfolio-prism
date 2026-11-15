@@ -21,12 +21,26 @@ they are the reason this document exists:
 
 ## 0. The whole gate set, in one place
 
-Run from the repository root. All of these are expected to pass on
-`feat/oidc-identity-isolation`.
+Start at the repository root. All of these are expected to pass on
+`feat/postgres-only`, **in this order** — it is the order CI enforces, and the order is
+load-bearing because three of the steps read the schema the step before them created.
 
 ```fish
-# Backend: 460 tests
-cd backend_rust; and cargo test
+# 0. A database, first. Five of the ten backend steps below need DATABASE_URL and five do
+# not read it at all; the one that needs it most is `cargo test`, which creates one real
+# database per test (src/test_db.rs). dev-db.sh prints the URL and creates `prism`; run it
+# inside `nix-shell -p postgresql_18` when initdb is not on PATH.
+cd backend_rust
+bash scripts/dev-db.sh
+set -x DATABASE_URL postgres://postgres@127.0.0.1:55432/prism
+
+# Schema, then the prepare cache. --no-dotenv because a .env file quietly disagreeing with
+# the environment is what this step is there to catch.
+sqlx migrate run --no-dotenv
+cargo sqlx prepare --check -- --all-targets
+
+# Backend: 511 tests, 0 failed, 0 ignored
+cargo test
 
 # Static access gate: prints "handlers inspected: 20, cleared: 20, files checked: 4"
 bash scripts/check_access_gate.sh
@@ -35,11 +49,17 @@ bash scripts/check_access_gate.sh
 bash scripts/check_pricing_seam.sh
 bash scripts/check_backup_portability.sh
 
+# Schema drift and prepare-cache drift. Both inspect the database DATABASE_URL names, not
+# migrations/ and not .sqlx/ on disk, so each one means something only after the migrate
+# above has run against a database nobody has hand-edited since.
+bash scripts/check_migrations.sh
+bash scripts/check_sqlx_cache.sh
+
 # The gate's own self-test (it is part of `cargo test`, listed here for clarity)
 cargo test --test access_gate_test
 
 # Lints and the release build
-cargo clippy --all-targets
+cargo clippy --all-targets        # 12 distinct warnings, all pre-existing
 cargo build --release
 
 # The release binary must refuse the development mode. Run it; CI does.
@@ -57,13 +77,24 @@ diff /tmp/schema.json ../docs/backup-schema/v1.json
 ```
 
 ```fish
-# Frontend: 256 tests, types, lint
+# Frontend: 260 tests, types, lint
 cd ../frontend
 npm test
 npm run generate-types; and git diff --exit-code src/types/api.d.ts
 npx tsc --noEmit
 npm run lint        # 0 errors; one pre-existing react-hooks warning is expected
 ```
+
+> **Why the database comes first.** This section used to headline `cd backend_rust; and
+> cargo test` with no `DATABASE_URL`, on a tree where that worked. It does not any more:
+> `src/test_db.rs` `expect`s the variable and panics with "DATABASE_URL must be set for
+> tests; `bash scripts/dev-db.sh` prints one". There is no file to fall back to and no
+> in-memory mode — the engine is a server, so a gate list without a database in it is a
+> gate list that cannot run. The same variable is what `sqlx migrate run`,
+> `cargo sqlx prepare --check`, `check_migrations.sh` and `check_sqlx_cache.sh` read; the
+> three static gates and the two compiles do not, because a `sqlx::query!` macro with no
+> database in reach resolves from the committed `.sqlx/` cache — which is also how
+> `backend_rust/Dockerfile` builds.
 
 `cargo test` covers the isolation matrix, the auth cookie paths, the access chokepoint,
 startup refusals, route coverage, and the gate script itself. None of it needs a
@@ -163,6 +194,7 @@ Six variables, and the backend refuses to start if any of the first four is miss
 From `backend_rust/`:
 
 ```fish
+set -x DATABASE_URL (bash scripts/dev-db.sh | tail -1 | sed 's/^DATABASE_URL=//')
 set -x OIDC_ISSUER "https://auth.titan.arrieta.eu/application/o/portfolio-prism/"
 set -x OIDC_CLIENT_ID portfolio-prism
 set -x OIDC_CLIENT_SECRET whatever-not-used
@@ -170,7 +202,16 @@ set -x OIDC_REDIRECT_URI http://localhost:8000/auth/callback
 bash scripts/auth_smoke.sh
 ```
 
-It starts its own backend on a throwaway SQLite file, so it does not touch your data.
+`DATABASE_URL` is required and must be Postgres: the backend is Postgres-only and the
+script refuses a `sqlite:` URL rather than starting a server that would die on its own
+configuration check. `scripts/dev-db.sh` prints the URL to use (run it inside
+`nix-shell -p postgresql_18` if `initdb` is not on PATH).
+
+It starts its own backend, on the database `DATABASE_URL` names and on its own
+`ROCKET_SECRET_KEY`, so it does not disturb a backend you already have running. It is
+**additive** to that database — it creates the schema if absent and writes a placeholder
+user and whatever the checks seed — so point `DATABASE_URL` at a scratch database if you
+want the run to leave nothing behind.
 What it checks, and what it looked like when run against a live authentik (using
 another app's issuer as a stand-in, since this app's provider does not exist yet):
 
@@ -458,8 +499,8 @@ above), *before* setting the variable.
 
 **The transfer is one-way.** The first login whose `sub` matches takes the placeholder
 row and everything it owns, and there is no admin surface to undo it. Set it to the
-wrong value, let that person log in, and the recovery is hand-editing SQLite with the
-pod scaled to zero. This was raised in review and accepted by the operator on the basis
+wrong value, let that person log in, and the recovery is hand-editing the `users` and
+`portfolios` rows in Postgres with the pod scaled to zero. This was raised in review and accepted by the operator on the basis
 that the operator is the first identity to log in.
 
 Leave it **empty** to keep the refusal rather than guess. A placeholder string such as
@@ -484,9 +525,18 @@ Leave it **empty** to keep the refusal rather than guess. A placeholder string s
 
 ## 8. What this still does not prove
 
-- **Concurrency.** Single-writer SQLite, `replicas: 1`. The read endpoints write
-  (analytics inserts split rows on a `GET`), which is how `SQLITE_BUSY` becomes
-  reachable — that is why a database failure now answers `503` instead of `401`.
+- **Concurrency.** `replicas: 1`, and the read endpoints still write (analytics inserts
+  split rows on a `GET`). Postgres is MVCC, so there is no `SQLITE_BUSY` to reach any
+  more: a writer blocks no reader, and two writers touching different rows do not block
+  each other. What still makes a database failure reachable is a saturated pool — every
+  connection checked out, `acquire_timeout` expiring — which is what
+  `backup_test.rs::an_exhausted_pool_is_a_lock_not_an_outage` pins as
+  `PoolTimedOut` → `DbFailure::Lock` → `503`. A serialisation failure (`40001`) or a
+  deadlock (`40P01`) is the other real "try later" condition, and it **is** classified now:
+  `backup::export::classify` maps `40001`, `40P01`, `55P03` and `57014` (the 30 s statement
+  timeout) to the same retryable `503` with `Retry-After`, and
+  `tests/restore_concurrency_test.rs` drives a genuine `40001` over HTTP rather than
+  asserting the mapping in isolation.
 - **Key rotation.** The JWKS cache has a 15-minute TTL, so a provider key rotation is
   self-healing within that window rather than an outage until restart. Not tested
   against a real rotation.

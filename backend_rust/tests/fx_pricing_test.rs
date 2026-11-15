@@ -8,19 +8,24 @@
 
 mod common;
 
-use common::{offline_pricing_service, seed_asset_currency, seed_portfolio, seed_transaction_at, DEFAULT_USER};
-use backend_rust::auth::StartupConfig;
+use common::{
+    db_with_user,
+    offline_pricing_service,
+    seed_asset_currency,
+    seed_portfolio,
+    seed_transaction_at,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
-use sqlx::sqlite::SqlitePool;
+use backend_rust::db::DbPool;
 use std::str::FromStr;
 
 use backend_rust::services::currency_service::{no_rate_error, PricingError};
 
-async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
+async fn seed_pair(pool: &DbPool, symbol: &str, rows: &[(&str, &str)]) {
     for (date, price) in rows {
         sqlx::query(
-            "INSERT INTO historical_prices (symbol, date, close_price) VALUES (?, ?, ?)
+            "INSERT INTO historical_prices (symbol, date, close_price) VALUES ($1, $2, $3)
                  ON CONFLICT(symbol, date) DO UPDATE SET close_price = excluded.close_price",
         )
         .bind(symbol)
@@ -30,14 +35,6 @@ async fn seed_pair(pool: &SqlitePool, symbol: &str, rows: &[(&str, &str)]) {
         .await
         .unwrap();
     }
-}
-
-async fn pool_with_prices() -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    let cfg = StartupConfig::from_env_with(&|key| (key == "AUTH_MODE").then(|| "disabled".to_string()))
-        .expect("AUTH_MODE=disabled parses in a debug build");
-    backend_rust::init_db(&pool, &cfg).await.unwrap();
-    pool
 }
 
 fn ts(date: &str) -> DateTime<Utc> {
@@ -54,7 +51,7 @@ fn dec(s: &str) -> Decimal {
 
 #[tokio::test]
 async fn get_rate_returns_the_seeded_past_dated_rate() {
-    let pool = pool_with_prices().await;
+    let (pool, _) = db_with_user("get_rate_returns_the_seeded_past_dated_rate").await;
     // A Friday close and nothing after it: the Saturday request must resolve to it.
     seed_pair(&pool, "EURUSD=X", &[("2024-03-07", "0.9100"), ("2024-03-08", "0.9125")]).await;
 
@@ -77,7 +74,7 @@ async fn get_rate_does_not_return_todays_rate_for_a_past_date() {
     // lookback (see `rate_from_db`). Three days is inside `PRICE_WINDOW_FRESH_DAYS`,
     // so this window is honest and answers hermetically, and the claim is unchanged:
     // the latest close in the table must not price a past date.
-    let pool = pool_with_prices().await;
+    let (pool, _) = db_with_user("get_rate_does_not_return_todays_rate_for_a_past_date").await;
     seed_pair(
         &pool,
         "EURUSD=X",
@@ -117,10 +114,10 @@ async fn no_rate_error_names_symbol_date_and_bound() {
 async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     use backend_rust::engines::tax_engine::TaxLotEngine;
 
-    let pool = pool_with_prices().await;
+    let (pool, user) = db_with_user("engine_converts_a_past_dated_sell_at_the_dated_rate").await;
 
     // Portfolio base EUR, asset priced in USD: the conversion is USD -> EUR.
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "FX", "EUR").await;
+    let port_id = seed_portfolio(&pool, user, "FX", "EUR").await;
     let asset_id = seed_asset_currency(&pool, port_id, "AAPL", "Apple", "USD").await;
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "SELL", 10.0, 130.0, 0.0, "2024-03-08T00:00:00Z").await;
@@ -143,7 +140,7 @@ async fn engine_converts_a_past_dated_sell_at_the_dated_rate() {
     seed_pair(&pool, "AAPL", &[(today_str.as_str(), "130.00")]).await;
 
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
-        "SELECT * FROM transactions WHERE asset_id = ?",
+        "SELECT * FROM transactions WHERE asset_id = $1",
     )
     .bind(asset_id)
     .fetch_all(&pool)
@@ -184,9 +181,9 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     // fresh one on today.
     use backend_rust::engines::tax_engine::TaxLotEngine;
 
-    let pool = pool_with_prices().await;
+    let (pool, user) = db_with_user("market_value_is_converted_at_the_valuation_date_not_the_last_transaction_date").await;
 
-    let port_id = seed_portfolio(&pool, DEFAULT_USER, "FX", "EUR").await;
+    let port_id = seed_portfolio(&pool, user, "FX", "EUR").await;
     let asset_id = seed_asset_currency(&pool, port_id, "AAPL", "Apple", "USD").await;
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 100.0, 0.0, "2024-01-02T00:00:00Z").await;
     seed_transaction_at(&pool, asset_id, "BUY", 10.0, 110.0, 0.0, "2024-03-08T00:00:00Z").await;
@@ -210,7 +207,7 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
     .await;
 
     let txs = sqlx::query_as::<_, backend_rust::models::Transaction>(
-        "SELECT * FROM transactions WHERE asset_id = ?",
+        "SELECT * FROM transactions WHERE asset_id = $1",
     )
     .bind(asset_id)
     .fetch_all(&pool)
@@ -251,7 +248,7 @@ async fn market_value_is_converted_at_the_valuation_date_not_the_last_transactio
 async fn get_rate_short_circuits_the_same_currency() {
     // Review Focus 5, and the only existing get_rate behaviour the suite pins
     // (currency_service.rs same-currency tests): same currency is exactly one.
-    let pool = pool_with_prices().await;
+    let (pool, _) = db_with_user("get_rate_short_circuits_the_same_currency").await;
     let svc = offline_pricing_service();
     let got = svc.get_rate("USD", "USD", ts("2020-01-01"), &pool).await.unwrap();
     assert_eq!(got.rate, Decimal::ONE);
@@ -262,7 +259,7 @@ async fn get_rate_short_circuits_the_same_currency() {
 async fn get_rate_short_circuits_a_case_difference() {
     // The cache key and the FX symbology both uppercase, so a case difference is the
     // same currency. Compared raw, "eur" -> "EUR" asked the provider for EUREUR=X.
-    let pool = pool_with_prices().await;
+    let (pool, _) = db_with_user("get_rate_short_circuits_a_case_difference").await;
     let svc = offline_pricing_service();
     let got = svc.get_rate("eur", "EUR", ts("2020-01-01"), &pool).await.unwrap();
     assert_eq!(got.rate, Decimal::ONE);
@@ -278,7 +275,7 @@ async fn get_price_answers_from_the_database_without_the_provider() {
     // performance_resolves_a_weekend_from_the_prior_weekday_close in
     // tests/analytics_test.rs and by the freshness tests in the service's own unit
     // tests.
-    let pool = pool_with_prices().await;
+    let (pool, _) = db_with_user("get_price_answers_from_the_database_without_the_provider").await;
     let today = chrono::Utc::now().date_naive();
     seed_pair(&pool, "SEEDED", &[(today.format("%Y-%m-%d").to_string().as_str(), "42.0")]).await;
     let svc = offline_pricing_service();

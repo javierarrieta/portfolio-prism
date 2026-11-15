@@ -1,5 +1,8 @@
 // Headless browser smoke for the printable statement. Same harness as
-// sell-pnl.smoke.mjs: a real browser, the real Rocket API, a real SQLite file.
+// sell-pnl.smoke.mjs: a real browser, the real Rocket API, a real Postgres database.
+// Everything sell-pnl.smoke.mjs's header says about where that database comes from --
+// the shared dev `prism` when run.sh has no DATABASE_URL, one scratch database per step
+// in CI, additive rather than isolated -- applies here too.
 // This is the only layer that sees real print CSS -- jsdom does not apply
 // @media print. The `e2e-smoke` job in .github/workflows/ci.yml runs it on every
 // push and pull request.
