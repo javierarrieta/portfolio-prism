@@ -79,13 +79,48 @@ From root:
 
 - **Full gate list and the OIDC walkthrough**: `docs/auth-testing.md`. It is the
   entry point for verifying the auth work, including the two things CI cannot check
-  (a real login, and whether the provider ends its own session on logout).
-- **Backend gates**: `cargo test`, `bash scripts/check_access_gate.sh`,
-  `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`,
-  `cargo clippy --all-targets`, `cargo build --release` — all from `backend_rust/`.
+  (a real login, and whether the provider ends its own session on logout). Its §0
+  ("the whole gate set") predates the Postgres switch and lists a subset — no migrate,
+  no prepare check, no `check_migrations.sh`, no `check_sqlx_cache.sh` — and **§0 is not
+  runnable as written**: its headline is `cd backend_rust; and cargo test` with no
+  `DATABASE_URL`, which panics on the `expect` in `src/test_db.rs` ("DATABASE_URL must be
+  set for tests; `bash scripts/dev-db.sh` prints one"), and its "Backend: 460 tests" is
+  now 511. So the enforced, runnable list is the **Backend gates** bullet below; rewriting
+  §0 belongs with Task 10's documentation pass.
+- **Backend gates**, in the order CI enforces them. `build-and-test` runs every one but
+  the last; `cargo build --release` is the `release-build` job:
+  `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check -- --all-targets`,
+  `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`,
+  `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`,
+  `bash scripts/check_sqlx_cache.sh`, `cargo clippy --all-targets`,
+  `cargo build --release` — all from `backend_rust/`.
+  **Five of the ten need `DATABASE_URL`** — migrate, prepare, `cargo test` (which creates
+  one real database per test, `src/test_db.rs`), `check_migrations.sh` and
+  `check_sqlx_cache.sh`. `scripts/dev-db.sh` prints the URL to export. The three static
+  gates do not read it, and neither do the two compiles: with no `DATABASE_URL` a
+  `sqlx::query!` macro resolves from the committed `.sqlx/` prepare cache, which is also
+  how `backend_rust/Dockerfile` builds with no database in reach.
+  `check_migrations.sh` inspects a **database**, not `migrations/` — it passes just as
+  happily against a stale schema — so it means something only after `sqlx migrate run` on
+  a database nobody has touched since. In CI that is the service's own `prism`, empty
+  until the migrate step. Until Task 9 landed, `check_migrations.sh` and
+  `check_sqlx_cache.sh` ran in no job at all: they existed, they had proved they can
+  fail, and nobody was watching. Both now fail rather than skip when their tool is
+  missing (`check_sqlx_cache.sh` refuses if `sqlx` or `cargo-sqlx` is not on PATH).
   Each gate script has its own test (`tests/access_gate_test.rs`,
   `tests/backup_portability_test.rs`) that runs the real script against a throwaway
   tree; a gate is only as good as the mutation that proves it can fail.
+  **Scope of the compile-time checking**: `src/` is checked against the schema at compile
+  time; **`tests/` is not** — roughly 124 runtime `sqlx::query`/`query_as` call sites
+  across 23 files still go to the server unprepared, so a wrong column in a test query
+  is a run-time failure, not a compile error. Do not read "compile-time checked queries"
+  as universal coverage.
+- **Image build compiles from the prepare cache**: `backend_rust/Dockerfile` copies
+  `.sqlx/` and sets `SQLX_OFFLINE=true` **in the builder stage only**, so `docker build`
+  never reaches a database. That is only safe while `check_sqlx_cache.sh` runs in CI;
+  unwire that gate and the image ships a binary built against a snapshot nobody checks.
+  `migrations/` must stay in the build context too — `sqlx::migrate!` embeds it at
+  compile time.
 - **Provider smoke (no browser)**: `bash scripts/auth_smoke.sh` from `backend_rust/`,
   with `DATABASE_URL` (Postgres — `scripts/dev-db.sh` prints one; a `sqlite:` URL is
   refused) plus `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI`

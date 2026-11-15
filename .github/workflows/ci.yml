@@ -9,20 +9,197 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    # Observed 1-2 min on main. A cap is not here to police slow builds; it is here
-    # because an uncapped job that stalls produces no log and reads as still running
-    # for six hours. Same reasoning as the release-workflow caps.
-    timeout-minutes: 20
+    # Observed 1-2 min on main before the engine switch. A cap is not here to police slow
+    # builds; it is here because an uncapped job that stalls produces no log and reads as
+    # still running for six hours. Same reasoning as the release-workflow caps.
+    #
+    # Raised from 20 min when the database gates landed. The job now also migrates, runs
+    # `cargo sqlx prepare --check` twice (once directly, once inside the cache gate), and
+    # on a cache miss builds sqlx-cli from source — a second crate, several minutes, see
+    # the cache step. A cap that the job routinely hits is worse than no cap: it reads as
+    # a red build rather than as a job that never finished.
+    timeout-minutes: 30
+    # Postgres-only, and now every database-touching step in this job needs it: `cargo
+    # test` is not a mock — `src/test_db.rs` creates and migrates one real database per
+    # test and panics without DATABASE_URL — `check_migrations.sh` inspects a migrated
+    # database, and `check_sqlx_cache.sh` re-describes every cached query against a live
+    # schema. A job that could reach green without this service is a job whose gates
+    # check nothing, which is the exact failure this workflow was rewired to close.
+    services:
+      postgres:
+        # Same major as production (CloudNativePG ghcr.io/cloudnative-pg/postgresql:18.6).
+        # The local harness runs 18.7 via nix-shell; patch drift is accepted and
+        # documented in the spec, §9.1. Same image, port and DSN as `e2e-smoke`, so the
+        # two jobs cannot drift into testing different servers.
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: prism }
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Gate tooling (psql and sha384sum)
+        # `scripts/check_migrations.sh` hard-requires `psql` and `sha384sum` and refuses
+        # to run without them. That is the right behaviour for a gate, but it is also the
+        # only thing that would notice a missing binary, and this job is the gate's only
+        # use in CI — no earlier green run proves either binary is on `ubuntu-latest`.
+        # So the job does not trust the runner image: it installs the one that is not
+        # coreutils, then checks both. `sha384sum` is coreutils and is expected to be
+        # present; it is checked anyway because "the gate cannot run" must not be
+        # discovered by its absence. Placed here, before anything expensive: the migrate,
+        # compile and test steps that follow cost minutes, and a gate that cannot run
+        # should be discovered before them rather than after.
+        #
+        # The distro client is a major or two behind the `postgres:18` service, which is
+        # fine: the gate reads `information_schema`, `pg_attribute`, `pg_index`,
+        # `pg_get_constraintdef` and `pg_get_expr`, none of which changed, and it passes
+        # `-w` so a password prompt cannot hang a non-tty job.
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          command -v psql      >/dev/null || { echo "runner has no psql and apt-get did not provide one"; exit 1; }
+          command -v sha384sum >/dev/null || { echo "runner has no sha384sum (GNU coreutils)"; exit 1; }
+          psql --version
+          # `sed -n 1p`, not `head -1`: steps run under `bash -eo pipefail`, and `head -1`
+          # closes the pipe early, so the version print would kill the job with SIGPIPE 141
+          # on an otherwise healthy runner.
+          sha384sum --version | sed -n 1p
+
+      - name: Cache sqlx-cli
+        # `cargo install sqlx-cli` is a cold build of a second crate: several minutes on
+        # every run, for a binary that only changes when the pin below changes. Cached on
+        # the two binaries it installs rather than on all of ~/.cargo/bin, because that
+        # directory also holds the rustup shims (cargo, rustc, clippy-driver) and
+        # restoring a cached copy of it over a freshly installed toolchain would shadow
+        # the toolchain this job is supposed to build with.
+        #
+        # The key names the version because the install pins it. sqlx-cli 0.9.0 is what
+        # every gate transcript on this branch was produced with — `--no-dotenv`,
+        # `--source`, and the `prepare --check` output that `scripts/check_sqlx_cache.sh`
+        # quotes in its header are 0.9 behaviour. An unpinned install would let a new
+        # release land in CI under a cache key still claiming 0.9.0, and version drift
+        # between the runner and the local harness is the thing that makes a gate fail
+        # here and pass there. Bump the pin and the key together. The key also carries
+        # `runner.arch`: this repo builds on `ubuntu-24.04-arm` as well as amd64, and a
+        # key without the architecture would let an amd64 `sqlx` be restored onto an ARM
+        # runner and fail at exec time rather than at build time.
+        id: cache-sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          key: ${{ runner.os }}-${{ runner.arch }}-sqlx-cli-0.9.0
+
+      - name: Install sqlx-cli
+        if: steps.cache-sqlx-cli.outputs.cache-hit != 'true'
+        # `--no-default-features --features postgres`: the mysql and sqlite drivers are
+        # not wanted, and the sqlite one is the slowest. `--locked` takes sqlx-cli's own
+        # Cargo.lock, so a cached binary and a freshly built one are the same binary.
+        #
+        # The toolchain floor is stated rather than inherited from whatever `stable` the
+        # runner happens to ship: sqlx-cli 0.9.0 declares `rust-version = "1.94.0"` in its
+        # own Cargo.toml, and `cargo install` refuses a package whose `rust-version` the
+        # toolchain does not satisfy. That floor is *above* the project's own pin —
+        # `backend_rust/Dockerfile` builds on `rust:1.92-slim` — so "the project builds on
+        # 1.92" and "sqlx-cli installs on 1.92" are different claims and the second is
+        # false. They can differ without breaking anything only because the image build
+        # never installs sqlx-cli: it compiles from the committed `.sqlx/`. Checked here
+        # so a runner behind the floor says which one it is on instead of printing cargo's
+        # resolution error three minutes into a cold install.
+        run: |
+          rustc --version
+          floor=1.94.0
+          have=$(rustc -V | sed 's/^rustc //; s/\([0-9][0-9.]*\).*/\1/')
+          if [ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" != "$floor" ]; then
+            echo "sqlx-cli 0.9.0 needs rustc >= ${floor}; this runner has ${have}"
+            echo "either update the toolchain step or pin sqlx-cli to a version this toolchain can build"
+            exit 1
+          fi
+          cargo install sqlx-cli --no-default-features --features postgres --locked --version 0.9.0
+
+      - name: Migrate
+        # The service's `prism` database arrives empty. Everything after this point —
+        # `prepare --check`, `cargo test`, `check_migrations.sh` — is only meaningful
+        # against the schema at head. `--no-dotenv` so a stray `.env` cannot point the
+        # migration at somebody's local cluster instead of the service.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: sqlx migrate run --no-dotenv
+        working-directory: backend_rust
+
+      - name: Prepare cache is current
+        # Before build, not after: a stale cache compiles and lies. `cargo build` would
+        # happily compile the `sqlx::query!` macros against `.sqlx/` as it was left, so
+        # the only thing that notices a migration with no regenerated cache is this step
+        # and the gate that re-runs it below.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: cargo sqlx prepare --check -- --all-targets
+        working-directory: backend_rust
+
       - name: Run Tests
+        # `src/test_db.rs` creates one Postgres database per test off this URL, so the
+        # role needs `createdb`; the service's `postgres` role is a superuser. The URL
+        # is per-step rather than job-level on purpose: the two `--print-*` steps below
+        # must keep working with no database in reach — that is what their early exit is
+        # for — and a job-level URL would quietly make them depend on the service.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
         run: |
           cd backend_rust
           cargo test
+
+      - name: Access-control gate
+        # Static rules over the handler surface. Prints what it inspected, so a
+        # gate that silently matched nothing fails instead of passing.
+        run: bash backend_rust/scripts/check_access_gate.sh
+
+      - name: Pricing-seam gate
+        # Static rule: no test may construct a pricing service pointed at the live
+        # provider. The suite used to make 21 outbound calls per run and still passed
+        # — the failure mode a green check cannot see. The script documents why the
+        # rule is static rather than a grep over test output.
+        run: bash backend_rust/scripts/check_pricing_seam.sh
+
+      - name: Backup module stays engine-portable
+        # Static rules over `src/backup/`, in the style of the access gate above.
+        # This is what the engine-selection spec leans on: it is the reason that
+        # spec's share of the work is a mechanical change to this module rather
+        # than a rewrite. The script prints what it inspected, and
+        # tests/backup_portability_test.rs runs it against throwaway trees that
+        # must fail, so the gate cannot rot into decoration.
+        run: bash backend_rust/scripts/check_backup_portability.sh
+
+      - name: Migration schema gate
+        # One of the two gates that existed and ran nowhere: ci.yml ran three gate
+        # scripts and this was not one of them, so a migration that changed a column
+        # type reached main green. It inspects a *database*, not `migrations/`, which is
+        # why it sits after the Migrate step and points at `prism` — the service's own
+        # database, empty until that step and written to by nothing since (`cargo test`
+        # makes its own `prism_t_*` databases). Against a stale schema the script passes
+        # vacuously; its ledger check — one successful `_sqlx_migrations` row per file,
+        # each stored sha384 matching the file on disk — is what ties this database to
+        # these migrations. It needs `psql` and `sha384sum` and FAILS if either is
+        # missing, so a runner without them is red rather than unenforced.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: bash backend_rust/scripts/check_migrations.sh
+
+      - name: Prepare-cache freshness gate
+        # The other gate that ran nowhere. It re-runs migrate + `prepare --check` itself,
+        # in that order and on purpose (its header explains why the order is
+        # load-bearing), so it overlaps the two steps above: those fail fast and name the
+        # drifted query, this one is the gate `AGENTS.md` points at and the one that
+        # prints the macro-exempt residue.
+        #
+        # No `continue-on-error`, no `|| true`, and no `if: <tool exists>`: the script
+        # refuses outright when `sqlx` or `cargo-sqlx` is absent precisely so that a gate
+        # cannot skip its way to green, and that exit code is the whole point of the step.
+        env: { DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism }
+        run: bash backend_rust/scripts/check_sqlx_cache.sh
 
       - name: Clippy
         # `AGENTS.md` ("Backend gates") and `docs/auth-testing.md` both list this as a
@@ -33,21 +210,14 @@ jobs:
         # warnings (deprecated `rocket::http::CookieBuilder::finish` in the auth tests,
         # dead_code in others) and silencing those is a change to the gate, not a step
         # to add here. What this step makes impossible is a clippy *error* reaching main.
+        #
+        # No DATABASE_URL, and that is a property worth keeping: with no URL the macros
+        # resolve from the committed `.sqlx/`, so this step also proves the cache is
+        # complete enough to build without a database — which is what the image build
+        # depends on. It sits after the gates to match the order `AGENTS.md` documents.
         run: |
           cd backend_rust
           cargo clippy --all-targets
-
-      - name: Pricing-seam gate
-        # Static rule: no test may construct a pricing service pointed at the live
-        # provider. The suite used to make 21 outbound calls per run and still passed
-        # — the failure mode a green check cannot see. The script documents why the
-        # rule is static rather than a grep over test output.
-        run: bash backend_rust/scripts/check_pricing_seam.sh
-
-      - name: Access-control gate
-        # Static rules over the handler surface. Prints what it inspected, so a
-        # gate that silently matched nothing fails instead of passing.
-        run: bash backend_rust/scripts/check_access_gate.sh
 
       - name: Generate and Validate OpenAPI Spec
         run: |
@@ -72,15 +242,6 @@ jobs:
           diff /tmp/current_backup_schema.json ../docs/backup-schema/v1.json \
             || (echo "Backup schema has changed! Regenerate docs/backup-schema/v1.json" && exit 1)
 
-      - name: Backup module stays engine-portable
-        # Static rules over `src/backup/`, in the style of the access gate above.
-        # This is what the engine-selection spec leans on: it is the reason that
-        # spec's share of the work is a mechanical change to this module rather
-        # than a rewrite. The script prints what it inspected, and
-        # tests/backup_portability_test.rs runs it against throwaway trees that
-        # must fail, so the gate cannot rot into decoration.
-        run: bash backend_rust/scripts/check_backup_portability.sh
-
   release-build:
     # Compiles the release binary with `AuthMode::Disabled` compiled out, and then
     # actually runs it to prove the runtime refusal. The refusal is behind
@@ -98,6 +259,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
+        # `SQLX_OFFLINE` makes explicit what this step was already doing by fall-through:
+        # with no `DATABASE_URL` the macros resolve from the committed `.sqlx/`, so this
+        # compile cannot detect a stale cache — it reads the cache, it does not check it.
+        # Schema truth is `build-and-test`'s job (migrate, then `prepare --check`, then the
+        # cache gate), and this job's contribution is that the cache is complete enough to
+        # build a release binary with no database in reach, which is the same claim the
+        # image build makes. Saying the flag out loud also means a future step that adds a
+        # job-level `DATABASE_URL` cannot silently turn this into a live-describe build.
+        env: { SQLX_OFFLINE: 'true' }
         run: cargo build --release
         working-directory: backend_rust
 
@@ -216,8 +386,8 @@ jobs:
     # `run.sh` boots the real backend, and the backend is Postgres-only: it refuses to start
     # without DATABASE_URL and refuses a `sqlite:` DSN outright. Before this service existed the
     # job fell through to `run.sh`'s "no DATABASE_URL" branch, demanded `initdb` on PATH, and
-    # died — the same way `build-and-test` would once Task 9 gives it the service. Same image,
-    # same port and same DSN shape as there, so the two jobs cannot drift into testing
+    # died — the same way `build-and-test` did until Task 9 gave that job its own service. Same
+    # image, same port and same DSN shape as there, so the two jobs cannot drift into testing
     # different servers.
     services:
       postgres:
@@ -279,9 +449,24 @@ jobs:
           # `prism` is the database the service creates; the second step uses the image's own
           # empty `postgres` database for the same purpose. Both arrive unmigrated and the
           # backend runs `sqlx::migrate!` against whichever it is pointed at, so there is no
-          # migrate step and no `createdb` — the runner is not promised a psql, and Task 9's
-          # proper per-run databases should not depend on this job guessing one.
+          # migrate step and no `createdb` — the runner is not promised a psql, and a job that
+          # guesses a database name is not the same thing as a job that owns one.
+          #
+          # `SQLX_OFFLINE` is load-bearing, not an optimisation. `run.sh` compiles the crate
+          # *after* exporting DATABASE_URL, and the database it points at is still empty: a
+          # `sqlx::query!` macro describing itself against an unmigrated schema fails with
+          # `error: error returned from database: relation "split_sync" does not exist`, which
+          # is a build failure dressed up as a smoke failure. With the flag the compile reads
+          # the committed `.sqlx/` cache — the same source of truth the image build uses, and
+          # for the same reason — and that cache's freshness is enforced by the
+          # `Prepare-cache freshness gate` in `build-and-test`, on the same commit. The *run*
+          # still needs a real Postgres: the app refuses to start without one and migrates
+          # whichever database it is given. And because the compile reads the cache, this job
+          # re-run on its own proves nothing about the schema — it describes nothing, it looks
+          # nothing up; the cache is only trustworthy because `build-and-test` validated it on
+          # the same commit. A green `e2e-smoke` alone is not evidence about the database.
           DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/prism
+          SQLX_OFFLINE: 'true'
           SMOKE_SHOT: /tmp/e2e-sell-pnl.png
           SMOKE_LOG_DIR: /tmp/e2e-logs/sell-pnl
         run: npm run e2e:sell-pnl
@@ -289,7 +474,11 @@ jobs:
       - name: Printable statement smoke
         working-directory: frontend
         env:
+          # Second empty database, for the reason above. `SQLX_OFFLINE` is repeated rather
+          # than inherited: the second `cargo run` is a no-op compile only because the first
+          # one succeeded, and a step must not depend on that for the right reason.
           DATABASE_URL: postgres://postgres:ci@127.0.0.1:55432/postgres
+          SQLX_OFFLINE: 'true'
           SMOKE_SHOT: /tmp/e2e-statement.png
           SMOKE_LOG_DIR: /tmp/e2e-logs/statement
         run: npm run e2e:statement
