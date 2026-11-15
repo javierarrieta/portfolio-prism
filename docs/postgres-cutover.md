@@ -12,14 +12,41 @@ easy return, and step 2 contains the one thing this procedure knowingly loses.
 
 ## Known limitations — read these before you trust anything below
 
-**The orphan audit has never been run against a production SQLite file.** Every run of
-`backend_rust/scripts/pre_cutover_audit.sh` that anyone has ever done was against a synthetic
-file built in a development workspace — a file with the right tables and columns, populated
-by hand to prove the exit codes. What that proves is the script's contract; what it does not
-prove is that the script meets the real `portfolio.db`, with its actual history of partial
-writes, its Python-era rows, and whatever the deployed schema drifted into.
+**The orphan audit has been run against the real production file, and it exited 2.** The earlier
+limitation — that no run had ever touched a real `portfolio.db` — was retired on 2026-11-15, and
+what the real run produced was not a clean `0`. Against a `kubectl cp` copy of the live file
+(45,056 bytes) it printed:
 
-*What was actually executed.* One synthetic file (`clean.db`, 28,672 bytes: one user, one
+```
+orphan transactions         : 0
+orphan assets               : 0
+portfolios, owner missing   : 0
+AUDIT ERROR: query failed against /tmp/pp.db: no such column: s.asset_id
+```
+
+Exit **2**. The three checks that ran found nothing; the fourth — `split_sync` rows whose asset is
+gone — never executed, because the deployed schema has no column by that name. Production was
+running `v0.0.6-M5`, whose `split_sync` is `symbol TEXT PRIMARY KEY, last_synced_at DATE`. The
+per-asset rekey that added `split_sync.asset_id` arrived in #57, which is **not** an ancestor of
+`v0.0.6-M5`. The script assumes a schema newer than the one a live M5 deployment writes.
+
+*What that exit code means.* Exit 2 is “the audit could not run”, not “the data is bad”. Do not read
+it as a clean result and do not repair it by editing data. If your source file is M5-era, look at the
+shape and run the missing check by hand:
+
+```
+sqlite3 /path/to/dst.db '.schema split_sync'
+# symbol-keyed, i.e. no asset_id — the equivalent orphan check for that shape:
+sqlite3 /path/to/dst.db "select s.symbol from split_sync s
+  left join assets a on a.symbol = s.symbol where a.symbol is null;"
+```
+
+*What retires this:* a script that branches on `PRAGMA table_info(split_sync)` and checks the shape
+it actually finds, or a source file already on the post-#57 schema. The script has **not** been
+changed, so this limitation stands for any future cutover from an M5-era file.
+
+*The earlier synthetic rehearsal, for the record.* One synthetic file (`clean.db`, 28,672 bytes:
+one user, one
 portfolio, one asset, two transactions, no `historical_prices`, no `split_sync`) and three
 mutations of it, each run for real. The clean file printed all four orphan counts at `0`,
 `portfolios, no owner : 0`, the six-row row-count block, then `No orphans. Safe to export.`
@@ -27,14 +54,8 @@ and exited **0**. The mutated file (one transaction pointing at asset 99, one as
 `GONE` pointing at portfolio 99) printed `orphan transactions : 1` with the offending row
 (`transaction 3 points at asset 99`) and `orphan assets : 1` with `asset 9 (GONE) points at
 portfolio 99`, then the stop text, and exited **1**. A text file that is not a database, and
-a path that does not exist, each exited **2** naming what was missing. Those are the three
-exit codes; the file they came from was invented, which is the limitation.
-
-*What retires this:* running `bash backend_rust/scripts/pre_cutover_audit.sh /path/to/dst.db`
-against **the consistent copy of the real file** step 1 describes, before the cutover window
-opens, and reading every line of its output rather than only its exit code. Do that once and
-this limitation goes away. Until it is done, treat a clean `0` from the audit as weaker
-evidence than it looks.
+a path that does not exist, each exited **2** naming what was missing. Those are the three exit
+codes — the contract, proven on a file the contract was invented for.
 
 **`docker-compose.auth-test.yml` has never been run by anyone.** The workspace it was written
 in has no container engine, so the file is unexecuted configuration, and the Postgres cutover
@@ -46,6 +67,28 @@ verified, including whether it starts at all.
 anyone. Until then the OIDC harness that *is* exercised is `backend_rust/scripts/auth_smoke.sh`
 against a local backend, and the browser half of `docs/walkthrough.md` §1–§2 has to be done
 against a real deployment.
+
+## Execution record — 2026-11-15, `portfolio.titan.arrieta.eu`
+
+This runbook has now been executed for real. What it found was that there was nothing to migrate.
+
+| step | what actually happened |
+| --- | --- |
+| 1 audit | Run against a `kubectl cp` copy of the live `portfolio.db`. **Exited 2** on a schema assumption — see the limitation above. The three checks that ran were clean. |
+| 2, 2b export, preview | **Not exercised.** The source was empty: `portfolios 0, assets 0, transactions 0, historical_prices 0, split_sync 0, users 2`. |
+| 3 stop writes | **Not exercised.** With nothing to export there was no window to freeze. |
+| 4 deploy | **Executed, by GitOps rather than `kubectl`.** CNPG `Database` + `DatabaseRole` in k8s-titan #296; image roll and inline `DATABASE_URL` removal in #297. The deployment is `Recreate` with one replica, so the SQLite pod went away before the Postgres pod started; unavailability was the pod swap, about three minutes including the Flux sync. |
+| 5 restore | **Not exercised** — no bundles existed. |
+| 6 verify counts | **Not exercised as a comparison.** What was checked instead: the backend reached `Rocket has launched`, which `main.rs:65,74` permits only after a successful `db::connect` **and** a successful `sqlx::migrate!`, and `/api/portfolios/` answers 401 rather than 500. |
+| 7 keep the PVC | **Done.** The PVC, its mount and its restic schedule are untouched; reverting the k8s-titan flip restores M5 with the file it never lost. |
+
+The two users in the source were the `local`/`bootstrap` placeholder and one Authentik identity.
+Neither was carried over: `ensure_bootstrap_owner` inserts the placeholder at startup and the
+identity reappears on first login. That is the entire data path this cutover needed.
+
+**The generalization to avoid:** an empty source made steps 2, 2b, 3, 5 and 6 unnecessary here. It
+does not make them unnecessary for a deployment that has data. Those steps are still unrehearsed
+against a populated file.
 
 ## What you need
 
@@ -479,18 +522,22 @@ editing one file at a time.
    the live object says so, and it is worth knowing which you are about to cause: under
    `Recreate` a badly ordered apply is an outage, and under `RollingUpdate` it is a
    crash-looping new pod while the old SQLite pod keeps serving an image that can no longer
-   reach the file it expects. Check, do not assume:
+   reach the file it expects. Check, do not assume — and note the live namespace and deployment
+   name are `apps/portfolio-prism`, not the `investment-portfolio-manager/app` this file used to
+   name from the stale manifests:
 
    ```bash
-   kubectl -n investment-portfolio-manager get deploy app \
-     -o jsonpath='{.spec.strategy.type}'
+   kubectl -n apps get deploy portfolio-prism -o jsonpath='{.spec.strategy.type}'
    echo
    ```
 
-   It prints `Recreate`, or nothing at all (some kubectl versions report the field as "not
-   found") when `spec.strategy` is absent — and absent means `RollingUpdate`. Whatever it
-   prints, the ordering above is still the correct one; what changes is whether a mistake
-   costs downtime immediately or costs a silently broken rollout.
+   **Measured on the live cluster, 2026-11-15: it prints `Recreate`.** The hazard is therefore the
+   immediate-outage kind, and the ordering above is not optional. Note that this is a fact about the
+   live object, not about this repository: `k8s/app-deployment.yaml` still declares no
+   `spec.strategy`, so re-check after any apply that rebuilds the deployment from a manifest rather
+   than editing the live object. If the field is ever absent the answer is `RollingUpdate`, and a
+   badly ordered apply becomes a crash-looping new pod while the old SQLite pod keeps serving an
+   image that can no longer reach the file it expects.
 3. **`docker-compose.auth-test.yml` — changed here, because nothing runs it in anger.** It
    is a local harness, so its `DATABASE_URL` now comes from `.auth-test.env` and it fails
    with a named error rather than starting a backend that dies on its own configuration
@@ -503,10 +550,9 @@ editing one file at a time.
 
 - The audit script was run for real, with all three exit codes exercised; the transcript is
   in *Known limitations* above, in this file, so a clone can read it. The file it was run
-  against was synthetic, which is the point of that limitation: **no `portfolio.db` exists in
-  this workspace**, so the audit has never seen a real production file. Running it against
-  the consistent copy step 1 describes is a job for the day, and it is not something this
-  document can pre-answer.
+  against was synthetic. That gap has since closed, and the result was not what the rehearsal
+  predicted: run against a copy of the live production file, the audit **exited 2** because the
+  deployed schema is older than the one it queries. See *Known limitations* above.
 - Steps 2, 2b, 5 and 6 were executed end to end against a local Postgres cluster (export →
   preview → restore → price restore → metrics comparison), with `AUTH_MODE=disabled` in
   place of a real provider login. The provider half of `docs/walkthrough.md` §1–§2 is not
@@ -515,9 +561,10 @@ editing one file at a time.
   against a bundle carrying a Python-era value the Rust decimal parser rejects. No such
   bundle exists in this workspace, which is exactly why step 2b says to run it against the
   real files rather than to trust that they are fine.
-- Steps 1, 3 and 4 have never been executed at all. Step 1 for the reason above; step 3 is a
-  `kubectl scale` against a deployment that does not exist in this workspace; step 4 is the
-  deferred half — there is no cluster here and the CNPG `Database` and `DatabaseRole` do not
-  exist yet. That is why this runbook ends with a pointer instead of a `kubectl` command.
-- Nothing here was executed against a real cluster, a real provider, or a real production
-  file. Those three gaps are the whole distance between this list and a rehearsal.
+- Step 1 has now been executed against a real file (exit 2, above) and step 4 has been executed
+  against a real cluster via GitOps. **Step 3 has never been executed at all** — it is a
+  `kubectl scale` against a deployment no workspace here has ever stopped.
+- What remains unproven is the part with data in it: steps 2, 2b, 5 and 6 against a **populated**
+  production file, and a real provider login at the end of it. The local rehearsal covered the
+  mechanics of those steps against a database someone had filled in a development workspace; the
+  production run skipped them because the live file held no portfolios at all.
