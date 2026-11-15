@@ -5,7 +5,6 @@ FROM rust:1.92-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
-    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -60,8 +59,11 @@ RUN cargo build --release -j $(nproc) --bin backend_rust
 # --- Stage 2: Runtime ---
 FROM debian:bookworm-slim AS runtime
 
+# `libsqlite3-0` used to be installed here for the same reason `libsqlite3-dev` was in the
+# builder: the engine was SQLite. It is gone because nothing links against it any more —
+# `ldd target/release/backend_rust | grep -i sqlite` prints nothing — and a runtime library
+# with no consumer is attack surface and image bytes for nothing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -69,20 +71,19 @@ WORKDIR /app
 
 COPY --from=builder /build/target/release/backend_rust /app/backend_rust
 
-# Expose volume for persistent data. PRE-CUTOVER: the app no longer writes to a file —
-# it connects to a Postgres server — so this volume is unused by the current image.
-VOLUME /app/data
-
-# PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE. This default is a SQLite DSN and the
-# backend refuses to start on one, so `docker run` without an explicit -e DATABASE_URL
-# exits immediately. Left as-is on purpose: the real URL carries a host and credentials
-# and belongs in the deployment's Secret, not baked into an image layer. Overriding it
-# (`docker run -e DATABASE_URL=postgres://...`) is the only correct way to use this image
-# until the cutover in Task 10 removes these two lines.
-ENV DATABASE_URL=sqlite:///app/data/portfolio.db?mode=rwc
-
+# No DATABASE_URL here, on purpose, and this is the line a pre-cutover image got wrong. The
+# backend requires the variable and has no default (`main.rs`), so a baked-in value is not a
+# convenience: it is a pod that starts with a URL nobody configured. The URL carries a host
+# and credentials and belongs in the deployment's Secret, so the only correct way to run
+# this image is to supply it:
+#
+#   docker run -e DATABASE_URL=postgres://… <image>
+#
+# With it missing the container exits at once, on a line beginning `startup refused:
+# DATABASE_URL is required. Postgres-only: there is no SQLite fallback.` — which is the
+# failure you want: a cutover that was not configured fails loudly instead of serving an
+# empty database.
 RUN useradd -r -s /bin/false app
-RUN mkdir -p /app/data && chown app:app /app/data
 USER app
 
 EXPOSE 8000

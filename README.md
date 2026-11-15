@@ -127,7 +127,7 @@ Single Pod
   │   └── proxies /api/* and /api-docs → 127.0.0.1:8000
   │
   └── backend (Rocket, :8000)
-      └── DATABASE_URL → Postgres (manifest still names a SQLite file; see Storage)
+      └── DATABASE_URL → Postgres (the ConfigMap still names a SQLite file; see Storage)
 ```
 
 Both containers run in the same pod and communicate over `127.0.0.1`. The frontend nginx proxies all API requests (`/api/*`, `/api-docs/*`) to the backend. The browser only talks to the frontend — no cross-service calls are needed.
@@ -147,10 +147,14 @@ no default, and the process refuses to start without it. In development
 prints the URL to export; `./start.sh` does that for you if the environment does not
 already set one. Schema comes from `backend_rust/migrations/` at startup.
 
-The `k8s/` manifests and `backend_rust/Dockerfile` still ship a `sqlite:` DSN and are
-**pre-cutover** — applying them as-is produces a pod that exits on its configuration
-check. Replacing them with a Postgres service and a Secret is tracked in Task 10; until
-then the persistent volume below is unused by the current image.
+Only `k8s/configmap.yaml` still ships a `sqlite:` DSN, and it does so on purpose: a running
+deployment consumes that manifest, so changing it is an ordered cutover step — database and
+Secret first, image last — rather than a commit. See `docs/postgres-cutover.md` (*What
+changed in the manifests, and in which order*) and
+`docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`. `backend_rust/Dockerfile`
+no longer ships one: it has no `DATABASE_URL`, no `libsqlite3`, and no `/app/data` volume,
+so a container started without an injected URL exits immediately and names the variable.
+Until the cutover the persistent volume below is unused by the current image.
 
 > **The manifests in `k8s/` are stale and do not describe the running deployment.** The
 > StorageClass is *named* `nfs-client`, but its provisioner is
@@ -173,8 +177,8 @@ Backend environment variables are configured in the ConfigMap:
 
 The backend is stateless now that it talks to a Postgres server, so replicas are a
 matter of pointing every pod at the same `DATABASE_URL`. What still holds it to one
-replica is the deployment: `k8s/` ships a file-backed volume and a `sqlite:` DSN
-(pre-cutover, see *Storage*), and `Recreate` rollout strategy.
+replica is the deployment: `k8s/` ships a file-backed volume and a `sqlite:` DSN in its
+ConfigMap (see *Storage* and `docs/postgres-cutover.md`), and `Recreate` rollout strategy.
 
 > **Do not follow the previous advice in this section**, which suggested "SQLite with WAL
 > mode and NFS". SQLite's own WAL documentation rules that out: *"All processes using a
@@ -200,7 +204,7 @@ The default deployment runs a single pod. For higher availability, increase repl
 kubectl scale deployment app -n investment-portfolio-manager --replicas=3
 ```
 
-Note: the storage engine is no longer the limit — the backend already talks to a Postgres server over a network, so replicas only need the same `DATABASE_URL`. What still needs doing before `--replicas=3` is meaningful is the cutover itself (Task 10): a Postgres service or managed instance in the cluster, the `sqlite:` DSN in `k8s/configmap.yaml` replaced, and the file-backed `pv.yaml`/`pvc.yaml` retired. The nginx proxy pass in the frontend container already makes horizontal scaling straightforward.
+Note: the storage engine is no longer the limit — the backend already talks to a Postgres server over a network, so replicas only need the same `DATABASE_URL`. What still needs doing before `--replicas=3` is meaningful is the cutover itself: a Postgres service or managed instance in the cluster, the `sqlite:` DSN in `k8s/configmap.yaml` replaced by the Secret's `DATABASE_URL`, and the file-backed `pv.yaml`/`pvc.yaml` retired. That is `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`, and the data side is `docs/postgres-cutover.md`. The nginx proxy pass in the frontend container already makes horizontal scaling straightforward.
 
 ### Cleanup
 

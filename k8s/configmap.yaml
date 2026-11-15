@@ -4,11 +4,23 @@ metadata:
   name: backend-config
   namespace: investment-portfolio-manager
 data:
-  # PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE. The backend is Postgres-only now and
-  # refuses to start on a `sqlite:` DSN, so applying this manifest as-is produces a
-  # CrashLoopBackOff. The value is deliberately left alone: changing it is the deployment
-  # cutover (Task 10), which has to move this and the Secret's POSTGRES_* together with a
-  # real host, and a running cluster consumes this file. Do not "fix" it here.
+  # STILL WRONG FOR THE CURRENT IMAGE, AND STILL DELIBERATE. The backend is Postgres-only
+  # and refuses to start on a `sqlite:` DSN, so applying this manifest as-is produces a
+  # CrashLoopBackOff. The value is left alone on purpose: a running cluster consumes this
+  # file. Deleting this key now breaks the live SQLite deployment on the next apply (no
+  # DATABASE_URL at all); replacing it with a Postgres placeholder breaks it differently (a
+  # DSN the app refuses). Either edit is an outage caused by a commit rather than by the
+  # cutover, so the key is deleted **at cutover**, in the one apply that also has the real
+  # value in `backend-secrets` and rolls the Postgres image — and that apply only happens
+  # once the CNPG `Database`, `DatabaseRole` and Secret exist and are Ready. With `replicas:
+  # 1` and `Recreate` the old pod is gone before the new one exists, so any other order means
+  # no serving replica. The ordering is in `docs/postgres-cutover.md` ("What changed in the
+  # manifests, and in which order") and
+  # `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` §2. Note which side wins:
+  # the deployment's `envFrom` lists this ConfigMap and then the `backend-secrets` Secret,
+  # and a key in a later source overrides the earlier one — so today this value is what the
+  # pod gets, and the moment the Secret grows a `DATABASE_URL` key that one wins. Do not
+  # "fix" it here.
   DATABASE_URL: "sqlite:///app/data/portfolio.db?mode=rwc"
 
   # Authentication. `oidc` is the only value the release image accepts: the

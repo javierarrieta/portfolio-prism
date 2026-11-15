@@ -53,9 +53,13 @@ From root:
   `postgres://postgres@127.0.0.1:55432/prism`, the URL `backend_rust/scripts/dev-db.sh`
   prints; `start.sh` exports it if the environment does not already set one. Schema comes
   from `backend_rust/migrations/` via `sqlx::migrate!` at startup, not from any
-  create-if-not-exists code. There is no `backend/` directory. **`k8s/configmap.yaml`
-  still ships a `sqlite:` DSN and is wrong for this build** — swapping it is a cutover
-  step, tracked in Task 10, because a running deployment consumes that manifest.
+  create-if-not-exists code. There is no `backend/` directory. The cutover procedure is
+  `docs/postgres-cutover.md`. **`k8s/configmap.yaml` still ships a `sqlite:` DSN on
+  purpose** — a live deployment consumes that manifest, and changing it is an ordered
+  cutover step (database and Secret first, image last), not a commit; see the runbook and
+  `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`. The image itself no
+  longer ships one: `backend_rust/Dockerfile` has no `DATABASE_URL` and no SQLite runtime
+  dependency, so a container without an injected URL exits and names the variable.
 - **Metrics Engine**: `backend_rust/src/engines/stats_engine.rs` computes the daily value
   series, cumulative **TWR**, portfolio value and beta-adjusted exposure. Volatility,
   Sharpe Ratio and Portfolio Beta are **not** computed — the response carries them as the
@@ -79,14 +83,11 @@ From root:
 
 - **Full gate list and the OIDC walkthrough**: `docs/auth-testing.md`. It is the
   entry point for verifying the auth work, including the two things CI cannot check
-  (a real login, and whether the provider ends its own session on logout). Its §0
-  ("the whole gate set") predates the Postgres switch and lists a subset — no migrate,
-  no prepare check, no `check_migrations.sh`, no `check_sqlx_cache.sh` — and **§0 is not
-  runnable as written**: its headline is `cd backend_rust; and cargo test` with no
-  `DATABASE_URL`, which panics on the `expect` in `src/test_db.rs` ("DATABASE_URL must be
-  set for tests; `bash scripts/dev-db.sh` prints one"), and its "Backend: 460 tests" is
-  now 511. So the enforced, runnable list is the **Backend gates** bullet below; rewriting
-  §0 belongs with Task 10's documentation pass.
+  (a real login, and whether the provider ends its own session on logout). Its §0 is the
+  whole gate set in CI's order and it brings the database up first, because `cargo test`
+  creates one real database per test and **panics** without `DATABASE_URL` — there is no
+  file to fall back to and no in-memory mode. If §0 and the **Backend gates** bullet below
+  ever disagree, the bullet below is what CI enforces.
 - **Backend gates**, in the order CI enforces them. `build-and-test` runs every one but
   the last; `cargo build --release` is the `release-build` job:
   `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check -- --all-targets`,
@@ -129,4 +130,11 @@ From root:
   (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
 
 ## Roadmap / Current Focus
+- **Postgres cutover, the deferred half**: the application side is merged (engine, tests,
+  gates, runbook). The cluster side is
+  `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — a CNPG `Database`,
+  `DatabaseRole` and Secret in the `k8s-titan` repo, applied **in that order** before the
+  image rolls, because the build refuses to start without `DATABASE_URL` and `replicas: 1`
+  with `Recreate` turns a badly ordered apply into an outage. The data procedure an
+  operator follows on the day is `docs/postgres-cutover.md`.
 - **Multi-Currency Support**: Implementing asset currency tracking and exchange rate conversion for tax and stats (see `docs/implementation_plan.md`).

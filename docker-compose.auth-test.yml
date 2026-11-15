@@ -12,10 +12,11 @@
 # `ALLOWED_ORIGINS` is wrong.
 #
 # NO VALIDATION WAS POSSIBLE HERE
-# The workspace this was written in has no docker, so this file has never been run.
-# The backend and its smoke script are tested; this orchestration is not. If a build
-# fails, the Dockerfiles are the place to look first — they are unchanged by this
-# branch and are known to build in CI.
+# The workspace this was written in has no docker, so this file has never been run. That is
+# still true after the Postgres cutover touched it: the `DATABASE_URL` line below and the
+# removal of the `auth-test-db` volume are edits to a file nobody has executed. The backend
+# and its smoke script are tested; this orchestration is not. If a build fails, the
+# Dockerfiles are the place to look first.
 #
 # USAGE (see docs/auth-testing.md for the full walkthrough)
 #   cp docker-compose.auth-test.env.example .auth-test.env
@@ -47,18 +48,21 @@ services:
       # authentication, so a mismatch is a 403 on writes, not a 401.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
       ROCKET_SECRET_KEY: ${ROCKET_SECRET_KEY:?set ROCKET_SECRET_KEY in .auth-test.env}
-      # PRE-CUTOVER, AND WRONG FOR THE CURRENT IMAGE: the backend is Postgres-only and
-      # refuses a `sqlite:` DSN, so this compose file cannot bring the stack up until the
-      # cutover (Task 10) replaces it with a Postgres service. The OIDC harness is run
-      # today with `backend_rust/scripts/dev-db.sh` plus `scripts/auth_smoke.sh`, which
-      # take DATABASE_URL from the environment.
-      DATABASE_URL: sqlite:///data/portfolio.db?mode=rwc
+      # Postgres only, and required with no default: the backend refuses to start without
+      # it, so inventing a value here would be a lie about what this harness needs (the
+      # pre-cutover file shipped a `sqlite:` DSN, which the backend now rejects on sight).
+      # Put a reachable Postgres in .auth-test.env — the cluster
+      # `backend_rust/scripts/dev-db.sh` prints is the usual answer:
+      #   DATABASE_URL=postgres://postgres@127.0.0.1:55432/prism
+      # This file deliberately grows no database service of its own. See the note at the
+      # top: it has never been run, and an unvalidated service definition is worse than a
+      # named missing variable. `backend_rust/scripts/auth_smoke.sh` exercises the same
+      # backend with no orchestration at all.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .auth-test.env; Postgres - see backend_rust/scripts/dev-db.sh}
     ports:
       - "8000:8000"
       # Published here, not on the frontend, because they share a namespace.
       - "8080:80"
-    volumes:
-      - auth-test-db:/data
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/ >/dev/null || exit 1"]
       interval: 10s
@@ -72,6 +76,3 @@ services:
     depends_on:
       backend:
         condition: service_started
-
-volumes:
-  auth-test-db:

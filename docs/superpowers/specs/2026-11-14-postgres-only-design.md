@@ -219,7 +219,7 @@ Postgres enforces all of them always, so:
    `assets`/`transactions` than the first draft claimed, because those two were
    already enforced; it remains a live possibility for `owner_id`.
 
-   **Required before cutover:** run the orphan audit (§11 step 2) against the live
+   **Required before cutover:** run the orphan audit (§11 step 1) against the live
    database across all four relationships and record the counts. If any are
    non-zero, the cutover does not proceed until they are either repaired or
    explicitly accepted as loss, in writing, by the operator. This is the one place
@@ -518,10 +518,12 @@ for iteration speed.
 
 The infrastructure half is §14. This is what happens to the data.
 
-1. **Freeze writes.** Scale the SQLite deployment to zero, or put it in read-only
-   mode. The bundle is a point-in-time snapshot per portfolio, but two snapshots
-   taken at different moments are not one consistent backup.
-2. **Audit for orphans** against the live SQLite database, and record the numbers:
+The order is **audit → export → freeze → deploy → restore → verify**. It used to lead with
+the freeze, and that was wrong: the export is an HTTP route, so an application scaled to zero
+cannot serve it. Freeze before the restore, not before the export.
+
+1. **Audit for orphans** against the live SQLite database — the app is still serving, and the
+   audit is a read with a 5 s busy timeout for exactly that reason — and record the numbers:
    ```sql
    SELECT COUNT(*) FROM transactions t LEFT JOIN assets a ON a.id = t.asset_id
      WHERE a.id IS NULL;
@@ -531,14 +533,26 @@ The infrastructure half is §14. This is what happens to the data.
      WHERE p.owner_id IS NOT NULL AND u.id IS NULL;
    ```
    Any non-zero count is a stop condition (§5.1).
-3. **Export** a bundle covering every portfolio, with `include_prices=true`.
-   Store the file outside the cluster. It is the only copy that matters.
+2. **Export** a bundle covering every portfolio, with `include_prices=true`, while the app
+   still serves. Store the file outside the cluster. It is the only copy that matters.
+
+   Every read the export issues runs inside one transaction that writes nothing, so the
+   bundle is one snapshot and **a write that commits after that snapshot is taken is in no
+   bundle.** That is accepted, not overlooked: between the export's snapshot and step 3 there
+   is a window in which a user can save a trade that will not exist after the cutover, and
+   nothing downstream reports it. Export at low traffic and say out loud that the window
+   exists. If the window is not acceptable, export again after step 3 — a frozen source
+   exports a bundle that is exactly current, and that second bundle is the one to restore.
+3. **Stop writes.** Scale the SQLite deployment to zero, or put it in read-only mode. From
+   here the source cannot move, which is what makes step 6's comparison mean anything.
 4. **Deploy Postgres** (§14) and start the Postgres build against an empty
    database. `sqlx migrate run` creates the schema.
 5. **Restore** with `apply_prices=true` and `BACKUP_ALLOW_PRICE_RESTORE=1`, then
    unset the flag. Preview first, as the feature requires.
-6. **Verify counts** — row counts per table against the SQLite source, and the
-   app's own reports for one portfolio against the pre-cutover numbers.
+6. **Verify counts** — row counts per table against the bundle and against the numbers
+   recorded in step 1, and the app's own reports for one portfolio against the pre-cutover
+   numbers. The step 1 counts were taken before the export, so they are a lower bound, not
+   the target: a table that grew between step 1 and step 3 grew into the lost window.
 7. **Keep the SQLite PVC** until the Postgres instance has survived one backup
    cycle of its own.
 
@@ -564,7 +578,7 @@ All from `backend_rust/`, all must pass, all must be warning-free:
 
 | Risk | Likelihood | Consequence | Mitigation |
 | --- | --- | --- | --- |
-| Orphan rows silently dropped at cutover | Unknown — unmeasured today | Silent data loss | §11 step 2 is a stop condition with recorded numbers |
+| Orphan rows silently dropped at cutover | Unknown — unmeasured today | Silent data loss | §11 step 1 is a stop condition with recorded numbers |
 | `sqlx prepare` cache drifts from head | High over time | Compiles and lies | `--check` in CI, always after `migrate run` |
 | 143-site rewrite breaks a query the tests do not cover | Medium | Wrong numbers, not a crash | Step 3 is placeholder-only and reviewable as such; the macro conversion in step 4 is where the compiler starts paying |
 | Podman cannot run containers in this pod | **Confirmed, not a risk any more** | No local container engine; local harness is the nix cluster instead | §9.1 is the plan and is proven. The pod-level cause is outside this workspace (§9.2). CI is authoritative either way. |
