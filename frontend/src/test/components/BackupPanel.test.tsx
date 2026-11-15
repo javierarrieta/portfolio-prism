@@ -1116,3 +1116,52 @@ describe('restore card', () => {
 
 })
 
+
+
+describe('oversized bundle', () => {
+  // The bug these two guard: a 1,284,105-byte bundle was refused by the proxy in
+  // front of the API, which answered with an HTML page the panel could not read,
+  // while the API itself advertised an 8 MiB cap it never got to apply.
+
+  it('refuses a file over the advertised cap without sending it', async () => {
+    // A cap smaller than any real file, so the test does not have to build an 8 MiB
+    // string to be over it. The number is the server's own, not a constant here.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) return jsonResponse({ error: 'never reached' }, 413)
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    const before = fetchMock.mock.calls.length
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    // The whole point of refusing locally: the body never leaves the browser, so a
+    // gateway's unreadable answer is never what the user is shown.
+    const sent = fetchMock.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(sent.some((u) => u.includes('/backup/preview'))).toBe(false)
+  })
+
+  it('names the limit when a gateway answers 413 with no readable reason', async () => {
+    // Capabilities never loaded, so the local refusal cannot fire and the answer comes
+    // from wherever the size limit actually lives. Rendering nginx's page would put a
+    // <title> in the panel and still explain nothing.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ nope: true })
+      if (url.includes('/backup/preview')) {
+        return new Response('<html><head><title>413 Request Entity Too Large</title></head></html>',
+          { status: 413, headers: { 'Content-Type': 'text/html' } })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('refused as too large (413)'))
+    expect(screen.getByTestId('restore-error')).not.toHaveTextContent('Request Entity Too Large')
+  })
+})

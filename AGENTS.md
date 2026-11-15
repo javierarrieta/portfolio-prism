@@ -92,12 +92,13 @@ From root:
   the last; `cargo build --release` is the `release-build` job:
   `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check -- --all-targets`,
   `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`,
-  `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`,
+  `bash scripts/check_backup_portability.sh`, `bash scripts/check_upload_path.sh`,
+  `bash scripts/check_migrations.sh`,
   `bash scripts/check_sqlx_cache.sh`, `cargo clippy --all-targets`,
   `cargo build --release` — all from `backend_rust/`.
-  **Five of the ten need `DATABASE_URL`** — migrate, prepare, `cargo test` (which creates
+  **Five of the eleven need `DATABASE_URL`** — migrate, prepare, `cargo test` (which creates
   one real database per test, `src/test_db.rs`), `check_migrations.sh` and
-  `check_sqlx_cache.sh`. `scripts/dev-db.sh` prints the URL to export. The three static
+  `check_sqlx_cache.sh`. `scripts/dev-db.sh` prints the URL to export. The four static
   gates do not read it, and neither do the two compiles: with no `DATABASE_URL` a
   `sqlx::query!` macro resolves from the committed `.sqlx/` prepare cache, which is also
   how `backend_rust/Dockerfile` builds with no database in reach.

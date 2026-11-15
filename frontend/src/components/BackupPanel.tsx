@@ -104,6 +104,13 @@ function describeFailure(body: FailureBody): string {
 /** The refusal body, or a sentence saying there was no readable one. A gateway's
  * HTML page is not the backend talking, and rendering it is worse than admitting it. */
 async function readFailure(res: Response): Promise<FailureBody> {
+  if (res.status === 413) {
+    // Nothing reached the backend, so there is no JSON reason to read and the cap the
+    // panel advertises is not the limit that answered. Naming which limit spoke is the
+    // difference between a retry, a smaller file, and a dead end.
+    return { error: 'The upload was refused as too large (413) before the API read any of it. '
+      + 'Something between this app and the API imposes a smaller limit than the cap this server advertises.' };
+  }
   try {
     return ((await res.json()) ?? {}) as FailureBody;
   } catch {
@@ -134,6 +141,21 @@ function isCounts(value: unknown): value is Counts {
   const c = value as Partial<Counts> | null;
   return !!c && typeof c === 'object'
     && Number.isFinite(c.portfolios) && Number.isFinite(c.assets) && Number.isFinite(c.transactions);
+}
+
+/** Why this file cannot be sent, or `null` when it can.
+ *
+ * The number is the server's own, read from `/backup/capabilities`; refusing here is
+ * not a shortcut around the server, which still refuses. It is the difference between
+ * a sentence naming the file and its size and whatever a gateway in front of the API
+ * answers with for a body over its limit — an HTML page carrying no reason at all.
+ * `null` when capabilities never loaded: an unknown cap must not block an upload that
+ * might be fine, and `readFailure` covers that case with what the server actually said. */
+function oversizeReason(file: File, caps: Capabilities | null): string | null {
+  if (!caps || file.size <= caps.max_bytes) return null;
+  return `That file is ${file.size.toLocaleString('en-US')} bytes, above the ` +
+    `${caps.max_bytes.toLocaleString('en-US')}-byte cap this server advertises, so it ` +
+    'would be refused before anything is read.';
 }
 
 /** The preview body, or `null` when it is not a plan for the mode that was asked for.
@@ -257,6 +279,14 @@ export default function BackupPanel({ portfolios }: Props) {
   // file, and choosing a mode — so the request goes out when the user changes
   // something rather than from an effect chasing that change after the fact.
   async function runPreview(target: File, forMode: RestoreMode) {
+    // Checked before the sequence advances, so an oversized file never becomes the
+    // current request: there is no in-flight answer to retire and no flag to clear.
+    const oversize = oversizeReason(target, caps);
+    if (oversize) {
+      setPlan(null);
+      setRestoreError(oversize);
+      return;
+    }
     const seq = ++previewSeq.current;
     setPreviewing(true);
     setRestoreError(null);
@@ -345,6 +375,14 @@ export default function BackupPanel({ portfolios }: Props) {
     // No plan, no restore: the gate is that the user has seen this file's counts, and
     // there is nothing to have seen until a preview has answered.
     if (!file || !plan) return;
+    // A restore cannot be reached without a preview of this same file, and the preview
+    // already refused an oversized one, so this is the same check standing where the
+    // write happens rather than a path anyone is expected to need.
+    const oversize = oversizeReason(file, caps);
+    if (oversize) {
+      setRestoreError(oversize);
+      return;
+    }
     retireInFlightPreview();
     setRestoring(true);
     setRestoreError(null);
