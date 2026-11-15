@@ -1060,6 +1060,8 @@ and in `steps`, before `Run Tests`:
 
 and add `DATABASE_URL` to the env of the existing `Run Tests` step.
 
+**Then wire the two gates that exist but run nowhere.** Task 8 confirmed by grep that `ci.yml` runs `check_pricing_seam.sh`, `check_access_gate.sh` and `check_backup_portability.sh`, but **neither `check_migrations.sh` nor `check_sqlx_cache.sh`** — so a migration landing without a regenerated `.sqlx` reaches `main` green today. Both get CI steps, and each must **fail rather than skip** when its tool is missing: `check_sqlx_cache.sh` already refuses when `sqlx` or `cargo-sqlx` is absent, and a step that swallows that exit code is a gate that only looks enforced.
+
 Then do the same for `e2e-smoke`: the same `postgres` service and `DATABASE_URL`, and fix the job description, which still says it drives "a real SQLite file". The backend runs `sqlx::migrate!` at startup, so that job needs no separate migrate step — the service database is empty and the app fills it.
 
 **One trap when you do.** The two smokes must not share a database. `statement.smoke.mjs:100` records that the app auto-selects the first portfolio it is given, and `GET /api/portfolios` has no `ORDER BY`, so if the sell-pnl run's portfolio exists when the statement run starts, the statement renders *that* portfolio, prints a plausible document, and passes without testing its own fixture. Task 3's stopgap gives the two steps different databases (`prism` and the image's own empty `postgres`) because the runner is not promised a `psql` to `createdb` with. Prefer the real fix: one scratch database per invocation, created and dropped by `run.sh`, which also restores the isolation the throwaway SQLite file used to provide for free.
@@ -1067,6 +1069,8 @@ Then do the same for `e2e-smoke`: the same `postgres` service and `DATABASE_URL`
 - [ ] **Step 2: Update the documented gate list**
 
 In `AGENTS.md` under *Backend gates*, replace the list with the real order: `sqlx migrate run --no-dotenv`, `cargo sqlx prepare --check`, `cargo test`, `bash scripts/check_access_gate.sh`, `bash scripts/check_pricing_seam.sh`, `bash scripts/check_backup_portability.sh`, `bash scripts/check_migrations.sh`, `cargo clippy --all-targets`, `cargo build --release`. Note that every one of them needs `DATABASE_URL` and that `scripts/dev-db.sh` prints it. Say explicitly that `check_migrations.sh` inspects a **database**, not the migration file — it will happily pass against a stale schema — so it is only meaningful after `sqlx migrate run` on a database nobody has touched since. Until this task landed, that gate was advisory: it existed, proved itself able to fail, and ran nowhere anyone was watching.
+
+The same bullet must also state the **scope** of the compile-time checking, because Task 8 converted `src/` only: say plainly that `src/` is compile-time checked against the schema and **`tests/` still issues runtime SQL** (~124 call sites across 23 files). Without that sentence, "compile-time checked queries" reads as universal coverage and the next person to write a test query will assume the compiler has their back.
 
 - [ ] **Step 3: Verify locally in the same order**
 
