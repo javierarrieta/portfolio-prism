@@ -567,7 +567,15 @@ async fn an_exhausted_pool_is_a_lock_not_an_outage() {
     let url = test_pool_url("an_exhausted_pool_is_a_lock").await;
     let pool = pool_options()
         .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_millis(50))
+        // 2s, not the 50ms this used to be. `acquire_timeout` bounds the *initial*
+        // `connect()` as much as any later acquire, and 50ms is not a budget in which a
+        // fresh Postgres connection can be relied on to complete: under CI's parallel test
+        // binaries the setup occasionally died with `PoolTimedOut` before the test had
+        // asserted anything (PR #66's first red run, `backup_test.rs:573` unwrapping a
+        // `PoolTimedOut` on `.connect`). The short timeout was here to make the held
+        // connection below fail fast, and 2s still does that — it is the same arm, just
+        // not racing the connection open against a 50ms clock.
+        .acquire_timeout(std::time::Duration::from_secs(2))
         .connect(&url)
         .await
         .unwrap();
