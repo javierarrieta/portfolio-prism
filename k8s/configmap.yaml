@@ -13,9 +13,11 @@ data:
   # cutover, so the key is deleted **at cutover**, in the one apply that also has the real
   # value in `backend-secrets` and rolls the Postgres image — and that apply only happens
   # once the CNPG `Database`, `DatabaseRole` and Secret exist and are Ready. With `replicas:
-  # 1` and `Recreate` the old pod is gone before the new one exists, so any other order means
-  # no serving replica. The ordering is in `docs/postgres-cutover.md` ("What changed in the
-  # manifests, and in which order") and
+  # 1` and a `Recreate` rollout the old pod is gone before the new one exists, so any other
+  # order means no serving replica — but this file declares no `spec.strategy`, so confirm
+  # `.spec.strategy.type` on the live deployment before the apply instead of assuming which
+  # behaviour you are about to cause. The ordering is in `docs/postgres-cutover.md` ("What
+  # changed in the manifests, and in which order") and
   # `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` §2. Note which side wins:
   # the deployment's `envFrom` lists this ConfigMap and then the `backend-secrets` Secret,
   # and a key in a later source overrides the earlier one — so today this value is what the

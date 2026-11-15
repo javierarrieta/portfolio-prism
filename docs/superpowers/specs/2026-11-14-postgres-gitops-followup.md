@@ -21,7 +21,8 @@ exactly that reason.
 >   build refuses to start without `DATABASE_URL` (§10), so the database and its
 >   Secret must exist before the image rolls out, and the cutover (§11) must happen
 >   between the two. With `replicas: 1` and `Recreate`, a badly ordered apply is a
->   crash-looping app with no serving replica, not a graceful degradation.
+>   crash-looping app with no serving replica, not a graceful degradation. (Confirm
+>   `.spec.strategy.type` on the live deployment before relying on that — see §2.)
 > - Whether the SQLite PVC and its restic backup are retired, and when.
 
 Each of those is a section below, except the third, which is §2 because it is the one that
@@ -37,7 +38,23 @@ fixes without also rolling the data story back.**
 
 `Recreate` means the old pod is torn down *before* the new one is created. There is no
 overlap in which both versions serve, so any reason the new pod has to exit is downtime for
-the whole app. The reasons this build exits are all configuration: no `DATABASE_URL`, a
+the whole app.
+
+**Confirm the strategy on the live deployment before you rely on the word `Recreate` anywhere
+in these documents.** `k8s/app-deployment.yaml` in this repository declares no
+`spec.strategy` at all, and the default is `RollingUpdate` — under which the old pod keeps
+serving and the shape of the outage below is softer. The manifests in this repo are known to
+be stale (see #61), so the live object is the only authority:
+
+```sh
+kubectl -n investment-portfolio-manager get deploy app -o jsonpath='{.spec.strategy.type}'
+```
+
+If it answers `RollingUpdate`, the ordering rule below does **not** relax: a new pod that
+cannot start never becomes ready, so you get a half-deployed rollout and a stale pod instead
+of a clean crash loop, which is harder to notice and harder to undo.
+
+The reasons this build exits are all configuration: no `DATABASE_URL`, a
 `sqlite:` `DATABASE_URL`, a `DATABASE_URL` it cannot connect to, migrations that fail, or
 orphaned rows with no `BOOTSTRAP_OWNER_SUBJ` to hand them to. Every one of those is an
 operator mistake, and every one of them looks the same from outside: `CrashLoopBackOff`.
@@ -121,8 +138,8 @@ Unanswered on purpose, and it needs a date rather than a cleanup.
   migrations applied (`select version, description from _sqlx_migrations order by version`).
 - The cutover runbook has been executed for real, end to end, **including its step 1 against
   the actual production SQLite file** — that audit has never run against a real file, only
-  against synthetic ones (`task-10-report.md` has the transcript, and the runbook's *Known
-  limitations* says so in its own preamble).
+  against synthetic ones; the runbook's *Known limitations* says so in its own preamble and
+  carries the transcript of the runs that were done.
 - The counts in runbook step 6 were recorded, and the report comparison passed.
 - A backup of the Postgres instance exists, and was restored somewhere to prove it.
 - Only then: the PVC and the restic schedule are retired, in writing, with the date.

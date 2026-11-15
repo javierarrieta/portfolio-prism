@@ -30,7 +30,7 @@ From root:
   cargo run --bin backend_rust -- --print-openapi > ../docs/openapi/openapi.json
   ```
   `--print-openapi` is checked before configuration, the database, and the network,
-  so it needs no `portfolio.db`, no running server, and no OIDC configuration. The
+  so it needs no database, no running server, and no OIDC configuration. The
   previous procedure started the real server and curled it; that server now refuses
   to launch without OIDC configuration, so the old command no longer works.
 
@@ -135,6 +135,8 @@ From root:
   `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — a CNPG `Database`,
   `DatabaseRole` and Secret in the `k8s-titan` repo, applied **in that order** before the
   image rolls, because the build refuses to start without `DATABASE_URL` and `replicas: 1`
-  with `Recreate` turns a badly ordered apply into an outage. The data procedure an
-  operator follows on the day is `docs/postgres-cutover.md`.
+  with `Recreate` turns a badly ordered apply into an outage — but `k8s/app-deployment.yaml`
+  declares no `spec.strategy`, so confirm `.spec.strategy.type` on the live deployment
+  before the apply rather than assuming which rollout behaviour you are about to cause. The
+  data procedure an operator follows on the day is `docs/postgres-cutover.md`.
 - **Multi-Currency Support**: Implementing asset currency tracking and exchange rate conversion for tax and stats (see `docs/implementation_plan.md`).

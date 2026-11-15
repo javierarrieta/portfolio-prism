@@ -95,11 +95,20 @@ Replace `<org>` with your GitHub username or organization.
 
 ### Single-File Deployment
 
-Apply all resources in one step:
-
 ```bash
 kubectl apply -f k8s/
 ```
+
+**Only while the app still speaks the storage these manifests describe.** It does not any
+more: the current image is Postgres-only and `k8s/configmap.yaml` still ships a `sqlite:`
+DSN, so this one command is exactly the outage `docs/postgres-cutover.md` documents — the
+new pod refuses its configuration and there is no serving replica. Read that document's
+*What changed in the manifests, and in which order* before applying any of these files, and
+note that the atomic cutover apply is deliberately **not** `kubectl apply -f k8s/`: the CNPG
+`Database`, the `DatabaseRole` and the Secret must already exist and be Ready. Also confirm
+`.spec.strategy.type` on the live deployment first — `k8s/app-deployment.yaml` declares no
+`spec.strategy`, so the manifest does not tell you whether you are about to cause a
+`Recreate` outage or a silently crash-looping rollout.
 
 ### Resource Overview
 
@@ -160,9 +169,11 @@ Until the cutover the persistent volume below is unused by the current image.
 > StorageClass is *named* `nfs-client`, but its provisioner is
 > `k8s.io/minikube-hostpath` — the name is a copied convention, not a description, and
 > nothing here has ever been NFS. The live app runs in the `apps` namespace against a
-> `local-path-retain` PVC on the node filesystem, with `replicas: 1` and `Recreate`.
-> Reconciling or deleting these manifests is tracked in #61. Do not infer the storage
-> backend from a StorageClass name; check `spec.provisioner` and the PV's volume source.
+> `local-path-retain` PVC on the node filesystem, with `replicas: 1` and a `Recreate`
+> strategy. Confirm `.spec.strategy.type` on the live deployment before relying on that: the
+> manifests declare no `spec.strategy`, whose default is `RollingUpdate`. Reconciling or
+> deleting these manifests is tracked in #61. Do not infer the storage backend from a
+> StorageClass name; check `spec.provisioner` and the PV's volume source.
 
 ### Environment Variables
 
@@ -178,7 +189,9 @@ Backend environment variables are configured in the ConfigMap:
 The backend is stateless now that it talks to a Postgres server, so replicas are a
 matter of pointing every pod at the same `DATABASE_URL`. What still holds it to one
 replica is the deployment: `k8s/` ships a file-backed volume and a `sqlite:` DSN in its
-ConfigMap (see *Storage* and `docs/postgres-cutover.md`), and `Recreate` rollout strategy.
+ConfigMap (see *Storage* and `docs/postgres-cutover.md`), and a `Recreate` rollout strategy
+— confirm `.spec.strategy.type` on the live deployment, because `k8s/app-deployment.yaml`
+declares no `spec.strategy` and the default is `RollingUpdate`.
 
 > **Do not follow the previous advice in this section**, which suggested "SQLite with WAL
 > mode and NFS". SQLite's own WAL documentation rules that out: *"All processes using a
@@ -190,21 +203,20 @@ ConfigMap (see *Storage* and `docs/postgres-cutover.md`), and `Recreate` rollout
 The supported path is migration to PostgreSQL (or another managed RDBMS). The manifests
 are written to be adaptable for a stateless backend against a managed database.
 
+The default deployment runs a single pod, and `--replicas=3` is still not meaningful until
+the cutover has happened: a Postgres service or managed instance in the cluster, the
+`sqlite:` DSN in `k8s/configmap.yaml` replaced by the Secret's `DATABASE_URL`, and the
+file-backed `pv.yaml`/`pvc.yaml` retired. That is
+`docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`, and the data side is
+`docs/postgres-cutover.md`. The nginx proxy pass in the frontend container already makes
+horizontal scaling straightforward once those are done.
+
 ```bash
-# Not a supported configuration — see above. Kept here only to record that it was tried
-# and why it is wrong.
+# Not a supported configuration yet — see above. Kept here only to record that it was tried
+# and why it is wrong, and so that nobody re-derives it: scaling the deployment while the
+# ConfigMap still names a file database gives every replica its own empty file.
 # kubectl scale deployment backend -n investment-portfolio-manager --replicas=3
 ```
-
-### Scaling
-
-The default deployment runs a single pod. For higher availability, increase replicas:
-
-```bash
-kubectl scale deployment app -n investment-portfolio-manager --replicas=3
-```
-
-Note: the storage engine is no longer the limit — the backend already talks to a Postgres server over a network, so replicas only need the same `DATABASE_URL`. What still needs doing before `--replicas=3` is meaningful is the cutover itself: a Postgres service or managed instance in the cluster, the `sqlite:` DSN in `k8s/configmap.yaml` replaced by the Secret's `DATABASE_URL`, and the file-backed `pv.yaml`/`pvc.yaml` retired. That is `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`, and the data side is `docs/postgres-cutover.md`. The nginx proxy pass in the frontend container already makes horizontal scaling straightforward.
 
 ### Cleanup
 

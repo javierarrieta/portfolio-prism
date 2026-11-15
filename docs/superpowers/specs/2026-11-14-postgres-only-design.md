@@ -273,11 +273,15 @@ bug, and a retry will not help.
 Everything above describes `src/backup/` and `api_routes/backup.rs`, which is where the
 rule was written and where it has always applied; it is not a whole-API contract, and an
 earlier reading of this section treated it as one. `api_routes/backup::lock_response` is
-the only emitter of `Retry-After` in the crate. Every other route answers a database
-failure with a plain 500 — the auth outage responder, `AuthedUser`'s guard failure
-(`auth::guard`), `access::outcome` and `ReportError::internal` all do — so a saturated
-pool or a cancelled statement is a retryable 503 on `/api/backup/*` and a permanent 500
-on `/api/portfolios/`. Deciding which routes *should* become retryable is a product API
+the only emitter of `Retry-After` in the crate. Everywhere else a database failure is
+answered one of two ways, neither shaped for a retry: a failure while resolving the caller
+(`auth::guard::resolve_caller`, which the auth outage fairing turns into
+`503 {"error":"service_unavailable"}`, proved by
+`tests/auth_test.rs::a_database_failure_is_not_reported_as_a_denial`) is a 503 **without**
+`Retry-After`; a failure on the route's own query (`access::outcome`,
+`ReportError::internal`) is a plain 500. So a saturated pool is a retryable 503 on
+`/api/backup/*` and a 503-without-`Retry-After` on `/api/portfolios/`, while a statement
+that fails inside a route — `57014`, say — is a permanent 500 there. Deciding which routes *should* become retryable is a product API
 decision, not an engine-migration detail, and it is a named follow-up on this branch
 rather than a change made here. The follow-up is not hypothetical: the statement timeout
 below is what introduced `57014 query_canceled`, a transient error by definition, and
@@ -532,12 +536,19 @@ for iteration speed.
 
 The infrastructure half is §14. This is what happens to the data.
 
-The order is **audit → export → freeze → deploy → restore → verify**. It used to lead with
-the freeze, and that was wrong: the export is an HTTP route, so an application scaled to zero
-cannot serve it. Freeze before the restore, not before the export.
+The order is **audit → export → preview → freeze → deploy → restore → verify**. It used to
+lead with the freeze, and that was wrong: the export and the preview are both HTTP routes, so
+an application scaled to zero cannot serve either. Freeze before the restore, not before the
+export.
 
-1. **Audit for orphans** against the live SQLite database — the app is still serving, and the
-   audit is a read with a 5 s busy timeout for exactly that reason — and record the numbers:
+1. **Audit for orphans** against a **consistent copy** of the SQLite file, made with
+   `sqlite3 … .backup` and not with `cp` — a hot `cp` of a rollback-journal database can be
+   torn, and an audit of a torn file reports whatever it happens to read. The app is still
+   serving at this point, and the audit is a read with a 5 s busy timeout for exactly that
+   reason, but the timeout is insurance rather than the plan. Record the numbers.
+   Four relationships, which are the four `scripts/pre_cutover_audit.sh` checks and the four
+   §5.1 names the same list; an earlier draft of this section listed three and omitted
+   `split_sync`, the one the new schema had to add a foreign key for:
    ```sql
    SELECT COUNT(*) FROM transactions t LEFT JOIN assets a ON a.id = t.asset_id
      WHERE a.id IS NULL;
@@ -545,6 +556,8 @@ cannot serve it. Freeze before the restore, not before the export.
      WHERE p.id IS NULL;
    SELECT COUNT(*) FROM portfolios p LEFT JOIN users u ON u.id = p.owner_id
      WHERE p.owner_id IS NOT NULL AND u.id IS NULL;
+   SELECT COUNT(*) FROM split_sync s LEFT JOIN assets a ON a.id = s.asset_id
+     WHERE a.id IS NULL;
    ```
    Any non-zero count is a stop condition (§5.1).
 2. **Export** a bundle covering every portfolio, with `include_prices=true`, while the app
@@ -561,12 +574,19 @@ cannot serve it. Freeze before the restore, not before the export.
    here the source cannot move, which is what makes step 6's comparison mean anything.
 4. **Deploy Postgres** (§14) and start the Postgres build against an empty
    database. `sqlx migrate run` creates the schema.
-5. **Restore** with `apply_prices=true` and `BACKUP_ALLOW_PRICE_RESTORE=1`, then
-   unset the flag. Preview first, as the feature requires.
+5. **Restore** with `apply_prices=true` and `BACKUP_ALLOW_PRICE_RESTORE=1`. Preview first, as
+   the feature requires — and preview the bundles at step 2 as well, before the freeze, because
+   `preview` is the only validator a bundle gets and a refusal discovered after the freeze costs
+   the window. Sign in to the new deployment per owner and mint a fresh session cookie for
+   each: the old database's cookie will not authenticate against the new instance, and the
+   restore is scoped to whoever the caller is.
 6. **Verify counts** — row counts per table against the bundle and against the numbers
    recorded in step 1, and the app's own reports for one portfolio against the pre-cutover
    numbers. The step 1 counts were taken before the export, so they are a lower bound, not
-   the target: a table that grew between step 1 and step 3 grew into the lost window.
+   the target: a table that grew between step 1 and step 3 grew into the lost window. Only
+   the tables a bundle carries are comparable: `users` and `split_sync` appear in no bundle,
+   so Postgres's counts for them have no relationship to the step-1 numbers — `users` can be
+   smaller, and `split_sync` starts at zero.
 7. **Keep the SQLite PVC** until the Postgres instance has survived one backup
    cycle of its own.
 
@@ -575,7 +595,14 @@ is not in any bundle. Re-export from Postgres before declaring the cutover done.
 
 ## 12. Verification gates
 
-All from `backend_rust/`, all must pass, all must be warning-free:
+All from `backend_rust/`, all must pass.
+
+`cargo test` must be **warning-free** — that one is a real zero. `cargo clippy --all-targets`
+is not, and was never going to be: it reports **12 distinct pre-existing warnings** on this
+branch, all of them older than the Postgres work, and `docs/auth-testing.md` records the
+number and the fact that none are new. The gate on clippy is that the set does not grow, not
+that it is empty; a build that demanded zero clippy warnings would have been red from the
+first commit and would have taught everyone to ignore it:
 
 - `sqlx migrate run` then `cargo sqlx prepare --check`
 - `cargo test` — including the new serialisation test (§5.4) and the FK-enforcement
@@ -584,9 +611,10 @@ All from `backend_rust/`, all must pass, all must be warning-free:
 - `cargo clippy --all-targets`
 - `cargo build --release`
 - `bash scripts/auth_smoke.sh` (unchanged, still must pass)
-- the manual walkthrough in `docs/backup-walkthrough.md`, re-run against Postgres —
-  several of its steps describe SQLite lock behaviour and will need rewriting,
-  not re-running
+- the manual walkthrough in `docs/walkthrough.md` — §3–§6 are the backup steps; an earlier
+  draft of this line named `docs/backup-walkthrough.md`, which has never existed —
+  re-run against Postgres. Several of its steps describe SQLite lock behaviour and needed
+  rewriting, not re-running
 
 ## 13. Risks
 
@@ -613,7 +641,9 @@ scratch. It is its own change in that repo, with that repo's own gates
   build refuses to start without `DATABASE_URL` (§10), so the database and its
   Secret must exist before the image rolls out, and the cutover (§11) must happen
   between the two. With `replicas: 1` and `Recreate`, a badly ordered apply is a
-  crash-looping app with no serving replica, not a graceful degradation.
+  crash-looping app with no serving replica, not a graceful degradation. Confirm
+  `.spec.strategy.type` on the live deployment — this repository's manifest declares no
+  `spec.strategy`, so `Recreate` is an assumption about production, not a fact from here.
 - Whether the SQLite PVC and its restic backup are retired, and when.
 
 ## 15. Explicitly deferred, with source

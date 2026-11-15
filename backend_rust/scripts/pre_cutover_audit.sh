@@ -110,7 +110,7 @@ for table in portfolios assets transactions users split_sync; do
   [ "$n" = 1 ] || die "$DB has no '$table' table, so it is not a portfolio-prism SQLite database and this audit cannot answer anything about it."
 done
 n=$(scalar "select count(*) from pragma_table_info('portfolios') where name = 'owner_id'") || exit 2
-[ "$n" = 1 ] || die "$DB's portfolios table has no owner_id column, so it predates the ownership work and has not been opened by the current backend. Start the current backend against it once — that adds the column and backfills owners — and re-run."
+[ "$n" = 1 ] || die "$DB's portfolios table has no owner_id column, so it predates the ownership work and has never been opened by a backend that added it. The CURRENT backend cannot add it: it is Postgres-only and will not open a SQLite file at all. Run the PRE-CUTOVER image — the last build that still speaks SQLite — against a COPY of this file once; that adds the column and backfills owners. Then audit the copy. Never do this to the original: the backfill writes."
 
 found=0
 

@@ -410,9 +410,9 @@ instance to restore into.
       Expected: at least one symbol with rows. If it answers nothing, the provider did not
       answer either, and every number below depends on that being fixed first. (In a
       headless run the same rows can be inserted with `insert into historical_prices
-      (symbol, date, close_price) values …`, which is what the executed transcript in
-      `task-10-report.md` had to do: the provider answered the live quote and rate-limited
-      the history request.)
+      (symbol, date, close_price) values …`; that is what the executed run of this section
+      had to do, because the provider answered the live quote and rate-limited the history
+      request.)
 
       Then restart the backend with `export BACKUP_ALLOW_PRICE_RESTORE=1`, tick **Include
       price history** on the export card — tick the same portfolio you opened — download,
@@ -441,6 +441,15 @@ instance to restore into.
       bundle through at all: the identical request was a `422` one restart earlier.
    d. Now the write itself, still on this instance. Clear one symbol's bars, and post the
       same file again:
+
+      **This one writes, and not to a scratch database.** The `DELETE` below runs against
+      whatever `$DATABASE_URL` points at, which — if you followed §0 — is the same dev
+      database `./start.sh` starts the app against, the one holding the data every other
+      section of this walkthrough reads. `historical_prices` has no `owner_id`, so
+      `delete from historical_prices where symbol = …` removes those bars for every
+      portfolio in the instance, not just yours, and the dated reports for that symbol read
+      as zero until the restore puts them back. Do it on a database you mean to overwrite.
+
       ```bash
       SYMBOL=$(python3 -c 'import json;print(json.load(open("/tmp/bundle-prices.json"))["prices"][0]["symbol"])')
       IN_BUNDLE=$(python3 -c 'import json,sys; print(sum(1 for p in json.load(open("/tmp/bundle-prices.json"))["prices"] if p["symbol"] == sys.argv[1]))' "$SYMBOL")
@@ -654,7 +663,7 @@ constants as if it were a check.
   confirmation parameter; the gate is authentication plus the `SameSite=Lax` session
   cookie. An authenticated caller can already delete every portfolio one at a time, so
   `replace` adds speed, not capability.
-- **Concurrency.** `replicas: 1`. `mode=replace` now runs in a `SERIALISABLE` transaction,
+- **Concurrency.** `replicas: 1`. `mode=replace` now runs in a `SERIALIZABLE` transaction,
   so two restores for one caller abort with `40001` and answer `503` with `Retry-After`
   (`tests/restore_concurrency_test.rs` proves it, including the mutation that shows the
   server's default isolation level fails there). What is still unproven is the
