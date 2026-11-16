@@ -416,10 +416,17 @@ button, input, select, textarea {
 
    Two 420px tracks plus the 16px gap need 856px of container, so the row splits at a
    1198px viewport (856 + 342) and stacks below it, where each half gets the whole
-   container and Flags stays on screen. */
+   container and Flags stays on screen.
+
+   The floor is `min(420px, 100%)` rather than a bare 420px. A hard floor is a promise the
+   container cannot always keep: below a 420px container — a viewport under roughly 762px,
+   where `.app-container` has already given `.main-content` the leftovers of a 260px
+   sidebar — a 420px track refuses to shrink and pushes the card wider than the page,
+   which is a worse failure than the narrow-and-scrolling one it replaces. With `min()`
+   the track gives way and the panel's own scroll wrapper absorbs the overflow. */
 .plan-sides {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
   gap: 16px;
   align-items: start;
 }
