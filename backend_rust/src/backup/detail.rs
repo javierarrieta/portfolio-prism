@@ -227,6 +227,186 @@ pub fn detail_from_bundle(bundle: &Bundle, today: NaiveDate) -> PlanSide {
     side
 }
 
+/// The live side: everything `user_id` owns, read from the database.
+///
+/// Three queries, and the split is the point. The portfolio aggregate and the flag
+/// aggregate cover **every** owned row, so every exact number comes from a full
+/// scan of the caller's data; only the asset detail query is bounded, and only by
+/// the display caps — and the asset cap is applied in Rust, from the same rows
+/// `more_assets` is computed from, so a SQL `LIMIT` cannot under-report it. A single
+/// joined query could not promise that without returning every asset to count it.
+///
+/// `today` is a parameter rather than a clock read so the future-dated flag is
+/// testable; `plan_for` passes the current UTC date.
+pub async fn owned_detail(
+    pool: &crate::db::DbPool,
+    user_id: i64,
+    today: chrono::NaiveDate,
+) -> Result<PlanSide, crate::backup::export::DbFailure> {
+    use crate::backup::export::classify;
+
+    // One row per owned portfolio, with its exact asset and transaction counts.
+    let portfolios = sqlx::query!(
+        r#"SELECT p.id AS "id!", p.name AS "name!", p.currency AS "currency!",
+                 (SELECT COUNT(*) FROM assets a WHERE a.portfolio_id = p.id) AS "assets!",
+                 (SELECT COUNT(*) FROM transactions t
+                    JOIN assets a ON a.id = t.asset_id
+                   WHERE a.portfolio_id = p.id) AS "transactions!"
+           FROM portfolios p WHERE p.owner_id = $1 ORDER BY p.id"#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(classify)?;
+
+    // Flag counts per portfolio, over every asset the caller owns. `AT TIME ZONE
+    // 'UTC'` pins the day: `date::date` would use the session zone and a portfolio
+    // would be future-dated in one timezone and not in another.
+    let flags = sqlx::query!(
+        r#"SELECT p.id AS "portfolio_id!",
+                  COUNT(*) FILTER (WHERE (SELECT COUNT(*) FROM transactions t
+                                           WHERE t.asset_id = a.id) = 0) AS "no_transactions!",
+                  COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM transactions t
+                                                  WHERE t.asset_id = a.id
+                                                    AND t.price ~ '^-?0+(\.0+)?$')) AS "zero_price!",
+                  COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM transactions t
+                                                  WHERE t.asset_id = a.id
+                                                    AND (t.date AT TIME ZONE 'UTC')::date > $2)) AS "future_dated!",
+                  COUNT(*) FILTER (WHERE a.currency <> p.currency) AS "currency_mismatch!",
+                  (SELECT COUNT(*) FROM (SELECT a2.symbol FROM assets a2
+                                          WHERE a2.portfolio_id = p.id
+                                          GROUP BY a2.symbol HAVING COUNT(*) > 1) d) AS "duplicates!"
+            FROM portfolios p JOIN assets a ON a.portfolio_id = p.id
+           WHERE p.owner_id = $1 GROUP BY p.id"#,
+        user_id,
+        today
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(classify)?;
+
+    // Detail for the portfolios that will actually be listed: at most
+    // MAX_PORTFOLIOS_SHOWN portfolios, ordered so the cap is deterministic. The asset
+    // cap is applied in Rust below, not here, because the same rows are what
+    // `more_assets` is computed from — a SQL LIMIT would under-report it.
+    let listed: Vec<i64> = portfolios.iter().take(MAX_PORTFOLIOS_SHOWN).map(|p| p.id).collect();
+    let assets = sqlx::query!(
+        r#"SELECT a.portfolio_id AS "portfolio_id!", a.symbol AS "symbol!",
+                 a.name AS "name!", a.currency AS "currency!",
+                 (SELECT COUNT(*) FROM transactions t WHERE t.asset_id = a.id) AS "transactions!",
+                 (SELECT MIN(t.date) FROM transactions t WHERE t.asset_id = a.id) AS "first_date",
+                 (SELECT MAX(t.date) FROM transactions t WHERE t.asset_id = a.id) AS "last_date",
+                 (SELECT COUNT(*) FROM transactions t
+                   WHERE t.asset_id = a.id AND t.price ~ '^-?0+(\.0+)?$') AS "zero_price!",
+                 (SELECT COUNT(*) FROM transactions t
+                   WHERE t.asset_id = a.id
+                     AND (t.date AT TIME ZONE 'UTC')::date > $2) AS "future_dated!"
+           FROM assets a WHERE a.portfolio_id = ANY($1)
+          ORDER BY a.portfolio_id, a.symbol, a.id"#,
+        &listed,
+        today
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(classify)?;
+
+    let mut side = PlanSide::empty();
+    for p in &portfolios {
+        side.counts.portfolios += 1;
+        side.counts.assets += p.assets as usize;
+        side.counts.transactions += p.transactions as usize;
+    }
+
+    for p in portfolios.iter().take(MAX_PORTFOLIOS_SHOWN) {
+        let rows: Vec<&_> = assets.iter().filter(|a| a.portfolio_id == p.id).collect();
+        let shown: Vec<PlanAsset> = rows
+            .iter()
+            .take(MAX_ASSETS_SHOWN)
+            .map(|a| PlanAsset {
+                symbol: a.symbol.clone(),
+                name: a.name.clone(),
+                currency: a.currency.clone(),
+                transactions: a.transactions as usize,
+                first_date: a.first_date.map(|d| d.date_naive().format("%Y-%m-%d").to_string()),
+                last_date: a.last_date.map(|d| d.date_naive().format("%Y-%m-%d").to_string()),
+                zero_price: a.zero_price as usize,
+                flags: asset_flags_from(
+                    a.transactions as usize,
+                    a.zero_price as usize,
+                    a.future_dated as usize,
+                    &a.currency,
+                    &p.currency,
+                ),
+            })
+            .collect();
+
+        let mut asset_flags: BTreeMap<String, usize> = BTreeMap::new();
+        let mut flags_vec = Vec::new();
+        if let Some(f) = flags.iter().find(|f| f.portfolio_id == p.id) {
+            // Asset-level facts, counted over every asset the caller owns.
+            for (code, n) in [
+                (flag::NO_TRANSACTIONS, f.no_transactions),
+                (flag::ZERO_PRICE, f.zero_price),
+                (flag::FUTURE_DATED, f.future_dated),
+                (flag::CURRENCY_MISMATCH, f.currency_mismatch),
+            ] {
+                if n > 0 {
+                    asset_flags.insert(code.to_string(), n as usize);
+                }
+            }
+            // Portfolio-level, and meaning the same thing it means on the bundle side:
+            // how many symbols are duplicated, expressed as present or absent.
+            if f.duplicates > 0 {
+                flags_vec.push(flag::DUPLICATE_SYMBOL.to_string());
+            }
+        }
+        if p.assets == 0 {
+            flags_vec.push(flag::NO_ASSETS.to_string());
+        }
+
+        side.transactions_in_shown += p.transactions as usize;
+        side.shown.push(PlanPortfolio {
+            name: p.name.clone(),
+            currency: p.currency.clone(),
+            assets: p.assets as usize,
+            transactions: p.transactions as usize,
+            more_assets: rows.len().saturating_sub(MAX_ASSETS_SHOWN),
+            shown,
+            asset_flags,
+            flags: flags_vec,
+        });
+    }
+    side.more_portfolios = portfolios.len().saturating_sub(MAX_PORTFOLIOS_SHOWN);
+    Ok(side)
+}
+
+/// Per-asset flags from the numbers the detail query already returned, so the asset
+/// rows and the portfolio's `asset_flags` cannot disagree about the same asset. The
+/// same four codes the bundle side sets, or the two producers would render differently
+/// depending on which one filled the panel.
+fn asset_flags_from(
+    transactions: usize,
+    zero_price: usize,
+    future_dated: usize,
+    asset_currency: &str,
+    portfolio_currency: &str,
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    if transactions == 0 {
+        flags.push(flag::NO_TRANSACTIONS.to_string());
+    }
+    if zero_price > 0 {
+        flags.push(flag::ZERO_PRICE.to_string());
+    }
+    if future_dated > 0 {
+        flags.push(flag::FUTURE_DATED.to_string());
+    }
+    if asset_currency != portfolio_currency {
+        flags.push(flag::CURRENCY_MISMATCH.to_string());
+    }
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

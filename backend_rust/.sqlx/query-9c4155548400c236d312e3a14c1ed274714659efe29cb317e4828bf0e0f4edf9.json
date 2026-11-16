@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.portfolio_id AS \"portfolio_id!\", a.symbol AS \"symbol!\",\n                 a.name AS \"name!\", a.currency AS \"currency!\",\n                 (SELECT COUNT(*) FROM transactions t WHERE t.asset_id = a.id) AS \"transactions!\",\n                 (SELECT MIN(t.date) FROM transactions t WHERE t.asset_id = a.id) AS \"first_date\",\n                 (SELECT MAX(t.date) FROM transactions t WHERE t.asset_id = a.id) AS \"last_date\",\n                 (SELECT COUNT(*) FROM transactions t\n                   WHERE t.asset_id = a.id AND t.price ~ '^-?0+(\\.0+)?$') AS \"zero_price!\",\n                 (SELECT COUNT(*) FROM transactions t\n                   WHERE t.asset_id = a.id\n                     AND (t.date AT TIME ZONE 'UTC')::date > $2) AS \"future_dated!\"\n           FROM assets a WHERE a.portfolio_id = ANY($1)\n          ORDER BY a.portfolio_id, a.symbol, a.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "portfolio_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "symbol!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "currency!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "transactions!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "first_date",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "last_date",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "zero_price!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "future_dated!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9c4155548400c236d312e3a14c1ed274714659efe29cb317e4828bf0e0f4edf9"
+}
