@@ -7,6 +7,7 @@
 //! change here rather than a rewrite. `scripts/check_backup_portability.sh`
 //! enforces it statically; do not weaken that script to make a statement fit.
 
+pub mod detail;
 pub mod export;
 pub mod restore;
 pub mod schema;

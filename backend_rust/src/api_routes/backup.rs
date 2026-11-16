@@ -1,4 +1,4 @@
-//! The backup routes: export, capabilities, preview, restore.
+//! The backup routes: export, capabilities, preview, restore, owned.
 //!
 //! No SQL here — that lives in `crate::backup`. Handlers here exist to authenticate,
 //! authorise, translate a `BundleError` into a status, and hand off.
@@ -18,7 +18,8 @@
 //! closed on any `<…>` in the route attribute, which includes a query parameter, so
 //! marking it would fail the gate rather than pass it. It clears Rule A the way the
 //! rest of this file does — through the `require` call `export` makes — and Rule C
-//! by taking `AuthedUser`.
+//! by taking `AuthedUser`. `owned` is in the same position: no marker, no `require`
+//! call of its own, cleared by the same sibling.
 //!
 //! An uploaded bundle is read through a `Data` guard and opened under
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
@@ -43,6 +44,7 @@ use crate::db::DbPool;
 
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
+use crate::backup::detail::{self as backup_detail, PlanSide};
 use crate::backup::export::{self as backup_export, DbFailure};
 use crate::backup::restore::{
     self as backup_restore, ApplyError, Mode, Plan, RestoreOutcome,
@@ -121,6 +123,16 @@ pub struct BundleDownload {
     bundle: Json<Bundle>,
     cache_control: Header<'static>,
     content_disposition: Header<'static>,
+}
+
+/// The readback: the caller's live state plus the header that keeps a cache from
+/// holding it. A struct for the same reason as [`BundleDownload`] — Rocket has no
+/// `Responder` for a `(Json, Header)` tuple — and the derive turns every field after
+/// the first into a response header.
+#[derive(rocket::Responder)]
+pub struct OwnedResponse {
+    side: Json<PlanSide>,
+    cache_control: Header<'static>,
 }
 
 #[utoipa::path(
@@ -357,7 +369,7 @@ fn too_large() -> BackupError {
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "The plan: mode, delete counts, insert counts, prices, warnings", body = serde_json::Value),
+        (status = 200, description = "The plan: mode, delete side, insert side, prices, warnings", body = serde_json::Value),
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),
@@ -444,7 +456,7 @@ pub async fn preview(
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Restored: inserted counts, portfolio_ids, prices_inserted", body = serde_json::Value),
+        (status = 200, description = "Restored: inserted counts, deleted counts (zero in copy mode, which deletes nothing), portfolio_ids, prices_inserted", body = serde_json::Value),
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` or `apply_prices` absent, repeated, or unrecognised; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation; a bundle carrying price history while price restore is disabled", body = serde_json::Value),
@@ -531,4 +543,60 @@ pub async fn restore(
     })?;
 
     Ok(Json(outcome))
+}
+
+/// The caller's own current state, in the shape the preview uses for both sides.
+///
+/// For the panel's post-restore readback: this reports what is in the database now,
+/// which is not necessarily what a preview promised a moment earlier. The response is
+/// live state at the moment the request was served, and must never be cached or shared
+/// between callers.
+//
+// Implementation notes, deliberately not in the published description:
+//
+// * It is the same function `preview` calls for its delete side — one implementation,
+//   two callers, so the readback cannot disagree with the plan by construction.
+// * It takes no id, so there is nothing for a `require*` call to scope-check. The
+//   `owner_id` filter inside `owned_detail` IS the isolation, and
+//   `tests/backup_detail_test.rs` pins it with two users. Rule C of the access gate is
+//   satisfied by `AuthedUser`.
+// * The response carries `Cache-Control: no-store`, the header `export` already sets
+//   for the same reason: the body is one caller's holdings at one instant, and a cache
+//   that kept it would hand one user's portfolio to the next. The property is enforced
+//   by that header rather than argued from RFC heuristic freshness — with no header to
+//   read, an intermediary is free to guess, and `max-age=0` would still let a shared
+//   cache store the response and revalidate it. `no-store` is the only spelling that
+//   does not depend on the intermediary's judgement, and `tests/backup_detail_test.rs`
+//   pins that the route actually sends it.
+#[utoipa::path(
+    get,
+    path = "/api/backup/owned",
+    responses(
+        (status = 200, description = "The caller's portfolios, assets and transaction spans", body = serde_json::Value),
+        (status = 401, description = "No valid session", body = serde_json::Value),
+        (status = 500, description = "The read failed", body = serde_json::Value),
+        (status = 503, description = "The database is busy", body = serde_json::Value),
+    )
+)]
+#[get("/backup/owned")]
+pub async fn owned(
+    user: AuthedUser,
+    pool: &State<DbPool>,
+) -> Result<OwnedResponse, BackupError> {
+    let today = Utc::now().date_naive();
+    backup_detail::owned_detail(pool.inner(), user.id, today)
+        .await
+        .map(|side| OwnedResponse {
+            side: Json(side),
+            cache_control: Header::new("Cache-Control", "no-store"),
+        })
+        .map_err(|e| match e {
+            // The same three arms `preview` answers with, from the same `DbFailure`:
+            // this route reads exactly the half of the preview that reads the live side.
+            DbFailure::Lock => lock_response(),
+            // Not reachable from here — nothing names a portfolio — named rather than
+            // swallowed by a catch-all, for the reason `preview` gives.
+            DbFailure::Missing => fail(Status::NotFound, "portfolio not found"),
+            DbFailure::Other => fail(DbFailure::Other.status(), "could not read the current data"),
+        })
 }

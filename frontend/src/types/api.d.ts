@@ -17,6 +17,16 @@ export interface paths {
   "/api/backup/export": {
     get: operations["export"];
   };
+  "/api/backup/owned": {
+    /**
+     * The caller's own current state, in the shape the preview uses for both sides.
+     * @description For the panel's post-restore readback: this reports what is in the database now,
+     * which is not necessarily what a preview promised a moment earlier. The response is
+     * live state at the moment the request was served, and must never be cached or shared
+     * between callers.
+     */
+    get: operations["owned"];
+  };
   "/api/backup/preview": {
     post: operations["preview"];
   };
@@ -614,6 +624,39 @@ export interface operations {
       };
     };
   };
+  /**
+   * The caller's own current state, in the shape the preview uses for both sides.
+   * @description For the panel's post-restore readback: this reports what is in the database now,
+   * which is not necessarily what a preview promised a moment earlier. The response is
+   * live state at the moment the request was served, and must never be cached or shared
+   * between callers.
+   */
+  owned: {
+    responses: {
+      /** @description The caller's portfolios, assets and transaction spans */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description The read failed */
+      500: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description The database is busy */
+      503: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+    };
+  };
   preview: {
     parameters: {
       query: {
@@ -627,7 +670,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description The plan: mode, delete counts, insert counts, prices, warnings */
+      /** @description The plan: mode, delete side, insert side, prices, warnings */
       200: {
         content: {
           "application/json": unknown;
@@ -684,7 +727,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description Restored: inserted counts, portfolio_ids, prices_inserted */
+      /** @description Restored: inserted counts, deleted counts (zero in copy mode, which deletes nothing), portfolio_ids, prices_inserted */
       200: {
         content: {
           "application/json": unknown;

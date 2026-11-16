@@ -17,14 +17,29 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const CAPS = { schema_versions: [1], allow_price_restore: false, max_bytes: 8388608, max_rows: 50000 }
 
-/** A plan body. The echoed `mode` is the mode that was asked for, because the card now
+/** A plan side that counts exactly what the test names and lists nothing under it.
+ * The counts are what the summary sentence reads and the listing is what the detail
+ * under it renders, so a test about counts should not have to invent a portfolio. */
+const sideOf = (counts: Counts) => ({
+  counts, shown: [], more_portfolios: 0, transactions_in_shown: 0,
+})
+
+/** The side that does nothing: what `replace` deletes from an empty account, and what
+ * an empty bundle inserts. */
+const emptySide = () => sideOf({ portfolios: 0, assets: 0, transactions: 0 })
+
+/** A plan body. Both halves are `PlanSide`s now — counts plus a bounded listing — and
+ * the counts still arrive as the flat triples the tests name, so a test that only
+ * cares about a count does not carry a listing it will never read.
+ *
+ * The echoed `mode` is the mode that was asked for, because the card now
  * refuses a plan whose echo disagrees with the request — and a mock that always said
  * `copy` would hide that check, and would have the summary reading "Will delete
  * nothing." at the moment the write sends `mode=replace`. */
 function planBody(over: {
   mode?: string
-  insert?: { portfolios: number; assets: number; transactions: number }
-  delete?: { portfolios: number; assets: number; transactions: number }
+  insert?: Counts
+  delete?: Counts
   prices?: number
   warnings?: string[]
 } = {}) {
@@ -32,10 +47,10 @@ function planBody(over: {
   return {
     schema_version: 1,
     mode,
-    delete: over.delete ?? (mode === 'replace'
+    delete: sideOf(over.delete ?? (mode === 'replace'
       ? { portfolios: 2, assets: 4, transactions: 6 }
-      : { portfolios: 0, assets: 0, transactions: 0 }),
-    insert: over.insert ?? { portfolios: 1, assets: 2, transactions: 3 },
+      : { portfolios: 0, assets: 0, transactions: 0 })),
+    insert: sideOf(over.insert ?? { portfolios: 1, assets: 2, transactions: 3 }),
     prices: over.prices ?? 0,
     warnings: over.warnings ?? [],
   }
@@ -410,6 +425,12 @@ describe('export download', () => {
   })
 })
 
+/** A bundle small enough to stay under any cap a test sets, so that the refusal under
+ * test is about the *other* file and this one's preview really does go out. */
+function tinyBundle(name = 'small.json') {
+  return new File(['{}'], name, { type: 'application/json' })
+}
+
 function bundleFile(name = 'bundle.json', portfolioName = 'Restored') {
   return new File([JSON.stringify({
     format: 'portfolio-prism-backup', schema_version: 1,
@@ -465,8 +486,23 @@ function gatedPreviews(): Array<(res: Response) => void> {
   return pending
 }
 
+/** What `/backup/owned` answers after a write: the caller's live side, in the same shape
+ * the preview uses for both halves. Its one portfolio is named something no restore
+ * response could produce, so a test that reads it knows it is reading the database's
+ * answer and not the write's own counts shown twice. */
+const OWNED_AFTER_RESTORE = {
+  counts: { portfolios: 2, assets: 3, transactions: 4 },
+  shown: [{
+    name: 'Read Back', currency: 'USD', assets: 3, transactions: 4,
+    shown: [], more_assets: 0, asset_flags: {}, flags: [],
+  }],
+  more_portfolios: 0, transactions_in_shown: 4,
+}
+
 /** Answers a successful restore, and a preview of either mode, so a test can watch
- * what a write leaves behind. */
+ * what a write leaves behind — the readback of the live database included. A restore
+ * test that asserts on the result block wants this helper rather than a bare 404 on
+ * `/backup/owned`, so that it is testing a readback that worked. */
 function restoreSucceeds(insert: Counts = { portfolios: 1, assets: 2, transactions: 3 }) {
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input)
@@ -477,6 +513,7 @@ function restoreSucceeds(insert: Counts = { portfolios: 1, assets: 2, transactio
     if (url.includes('/backup/restore')) {
       return jsonResponse({ inserted: insert, portfolio_ids: [7], prices_inserted: 0 })
     }
+    if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
     return jsonResponse({}, 404)
   })
 }
@@ -721,6 +758,11 @@ describe('restore card', () => {
     // delete, so the line below is the plan for the request about to be sent.
     await waitFor(() => expect(screen.getByTestId('preview-summary'))
       .toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.'))
+    // Scoped inside `preview-delete`, and naming that half's own counts. The summary
+    // above only proves the words are somewhere on screen, so swapping the two `side`
+    // props -- "Will delete" reading the insert side -- leaves it standing.
+    expect(within(screen.getByTestId('preview-delete')).getByTestId('plan-side'))
+      .toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.')
     await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
     await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
 
@@ -728,10 +770,14 @@ describe('restore card', () => {
     // that sent `copy` under a `replace` confirmation would delete nothing after
     // asking to be told it could delete everything.
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      if (String(input).includes('/backup/restore')) {
+      const url = String(input)
+      if (url.includes('/backup/restore')) {
         return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
           portfolio_ids: [7], prices_inserted: 0 })
       }
+      // The readback the panel asks for after a committed write, answered here so the
+      // result block below is a card whose readback worked.
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
       return jsonResponse({}, 404)
     })
     await userEvent.click(screen.getByTestId('restore-button'))
@@ -740,6 +786,72 @@ describe('restore card', () => {
     // What the server says it wrote, not what the card hoped it wrote.
     await waitFor(() => expect(screen.getByTestId('restore-result'))
       .toHaveTextContent('Restored 1 portfolio, 2 assets, 3 transactions.'))
+  })
+
+  it('says what a replace restore actually removed, from the restore response', async () => {
+    // The plan describes a moment and the database may have moved, which is why the
+    // restore response carries its own `deleted` counts off `rows_affected`. Nothing
+    // read them, so the card could only ever report what was *planned* as what was
+    // removed. The three sets of numbers below are all different -- the plan's delete
+    // half is 2/4/6, the write inserted 1/2/3 and removed 5/7/11 -- so the sentence can
+    // only have been spelled from the response, and neither a plan echo nor an
+    // inserted-counts echo can pass for it.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.getByTestId('preview-delete')).toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.')
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ mode: 'replace' }))
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
+          deleted: { portfolios: 5, assets: 7, transactions: 11 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+    // Exact, not a substring: the `Restored ...` half is the record every other test
+    // reads, and the clause is appended after it rather than replacing it. Outside the
+    // `waitFor` above on purpose -- a failed `toBe` inside it prints the whole DOM rather
+    // than the two sentences that differ, and this assertion is about the words.
+    expect(screen.getByTestId('restore-result').textContent)
+      .toBe('Restored 1 portfolio, 2 assets, 3 transactions (replaced 5 portfolios, 7 assets, 11 transactions).')
+  })
+
+  it('says nothing about replacing when the mode deleted nothing', async () => {
+    // Copy mode deletes nothing, so every deleted count is zero -- and a
+    // `(replaced 0 portfolios, 0 assets, 0 transactions)` on a sentence about adding
+    // portfolios reads like a warning about nothing. The clause appears only when
+    // something was replaced, which leaves the copy-mode sentence exactly as it was.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ mode: 'copy' }))
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+    expect(screen.getByTestId('restore-result').textContent)
+      .toBe('Restored 1 portfolio, 2 assets, 3 transactions.')
+    expect(screen.getByTestId('restore-result')).not.toHaveTextContent('replaced')
   })
 
   it('says the database is busy, and stays retryable, when a restore hits a lock', async () => {
@@ -992,16 +1104,16 @@ describe('restore card', () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
-      // The right mode, the right prices, and an `insert` that is not three counts: a
+      // The right mode, the right prices, and an `insert` that is not a plan side: a
       // proxy that echoed the request and mangled the body on the way past it. The
-      // failure this prevents is the quiet one: `countList(plan.insert)` reading
-      // `portfolios` off the string 'two' throws during render, and with no error
-      // boundary anywhere in this app the page would go blank at the moment the user is
+      // failure this prevents is the quiet one: `PlanSideView` reading `side.counts`
+      // off the string 'two' throws during render, and with no error boundary anywhere
+      // in this app the page would go blank at the moment the user is
       // deciding whether to destroy their data.
       if (url.includes('/backup/preview')) {
         return jsonResponse({
           mode: 'copy', prices: 0, warnings: [], ok: true,
-          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          delete: emptySide(),
           insert: 'two',
         })
       }
@@ -1022,11 +1134,13 @@ describe('restore card', () => {
       const url = String(input)
       if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
       // Every count on it is fine; the array the summary maps over is simply not there.
+      // Both halves are real plan sides here so that the refusal below is about
+      // `warnings` and not about a half the test forgot to upgrade.
       if (url.includes('/backup/preview')) {
         return jsonResponse({
           schema_version: 1, mode: 'copy', prices: 0,
-          delete: { portfolios: 0, assets: 0, transactions: 0 },
-          insert: { portfolios: 1, assets: 2, transactions: 3 },
+          delete: emptySide(),
+          insert: sideOf({ portfolios: 1, assets: 2, transactions: 3 }),
         })
       }
       return jsonResponse({}, 404)
@@ -1052,6 +1166,7 @@ describe('restore card', () => {
       if (url.includes('/backup/restore')) {
         return new Promise<Response>((resolve) => { release = resolve })
       }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
       return jsonResponse({}, 404)
     })
     await userEvent.click(screen.getByTestId('restore-button'))
@@ -1086,12 +1201,33 @@ describe('restore card', () => {
 
     // The card never sends `apply_prices`, so these rows are not coming. Saying so is
     // the difference between a bundle restored and a bundle restored except for the
-    // part nobody mentioned.
+    // part nobody mentioned -- and it is said as the operator flow it is, not as a
+    // feature this panel is one checkbox short of.
     await waitFor(() => expect(screen.getByTestId('preview-prices'))
-      .toHaveTextContent('4200 price rows in this bundle will be left alone'))
+      .toHaveTextContent('This bundle carries 4200 price rows'))
+    expect(screen.getByTestId('preview-prices'))
+      .toHaveTextContent('restored by an operator, not from this panel')
     // Still a plan, still restorable: naming what is left out is not a refusal.
     expect(screen.getByTestId('preview-summary')).toBeInTheDocument()
     expect(screen.getByTestId('restore-button')).toBeEnabled()
+  })
+
+  it('says "1 price row" about a bundle carrying exactly one', async () => {
+    // The singular branch is the one no other price test touches -- both of them count
+    // in the thousands -- so "1 price rows" is a live regression, and the sort a later
+    // tidy-up of the plural introduces quietly.
+    render(<BackupPanel portfolios={portfolios} />)
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ prices: 1 }))
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('preview-prices'))
+      .toHaveTextContent('This bundle carries 1 price row.'))
+    expect(screen.getByTestId('preview-prices')).not.toHaveTextContent('price rows')
   })
 
   it('posts the bytes of the file that was chosen, to both routes', async () => {
@@ -1114,6 +1250,374 @@ describe('restore card', () => {
     }
   })
 
+  /** The body both halves of the plan now carry. Built here rather than imported from
+   * the component's test helper so a change to the server shape lands as a failing
+   * assertion, not as a shared fixture that quietly moves with it. */
+  const sideFixture = (name = 'Alpha Fund') => ({
+    counts: { portfolios: 1, assets: 1, transactions: 2 },
+    shown: [{
+      name, currency: 'USD', assets: 1, transactions: 2,
+      shown: [{ symbol: 'AAA', name: 'Alpha', currency: 'USD', transactions: 2,
+                first_date: '2026-01-05', last_date: '2026-02-05', zero_price: 0, flags: [] }],
+      more_assets: 0, asset_flags: {}, flags: [],
+    }],
+    more_portfolios: 0, transactions_in_shown: 2,
+  })
+
+  it('names the portfolios and the securities on both sides', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          insert: sideFixture(), delete: emptySide() })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('preview-insert')).toBeInTheDocument())
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('Alpha Fund')
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('AAA')
+    // What the delete half says, not merely that a delete half is there: presence
+    // alone passes even if the wrapper rendered the insert side, which is the one
+    // wrong-side failure nothing else in this file would notice in `copy`.
+    expect(screen.getByTestId('preview-delete')).toHaveTextContent('Will delete nothing.')
+  })
+
+  /** A 200 that is not a plan — a proxy envelope, a truncated body, a renamed field.
+   * Rendering half of one means reading `.map` off `undefined`, and with no error
+   * boundary in this app a throw during render is a blank page at the worst possible
+   * moment. The existing guard catches this; this test keeps it there. */
+  it('refuses a 200 whose body is not a plan, and does not arm the write', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ data: { message: 'ok' } })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-insert')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).not.toBeEnabled()
+  })
+
+  /** The exact body this panel read before the plan grew its listings: `delete` and
+   * `insert` as three bare counts. The risk is not hypothetical — a browser still
+   * holding the previous build of this frontend sends and receives that body, and the
+   * tempting "fix" for a stale client is a guard widened to take either shape. This
+   * refuses it: a plan this panel cannot fully describe must not arm a write, and a
+   * half accepted as counts and rendered as a side reads `side.counts` off
+   * `undefined`, which is a thrown render, not a warning. */
+  it('refuses the old flat plan shape rather than reading counts off it', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          insert: { portfolios: 1, assets: 2, transactions: 3 },
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.queryByTestId('preview-insert')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  /** The delete half on its own, in the one mode that renders it. Every other refusal
+   * test here has a valid delete half or a flat delete beside a flat insert, so the
+   * delete arm of `asPlan` is nothing but this test: drop it and a `replace` body with
+   * a good `insert` and `delete: 'two'` passes the guard, arms Restore, and hands
+   * `'two'` to `PlanSideView`, which reads `side.counts` off a string. That is a throw
+   * during render, and with no error boundary in this app it is the blank page the
+   * fail-closed path exists to prevent -- at the moment the user is deciding whether to
+   * delete everything they own. */
+  it('refuses a replace plan whose delete half is not a plan', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          schema_version: 1, mode: 'replace', prices: 0, warnings: [],
+          delete: 'two',
+          insert: sideOf({ portfolios: 1, assets: 2, transactions: 3 }),
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    // Mode first, file second, so the one preview that runs is asked for as `replace`
+    // and the echoed mode matches. Otherwise the refusal below would be about the mode
+    // guard and this branch would go untested.
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    // The half that could not be read is the half that is not on screen, and the write
+    // that would have destroyed the account against it never arms.
+    expect(screen.queryByTestId('preview-delete')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('describes price history as an operator flow, not a missing feature', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 1234, warnings: [],
+          insert: sideFixture(), delete: emptySide() })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    expect(await screen.findByTestId('preview-prices')).toHaveTextContent(
+      'restored by an operator, not from this panel')
+    expect(screen.queryByText(/will be left alone/)).not.toBeInTheDocument()
+  })
+
+  // The readback. Once a write has committed the plan is gone, and what the user is left
+  // with is the panel's own account of what the database now holds. Two rules govern it:
+  // it is the database's answer rather than the write's own counts shown twice, and it is
+  // decoration -- a read that fails may not make a committed write look like a failure,
+  // and it may not gate anything the user can press. A third rule decides how long it
+  // stays: it belongs to the write it describes, so a fresh preview drops it rather than
+  // leaving the old answer on screen beside a new plan for the same account -- and a
+  // readback that lands after such a preview is retired with it, rather than returning.
+
+  it('shows what the database holds after a restore', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) {
+        // Counts that differ from the write's 1/1/2 above. With identical counts the
+        // portfolio name is the only thing telling the readback apart from the restore
+        // outcome shown twice, and the sentence below would pass even if the panel had
+        // rendered the write's counts in the readback slot. Coherent on its own terms:
+        // one portfolio shown, holding all of it.
+        return jsonResponse({
+          counts: { portfolios: 2, assets: 3, transactions: 4 },
+          shown: [{
+            name: 'Renamed After Restore', currency: 'USD', assets: 3, transactions: 4,
+            shown: [{ symbol: 'AAA', name: 'Alpha', currency: 'USD', transactions: 4,
+                      first_date: '2026-01-05', last_date: '2026-02-05', zero_price: 0, flags: [] }],
+            more_assets: 0, asset_flags: {}, flags: [],
+          }],
+          more_portfolios: 0, transactions_in_shown: 4,
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-owned'))
+      .toHaveTextContent('Renamed After Restore'))
+    // The readback body and not the restore outcome shown twice: the counts differ from
+    // the write's, so this sentence can only have come from `/backup/owned` -- and the
+    // line below can only have come from the restore response. Each assertion now
+    // discriminates in both directions. Scoped inside the wrapper because `plan-side`
+    // renders once per side -- an unscoped query reads whichever renders first, or throws.
+    expect(within(screen.getByTestId('restore-owned')).getByTestId('plan-side'))
+      .toHaveTextContent('Your portfolios now 2 portfolios, 3 assets, 4 transactions.')
+    // The write's own line is untouched beside it: the readback is a second account, not
+    // a replacement for the first.
+    expect(screen.getByTestId('restore-result'))
+      .toHaveTextContent('Restored 1 portfolio, 1 asset, 2 transactions.')
+  })
+
+  /** A failed readback is not a failed restore. The write committed, and a line saying
+   * otherwise is how someone restores the same bundle twice. */
+  it('keeps a successful restore successful when the readback fails', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) {
+        return jsonResponse({ error: 'the database is busy' }, 503)
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    // The readback's own line is what is waited for, not the result line: the result
+    // renders first, so asserting this one a tick after that would be a race and not a
+    // check.
+    await waitFor(() => expect(screen.getByTestId('restore-owned-failed'))
+      .toHaveTextContent(/could not be read back/))
+    // The success survives it, and nothing is raised as an error. The restore completed;
+    // a refusal-shaped line here is the lie that gets a bundle restored twice.
+    expect(screen.getByTestId('restore-result'))
+      .toHaveTextContent('Restored 1 portfolio, 1 asset, 2 transactions.')
+    expect(screen.queryByTestId('restore-error')).not.toBeInTheDocument()
+    // And it offers no retry that would re-run the write. The card is disarmed for the
+    // reason it is always disarmed after a write -- the plan is gone -- and not because
+    // the readback failed; a preview, which only ever reads, is still on offer. These are
+    // read while the failed read is on the screen, because that is the only moment a read
+    // that gated something could be caught gating it -- a fresh preview drops the readback.
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+    expect(screen.getByRole('radio', { name: /replace/i })).toBeEnabled()
+    expect(screen.getByTestId('bundle-file')).toBeEnabled()
+    // Informational to the end. A fresh preview re-arms the write to the same enabled
+    // state it reaches after a read that worked (compare the last test), so nothing about
+    // the failed read decided whether the write could be pressed. What the fresh preview
+    // does take is the stale readback -- the line above described the account before this
+    // new plan, and beside "Will delete …" it reads as current state.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.queryByTestId('restore-owned-failed')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
+  })
+
+  it('treats a readback that is not a plan side as unread, not as an empty account', async () => {
+    // The `isPlanSide` branch is the one a proxy can trip: a 200 carrying an envelope or
+    // a renamed field. Rendering half of a side is worse than admitting the read failed,
+    // and "Your portfolios now 0 portfolios" about a write that just committed is a
+    // sentence no readback is allowed to produce.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse({ data: { portfolios: 1 } })
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-owned-failed')).toBeInTheDocument())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
+  })
+
+  it('reads the database back once per restore and gates nothing on the answer', async () => {
+    const ownedCalls = () => fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/backup/owned')).length
+    restoreSucceeds()
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    // Nothing is read back before anything has been written: there is no completed
+    // restore to describe, and asking would be a request with no answer to give.
+    expect(ownedCalls()).toBe(0)
+
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-owned'))
+      .toHaveTextContent('Read Back'))
+    // Once per completed restore -- not once per render, and not on a timer.
+    expect(ownedCalls()).toBe(1)
+    // Free while the answer is on screen -- the only moment a read that gated something
+    // could be caught gating it, since a fresh preview drops the readback -- and disarmed
+    // for the plan reason, not because of anything the read said.
+    expect(screen.getByRole('radio', { name: /copy/i })).toBeEnabled()
+    expect(screen.getByTestId('bundle-file')).toBeEnabled()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+
+    // Informational to the end: the read-only way back re-arms the write to the same
+    // enabled state the failed-readback test ends in, so the answer changes nothing about
+    // the write. It does drop the readback, because a fresh plan is a fresh question and
+    // "Your portfolios now …" answered the old one; the result line it belonged to stays.
+    // And no second request goes out for a preview.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(ownedCalls()).toBe(1)
+  })
+
+  it('drops a readback that lands after a newer preview has answered', async () => {
+    // The race the generation guard retires. A write commits, the readback goes out, and
+    // the read is slow. Preview is gated only on `previewing` -- not on `restoring` -- so
+    // it is pressable in that window: the new plan lands, the card is answering a fresh
+    // question, and then the old read arrives and reprints the account as it stood before
+    // the write, right beside a plan that counts it differently. That is the same defect
+    // the last commit fixed, arriving by a different route: not a readback that outlived a
+    // preview, but one that came back after it. Both answers name a portfolio, and only
+    // the preview's name may ever be on screen.
+    const freshSide = sideFixture('Named By The New Plan')
+    const staleSide = sideFixture('Written Before The Preview')
+    let releaseOwned: ((res: Response) => void) | null = null
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          insert: freshSide, delete: emptySide() })
+      }
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) {
+        return new Promise<Response>((resolve) => { releaseOwned = resolve })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    // The readback is in flight and has said nothing yet -- so anything the test finds
+    // later came from the response it is about to release, and from nowhere else.
+    await waitFor(() => expect(releaseOwned).not.toBeNull())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+
+    // The preview that window allows, and it answers with a different portfolio.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('preview-insert'))
+      .toHaveTextContent('Named By The New Plan'))
+
+    // The stale read lands last. It describes the account this new plan is about to
+    // change, so none of it may print: not the name, not the counts, not a failure line
+    // beside them. Without the guard this is the line that fails -- `setOwned` runs on an
+    // answer a whole question behind the screen and the old portfolio reappears under
+    // "Your portfolios now".
+    const held = releaseOwned as unknown as (res: Response) => void
+    await answer([held], 0, jsonResponse(staleSide))
+    expect(screen.queryByText('Written Before The Preview')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('restore-owned-failed')).not.toBeInTheDocument()
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('Named By The New Plan')
+    // And discarding it does not wedge the card: the write bracket still closed, so the
+    // plan the user is reading is pressable.
+    expect(screen.getByTestId('restore-button')).toBeEnabled()
+  })
 })
 
 
@@ -1163,5 +1667,51 @@ describe('oversized bundle', () => {
     await waitFor(() => expect(screen.getByTestId('restore-error'))
       .toHaveTextContent('refused as too large (413)'))
     expect(screen.getByTestId('restore-error')).not.toHaveTextContent('Request Entity Too Large')
+  })
+
+  it('retires the preview still in flight when the next file is refused as oversize', async () => {
+    // The invariant the card states as absolute: the plan on screen is the plan for the
+    // file and the mode on screen, or there is no plan at all. An oversize file is
+    // refused before its own request goes out, so it never becomes the current sequence
+    // -- and the answer still in flight belongs to the file that was on screen before it.
+    // Retire that answer and the refusal is the whole card; leave it and it passes its
+    // own sequence guard, prints the previous file's counts under this file's refusal,
+    // and arms Restore to write them.
+    const pending: Array<(res: Response) => void> = []
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) {
+        return new Promise<Response>((resolve) => { pending.push(resolve) })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    // The limits line only renders once capabilities have landed, so waiting for it is
+    // what makes the refusal below a decision rather than a race with that read.
+    await screen.findByTestId('caps-note')
+
+    // A file small enough to be sent, and its preview is held open.
+    await userEvent.upload(screen.getByTestId('bundle-file'), tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    // The oversize file is chosen while that answer is still on its way, and is refused
+    // locally -- no second request goes out.
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    expect(pending).toHaveLength(1)
+
+    // The old answer lands. It is about a file that is no longer on the card, so none of
+    // it may come back: no plan, no armed write, and the refusal keeps the card's only
+    // word. Without the retirement in the oversize branch this is the line that fails.
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap')
+    // And the card is not left wedged on the first file's spinner: the retired answer
+    // cannot clear the flag in its own `finally`, so the refusal had to take it down.
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 })

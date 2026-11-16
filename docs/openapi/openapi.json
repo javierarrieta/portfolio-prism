@@ -185,6 +185,45 @@
         }
       }
     },
+    "/api/backup/owned": {
+      "get": {
+        "tags": [
+          "crate::api_routes::backup"
+        ],
+        "summary": "The caller's own current state, in the shape the preview uses for both sides.",
+        "description": "For the panel's post-restore readback: this reports what is in the database now,\nwhich is not necessarily what a preview promised a moment earlier. The response is\nlive state at the moment the request was served, and must never be cached or shared\nbetween callers.",
+        "operationId": "owned",
+        "responses": {
+          "200": {
+            "description": "The caller's portfolios, assets and transaction spans",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "500": {
+            "description": "The read failed",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "The database is busy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/backup/preview": {
       "post": {
         "tags": [
@@ -218,7 +257,7 @@
         },
         "responses": {
           "200": {
-            "description": "The plan: mode, delete counts, insert counts, prices, warnings",
+            "description": "The plan: mode, delete side, insert side, prices, warnings",
             "content": {
               "application/json": {
                 "schema": {}
@@ -319,7 +358,7 @@
         },
         "responses": {
           "200": {
-            "description": "Restored: inserted counts, portfolio_ids, prices_inserted",
+            "description": "Restored: inserted counts, deleted counts (zero in copy mode, which deletes nothing), portfolio_ids, prices_inserted",
             "content": {
               "application/json": {
                 "schema": {}

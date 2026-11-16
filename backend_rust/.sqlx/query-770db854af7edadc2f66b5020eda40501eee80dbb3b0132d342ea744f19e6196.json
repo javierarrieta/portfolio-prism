@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.id AS \"id!\", p.name AS \"name!\", p.currency AS \"currency!\",\n                 (SELECT COUNT(*) FROM assets a WHERE a.portfolio_id = p.id) AS \"assets!\",\n                 (SELECT COUNT(*) FROM transactions t\n                    JOIN assets a ON a.id = t.asset_id\n                   WHERE a.portfolio_id = p.id) AS \"transactions!\"\n           FROM portfolios p WHERE p.owner_id = $1 ORDER BY p.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "currency!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "assets!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "transactions!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "770db854af7edadc2f66b5020eda40501eee80dbb3b0132d342ea744f19e6196"
+}

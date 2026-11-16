@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.id AS \"portfolio_id!\",\n                  COUNT(*) FILTER (WHERE (SELECT COUNT(*) FROM transactions t\n                                           WHERE t.asset_id = a.id) = 0) AS \"no_transactions!\",\n                  COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM transactions t\n                                                  WHERE t.asset_id = a.id\n                                                    AND t.price ~ '^-?0+(\\.0+)?$')) AS \"zero_price!\",\n                  COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM transactions t\n                                                  WHERE t.asset_id = a.id\n                                                    AND (t.date AT TIME ZONE 'UTC')::date > $2)) AS \"future_dated!\",\n                  COUNT(*) FILTER (WHERE a.currency <> p.currency) AS \"currency_mismatch!\",\n                  (SELECT COUNT(*) FROM (SELECT a2.symbol FROM assets a2\n                                          WHERE a2.portfolio_id = p.id\n                                          GROUP BY a2.symbol HAVING COUNT(*) > 1) d) AS \"duplicates!\"\n            FROM portfolios p JOIN assets a ON a.portfolio_id = p.id\n           WHERE p.owner_id = $1 GROUP BY p.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "portfolio_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "no_transactions!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "zero_price!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "future_dated!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "currency_mismatch!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "duplicates!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "33a80a727ed9c7cea4aa881f97a0f12a79d9bf503129610009a09c115352a28d"
+}

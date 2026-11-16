@@ -273,7 +273,7 @@ async fn every_api_route_is_unauthenticated_without_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 20,
+        checked, 21,
         "the sweep must cover the whole mounted surface"
     );
 }
@@ -328,7 +328,7 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 19,
+        checked, 20,
         "the sweep covers the mounted surface bar the network route"
     );
 }

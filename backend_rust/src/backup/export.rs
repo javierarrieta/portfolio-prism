@@ -137,10 +137,11 @@ pub async fn build(
     Ok(bundle)
 }
 
-/// The transaction [`build`] reads inside, opened in one place so that every test of the
-/// isolation level goes through the same call `build` makes, and so that the portability
-/// gate has one spelling to look for. `build` is its only caller, and the gate rule is
-/// what keeps a second caller from appearing with a bare `pool.begin()` instead — see
+/// The transaction [`build`] reads inside, opened in one place so that every read that
+/// has to be a point-in-time snapshot goes through the same call and the same isolation
+/// level, and so that the portability gate has one spelling to look for. Its callers are
+/// [`build`] and [`crate::backup::detail::owned_detail`], and the gate rule is what keeps
+/// a third from appearing with a bare `pool.begin()` instead — see
 /// Rule 3 of `scripts/check_backup_portability.sh`.
 pub async fn begin_read_tx(
     pool: &DbPool,

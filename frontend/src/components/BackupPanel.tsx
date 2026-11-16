@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
+import { PlanSideView, isPlanSide, isCounts, countList, type Counts, type PlanSide } from './BackupPlanDetail';
 
 /**
  * Export and restore for the signed-in user's own portfolios: one card per half, in
@@ -33,24 +34,22 @@ interface PortfolioOption {
   name: string;
 }
 
-/** Rows counted by the server, in the three tables a bundle touches. One type for
- * both what a plan counts and what a restore reports having written, because the
- * server uses one shape for both. */
-interface Counts {
-  portfolios: number;
-  assets: number;
-  transactions: number;
-}
-
 /** What `/backup/preview?mode=` answers: what the bundle would write and — for
- * `replace` — what it would delete. Read from the server and never recomputed here:
- * counts a UI works out itself are counts of what the UI guessed the bundle holds,
- * and the guess is what the user reads as a promise. */
+ * `replace` — what it would delete. Each half is a `PlanSide`: the counts the server
+ * made plus the bounded listing under them. `PlanSide`, and `Counts` for the restore
+ * outcome below, come from `BackupPlanDetail` along with `countList` and the readers
+ * below — the panel spells the plan sentence and checks an untrusted body with the
+ * same functions the detail view does, and two copies of either is how they start
+ * disagreeing.
+ *
+ * The plan is read from the server and never recomputed here: counts a UI works out
+ * itself are counts of what the UI guessed the bundle holds, and the guess is what the
+ * user reads as a promise. */
 interface Plan {
   schema_version: number;
   mode: string;
-  delete: Counts;
-  insert: Counts;
+  delete: PlanSide;
+  insert: PlanSide;
   prices: number;
   warnings: string[];
 }
@@ -136,13 +135,6 @@ function asCapabilities(body: unknown): Capabilities | null {
   return c as Capabilities;
 }
 
-/** One set of the three counts a plan carries, read off an untrusted body. */
-function isCounts(value: unknown): value is Counts {
-  const c = value as Partial<Counts> | null;
-  return !!c && typeof c === 'object'
-    && Number.isFinite(c.portfolios) && Number.isFinite(c.assets) && Number.isFinite(c.transactions);
-}
-
 /** Why this file cannot be sent, or `null` when it can.
  *
  * The number is the server's own, read from `/backup/capabilities`; refusing here is
@@ -171,12 +163,19 @@ function oversizeReason(file: File, caps: Capabilities | null): string | null {
  * one operation are read from two places: the delete sentence is rendered from the
  * plan and the write is sent from the component's own mode. If they ever disagree the
  * card would be describing one operation while performing the other, and that is the
- * one disagreement a user cannot see. */
+ * one disagreement a user cannot see.
+ *
+ * Each half is checked as a whole `PlanSide`, not as its counts: the listing beside
+ * them is rendered too, so a body that counts correctly and carries `shown: null` is
+ * as unrenderable as one that counts wrongly, and `isPlanSide` is the function that
+ * knows what renderable means. A body in the old flat shape — three bare counts per
+ * side, which is what this panel read before the plan grew its listings — fails here
+ * on purpose. Accepting it would mean reading `side.counts` off `undefined`. */
 function asPlan(body: unknown, askedFor: RestoreMode): Plan | null {
   const p = body as Partial<Plan> | null;
   if (!p || typeof p !== 'object') return null;
   if (p.mode !== askedFor) return null;
-  if (!isCounts(p.delete) || !isCounts(p.insert)) return null;
+  if (!isPlanSide(p.delete) || !isPlanSide(p.insert)) return null;
   if (!Number.isFinite(p.prices)) return null;
   if (!Array.isArray(p.warnings) || !p.warnings.every((w) => typeof w === 'string')) return null;
   return p as Plan;
@@ -186,6 +185,33 @@ function asPlan(body: unknown, askedFor: RestoreMode): Plan | null {
  * answer, or an answer that is not the outcome. It cannot promise nothing was written,
  * so it says what is true and where to look instead. */
 const UNCONFIRMED_RESTORE = 'The restore could not be confirmed, so it cannot be tried again from this page. Reload the page to see what it wrote.';
+
+/** What a confirmed write reported: what it inserted, and — for `replace` — what its
+ * deletes actually removed, or `null` when the answer carried no such field. */
+interface RestoreResult {
+  inserted: Counts;
+  deleted: Counts | null;
+}
+
+/** The record a committed write leaves on the card, in one sentence.
+ *
+ * `deleted` is the server's own `rows_affected` total for the delete, not a recount of
+ * the plan that was on screen, so a plan that went stale between the preview and the
+ * write cannot misreport what was actually removed. It is named in parentheses because
+ * it is the cost of the write rather than the write: "Restored 1 portfolio, 2 assets,
+ * 3 transactions (replaced 2 portfolios, 4 assets, 6 transactions)."
+ *
+ * Copy mode deletes nothing, and every count on it is zero. Printing `(replaced 0
+ * portfolios, 0 assets, 0 transactions)` there reads like a warning about nothing, and
+ * "replaced nothing" reads like an apology, so the clause appears only when something
+ * really was replaced. A body that carried no `deleted` at all gets the plain sentence:
+ * `inserted` is what confirms the write, and a missing decoration may not unsay that. */
+function restoreSentence(result: RestoreResult): string {
+  const head = `Restored ${countList(result.inserted)}`;
+  const d = result.deleted;
+  if (!d || (d.portfolios === 0 && d.assets === 0 && d.transactions === 0)) return `${head}.`;
+  return `${head} (replaced ${countList(d)}).`;
+}
 
 /** The bundle's text.
  *
@@ -201,17 +227,6 @@ function readFileText(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error('the file could not be read'));
     reader.readAsText(file);
   });
-}
-
-/** `{n} {noun}` with the plural spelled out, so the plan reads "1 portfolio, 2
- * assets, 3 transactions". The counts are the server's; only the English is here. */
-function countList(counts: Counts): string {
-  const named = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
-  return [
-    named(counts.portfolios, 'portfolio'),
-    named(counts.assets, 'asset'),
-    named(counts.transactions, 'transaction'),
-  ].join(', ');
 }
 
 /** The name the server chose, off its `Content-Disposition`. The route names the
@@ -267,7 +282,16 @@ export default function BackupPanel({ portfolios }: Props) {
   const [previewing, setPreviewing] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
-  const [restoreResult, setRestoreResult] = useState<{ inserted: Counts } | null>(null);
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  // What the database says it holds, read back once a write has committed, and whether
+  // that read failed. Both are decoration beside `restoreResult` and nothing else: they
+  // gate no button and no control, because a committed write must never be made to look
+  // like a failure by a second read that did not land. Cleared with the result line they
+  // belong to, and by any fresh preview: a readback describes the write it followed, never
+  // the plan that is on screen afterwards — and one that lands after a newer question went
+  // out never lands at all, because `runRestore` guards it the way previews are guarded.
+  const [owned, setOwned] = useState<PlanSide | null>(null);
+  const [ownedFailed, setOwnedFailed] = useState(false);
 
   // Which preview is the current one. Two uploads in a row leave two responses in
   // flight and they may land in any order, so the response that arrives last is not
@@ -275,14 +299,32 @@ export default function BackupPanel({ portfolios }: Props) {
   // counter, and a superseded answer is dropped rather than displayed.
   const previewSeq = useRef(0);
 
+  // The one way to retire a preview that has not answered yet. A write uses it at both
+  // ends — before it starts, and again when it finishes — and so does a preview that is
+  // refused before it ever goes out, because the answer still in flight is then the
+  // *previous* file's. Bumping the sequence is what makes an in-flight answer fail the
+  // guard in `runPreview` instead of being displayed; the flag has to come down here
+  // too, because that answer's `finally` clears it only for the sequence number that is
+  // current, and this has just made it not current.
+  const retireInFlightPreview = () => {
+    previewSeq.current += 1;
+    setPreviewing(false);
+  };
+
   // The one place that asks for a plan. Both callers are user actions — choosing a
   // file, and choosing a mode — so the request goes out when the user changes
   // something rather than from an effect chasing that change after the fact.
   async function runPreview(target: File, forMode: RestoreMode) {
-    // Checked before the sequence advances, so an oversized file never becomes the
-    // current request: there is no in-flight answer to retire and no flag to clear.
+    // Refused here rather than at the server, and before this file becomes the current
+    // request — but not before there is nothing to retire. The answer in flight is the
+    // *previous* file's preview, and its sequence number is still the current one, so
+    // left alone it lands, passes its own guard, and puts the old file's counts back on
+    // the card under this file's refusal, with Restore armed to write them. Retiring it
+    // also takes `previewing` down: that answer's `finally` clears the flag only for the
+    // sequence it believes is current, and this bump is what makes it not current.
     const oversize = oversizeReason(target, caps);
     if (oversize) {
+      retireInFlightPreview();
       setPlan(null);
       setRestoreError(oversize);
       return;
@@ -290,6 +332,14 @@ export default function BackupPanel({ portfolios }: Props) {
     const seq = ++previewSeq.current;
     setPreviewing(true);
     setRestoreError(null);
+    // A preview is a fresh question about what the next write would do, and the readback
+    // beside the last write's result line is the answer to the *previous* question. Left
+    // up, the card reads "Will delete 2 portfolios…" directly above "Your portfolios now
+    // 1 portfolio…" — two present-tense answers about the same account, and the stale one
+    // is the one that looks like current state. It goes with the plan it was read against,
+    // exactly as the confirmation goes with the plan it was typed against.
+    setOwned(null);
+    setOwnedFailed(false);
     // The words belong to the plan on screen, so they go with the plan this request is
     // about to replace. Retrying a preview is not a no-op: the second answer can count
     // more to delete than the first, and a confirmation carried across it is one the
@@ -345,16 +395,6 @@ export default function BackupPanel({ portfolios }: Props) {
     if (file) void runPreview(file, next);
   };
 
-  // A write retires every preview that has not answered yet, at both ends of the write:
-  // before it starts, and again when it finishes. Bumping the sequence is what makes an
-  // in-flight answer fail the guard in `runPreview` instead of being displayed; the flag
-  // has to come down here too, because that answer's `finally` clears it only for the
-  // sequence number that is current, and this has just made it not current.
-  const retireInFlightPreview = () => {
-    previewSeq.current += 1;
-    setPreviewing(false);
-  };
-
   // Take the card apart at the end of a write: no plan and no words, so there is
   // nothing left to press. Both callers are the end of a restore — one that wrote, and
   // one whose outcome cannot be read.
@@ -387,6 +427,8 @@ export default function BackupPanel({ portfolios }: Props) {
     setRestoring(true);
     setRestoreError(null);
     setRestoreResult(null);
+    setOwned(null);
+    setOwnedFailed(false);
     try {
       const res = await apiFetch(`${API_BASE}/backup/restore?mode=${mode}`, {
         method: 'POST',
@@ -402,7 +444,8 @@ export default function BackupPanel({ portfolios }: Props) {
         setRestoreError(describeFailure(await readFailure(res)));
         return;
       }
-      const written = ((await res.json()) as { inserted?: unknown } | null)?.inserted;
+      const body = (await res.json()) as { inserted?: unknown; deleted?: unknown } | null;
+      const written = body?.inserted;
       if (!isCounts(written)) {
         // A 200 whose body is not the outcome is an answer that cannot be read, which
         // is the same unknown as no answer at all.
@@ -416,7 +459,45 @@ export default function BackupPanel({ portfolios }: Props) {
       // would duplicate the portfolios with nothing in the way. The result line stays as
       // the record, and Preview arms the card again for anyone who means to go on.
       disarmRestore();
-      setRestoreResult({ inserted: written });
+      // The deleted counts are decoration on a sentence the write already earned, so an
+      // answer that omitted them costs the clause and nothing more — see `RestoreResult`.
+      const rawDeleted = body?.deleted;
+      const replaced = isCounts(rawDeleted) ? rawDeleted : null;
+      setRestoreResult({ inserted: written, deleted: replaced });
+      // The write is committed and the panel is now describing it, so the readback is
+      // decoration: if it fails, the counts the restore itself returned stay on screen
+      // with one honest line beside them. Nothing here may make a committed write look
+      // like a failure — that is how the same bundle gets restored twice.
+      //
+      // What makes an out-of-order answer safe is the generation guard below, not the
+      // `restoring` bracket this request sits inside. The bracket still matters — it is
+      // what disables the file input and the mode radios until the read lands, so today
+      // it is what keeps two readbacks from overlapping at all — but a safety property
+      // that travelled with a disabled control would vanish the moment someone moved this
+      // request below the `finally` to shave a frame off the busy state, and the card
+      // would then state what the database held *before* the newer write as though it
+      // were the answer about what it holds now. That is the one sentence here that is
+      // not allowed to be wrong about the present tense, so the guard retires a stale
+      // answer whatever the busy state happens to allow.
+      //
+      // The guard is the counter that already decides which preview may display, and for
+      // the same reason: Preview is gated only on `previewing`, so it can be pressed in
+      // the window between this write committing and this read landing. That preview is a
+      // fresh question, and `runPreview` has just dropped the readback as the answer to
+      // the old one — so an answer from a retired generation lands on top of the new
+      // plan and reprints the account as it stood before the write. It is dropped whole:
+      // no counts, no failure line, no change to what is on screen.
+      const readback = previewSeq.current;
+      try {
+        const back = await apiFetch(`${API_BASE}/backup/owned`);
+        const body = back.ok ? (await back.json()) as unknown : null;
+        if (readback !== previewSeq.current) return;
+        if (isPlanSide(body)) setOwned(body);
+        else setOwnedFailed(true);
+      } catch {
+        if (readback !== previewSeq.current) return;
+        setOwnedFailed(true);
+      }
     } catch {
       // No answer. The write may have committed, may have rolled back, or may never
       // have arrived, and nothing this client can observe tells it which, so no
@@ -467,6 +548,8 @@ export default function BackupPanel({ portfolios }: Props) {
               setPlan(null);
               setRestoreError(null);
               setRestoreResult(null);
+              setOwned(null);
+              setOwnedFailed(false);
               setConfirm('');
               setConfirmFor(null);
               if (chosen) void runPreview(chosen, mode);
@@ -515,18 +598,29 @@ export default function BackupPanel({ portfolios }: Props) {
 
         {plan && (
           <div data-testid="preview-summary" role="status" style={{ marginTop: '12px' }}>
-            <p>
+            {/* One `PlanSideView` per side, so the sentence the summary used to be is
+                the first line of the detail rather than a second copy of it. The
+                listing under it is the server's own bounded one — this renders what
+                arrived in the preview response and nothing more, so a bigger plan
+                costs a bigger response and never a re-read of the bundle. */}
+            <div data-testid="preview-delete">
               {plan.mode === 'replace'
-                ? `Will delete ${countList(plan.delete)}.`
-                : 'Will delete nothing.'}
-            </p>
-            <p>{`Will insert ${countList(plan.insert)}.`}</p>
+                ? <PlanSideView title="Will delete" side={plan.delete} />
+                : <p>Will delete nothing.</p>}
+            </div>
+            <div data-testid="preview-insert">
+              <PlanSideView title="Will insert" side={plan.insert} />
+            </div>
             {/* The card never sends `apply_prices`, so a bundle carrying price history
                 restores without it. That is a decision the user should not have to guess
-                at, and `prices` is the server's own count of what is being left out. */}
+                at, and `prices` is the server's own count of what is being left out. It
+                is stated as the operator flow it is: this panel will never grow the
+                control, so "will be left alone" read as a feature it was one checkbox
+                short of. */}
             {plan.prices > 0 && (
               <p data-testid="preview-prices" className="text-muted">
-                {`${plan.prices} price row${plan.prices === 1 ? '' : 's'} in this bundle will be left alone — this panel does not restore price history.`}
+                {`This bundle carries ${plan.prices} price row${plan.prices === 1 ? '' : 's'}. `
+                  + 'Price history is shared market data and is restored by an operator, not from this panel.'}
               </p>
             )}
             {plan.warnings.map((w) => (
@@ -551,8 +645,22 @@ export default function BackupPanel({ portfolios }: Props) {
         )}
         {restoreResult && (
           <div data-testid="restore-result" role="status" style={{ marginTop: '12px' }}>
-            {`Restored ${countList(restoreResult.inserted)}.`}
+            {restoreSentence(restoreResult)}
           </div>
+        )}
+        {restoreResult && owned && (
+          <div data-testid="restore-owned" style={{ marginTop: '12px' }}>
+            <PlanSideView title="Your portfolios now" side={owned} />
+          </div>
+        )}
+        {/* Mutually exclusive with the line above, and success wins: `owned` and
+            `ownedFailed` are set in one `if`/`else` today, but two independent conditions
+            would print "Your portfolios now …" and "could not be read back" about the
+            same write the moment that ever stops holding. */}
+        {restoreResult && !owned && ownedFailed && (
+          <p data-testid="restore-owned-failed" className="text-muted" style={{ marginTop: '8px' }}>
+            The restore succeeded, but your data could not be read back to confirm it. Reload to see what is there.
+          </p>
         )}
       </section>
     </div>

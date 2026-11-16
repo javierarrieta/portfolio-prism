@@ -16,13 +16,14 @@ use std::collections::HashSet;
 
 /// Method, path, and the level required where one exists.
 ///
-/// `None` for the five routes that authenticate but check no resource id:
+/// `None` for the six routes that authenticate but check no resource id:
 /// `POST /api/portfolios/` (the caller becomes the owner),
 /// `GET /api/assets/lookup` (touches none of the three tables),
 /// `GET /api/backup/capabilities` (reports server limits, no caller data),
 /// `POST /api/backup/preview` (the only thing it reads is the caller's own upload),
-/// and `POST /api/backup/restore` (the same, and every row it writes is owned by the
-/// caller because the caller's own id is the only owner it is given).
+/// `POST /api/backup/restore` (the same, and every row it writes is owned by the
+/// caller because the caller's own id is the only owner it is given), and
+/// `GET /api/backup/owned` (reads the caller's own rows and no one else's).
 ///
 /// Routes outside `/api/` — `/`, `/api-docs/openapi.json`, `/auth/*`,
 /// `/_auth/denied` — are deliberately **not** in this inventory: the first two are
@@ -87,6 +88,9 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // Nothing here is authorisable against a resource, which is why the write path is
     // pinned by `tests/backup_test.rs` instead of by an `Access` level.
     ("POST", "/api/backup/restore", None),
+    // Reads the caller's own portfolios and nothing else; scoped by `owner_id`
+    // inside `owned_detail`, pinned by two users in `tests/backup_detail_test.rs`.
+    ("GET", "/api/backup/owned", None),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -162,7 +166,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 20, "the mounted /api surface is 20 operations");
+    assert_eq!(checked, 21, "the mounted /api surface is 21 operations");
 }
 
 #[tokio::test]
@@ -284,7 +288,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 20);
+    assert_eq!(PROTECTED_ROUTES.len(), 21);
 }
 
 #[test]
@@ -299,7 +303,7 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .count();
     assert_eq!(
         with_level, 15,
-        "five routes authenticate without checking an id"
+        "six routes authenticate without checking an id"
     );
 }
 

@@ -17,6 +17,7 @@ use backend_rust::ensure_bootstrap_owner;
 use common::{
     build_rocket,
     bundle_json,
+    bundle_with_size,
     db_with_user,
     disabled_config,
     placeholder_id,
@@ -699,12 +700,12 @@ async fn preview_counts_what_replace_would_delete_and_insert() {
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
     assert_eq!(body["mode"], "replace");
-    assert_eq!(body["delete"]["portfolios"], 2, "both owned portfolios go");
-    assert_eq!(body["delete"]["assets"], 1);
-    assert_eq!(body["delete"]["transactions"], 1);
-    assert_eq!(body["insert"]["portfolios"], 1);
-    assert_eq!(body["insert"]["assets"], 1);
-    assert_eq!(body["insert"]["transactions"], 1);
+    assert_eq!(body["delete"]["counts"]["portfolios"], 2, "both owned portfolios go");
+    assert_eq!(body["delete"]["counts"]["assets"], 1);
+    assert_eq!(body["delete"]["counts"]["transactions"], 1);
+    assert_eq!(body["insert"]["counts"]["portfolios"], 1);
+    assert_eq!(body["insert"]["counts"]["assets"], 1);
+    assert_eq!(body["insert"]["counts"]["transactions"], 1);
 }
 
 #[tokio::test]
@@ -722,10 +723,10 @@ async fn preview_in_copy_mode_deletes_nothing() {
     assert_eq!(res.status(), Status::Ok);
     let body: Value = res.into_json().await.unwrap();
     assert_eq!(body["mode"], "copy");
-    assert_eq!(body["delete"]["portfolios"], 0);
-    assert_eq!(body["delete"]["transactions"], 0);
+    assert_eq!(body["delete"]["counts"]["portfolios"], 0);
+    assert_eq!(body["delete"]["counts"]["transactions"], 0);
     // Copy still inserts: "deletes nothing" is not the same as "does nothing".
-    assert_eq!(body["insert"]["portfolios"], 1);
+    assert_eq!(body["insert"]["counts"]["portfolios"], 1);
 }
 
 #[tokio::test]
@@ -1012,7 +1013,7 @@ async fn two_splits_on_different_utc_days_are_accepted_even_in_the_same_local_da
     let status = res.status();
     let body: Value = res.into_json().await.unwrap();
     assert_eq!(status, Status::Ok, "2024-01-14T20:00Z and 2024-01-15T15:00Z are different UTC days: {body}");
-    assert_eq!(body["insert"]["transactions"], 2);
+    assert_eq!(body["insert"]["counts"]["transactions"], 2);
 }
 
 #[tokio::test]
@@ -1108,6 +1109,11 @@ async fn a_preview_describes_only_the_caller_s_own_rows() {
     // and never database ids, so a bundle cannot address another user's rows — and
     // the counts it is answered with are its own. `replace` describing a foreign
     // portfolio would be a promise to delete what the caller does not own.
+    //
+    // The fixture below deliberately impersonates user B — it reuses B's portfolio
+    // name, B's asset name and B's id-shaped refs, because that is exactly what a
+    // hand-edited file would try. Do not "clean up" those names: with them removed
+    // this test would still pass while proving nothing about impersonation.
     let (pool, user) = db_with_user("a_preview_describes_only_the_caller_s_own_rows").await;
     seed_two_portfolios(&pool, user).await;
     let other = common::seed_user(&pool, "user-b").await;
@@ -1144,12 +1150,107 @@ async fn a_preview_describes_only_the_caller_s_own_rows() {
     let body: Value = res.into_json().await.unwrap();
     // The caller's own two portfolios, and none of B's: B's one asset and one
     // transaction are absent from every count.
-    assert_eq!(body["delete"]["portfolios"], 2, "{body}");
-    assert_eq!(body["delete"]["assets"], 1, "{body}");
-    assert_eq!(body["delete"]["transactions"], 1, "{body}");
-    // And the plan is counts, not rows: nothing from either side's data appears.
-    let text = body.to_string();
-    assert!(!text.contains("Asset B") && !text.contains("Theirs"), "{text}");
+    assert_eq!(body["delete"]["counts"]["portfolios"], 2, "{body}");
+    assert_eq!(body["delete"]["counts"]["assets"], 1, "{body}");
+    assert_eq!(body["delete"]["counts"]["transactions"], 1, "{body}");
+    // The live side — the half read from the database — names only the caller's own
+    // rows. Both halves are load-bearing: the negative is the leak check, and the
+    // positive is what stops the negative passing vacuously. A delete side that listed
+    // nothing at all would satisfy `!contains` exactly as happily as one that filtered
+    // by owner correctly, and a broken owner filter is indistinguishable from a broken
+    // delete side from the outside.
+    let live = body["delete"].to_string();
+    assert!(
+        !live.contains("Asset B") && !live.contains("Theirs"),
+        "the plan must not name another tenant's rows: {live}"
+    );
+    assert!(
+        live.contains("One") && live.contains("Two"),
+        "the caller's own portfolios must be listed, or the check above proves nothing: {live}"
+    );
+    // The bundle side is the caller's own upload reflected back, so it *does* name
+    // "Theirs" and "Asset B" — the caller typed them into the file. Asserting the echo
+    // is what separates "the bundle's rows are listed" from "they were silently
+    // dropped"; it is not a leak, because the only reader of a preview is the caller
+    // who uploaded it.
+    let uploaded = body["insert"].to_string();
+    assert!(
+        uploaded.contains("Theirs") && uploaded.contains("Asset B"),
+        "the insert side echoes the uploaded bundle: {uploaded}"
+    );
+}
+
+#[tokio::test]
+async fn preview_names_the_portfolios_and_assets_it_will_insert() {
+    // The counts alone are not a preview: a user with 40 portfolios cannot decide
+    // whether "2 portfolios, 6 assets" is the file they meant to upload. `insert`
+    // carries the names behind its numbers, and `delete` carries the same shape even
+    // when it is empty, so the panel renders both sides with one component.
+    let (pool, user) = db_with_user("preview-detail-insert").await;
+    let c = client(pool, user).await;
+    // One transaction's price is zeroed, so the flag aggregation has something to
+    // report. `bundle_with_size` builds a clean file, and a clean file's `asset_flags`
+    // is `{}` whether or not the aggregation ever ran — asserting on it would pin shape
+    // and nothing else. The aggregation itself (over every asset, not just the listed
+    // ones) is pinned by the unit test
+    // `backup::detail::tests::asset_flags_are_counted_over_every_asset_not_just_the_shown_ones`;
+    // what this one pins is that a set flag survives the trip through the route.
+    let body = {
+        let mut bundle: Value = serde_json::from_str(&bundle_with_size(2, 3, 4)).unwrap();
+        bundle["portfolios"][0]["assets"][0]["transactions"][0]["price"] = json!("0.00");
+        bundle.to_string()
+    };
+
+    let res = c
+        .post("/api/backup/preview?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(body)
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let plan: Value = res.into_json().await.unwrap();
+
+    assert_eq!(plan["insert"]["counts"]["portfolios"], 2);
+    assert_eq!(plan["insert"]["shown"].as_array().unwrap().len(), 2);
+    let first = &plan["insert"]["shown"][0];
+    assert_eq!(first["shown"].as_array().unwrap().len(), 3);
+    assert_eq!(first["name"], "P0");
+    assert_eq!(first["asset_flags"]["zero_price"], 1);
+    // Copy deletes nothing, and says so with an empty side rather than a missing one.
+    // This caller owns nothing, so these two lines pin that the `delete` key is present
+    // and empty — the panel must not have to branch on a missing key — not that copy
+    // leaves the caller's rows alone. `preview_in_copy_mode_deletes_nothing` is the test
+    // that pins that behaviour, against a caller who does own rows.
+    assert_eq!(plan["delete"]["counts"]["portfolios"], 0);
+    assert!(plan["delete"]["shown"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replace_preview_names_what_it_will_delete() {
+    // The delete side is the one that can hurt, so it is the one that has to name
+    // rows: "replace will delete 1 portfolio" is not enough to catch uploading the
+    // wrong file over a live account.
+    let (pool, user) = db_with_user("preview-detail-delete").await;
+    let pid = seed_portfolio(&pool, user, "Doomed", "EUR").await;
+    let aid = seed_asset(&pool, pid, "DOOM", "Doomed One").await;
+    seed_transaction(&pool, aid, "BUY", 1.0, 4.0, 0.0).await;
+
+    let c = client(pool, user).await;
+    let res = c
+        .post("/api/backup/preview?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_size(1, 1, 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let plan: Value = res.into_json().await.unwrap();
+
+    assert_eq!(plan["delete"]["counts"]["portfolios"], 1);
+    assert_eq!(plan["delete"]["shown"][0]["name"], "Doomed");
+    assert_eq!(plan["delete"]["shown"][0]["currency"], "EUR");
+    assert_eq!(plan["delete"]["shown"][0]["transactions"], 1);
 }
 
 #[tokio::test]
@@ -1740,6 +1841,60 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
         "a replace that succeeds must leave the caller holding fewer rows than before: \
          {mine_after:?}"
     );
+}
+
+/// A plan is a statement about a moment. If rows appeared between the preview and the
+/// restore, `replace` deletes what is there now — so the outcome has to report the
+/// deletes it actually made, not repeat the plan's number.
+#[tokio::test]
+async fn restore_reports_the_rows_it_actually_deleted() {
+    let (pool, user) = db_with_user("restore_reports_the_rows_it_actually_deleted").await;
+    let pid = seed_portfolio(&pool, user, "Existing", "USD").await;
+    let aid = seed_asset(&pool, pid, "EX", "Existing").await;
+    seed_transaction(&pool, aid, "BUY", 1.0, 3.0, 0.0).await;
+    seed_transaction(&pool, aid, "BUY", 1.0, 4.0, 0.0).await;
+    // A second portfolio holding a second asset, so that every count below differs from
+    // the bundle's 1/1/1. With one portfolio holding one asset only the transactions
+    // count could tell `rows_affected` from an echo of the bundle's own numbers.
+    let other = seed_portfolio(&pool, user, "Other", "USD").await;
+    seed_asset(&pool, other, "OT", "Other").await;
+
+    let c = client(pool.clone(), user).await;
+    let res = c
+        .post("/api/backup/restore?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_size(1, 1, 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let out: Value = res.into_json().await.unwrap();
+
+    assert_eq!(out["deleted"]["portfolios"], 2);
+    assert_eq!(out["deleted"]["assets"], 2);
+    assert_eq!(out["deleted"]["transactions"], 2);
+    assert_eq!(out["inserted"]["portfolios"], 1);
+}
+
+#[tokio::test]
+async fn copy_mode_reports_nothing_deleted() {
+    let (pool, user) = db_with_user("copy_mode_reports_nothing_deleted").await;
+    seed_portfolio(&pool, user, "Kept", "USD").await;
+
+    let c = client(pool.clone(), user).await;
+    let res = c
+        .post("/api/backup/restore?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_size(1, 1, 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let out: Value = res.into_json().await.unwrap();
+
+    assert_eq!(out["deleted"]["portfolios"], 0);
+    assert_eq!(out["deleted"]["assets"], 0);
+    assert_eq!(out["deleted"]["transactions"], 0);
 }
 
 // ---------------------------------------------------------------------------

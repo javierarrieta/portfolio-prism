@@ -60,66 +60,13 @@ pub struct Counts {
 pub struct Plan {
     pub schema_version: i64,
     pub mode: String,
-    pub delete: Counts,
-    pub insert: Counts,
+    /// What the caller owns today, in the same shape as `insert` so one component
+    /// renders both. Was a bare `Counts`.
+    pub delete: super::detail::PlanSide,
+    /// What the bundle holds.
+    pub insert: super::detail::PlanSide,
     pub prices: usize,
     pub warnings: Vec<String>,
-}
-
-/// Rows the caller owns today — the exact set `replace` would delete.
-///
-/// Scoped by `owner_id` and by nothing else: every count a foreign bundle can
-/// provoke is a count of the caller's own rows, because the caller's id is the
-/// only filter any of these three queries has.
-pub async fn owned_counts(pool: &DbPool, user_id: i64) -> Result<Counts, DbFailure> {
-    let portfolios: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id = $1"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    let assets: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM assets WHERE portfolio_id IN
-          (SELECT id FROM portfolios WHERE owner_id = $1)"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    let transactions: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id IN
-          (SELECT id FROM assets WHERE portfolio_id IN
-           (SELECT id FROM portfolios WHERE owner_id = $1))"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    Ok(Counts {
-        portfolios: portfolios as usize,
-        assets: assets as usize,
-        transactions: transactions as usize,
-    })
-}
-
-/// Counts in the bundle, which is what the UI shows as "will insert".
-pub fn bundle_counts(bundle: &Bundle) -> Counts {
-    let mut c = Counts {
-        portfolios: bundle.portfolios.len(),
-        assets: 0,
-        transactions: 0,
-    };
-    for p in &bundle.portfolios {
-        c.assets += p.assets.len();
-        for a in &p.assets {
-            c.transactions += a.transactions.len();
-        }
-    }
-    c
 }
 
 /// The plan the user must see before restoring. Reads only; writes nothing.
@@ -129,19 +76,23 @@ pub async fn plan_for(
     bundle: &Bundle,
     mode: Mode,
 ) -> Result<Plan, DbFailure> {
+    // One clock reading for both sides, so a preview that straddles midnight cannot
+    // call the same transaction future-dated on one side and not on the other.
+    let today = chrono::Utc::now().date_naive();
+    let insert = super::detail::detail_from_bundle(bundle, today);
     let delete = match mode {
-        Mode::Copy => Counts::default(),
-        Mode::Replace => owned_counts(pool, user_id).await?,
+        Mode::Copy => super::detail::PlanSide::empty(),
+        Mode::Replace => super::detail::owned_detail(pool, user_id, today).await?,
     };
 
     let mut warnings = Vec::new();
-    if mode == Mode::Replace && delete.portfolios > 0 {
+    if mode == Mode::Replace && delete.counts.portfolios > 0 {
         warnings.push(format!(
             "replace will delete all {} portfolio(s) you own, including any not in this bundle",
-            delete.portfolios
+            delete.counts.portfolios
         ));
     }
-    if mode == Mode::Replace && delete.assets > 0 {
+    if mode == Mode::Replace && delete.counts.assets > 0 {
         // `Counts` has three fields because those are the three tables a bundle has
         // rows in. `replace` clears a fourth that a bundle says nothing about:
         // `split_sync` throttle rows, which carry an `asset_id` with no foreign key,
@@ -162,7 +113,7 @@ pub async fn plan_for(
         schema_version: bundle.schema_version,
         mode: mode.as_str().to_string(),
         delete,
-        insert: bundle_counts(bundle),
+        insert,
         prices: bundle.prices.len(),
         warnings,
     })
@@ -172,6 +123,9 @@ pub async fn plan_for(
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoreOutcome {
     pub inserted: Counts,
+    /// Rows the `replace` deletes actually removed, from `rows_affected`, not from
+    /// the plan. A plan describes a moment and the database may have moved.
+    pub deleted: Counts,
     /// The database ids the restore allocated, in bundle order. Returned so the UI
     /// can link straight to what appeared — and as proof that the ids are new.
     pub portfolio_ids: Vec<i64>,
@@ -270,9 +224,17 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
+    let mut deleted = Counts::default();
+
     if mode == Mode::Replace {
         // Reverse dependency order, scoped by `owner_id` and by nothing else: no
         // caller-supplied id is involved, so no bundle value can widen the delete.
+        //
+        // The three counted deletes below report `rows_affected` from inside this
+        // transaction, because that is the only moment that matches the deletes: a
+        // count re-queried after `commit` would describe a database another writer
+        // may have moved on, and reporting the plan's numbers would describe the
+        // preview rather than the restore.
         //
         // `split_sync` goes first, and now for the same reason as everything else:
         // `split_sync.asset_id` is `REFERENCES assets(id)` in `0001_init.sql`, so
@@ -287,6 +249,11 @@ pub async fn apply(
         // and `split_sync.asset_id` to `assets` — and none of them declares
         // `ON DELETE CASCADE`, so deleting a parent with children still attached is an
         // error, not a cascade.
+        //
+        // Uncounted on purpose: `Counts` counts the three tables a bundle has rows in,
+        // and `split_sync` is throttle state no bundle describes, so there is no field
+        // for its number to go in. The plan already warns that it is cleared
+        // (`plan_for`), which is where the user learns about it.
         sqlx::query!(
             "DELETE FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
@@ -297,7 +264,7 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!(
+        let txns = sqlx::query!(
             "DELETE FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
@@ -307,7 +274,7 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!(
+        let assets = sqlx::query!(
             "DELETE FROM assets WHERE portfolio_id IN \
              (SELECT id FROM portfolios WHERE owner_id = $1)",
             user_id
@@ -316,10 +283,16 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
+        let ports = sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
+
+        deleted = Counts {
+            portfolios: ports.rows_affected() as usize,
+            assets: assets.rows_affected() as usize,
+            transactions: txns.rows_affected() as usize,
+        };
     }
 
     let mut portfolio_ids = Vec::with_capacity(bundle.portfolios.len());
@@ -435,6 +408,7 @@ pub async fn apply(
 
     Ok(RestoreOutcome {
         inserted,
+        deleted,
         portfolio_ids,
         prices_inserted,
     })
@@ -443,6 +417,7 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backup::detail::detail_from_bundle;
     use crate::backup::{
         BundleAsset, BundlePortfolio, BundleTransaction, CURRENT_SCHEMA_VERSION, FORMAT_TAG,
         row_count,
@@ -509,13 +484,21 @@ mod tests {
         }
     }
 
+    /// The agreement test runs against `detail_from_bundle`, not against a private
+    /// counting helper, because `detail_from_bundle` is the only producer of
+    /// `plan.insert` — it is the function that makes the promise, so it is the function
+    /// the promise has to be checked on. Counting the bundle somewhere else and testing
+    /// that copy instead would leave the shipped numbers unpinned.
     #[test]
-    fn bundle_counts_counts_every_level_of_the_bundle() {
+    fn detail_from_bundle_counts_every_level_of_the_bundle() {
         // The same three levels `row_count` walks on the way in. If the two ever
         // disagree, the plan promises a different number of rows than validation
         // counted, and the user is shown one file and told about another.
         let bundle = bundle();
-        let c = bundle_counts(&bundle);
+        // A fixed day, so the counts cannot drift with the clock. Counts do not read
+        // `today` — only the flags do — but the producer takes it, so the test does.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let c = detail_from_bundle(&bundle, today).counts;
         assert_eq!((c.portfolios, c.assets, c.transactions), (1, 2, 1));
         assert_eq!(
             row_count(&bundle),
