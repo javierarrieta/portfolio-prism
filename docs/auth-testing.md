@@ -39,7 +39,7 @@ set -x DATABASE_URL postgres://postgres@127.0.0.1:55432/prism
 sqlx migrate run --no-dotenv
 cargo sqlx prepare --check -- --all-targets
 
-# Backend: 511 tests, 0 failed, 0 ignored
+# Backend: 559 tests, 0 failed, 0 ignored
 cargo test
 
 # Static access gate: prints "handlers inspected: 21, cleared: 21, files checked: 4"
@@ -77,7 +77,7 @@ diff /tmp/schema.json ../docs/backup-schema/v1.json
 ```
 
 ```fish
-# Frontend: 260 tests, types, lint
+# Frontend: 289 tests, types, lint
 cd ../frontend
 npm test
 npm run generate-types; and git diff --exit-code src/types/api.d.ts

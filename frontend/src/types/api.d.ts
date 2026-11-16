@@ -727,7 +727,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description Restored: inserted counts, portfolio_ids, prices_inserted */
+      /** @description Restored: inserted counts, deleted counts (zero in copy mode, which deletes nothing), portfolio_ids, prices_inserted */
       200: {
         content: {
           "application/json": unknown;

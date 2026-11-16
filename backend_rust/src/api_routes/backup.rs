@@ -1,4 +1,4 @@
-//! The backup routes: export, capabilities, preview, restore.
+//! The backup routes: export, capabilities, preview, restore, owned.
 //!
 //! No SQL here — that lives in `crate::backup`. Handlers here exist to authenticate,
 //! authorise, translate a `BundleError` into a status, and hand off.
@@ -456,7 +456,7 @@ pub async fn preview(
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Restored: inserted counts, portfolio_ids, prices_inserted", body = serde_json::Value),
+        (status = 200, description = "Restored: inserted counts, deleted counts (zero in copy mode, which deletes nothing), portfolio_ids, prices_inserted", body = serde_json::Value),
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` or `apply_prices` absent, repeated, or unrecognised; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation; a bundle carrying price history while price restore is disabled", body = serde_json::Value),
