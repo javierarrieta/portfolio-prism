@@ -63,13 +63,16 @@ describe('PlanSideView', () => {
         })}
       />,
     );
-    const block = document.querySelector('details[data-testid="plan-portfolio"]');
-    expect(block).not.toBeNull();
-    expect(block?.hasAttribute('open')).toBe(false);
+    // Collapsed, and the way out of it on the page: five of the six rows are held back
+    // and the control that reveals the sixth says so. A component that truncated the
+    // sixth row with no control — what this used to do — fails on the second line.
+    expect(screen.getAllByTestId('plan-asset')).toHaveLength(5);
+    expect(screen.getByTestId('plan-show-all')).toHaveAttribute('aria-expanded', 'false');
   });
 
   /** Together with the six-asset case this pins `COLLAPSE_ABOVE` to exactly 5: a threshold
-   * of 1-4 collapses these five, a threshold of 6 or more leaves the six-asset case open. */
+   * of 1-4 collapses these five and puts a toggle on the page, a threshold of 6 or more
+   * leaves the six-asset case open. */
   it('leaves a portfolio of exactly five assets open', () => {
     const five = Array.from({ length: 5 }, (_, i) => asset({ symbol: `S${i}` }));
     render(
@@ -80,14 +83,14 @@ describe('PlanSideView', () => {
         })}
       />,
     );
-    expect(document.querySelector('details[data-testid="plan-portfolio"]')).toBeNull();
+    expect(screen.queryByTestId('plan-show-all')).toBeNull();
     expect(screen.getAllByTestId('plan-asset')).toHaveLength(5);
   });
 
   it('leaves a small portfolio open', () => {
     render(<PlanSideView title="Will insert" side={side()} />);
-    expect(document.querySelector('details[data-testid="plan-portfolio"]')).toBeNull();
-    // No <details> is not the same claim as the rows being on the page. Assert both, or a
+    expect(screen.queryByTestId('plan-show-all')).toBeNull();
+    // No toggle is not the same claim as the rows being on the page. Assert both, or a
     // component that renders the header and drops the rows passes this test.
     expect(screen.getByTestId('plan-portfolio')).toBeInTheDocument();
     expect(screen.getByTestId('plan-asset')).toHaveTextContent('AAA');
@@ -108,14 +111,16 @@ describe('PlanSideView', () => {
         })}
       />,
     );
-    const summary = screen.getByText(/Wide/).closest('summary');
-    // The anchor is the assertion, not the text checks below: if the aggregate moved into
-    // the collapsed body, `closest('summary')` returns null and a `?? document.body`
-    // fallback would let both text checks pass while nothing is visible without expanding.
-    expect(summary).not.toBeNull();
-    expect(summary?.textContent).toContain('across all assets');
-    expect(summary?.textContent).toContain('zero-price ×3');
-    expect(summary?.textContent).toContain('future-dated ×1');
+    const row = screen.getByText(/Wide/).closest('tr');
+    // The anchor is the assertion, not the text checks below: it pins the aggregate into
+    // the portfolio's own row, the one row a collapse never hides. Were the aggregate
+    // instead printed inside an asset row, these checks would be reading a row the
+    // collapsed state is holding back — which the last line below is what rules out.
+    expect(row).not.toBeNull();
+    expect(row?.textContent).toContain('across all assets');
+    expect(row?.textContent).toContain('zero-price ×3');
+    expect(row?.textContent).toContain('future-dated ×1');
+    expect(screen.getAllByTestId('plan-asset')).toHaveLength(5);
   });
 
   /** The header aggregate counts every asset and the rows count one each, so the header
@@ -178,8 +183,8 @@ describe('PlanSideView', () => {
         })}
       />,
     );
-    expect(screen.getByText(/1 txn ·/)).toBeInTheDocument();
-    expect(screen.getByText(/3 txns ·/)).toBeInTheDocument();
+    expect(screen.getByText('1 txn')).toBeInTheDocument();
+    expect(screen.getByText('3 txns')).toBeInTheDocument();
   });
 
   it('renders a flag code it does not know instead of throwing', () => {

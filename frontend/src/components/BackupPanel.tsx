@@ -791,14 +791,21 @@ export default function BackupPanel({ portfolios }: Props) {
                 the first line of the detail rather than a second copy of it. The
                 listing under it is the server's own bounded one — this renders what
                 arrived in the preview response and nothing more, so a bigger plan
-                costs a bigger response and never a re-read of the bundle. */}
-            <div data-testid="preview-delete">
-              {plan.mode === 'replace'
-                ? <PlanSideView title="Will delete" side={plan.delete} />
-                : <p>Will delete nothing.</p>}
-            </div>
-            <div data-testid="preview-insert">
-              <PlanSideView title="Will insert" side={plan.insert} />
+                costs a bigger response and never a re-read of the bundle.
+
+                The two halves share a row on a wide screen because the question being
+                asked is a comparison — what goes against what — and two halves stacked
+                a screen apart cannot be read against each other. They stack below 900px,
+                where two columns would each be too narrow to hold a table. */}
+            <div className="plan-sides">
+              <div className="plan-side-panel" data-testid="preview-delete">
+                {plan.mode === 'replace'
+                  ? <PlanSideView title="Will delete" side={plan.delete} />
+                  : <p>Will delete nothing.</p>}
+              </div>
+              <div className="plan-side-panel" data-testid="preview-insert">
+                <PlanSideView title="Will insert" side={plan.insert} />
+              </div>
             </div>
             {/* The card never sends `apply_prices`, so a bundle carrying price history
                 restores without it. That is a decision the user should not have to guess

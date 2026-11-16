@@ -398,6 +398,156 @@ button, input, select, textarea {
   font-size: 0.75rem;
 }
 
+/* The preview comparison in the Backup tab (`BackupPanel`): the delete half and the
+   insert half side by side, each a panel of the same height budget, so the two can be
+   read against each other rather than scrolled apart. Below 900px two columns cannot
+   hold a five-column table each, so they stack. */
+.plan-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .plan-sides {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.plan-side-panel {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* The panel is already a box inside the restore card, so it does not get the glass
+   treatment too — and it scrolls its own table rather than widening the card. */
+.plan-table-scroll {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.875rem;
+}
+
+.plan-table th,
+.plan-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  vertical-align: top;
+}
+
+.plan-table thead th {
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* The portfolio row is the row a reader scans first, and it is the row that carries the
+   aggregated flags, so it is set apart from the asset rows under it. */
+.plan-portfolio-row > th {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.plan-portfolio-row > td,
+.plan-portfolio-row > th {
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* The asset table sits inside the portfolio row's cell, so it reads as the detail of
+   that row rather than as a peer table. */
+.plan-table--assets {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+}
+
+.plan-assets-row > td {
+  padding: 4px 10px 12px;
+}
+
+/* The flags column is the one that grows — a portfolio can carry several badges — so it
+   keeps enough width to hold one without squeezing the counts column beside it. */
+.plan-cell-flags {
+  min-width: 140px;
+}
+
+/* A note row (the toggle, the server's cap, the no-assets row) belongs to the rows above
+   it rather than standing as another row of its own, so it carries no separator. */
+.plan-note-row > td {
+  border-bottom: 0;
+  padding-top: 6px;
+}
+
+.plan-cell-num,
+.plan-cell-date {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.plan-cell-muted {
+  color: var(--text-muted);
+}
+
+.plan-flags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Colour only: the size and shape come from the existing `.badge`, which is not
+   redefined here so that nothing outside this panel moves. */
+.plan-flag {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--color-warning);
+}
+
+.plan-flag-scope {
+  font-size: 0.75rem;
+}
+
+.plan-toggle {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.plan-toggle:hover {
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* A caption a screen reader reads and an eye does not lay out: the table already says
+   what it holds in its columns, and the sentence above it already says which side it is.
+   Naming the side is for the reader that loses that context the moment it enters a table. */
+.plan-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
