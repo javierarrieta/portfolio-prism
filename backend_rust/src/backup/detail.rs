@@ -192,6 +192,9 @@ fn portfolio_detail(p: &BundlePortfolio, today: NaiveDate) -> PlanPortfolio {
         all.push(d);
     }
 
+    // Push order is contractual, not incidental: `flags` is a `Vec<String>` and the
+    // round-trip test compares vectors, not sets, so `owned_detail` pushes in this same
+    // order (`no_assets` first, then `duplicate_symbol`).
     let mut flags = Vec::new();
     if p.assets.is_empty() {
         flags.push(flag::NO_ASSETS.to_string());
@@ -259,9 +262,27 @@ pub fn detail_from_bundle(bundle: &Bundle, today: NaiveDate) -> PlanSide {
 /// single joined query could not promise that without returning every asset to count
 /// it. Bounding the rows exactly *is* possible — a windowed `ROW_NUMBER()` partitioned
 /// by portfolio and ordered the same way the cap is applied would return precisely the
-/// listed assets — and is deliberately not done: it copies a display constant into SQL
-/// and does not make the read cheaper, because the flag aggregate below already scans
-/// every owned asset to count it.
+/// listed assets, and it would make the read cheaper, because the detail query runs five
+/// correlated subqueries for every row it returns — and it is deliberately not done: the
+/// cap is a display constant and the window would copy it into SQL, while the row count
+/// is already bounded by the portfolio cap the query is handed (`ANY($1)`).
+///
+/// **All three reads share one snapshot.** They run on one connection inside the
+/// `READ ONLY REPEATABLE READ` transaction [`super::export::begin_read_tx`] opens, and
+/// the transaction ends as soon as the third read returns. This is not decoration: at
+/// the server default Postgres takes a fresh snapshot per *statement*, so an ordinary
+/// write committing between query 1 and query 3 would be counted by query 1 and absent
+/// from query 3 — `counts.assets = 51` next to 50 rows and `more_assets = 0`, a
+/// truncated list presented as complete, which is the exact failure this feature exists
+/// to prevent. Wrapping the three reads in a plain transaction would not fix it, only
+/// make it rarer; `REPEATABLE READ` is what takes one snapshot for all three.
+///
+/// Stated plainly, because it is not testable: **no test pins the snapshot property.**
+/// There is no way to force a write to land between two statements on demand, so the
+/// guarantee rests on the isolation level plus the single connection — the same basis
+/// `export::build` documents for itself, and the same one Rule 3 of
+/// `scripts/check_backup_portability.sh` guards (a bare `.begin(` here would run at the
+/// server default and every test would stay green).
 ///
 /// `today` is a parameter rather than a clock read so the future-dated flag is
 /// testable; `plan_for` passes the current UTC date.
@@ -271,6 +292,13 @@ pub async fn owned_detail(
     today: chrono::NaiveDate,
 ) -> Result<PlanSide, crate::backup::export::DbFailure> {
     use crate::backup::export::classify;
+
+    // One snapshot for all three reads, on one connection, opened through the export's
+    // helper so there is one spelling of the isolation level in the module. The scope is
+    // deliberately the three queries and nothing else: the aggregation below is pure
+    // Rust over rows already fetched, and widening the transaction to cover it would hold
+    // the snapshot open for no reason.
+    let mut tx = super::export::begin_read_tx(pool).await?;
 
     // One row per owned portfolio, with its exact asset and transaction counts.
     let portfolios = sqlx::query!(
@@ -282,7 +310,7 @@ pub async fn owned_detail(
            FROM portfolios p WHERE p.owner_id = $1 ORDER BY p.id"#,
         user_id
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(classify)?;
 
@@ -308,18 +336,19 @@ pub async fn owned_detail(
         user_id,
         today
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(classify)?;
 
     // Detail for the portfolios that will actually be listed: at most
     // MAX_PORTFOLIOS_SHOWN portfolios, ordered so the cap is deterministic. The asset
     // cap is applied in Rust below, not here, because the same rows are what
-    // `more_assets` is computed from — a plain SQL LIMIT would under-report it. A
-    // ROW_NUMBER() OVER (PARTITION BY portfolio_id ORDER BY symbol, id) window in a
-    // subquery would bound it exactly instead; that is possible and deliberately not
-    // done, because it duplicates a display constant in SQL for no gain in cost (the
-    // flag aggregate above already scans every owned asset).
+    // `more_assets` is computed from — pushing a plain SQL LIMIT would under-report it.
+    // A ROW_NUMBER() OVER (PARTITION BY portfolio_id ORDER BY symbol, id) window in a
+    // subquery would bound it exactly instead, and would cut work: this query runs five
+    // correlated subqueries per row returned, so 25x50 rows is less than the unbounded
+    // read. Not done here because the row count is already bounded by the portfolio cap
+    // the query is handed, and the window would copy a display constant into SQL.
     let listed: Vec<i64> = portfolios.iter().take(MAX_PORTFOLIOS_SHOWN).map(|p| p.id).collect();
     let assets = sqlx::query!(
         r#"SELECT a.portfolio_id AS "portfolio_id!", a.symbol AS "symbol!",
@@ -337,9 +366,14 @@ pub async fn owned_detail(
         &listed,
         today
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(classify)?;
+
+    // The snapshot is no longer needed; ending the transaction releases it. A read-only
+    // commit writes nothing — see `export::build`, which does the same for the same
+    // reason. A `?` above drops `tx` instead, which rolls the read-only transaction back.
+    tx.commit().await.map_err(classify)?;
 
     let mut side = PlanSide::empty();
     for p in &portfolios {
@@ -372,7 +406,14 @@ pub async fn owned_detail(
             .collect();
 
         let mut asset_flags: BTreeMap<String, usize> = BTreeMap::new();
+        // Push order is contractual, not incidental: `flags` is a `Vec<String>` and the
+        // round-trip test compares vectors, not sets, so this side pushes in the same
+        // order as `portfolio_detail` on the bundle side (`no_assets`, then
+        // `duplicate_symbol`).
         let mut flags_vec = Vec::new();
+        if p.assets == 0 {
+            flags_vec.push(flag::NO_ASSETS.to_string());
+        }
         if let Some(f) = flags.iter().find(|f| f.portfolio_id == p.id) {
             // Asset-level facts, counted over every asset the caller owns.
             for (code, n) in [
@@ -390,9 +431,6 @@ pub async fn owned_detail(
             if f.duplicates > 0 {
                 flags_vec.push(flag::DUPLICATE_SYMBOL.to_string());
             }
-        }
-        if p.assets == 0 {
-            flags_vec.push(flag::NO_ASSETS.to_string());
         }
 
         side.transactions_in_shown += p.transactions as usize;
