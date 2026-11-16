@@ -58,6 +58,9 @@ The spec implies these inputs and no task's happy path exercises them. Each line
 **Files:**
 - Create: `backend_rust/src/backup/detail.rs`
 - Modify: `backend_rust/src/backup/mod.rs` (add `pub mod detail;` beside `pub mod restore;`)
+- Modify: `backend_rust/tests/backup_portability_test.rs:89` — the portability tripwire counts
+  the files under `src/backup/`; a fifth module makes it 5 and the assertion moves with it. That
+  is the tripwire doing its job. INSERT counts stay at 4: `detail.rs` adds no INSERT statements.
 - Test: unit tests in `backend_rust/src/backup/detail.rs` (`#[cfg(test)] mod tests`)
 
 **Interfaces:**
@@ -84,7 +87,7 @@ mod tests {
     /// A function, not a `const`: `Option::unwrap` is not a `const fn`, so a constant
     /// built with `.unwrap()` is E0015 and the module does not compile at all.
     fn today() -> NaiveDate {
-        NaiveDate::from_ym_opt(2026, 6, 1).unwrap()
+        NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
     }
 
     fn tx(price: &str, date: &str) -> BundleTransaction {
@@ -149,7 +152,7 @@ mod tests {
         assert_eq!(side.counts.transactions, 26 * 51 * 2);
         assert_eq!(side.shown.len(), MAX_PORTFOLIOS_SHOWN);
         assert_eq!(side.more_portfolios, 1);
-        assert_eq!(side.transactions_in_shown, 25 * 50 * 2);
+        assert_eq!(side.transactions_in_shown, 25 * 51 * 2);
 
         let p = &side.shown[0];
         assert_eq!(p.assets, 51);
@@ -527,7 +530,7 @@ use common::{db_with_user, seed_asset, seed_asset_currency, seed_portfolio, seed
 
 /// A function, not a `const` — `Option::unwrap` is not a `const fn` (see Task 1).
 fn today() -> chrono::NaiveDate {
-    chrono::NaiveDate::from_ym_opt(2026, 6, 1).unwrap()
+    chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
 }
 
 #[tokio::test]
