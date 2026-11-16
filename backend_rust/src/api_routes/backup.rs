@@ -357,7 +357,7 @@ fn too_large() -> BackupError {
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "The plan: mode, delete counts, insert counts, prices, warnings", body = serde_json::Value),
+        (status = 200, description = "The plan: mode, prices, warnings, and both sides — `delete` (what the caller owns today) and `insert` (what the bundle holds) — each as exact counts plus a bounded listing of its portfolios and assets", body = serde_json::Value),
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),

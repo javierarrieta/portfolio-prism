@@ -1188,7 +1188,18 @@ async fn preview_names_the_portfolios_and_assets_it_will_insert() {
     // when it is empty, so the panel renders both sides with one component.
     let (pool, user) = db_with_user("preview-detail-insert").await;
     let c = client(pool, user).await;
-    let body = bundle_with_size(2, 3, 4);
+    // One transaction's price is zeroed, so the flag aggregation has something to
+    // report. `bundle_with_size` builds a clean file, and a clean file's `asset_flags`
+    // is `{}` whether or not the aggregation ever ran — asserting on it would pin shape
+    // and nothing else. The aggregation itself (over every asset, not just the listed
+    // ones) is pinned by the unit test
+    // `backup::detail::tests::asset_flags_are_counted_over_every_asset_not_just_the_shown_ones`;
+    // what this one pins is that a set flag survives the trip through the route.
+    let body = {
+        let mut bundle: Value = serde_json::from_str(&bundle_with_size(2, 3, 4)).unwrap();
+        bundle["portfolios"][0]["assets"][0]["transactions"][0]["price"] = json!("0.00");
+        bundle.to_string()
+    };
 
     let res = c
         .post("/api/backup/preview?mode=copy")
@@ -1204,9 +1215,13 @@ async fn preview_names_the_portfolios_and_assets_it_will_insert() {
     assert_eq!(plan["insert"]["shown"].as_array().unwrap().len(), 2);
     let first = &plan["insert"]["shown"][0];
     assert_eq!(first["shown"].as_array().unwrap().len(), 3);
-    assert!(first["name"].is_string());
-    assert!(first["asset_flags"].is_object());
+    assert_eq!(first["name"], "P0");
+    assert_eq!(first["asset_flags"]["zero_price"], 1);
     // Copy deletes nothing, and says so with an empty side rather than a missing one.
+    // This caller owns nothing, so these two lines pin that the `delete` key is present
+    // and empty — the panel must not have to branch on a missing key — not that copy
+    // leaves the caller's rows alone. `preview_in_copy_mode_deletes_nothing` is the test
+    // that pins that behaviour, against a caller who does own rows.
     assert_eq!(plan["delete"]["counts"]["portfolios"], 0);
     assert!(plan["delete"]["shown"].as_array().unwrap().is_empty());
 }

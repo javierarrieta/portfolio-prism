@@ -69,22 +69,6 @@ pub struct Plan {
     pub warnings: Vec<String>,
 }
 
-/// Counts in the bundle, which is what the UI shows as "will insert".
-pub fn bundle_counts(bundle: &Bundle) -> Counts {
-    let mut c = Counts {
-        portfolios: bundle.portfolios.len(),
-        assets: 0,
-        transactions: 0,
-    };
-    for p in &bundle.portfolios {
-        c.assets += p.assets.len();
-        for a in &p.assets {
-            c.transactions += a.transactions.len();
-        }
-    }
-    c
-}
-
 /// The plan the user must see before restoring. Reads only; writes nothing.
 pub async fn plan_for(
     pool: &DbPool,
@@ -410,6 +394,7 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backup::detail::detail_from_bundle;
     use crate::backup::{
         BundleAsset, BundlePortfolio, BundleTransaction, CURRENT_SCHEMA_VERSION, FORMAT_TAG,
         row_count,
@@ -476,13 +461,21 @@ mod tests {
         }
     }
 
+    /// The agreement test runs against `detail_from_bundle`, not against a private
+    /// counting helper, because `detail_from_bundle` is the only producer of
+    /// `plan.insert` — it is the function that makes the promise, so it is the function
+    /// the promise has to be checked on. Counting the bundle somewhere else and testing
+    /// that copy instead would leave the shipped numbers unpinned.
     #[test]
-    fn bundle_counts_counts_every_level_of_the_bundle() {
+    fn detail_from_bundle_counts_every_level_of_the_bundle() {
         // The same three levels `row_count` walks on the way in. If the two ever
         // disagree, the plan promises a different number of rows than validation
         // counted, and the user is shown one file and told about another.
         let bundle = bundle();
-        let c = bundle_counts(&bundle);
+        // A fixed day, so the counts cannot drift with the clock. Counts do not read
+        // `today` — only the flags do — but the producer takes it, so the test does.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let c = detail_from_bundle(&bundle, today).counts;
         assert_eq!((c.portfolios, c.assets, c.transactions), (1, 2, 1));
         assert_eq!(
             row_count(&bundle),
