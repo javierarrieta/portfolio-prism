@@ -537,16 +537,22 @@ pub async fn restore(
 
 /// The caller's own current state, in the shape the preview uses for both sides.
 ///
-/// It exists for the panel's post-restore readback, and it is the same function
-/// `preview` calls for its delete side — one implementation, two callers. It takes
-/// no id, so there is nothing for a `require*` call to scope-check; the `owner_id`
-/// filter inside `owned_detail` is the isolation, and `tests/backup_detail_test.rs`
-/// pins it with two users. Rule C of the access gate is satisfied by `AuthedUser`.
-///
-/// The response is the caller's live state at the moment the request was served, and
-/// it must never be cached or shared between callers. No `Cache-Control` header is set
-/// here because nothing between the browser and this process caches authenticated
-/// responses — unlike `export`, which hands back a download.
+/// For the panel's post-restore readback: this reports what is in the database now,
+/// which is not necessarily what a preview promised a moment earlier. The response is
+/// live state at the moment the request was served, and must never be cached or shared
+/// between callers.
+//
+// Implementation notes, deliberately not in the published description:
+//
+// * It is the same function `preview` calls for its delete side — one implementation,
+//   two callers, so the readback cannot disagree with the plan by construction.
+// * It takes no id, so there is nothing for a `require*` call to scope-check. The
+//   `owner_id` filter inside `owned_detail` IS the isolation, and
+//   `tests/backup_detail_test.rs` pins it with two users. Rule C of the access gate is
+//   satisfied by `AuthedUser`.
+// * No `Cache-Control` header is set here because nothing between the browser and this
+//   process caches authenticated responses — unlike `export`, which hands back a
+//   download.
 #[utoipa::path(
     get,
     path = "/api/backup/owned",
