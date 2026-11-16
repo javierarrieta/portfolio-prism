@@ -18,7 +18,8 @@
 //! closed on any `<…>` in the route attribute, which includes a query parameter, so
 //! marking it would fail the gate rather than pass it. It clears Rule A the way the
 //! rest of this file does — through the `require` call `export` makes — and Rule C
-//! by taking `AuthedUser`.
+//! by taking `AuthedUser`. `owned` is in the same position: no marker, no `require`
+//! call of its own, cleared by the same sibling.
 //!
 //! An uploaded bundle is read through a `Data` guard and opened under
 //! `MAX_BUNDLE_BYTES` **per route** — no global `Limits` entry is raised to serve
@@ -43,6 +44,7 @@ use crate::db::DbPool;
 
 use crate::access::{require, Access};
 use crate::auth::guard::AuthedUser;
+use crate::backup::detail::{self as backup_detail, PlanSide};
 use crate::backup::export::{self as backup_export, DbFailure};
 use crate::backup::restore::{
     self as backup_restore, ApplyError, Mode, Plan, RestoreOutcome,
@@ -357,7 +359,7 @@ fn too_large() -> BackupError {
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "The plan: mode, prices, warnings, and both sides — `delete` (what the caller owns today) and `insert` (what the bundle holds) — each as exact counts plus a bounded listing of its portfolios and assets", body = serde_json::Value),
+        (status = 200, description = "The plan: mode, delete side, insert side, prices, warnings", body = serde_json::Value),
         (status = 400, description = "The upload could not be read", body = serde_json::Value),
         (status = 413, description = "The upload is over `max_bytes`", body = serde_json::Value),
         (status = 422, description = "`mode` absent, repeated, or neither `copy` nor `replace`; an upload that is not JSON, not a bundle, from an unsupported `schema_version`, or that failed validation", body = serde_json::Value),
@@ -531,4 +533,46 @@ pub async fn restore(
     })?;
 
     Ok(Json(outcome))
+}
+
+/// The caller's own current state, in the shape the preview uses for both sides.
+///
+/// It exists for the panel's post-restore readback, and it is the same function
+/// `preview` calls for its delete side — one implementation, two callers. It takes
+/// no id, so there is nothing for a `require*` call to scope-check; the `owner_id`
+/// filter inside `owned_detail` is the isolation, and `tests/backup_detail_test.rs`
+/// pins it with two users. Rule C of the access gate is satisfied by `AuthedUser`.
+///
+/// The response is the caller's live state at the moment the request was served, and
+/// it must never be cached or shared between callers. No `Cache-Control` header is set
+/// here because nothing between the browser and this process caches authenticated
+/// responses — unlike `export`, which hands back a download.
+#[utoipa::path(
+    get,
+    path = "/api/backup/owned",
+    responses(
+        (status = 200, description = "The caller's portfolios, assets and transaction spans", body = serde_json::Value),
+        (status = 401, description = "No valid session", body = serde_json::Value),
+        (status = 500, description = "The read failed", body = serde_json::Value),
+        (status = 503, description = "The database is busy", body = serde_json::Value),
+    )
+)]
+#[get("/backup/owned")]
+pub async fn owned(
+    user: AuthedUser,
+    pool: &State<DbPool>,
+) -> Result<Json<PlanSide>, BackupError> {
+    let today = Utc::now().date_naive();
+    backup_detail::owned_detail(pool.inner(), user.id, today)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            // The same three arms `preview` answers with, from the same `DbFailure`:
+            // this route reads exactly the half of the preview that reads the live side.
+            DbFailure::Lock => lock_response(),
+            // Not reachable from here — nothing names a portfolio — named rather than
+            // swallowed by a catch-all, for the reason `preview` gives.
+            DbFailure::Missing => fail(Status::NotFound, "portfolio not found"),
+            DbFailure::Other => fail(DbFailure::Other.status(), "could not read the current data"),
+        })
 }

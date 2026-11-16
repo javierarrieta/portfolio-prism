@@ -1,16 +1,26 @@
 //! `owned_detail` — the live half of the preview, and the readback after a restore.
 //!
+//! The last three tests go over HTTP, because what they pin is the route that hands
+//! this function to the panel: that it answers the caller and only the caller, that it
+//! needs a session, and that after a restore it agrees with what the preview promised.
+//!
 //! Runtime `sqlx::query` here, not `query!`: the compile-time macro lives in `src/`
 //! only, so the cache does not have to know about test SQL.
 
 mod common;
 
-use backend_rust::backup::detail::{flag, owned_detail, MAX_ASSETS_SHOWN, MAX_PORTFOLIOS_SHOWN};
+use backend_rust::backup::detail::{
+    detail_from_bundle, flag, owned_detail, MAX_ASSETS_SHOWN, MAX_PORTFOLIOS_SHOWN,
+};
+use backend_rust::backup::Bundle;
 use chrono::NaiveDate;
 use common::{
-    db_with_user, seed_asset, seed_asset_currency, seed_portfolio, seed_transaction,
-    seed_transaction_at, seed_user,
+    build_rocket, build_rocket_oidc, bundle_with_size, db_with_user, seed_asset,
+    seed_asset_currency, seed_portfolio, seed_transaction, seed_transaction_at, seed_user,
 };
+use rocket::http::Status;
+use rocket::local::asynchronous::Client;
+use serde_json::Value;
 
 /// A function, not a `const` — `Option::unwrap` is not a `const fn` (see Task 1).
 fn today() -> NaiveDate {
@@ -309,4 +319,83 @@ async fn the_portfolio_cap_bounds_the_list_and_not_the_count() {
     assert_eq!(side.more_portfolios, 1);
     assert_eq!(side.transactions_in_shown, held_by_shown);
     assert_eq!(held_by_shown, 25);
+}
+
+// ---------------------------------------------------------------------------
+// `GET /api/backup/owned` — the route that hands `owned_detail` to the panel.
+// ---------------------------------------------------------------------------
+
+/// The route takes no id, so the only thing scoping it is `owner_id` inside
+/// `owned_detail`. Two users in one database — see the note on the isolation test in
+/// Task 2 for why a second `db_with_user` would not do.
+#[tokio::test]
+async fn owned_route_returns_the_callers_side() {
+    let (pool, uid) = db_with_user("owned-route-isolation").await;
+    let theirs = seed_user(&pool, "owned-route-theirs").await;
+    seed_portfolio(&pool, theirs, "Theirs", "USD").await;
+    seed_portfolio(&pool, uid, "Mine", "USD").await;
+
+    let client = Client::tracked(build_rocket(pool, uid)).await.unwrap();
+    let res = client
+        .get("/api/backup/owned")
+        .header(common::session_header())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let side: Value = res.into_json().await.unwrap();
+    assert_eq!(side["counts"]["portfolios"], 1);
+    assert_eq!(side["shown"][0]["name"], "Mine");
+    // The leak this pins is a name in the body, so the assertion is on the name. The
+    // other tenant's portfolio id is a free number off a sequence — asserting it is
+    // positive could not fail, and would prove nothing about isolation. Drop the
+    // `owner_id` filter from `owned_detail`'s portfolio aggregate and "Theirs" appears
+    // in this body, which is the mutation this test exists to catch.
+    let body = side.to_string();
+    assert!(
+        body.contains("Mine"),
+        "the caller's own portfolio is missing from the readback: {body}"
+    );
+    assert!(
+        !body.contains("Theirs"),
+        "another tenant's portfolio leaked into the readback: {body}"
+    );
+}
+
+#[tokio::test]
+async fn owned_route_needs_a_session() {
+    let (pool, _uid) = db_with_user("owned-route-anon").await;
+    let client = Client::tracked(build_rocket_oidc(pool)).await.unwrap();
+    let res = client.get("/api/backup/owned").dispatch().await;
+    assert_eq!(res.status(), Status::Unauthorized);
+}
+
+/// The claim the readback rests on: what the preview promised to insert is what the
+/// database holds afterwards. If the two producers drift, this is where it shows.
+#[tokio::test]
+async fn after_a_restore_the_readback_matches_what_the_preview_promised() {
+    let (pool, uid) = db_with_user("owned-route-roundtrip").await;
+    let bundle = bundle_with_size(2, 3, 4);
+    let parsed: Bundle = serde_json::from_str(&bundle).unwrap();
+    let promised = detail_from_bundle(&parsed, today());
+
+    let client = Client::tracked(build_rocket(pool.clone(), uid)).await.unwrap();
+    let res = client
+        .post("/api/backup/restore?mode=replace")
+        .header(common::session_header())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle.clone())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+
+    let after = owned_detail(&pool, uid, today()).await.unwrap();
+    assert_eq!(after.counts.portfolios, promised.counts.portfolios);
+    assert_eq!(after.counts.assets, promised.counts.assets);
+    assert_eq!(after.counts.transactions, promised.counts.transactions);
+    assert_eq!(after.shown.len(), promised.shown.len());
+    assert_eq!(after.shown[0].assets, promised.shown[0].assets);
+    // The flags too, not just the numbers: two producers that agree on counts and
+    // disagree on what a code means would pass every assertion above.
+    assert_eq!(after.shown[0].asset_flags, promised.shown[0].asset_flags);
+    assert_eq!(after.shown[0].flags, promised.shown[0].flags);
 }

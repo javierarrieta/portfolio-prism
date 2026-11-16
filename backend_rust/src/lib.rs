@@ -330,6 +330,7 @@ pub fn build_rocket(
             api_routes::backup::export,
             api_routes::backup::preview,
             api_routes::backup::restore,
+            api_routes::backup::owned,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same
