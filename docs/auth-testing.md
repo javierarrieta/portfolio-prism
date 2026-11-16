@@ -42,7 +42,7 @@ cargo sqlx prepare --check -- --all-targets
 # Backend: 511 tests, 0 failed, 0 ignored
 cargo test
 
-# Static access gate: prints "handlers inspected: 20, cleared: 20, files checked: 4"
+# Static access gate: prints "handlers inspected: 21, cleared: 21, files checked: 4"
 bash scripts/check_access_gate.sh
 
 # Pricing seam and engine portability: both print what they inspected

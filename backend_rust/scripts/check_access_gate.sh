@@ -45,7 +45,7 @@
 #     gate for that shape, not this script.
 #   * All three rules anchor on a route attribute in column 0 (`^#\[(get|post|...)`), so
 #     an **indented** route attribute is invisible to every rule: not flagged, not
-#     counted, not printed. No handler is indented today (all 20 in `src/api_routes` are
+#     counted, not printed. No handler is indented today (all 21 in `src/api_routes` are
 #     at column 0); a new one that is would be silently ungatechecked rather than
 #     failing. Fixing the anchor is a one-character change to each awk pattern; it is
 #     listed here so the gap is the script's known limit and not a discovery.

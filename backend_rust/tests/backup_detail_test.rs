@@ -1,8 +1,12 @@
 //! `owned_detail` — the live half of the preview, and the readback after a restore.
 //!
-//! The last three tests go over HTTP, because what they pin is the route that hands
-//! this function to the panel: that it answers the caller and only the caller, that it
-//! needs a session, and that after a restore it agrees with what the preview promised.
+//! The tests below the divider go over HTTP, because what they pin is the route that
+//! hands this function to the panel: that it answers the caller and only the caller, that
+//! it needs a session, that after a restore it agrees with what the preview promised, that
+//! it reads the clock for itself rather than being handed `today`, and that it tells every
+//! cache to keep nothing. The round-trip test is the one half-exception: it restores over
+//! HTTP but reads back through `owned_detail` directly, because that is the call `preview`
+//! makes.
 //!
 //! Runtime `sqlx::query` here, not `query!`: the compile-time macro lives in `src/`
 //! only, so the cache does not have to know about test SQL.
@@ -10,17 +14,19 @@
 mod common;
 
 use backend_rust::backup::detail::{
-    detail_from_bundle, flag, owned_detail, MAX_ASSETS_SHOWN, MAX_PORTFOLIOS_SHOWN,
+    detail_from_bundle, flag, owned_detail, PlanPortfolio, MAX_ASSETS_SHOWN,
+    MAX_PORTFOLIOS_SHOWN,
 };
 use backend_rust::backup::Bundle;
 use chrono::NaiveDate;
 use common::{
-    build_rocket, build_rocket_oidc, bundle_with_size, db_with_user, seed_asset,
-    seed_asset_currency, seed_portfolio, seed_transaction, seed_transaction_at, seed_user,
+    build_rocket, build_rocket_oidc, db_with_user, seed_asset, seed_asset_currency,
+    seed_portfolio, seed_transaction, seed_transaction_at, seed_user,
 };
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// A function, not a `const` — `Option::unwrap` is not a `const fn` (see Task 1).
 fn today() -> NaiveDate {
@@ -369,12 +375,102 @@ async fn owned_route_needs_a_session() {
     assert_eq!(res.status(), Status::Unauthorized);
 }
 
+/// A bundle built for the round-trip test alone, because the shared `bundle_with_size`
+/// cannot produce a single flag: every asset is USD in a USD portfolio, every price is
+/// `10.00`, every date is in 2024 and every symbol is unique. Restoring it and comparing
+/// the two producers' `asset_flags` compared two empty maps, so `bundle_with_size` stays
+/// untouched — `tests/restore_concurrency_test.rs` restores it and wants no flags either
+/// — and this stands beside it.
+///
+/// Every asset-level flag code the module has appears in `Flags`, each on its own asset,
+/// with `duplicate_symbol` at the portfolio level, so `1` is the only right count for any
+/// of them and a producer that flags two assets where the other flags one cannot pass.
+/// `Plain` carries none, which is what makes the counts in `Flags` per-portfolio rather
+/// than global.
+///
+/// `PLUSZERO` is the deliberate oddity. `+0` is a price a bundle may really carry —
+/// validation accepts it and `restore.rs` writes the string verbatim — and the rule both
+/// producers share is a *text* match (`^-?0+(\.0+)?$` in SQL, `is_zero` on the bundle
+/// side) that does **not** accept it. So this row is the exact drift the comparison
+/// exists to catch: widen the SQL regex to `\+?-?0+` and the database side counts two
+/// zero-price assets where the bundle side still counts one.
+fn flagged_bundle() -> String {
+    let tx = |price: &str, date: &str| {
+        json!({ "type": "BUY", "quantity": "1.0", "price": price, "fee": "0.00",
+                "date": date })
+    };
+    let asset = |r: &str, symbol: &str, name: &str, currency: &str, txs: Vec<Value>| {
+        json!({ "ref": r, "symbol": symbol, "name": name, "asset_type": "STOCK",
+                "sector": null, "currency": currency, "isin": null, "transactions": txs })
+    };
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-06-01T00:00:00Z",
+        "portfolios": [
+            {
+                "ref": "p-flags", "name": "Flags", "description": null,
+                "currency": "EUR", "base_currency": "EUR",
+                "assets": [
+                    // zero_price: the one spelling of zero the text rule accepts.
+                    asset("a-zero", "ZERO", "Zero", "EUR",
+                        vec![tx("0.00", "2024-01-15T00:00:00Z")]),
+                    // Flagged by neither side, and here to prove it stays that way.
+                    asset("a-plus", "PLUSZERO", "Plus zero", "EUR",
+                        vec![tx("+0", "2024-01-15T00:00:00Z")]),
+                    // duplicate_symbol: two assets, one symbol, one portfolio.
+                    asset("a-dup-1", "DUP", "Dup one", "EUR",
+                        vec![tx("2.00", "2024-01-16T00:00:00Z")]),
+                    asset("a-dup-2", "DUP", "Dup two", "EUR",
+                        vec![tx("3.00", "2024-01-17T00:00:00Z")]),
+                    // currency_mismatch: this portfolio is EUR.
+                    asset("a-fx", "FX", "Fx", "USD",
+                        vec![tx("4.00", "2024-01-18T00:00:00Z")]),
+                    // no_transactions.
+                    asset("a-none", "NONE", "None", "EUR", vec![]),
+                    // future_dated: one day past the `today()` both producers are given.
+                    asset("a-soon", "SOON", "Soon", "EUR",
+                        vec![tx("5.00", "2026-06-02T00:00:00Z")]),
+                ]
+            },
+            {
+                "ref": "p-plain", "name": "Plain", "description": null,
+                "currency": "USD", "base_currency": "USD",
+                "assets": [
+                    asset("a-calm", "CALM", "Calm", "USD",
+                        vec![tx("6.00", "2024-01-19T00:00:00Z")]),
+                ]
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// A portfolio's assets lined up by what identifies them here — symbol and name — with
+/// the two numbers that come from the per-asset flag logic: how many of the asset's rows
+/// read as a zero price, and the flags that conclusion produced.
+///
+/// The key is symbol **and** name because the SQL side orders assets by symbol while the
+/// bundle side keeps the order they were written in, and `DUP` is one symbol held by two
+/// different assets. Comparing `shown` positionally would compare `ZERO` against `DUP`.
+fn per_asset(p: &PlanPortfolio) -> BTreeMap<(&str, &str), (usize, Vec<&str>)> {
+    p.shown
+        .iter()
+        .map(|a| {
+            (
+                (a.symbol.as_str(), a.name.as_str()),
+                (a.zero_price, a.flags.iter().map(String::as_str).collect()),
+            )
+        })
+        .collect()
+}
+
 /// The claim the readback rests on: what the preview promised to insert is what the
 /// database holds afterwards. If the two producers drift, this is where it shows.
 #[tokio::test]
 async fn after_a_restore_the_readback_matches_what_the_preview_promised() {
     let (pool, uid) = db_with_user("owned-route-roundtrip").await;
-    let bundle = bundle_with_size(2, 3, 4);
+    let bundle = flagged_bundle();
     let parsed: Bundle = serde_json::from_str(&bundle).unwrap();
     let promised = detail_from_bundle(&parsed, today());
 
@@ -394,8 +490,170 @@ async fn after_a_restore_the_readback_matches_what_the_preview_promised() {
     assert_eq!(after.counts.transactions, promised.counts.transactions);
     assert_eq!(after.shown.len(), promised.shown.len());
     assert_eq!(after.shown[0].assets, promised.shown[0].assets);
+
     // The flags too, not just the numbers: two producers that agree on counts and
-    // disagree on what a code means would pass every assertion above.
-    assert_eq!(after.shown[0].asset_flags, promised.shown[0].asset_flags);
-    assert_eq!(after.shown[0].flags, promised.shown[0].flags);
+    // disagree on what a code means would pass every assertion above. Portfolios are
+    // lined up by name, not index: the SQL side orders assets by symbol and the bundle
+    // side keeps the order they were written in, so the names are the only safe key.
+    for want in &promised.shown {
+        let got = after
+            .shown
+            .iter()
+            .find(|p| p.name == want.name)
+            .unwrap_or_else(|| panic!("{} is missing from the readback", want.name));
+        assert_eq!(
+            got.asset_flags, want.asset_flags,
+            "asset_flags differ for {}",
+            want.name
+        );
+        assert_eq!(got.flags, want.flags, "flags differ for {}", want.name);
+        // The per-asset flags and zero counts too. The map above is built from the flag
+        // aggregate's `FILTER` clauses; the list each asset carries is built by
+        // `asset_flags_from` from the *detail* query's counts, and the bundle side has
+        // its own `is_zero` and its own pushes. That is four pieces of logic, not two, and
+        // dropping the currency comparison from `asset_flags_from` moves nothing in the
+        // map above — so this is the only place that can catch it.
+        assert_eq!(
+            per_asset(got),
+            per_asset(want),
+            "per-asset flags differ for {}",
+            want.name
+        );
+    }
+
+    // The equality above is only worth having if there is something in the maps to agree
+    // about. Two empty maps are equal, and for as long as this test ran on
+    // `bundle_with_size` — every asset USD in a USD portfolio, every price `10.00`, every
+    // date in 2024, every symbol unique — that is all it checked: the producers "agreed"
+    // by agreeing that nothing happened. Each code is named with its count so a producer
+    // that stops flagging fails here, rather than in the equality above where the failure
+    // message is two `{}`s.
+    let want_flags = promised.shown.iter().find(|p| p.name == "Flags").unwrap();
+    let got_flags = after.shown.iter().find(|p| p.name == "Flags").unwrap();
+    assert!(
+        !want_flags.asset_flags.is_empty() && !got_flags.asset_flags.is_empty(),
+        "the fixture produced no flags on at least one side: bundle {:?}, database {:?}",
+        want_flags.asset_flags,
+        got_flags.asset_flags
+    );
+    for (code, n) in [
+        (flag::ZERO_PRICE, 1usize),
+        (flag::CURRENCY_MISMATCH, 1),
+        (flag::NO_TRANSACTIONS, 1),
+        (flag::FUTURE_DATED, 1),
+    ] {
+        assert_eq!(
+            want_flags.asset_flags.get(code),
+            Some(&n),
+            "the bundle side never set {code}"
+        );
+        assert_eq!(
+            got_flags.asset_flags.get(code),
+            Some(&n),
+            "the database side never set {code}"
+        );
+    }
+    // `duplicate_symbol` is a portfolio fact, and the one code the loop above would
+    // least like to lose: the SQL side counts *duplicated symbols*, not duplicated
+    // assets, and this fixture has two assets sharing one symbol — a producer that
+    // counted assets would report 2, and the flag is presence either way.
+    assert_eq!(want_flags.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
+    assert_eq!(got_flags.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
+    // The clean half. Without a portfolio that has nothing to flag, the four codes above
+    // could have come from a count taken across the whole caller rather than per
+    // portfolio, and both producers could be wrong in the same direction.
+    let want_plain = promised.shown.iter().find(|p| p.name == "Plain").unwrap();
+    let got_plain = after.shown.iter().find(|p| p.name == "Plain").unwrap();
+    assert!(want_plain.asset_flags.is_empty() && want_plain.flags.is_empty());
+    assert!(
+        got_plain.asset_flags.is_empty() && got_plain.flags.is_empty(),
+        "the unflagged portfolio came back flagged: {:?} / {:?}",
+        got_plain.asset_flags,
+        got_plain.flags
+    );
+}
+
+/// The handler reads the clock itself — `Utc::now().date_naive()` in
+/// `api_routes/backup.rs` — while every other test in this file passes `today` in as a
+/// parameter. Nothing else pins that reading, and a `today` one day off in the handler
+/// would mis-flag `future_dated` for every user in production with this whole file
+/// green. Over HTTP for that reason: the thing under test is the call the handler makes,
+/// not the function it calls.
+#[tokio::test]
+async fn owned_route_reads_the_clock_for_itself() {
+    let (pool, uid) = db_with_user("owned-route-clock").await;
+    let pid = seed_portfolio(&pool, uid, "P", "USD").await;
+    let tomorrow = seed_asset(&pool, pid, "TOMORROW", "Tomorrow").await;
+    let same_day = seed_asset(&pool, pid, "TODAY", "Today").await;
+    let now = chrono::Utc::now().date_naive();
+    // Midday UTC on both rows, so the hour cannot move either one to another day. The
+    // window this leaves is the one no test can close: if UTC midnight falls between this
+    // line and the handler's own reading, TOMORROW becomes "today" and the first
+    // assertion below fails. It is microseconds wide.
+    seed_transaction_at(
+        &pool,
+        tomorrow,
+        "BUY",
+        1.0,
+        1.0,
+        0.0,
+        &format!("{}T12:00:00Z", now.succ_opt().unwrap()),
+    )
+    .await;
+    seed_transaction_at(
+        &pool,
+        same_day,
+        "BUY",
+        1.0,
+        1.0,
+        0.0,
+        &format!("{now}T12:00:00Z"),
+    )
+    .await;
+
+    let client = Client::tracked(build_rocket(pool, uid)).await.unwrap();
+    let res = client
+        .get("/api/backup/owned")
+        .header(common::session_header())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let side: Value = res.into_json().await.unwrap();
+
+    // The portfolio header first, because that is what the panel renders: exactly one
+    // future-dated asset, counted over every asset the caller owns.
+    assert_eq!(side["shown"][0]["asset_flags"][flag::FUTURE_DATED], 1);
+    // And which asset it was. TOMORROW is the half that catches a `today` that is too
+    // late; TODAY not being in the list is the half that catches one that is too early.
+    let flagged: Vec<&str> = side["shown"][0]["shown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| {
+            a["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f.as_str() == Some(flag::FUTURE_DATED))
+        })
+        .map(|a| a["symbol"].as_str().unwrap())
+        .collect();
+    assert_eq!(flagged, vec!["TOMORROW"]);
+}
+
+/// The readback is one caller's live holdings, so a cache that kept it would answer the
+/// next caller with someone else's portfolio. `export` sets the same header for the same
+/// reason, and `tests/backup_test.rs::export_is_a_download_and_is_never_cached` pins it
+/// there; this is the same claim on this route.
+#[tokio::test]
+async fn owned_route_says_the_response_is_not_cacheable() {
+    let (pool, uid) = db_with_user("owned-route-no-store").await;
+    let client = Client::tracked(build_rocket(pool, uid)).await.unwrap();
+    let res = client
+        .get("/api/backup/owned")
+        .header(common::session_header())
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(res.headers().get_one("Cache-Control"), Some("no-store"));
 }

@@ -125,6 +125,16 @@ pub struct BundleDownload {
     content_disposition: Header<'static>,
 }
 
+/// The readback: the caller's live state plus the header that keeps a cache from
+/// holding it. A struct for the same reason as [`BundleDownload`] — Rocket has no
+/// `Responder` for a `(Json, Header)` tuple — and the derive turns every field after
+/// the first into a response header.
+#[derive(rocket::Responder)]
+pub struct OwnedResponse {
+    side: Json<PlanSide>,
+    cache_control: Header<'static>,
+}
+
 #[utoipa::path(
     get,
     path = "/api/backup/capabilities",
@@ -550,9 +560,14 @@ pub async fn restore(
 //   `owner_id` filter inside `owned_detail` IS the isolation, and
 //   `tests/backup_detail_test.rs` pins it with two users. Rule C of the access gate is
 //   satisfied by `AuthedUser`.
-// * No `Cache-Control` header is set here because nothing between the browser and this
-//   process caches authenticated responses — unlike `export`, which hands back a
-//   download.
+// * The response carries `Cache-Control: no-store`, the header `export` already sets
+//   for the same reason: the body is one caller's holdings at one instant, and a cache
+//   that kept it would hand one user's portfolio to the next. The property is enforced
+//   by that header rather than argued from RFC heuristic freshness — with no header to
+//   read, an intermediary is free to guess, and `max-age=0` would still let a shared
+//   cache store the response and revalidate it. `no-store` is the only spelling that
+//   does not depend on the intermediary's judgement, and `tests/backup_detail_test.rs`
+//   pins that the route actually sends it.
 #[utoipa::path(
     get,
     path = "/api/backup/owned",
@@ -567,11 +582,14 @@ pub async fn restore(
 pub async fn owned(
     user: AuthedUser,
     pool: &State<DbPool>,
-) -> Result<Json<PlanSide>, BackupError> {
+) -> Result<OwnedResponse, BackupError> {
     let today = Utc::now().date_naive();
     backup_detail::owned_detail(pool.inner(), user.id, today)
         .await
-        .map(Json)
+        .map(|side| OwnedResponse {
+            side: Json(side),
+            cache_control: Header::new("Cache-Control", "no-store"),
+        })
         .map_err(|e| match e {
             // The same three arms `preview` answers with, from the same `DbFailure`:
             // this route reads exactly the half of the preview that reads the live side.
