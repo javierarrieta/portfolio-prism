@@ -116,8 +116,30 @@ fn is_zero(price: &str) -> bool {
 /// anything shorter contributes no date rather than panicking in a preview. Sliced
 /// with `get`, not indexing: `len() >= 10` is a byte count, so indexing byte 10 would
 /// panic on a multi-byte character straddling it.
+///
+/// This is the *fallback*, not the rule — see [`utc_day`].
 fn date_part(rfc3339: &str) -> Option<String> {
     rfc3339.get(..10).map(str::to_string)
+}
+
+/// The calendar day of an RFC 3339 timestamp, **in UTC**.
+///
+/// The offset a bundle writes does not survive the restore: `restore.rs:379` parses the
+/// same string and converts it to UTC before binding it into a `TIMESTAMPTZ`, which keeps
+/// no offset, so [`owned_detail`] can only ever report the UTC day. Taking the first ten
+/// characters as written would therefore name one day before the restore and another one
+/// after it — `2026-06-02T01:00:00+02:00` is `2026-06-01` in UTC — and `first_date`,
+/// `last_date` and `future_dated` all read this value, so one row would give the two
+/// producers two different answers. Parsing and converting is what makes them agree.
+///
+/// A string that does not parse falls back to the textual prefix rather than
+/// contributing nothing: a bare `YYYY-MM-DD` has no offset to convert, and the
+/// no-panic-on-multibyte behaviour [`date_part`] pins stays reachable.
+fn utc_day(rfc3339: &str) -> Option<String> {
+    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(dt) => Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%d").to_string()),
+        Err(_) => date_part(rfc3339),
+    }
 }
 
 fn asset_detail(a: &BundleAsset, portfolio_currency: &str, today: NaiveDate) -> PlanAsset {
@@ -126,7 +148,7 @@ fn asset_detail(a: &BundleAsset, portfolio_currency: &str, today: NaiveDate) -> 
     let dates: Vec<String> = a
         .transactions
         .iter()
-        .filter_map(|t| date_part(&t.date))
+        .filter_map(|t| utc_day(&t.date))
         .collect();
     let first_date = dates.iter().min().cloned();
     let last_date = dates.iter().max().cloned();
@@ -233,8 +255,13 @@ pub fn detail_from_bundle(bundle: &Bundle, today: NaiveDate) -> PlanSide {
 /// aggregate cover **every** owned row, so every exact number comes from a full
 /// scan of the caller's data; only the asset detail query is bounded, and only by
 /// the display caps — and the asset cap is applied in Rust, from the same rows
-/// `more_assets` is computed from, so a SQL `LIMIT` cannot under-report it. A single
-/// joined query could not promise that without returning every asset to count it.
+/// `more_assets` is computed from, so a plain SQL `LIMIT` cannot under-report it. A
+/// single joined query could not promise that without returning every asset to count
+/// it. Bounding the rows exactly *is* possible — a windowed `ROW_NUMBER()` partitioned
+/// by portfolio and ordered the same way the cap is applied would return precisely the
+/// listed assets — and is deliberately not done: it copies a display constant into SQL
+/// and does not make the read cheaper, because the flag aggregate below already scans
+/// every owned asset to count it.
 ///
 /// `today` is a parameter rather than a clock read so the future-dated flag is
 /// testable; `plan_for` passes the current UTC date.
@@ -288,7 +315,11 @@ pub async fn owned_detail(
     // Detail for the portfolios that will actually be listed: at most
     // MAX_PORTFOLIOS_SHOWN portfolios, ordered so the cap is deterministic. The asset
     // cap is applied in Rust below, not here, because the same rows are what
-    // `more_assets` is computed from — a SQL LIMIT would under-report it.
+    // `more_assets` is computed from — a plain SQL LIMIT would under-report it. A
+    // ROW_NUMBER() OVER (PARTITION BY portfolio_id ORDER BY symbol, id) window in a
+    // subquery would bound it exactly instead; that is possible and deliberately not
+    // done, because it duplicates a display constant in SQL for no gain in cost (the
+    // flag aggregate above already scans every owned asset).
     let listed: Vec<i64> = portfolios.iter().take(MAX_PORTFOLIOS_SHOWN).map(|p| p.id).collect();
     let assets = sqlx::query!(
         r#"SELECT a.portfolio_id AS "portfolio_id!", a.symbol AS "symbol!",
@@ -426,6 +457,15 @@ mod tests {
             price: price.into(),
             fee: "0".into(),
             date: format!("{date}T00:00:00+00:00"),
+        }
+    }
+
+    /// A transaction whose date string is used verbatim. `tx` appends a `+00:00` time,
+    /// so it cannot express the one thing the offset tests are about.
+    fn tx_at(price: &str, rfc3339: &str) -> BundleTransaction {
+        BundleTransaction {
+            date: rfc3339.into(),
+            ..tx(price, "2026-01-01")
         }
     }
 
@@ -593,6 +633,49 @@ mod tests {
         );
         assert!(side.shown[0].shown[0].flags.contains(&flag::FUTURE_DATED.to_string()));
         assert!(!side.shown[1].shown[0].flags.contains(&flag::FUTURE_DATED.to_string()));
+    }
+
+    /// The two producers must be able to name the same day for the same row, so the day
+    /// is UTC on both. `2026-06-02T01:00:00+02:00` restores as the instant
+    /// `2026-06-01T23:00:00Z` — a `TIMESTAMPTZ` keeps no offset — so the readback says
+    /// 2026-06-01 and raises no flag. Slicing the string as written said 2026-06-02 and
+    /// flagged the asset future-dated, which is one row giving the panel two answers
+    /// depending on which producer filled it. All three fields the day feeds are asserted
+    /// because all three read it: `first_date`, `last_date` and `future_dated`.
+    #[test]
+    fn a_non_utc_offset_is_converted_to_the_utc_day() {
+        let side = detail_from_bundle(
+            &bundle(vec![portfolio("P", "USD", vec![asset(
+                "AAA",
+                "USD",
+                vec![tx_at("1", "2026-06-02T01:00:00+02:00")],
+            )])]),
+            today(),
+        );
+        let a = &side.shown[0].shown[0];
+        assert_eq!(a.first_date.as_deref(), Some("2026-06-01"));
+        assert_eq!(a.last_date.as_deref(), Some("2026-06-01"));
+        assert!(!a.flags.contains(&flag::FUTURE_DATED.to_string()));
+    }
+
+    /// The mirror direction of the test above: a negative offset moves the written date
+    /// the other way. `2026-05-31T23:00:00-02:00` is `2026-06-01T01:00:00Z`, so the UTC
+    /// day is today and the asset is not future-dated, while slicing the string would have
+    /// named 2026-05-31 — a mismatch only this direction can show.
+    #[test]
+    fn a_negative_offset_moves_the_day_the_other_way() {
+        let side = detail_from_bundle(
+            &bundle(vec![portfolio("P", "USD", vec![asset(
+                "AAA",
+                "USD",
+                vec![tx_at("1", "2026-05-31T23:00:00-02:00")],
+            )])]),
+            today(),
+        );
+        let a = &side.shown[0].shown[0];
+        assert_eq!(a.first_date.as_deref(), Some("2026-06-01"));
+        assert_eq!(a.last_date.as_deref(), Some("2026-06-01"));
+        assert!(!a.flags.contains(&flag::FUTURE_DATED.to_string()));
     }
 
     #[test]

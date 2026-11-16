@@ -124,6 +124,11 @@ so a frontend aggregation would silently under-report a flag sitting on asset 51
 says `zero-price ×2` when the portfolio holds three is a preview that lies, which is the failure
 this whole design exists to close.
 
+`first_date` and `last_date` are calendar days **in UTC on both producers** — the bundle side
+converts the timestamp's offset before formatting, because the restored `TIMESTAMPTZ` keeps no
+offset, so a day sliced off the string as written would name one date in the preview and another
+in the readback after the restore.
+
 `Plan` keeps its field names; two change type:
 
 ```rust
