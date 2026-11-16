@@ -81,7 +81,7 @@ diff /tmp/schema.json ../docs/backup-schema/v1.json
 ```
 
 ```fish
-# Frontend: 289 tests, types, lint
+# Frontend: 293 tests, types, lint
 cd ../frontend
 npm test
 npm run generate-types; and git diff --exit-code src/types/api.d.ts

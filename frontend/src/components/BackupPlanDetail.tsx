@@ -63,10 +63,17 @@ const FLAG_LABELS: Record<string, string> = {
   duplicate_symbol: 'duplicate symbol',
 };
 
-function flagLabel(code: string, count?: number): string {
-  const label = FLAG_LABELS[code] ?? code;
+function flagLabel(code: string, count?: number, labels?: Record<string, string>): string {
+  const label = labels?.[code] ?? FLAG_LABELS[code] ?? code;
   return count === undefined ? label : `${label} ×${count}`;
 }
+
+/** Copy that overrides `FLAG_LABELS` for one place only, because one code means two
+ * different units depending on who counts it. `zero_price` on a `PlanAsset` is a count
+ * of that asset's zero-price TRANSACTIONS; in a portfolio's `asset_flags` it is a count
+ * of flagged ASSETS. The header disambiguates with its "across all assets" prefix, so
+ * only the row needs its unit spelled out. */
+const ASSET_ROW_LABELS: Record<string, string> = { zero_price: 'zero-price rows' };
 
 /** The plan sentence. Exported because `BackupPanel` spells the same sentence for the
  * restore outcome, and two spellings of one promise is how they drift. */
@@ -116,16 +123,18 @@ export function isPlanSide(value: unknown): value is PlanSide {
 }
 
 /** Owns its own leading separator, so a list that renders nothing leaves no orphan `·` behind
- * and a caller cannot forget to put one in. `prefix` labels the scope of the counts. */
-function FlagList({ codes, counts, prefix }: {
+ * and a caller cannot forget to put one in. `prefix` labels the scope of the counts,
+ * `labels` renames a code for this caller alone. */
+function FlagList({ codes, counts, prefix, labels }: {
   codes: string[];
   counts?: Record<string, number>;
   prefix?: string;
+  labels?: Record<string, string>;
 }) {
   if (codes.length === 0) return null;
   return (
     <span data-testid="plan-flags" className="text-muted">
-      {` · ${prefix ?? ''}${codes.map((c) => flagLabel(c, counts?.[c])).join(' · ')}`}
+      {` · ${prefix ?? ''}${codes.map((c) => flagLabel(c, counts?.[c], labels)).join(' · ')}`}
     </span>
   );
 }
@@ -139,7 +148,7 @@ function AssetRow({ asset }: { asset: PlanAsset }) {
       <strong>{asset.symbol}</strong>
       {` ${asset.name} · ${asset.currency} · ${one(asset.transactions, 'txn', 'txns')}`}
       {` · ${span}`}
-      <FlagList codes={asset.flags} counts={{ zero_price: asset.zero_price }} />
+      <FlagList codes={asset.flags} counts={{ zero_price: asset.zero_price }} labels={ASSET_ROW_LABELS} />
     </div>
   );
 }

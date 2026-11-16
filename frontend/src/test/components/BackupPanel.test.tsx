@@ -425,6 +425,12 @@ describe('export download', () => {
   })
 })
 
+/** A bundle small enough to stay under any cap a test sets, so that the refusal under
+ * test is about the *other* file and this one's preview really does go out. */
+function tinyBundle(name = 'small.json') {
+  return new File(['{}'], name, { type: 'application/json' })
+}
+
 function bundleFile(name = 'bundle.json', portfolioName = 'Restored') {
   return new File([JSON.stringify({
     format: 'portfolio-prism-backup', schema_version: 1,
@@ -780,6 +786,72 @@ describe('restore card', () => {
     // What the server says it wrote, not what the card hoped it wrote.
     await waitFor(() => expect(screen.getByTestId('restore-result'))
       .toHaveTextContent('Restored 1 portfolio, 2 assets, 3 transactions.'))
+  })
+
+  it('says what a replace restore actually removed, from the restore response', async () => {
+    // The plan describes a moment and the database may have moved, which is why the
+    // restore response carries its own `deleted` counts off `rows_affected`. Nothing
+    // read them, so the card could only ever report what was *planned* as what was
+    // removed. The three sets of numbers below are all different -- the plan's delete
+    // half is 2/4/6, the write inserted 1/2/3 and removed 5/7/11 -- so the sentence can
+    // only have been spelled from the response, and neither a plan echo nor an
+    // inserted-counts echo can pass for it.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.getByTestId('preview-delete')).toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.')
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ mode: 'replace' }))
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
+          deleted: { portfolios: 5, assets: 7, transactions: 11 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+    // Exact, not a substring: the `Restored ...` half is the record every other test
+    // reads, and the clause is appended after it rather than replacing it. Outside the
+    // `waitFor` above on purpose -- a failed `toBe` inside it prints the whole DOM rather
+    // than the two sentences that differ, and this assertion is about the words.
+    expect(screen.getByTestId('restore-result').textContent)
+      .toBe('Restored 1 portfolio, 2 assets, 3 transactions (replaced 5 portfolios, 7 assets, 11 transactions).')
+  })
+
+  it('says nothing about replacing when the mode deleted nothing', async () => {
+    // Copy mode deletes nothing, so every deleted count is zero -- and a
+    // `(replaced 0 portfolios, 0 assets, 0 transactions)` on a sentence about adding
+    // portfolios reads like a warning about nothing. The clause appears only when
+    // something was replaced, which leaves the copy-mode sentence exactly as it was.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ mode: 'copy' }))
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
+      return jsonResponse({}, 404)
+    })
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-result')).toBeInTheDocument())
+    expect(screen.getByTestId('restore-result').textContent)
+      .toBe('Restored 1 portfolio, 2 assets, 3 transactions.')
+    expect(screen.getByTestId('restore-result')).not.toHaveTextContent('replaced')
   })
 
   it('says the database is busy, and stays retryable, when a restore hits a lock', async () => {
@@ -1595,5 +1667,51 @@ describe('oversized bundle', () => {
     await waitFor(() => expect(screen.getByTestId('restore-error'))
       .toHaveTextContent('refused as too large (413)'))
     expect(screen.getByTestId('restore-error')).not.toHaveTextContent('Request Entity Too Large')
+  })
+
+  it('retires the preview still in flight when the next file is refused as oversize', async () => {
+    // The invariant the card states as absolute: the plan on screen is the plan for the
+    // file and the mode on screen, or there is no plan at all. An oversize file is
+    // refused before its own request goes out, so it never becomes the current sequence
+    // -- and the answer still in flight belongs to the file that was on screen before it.
+    // Retire that answer and the refusal is the whole card; leave it and it passes its
+    // own sequence guard, prints the previous file's counts under this file's refusal,
+    // and arms Restore to write them.
+    const pending: Array<(res: Response) => void> = []
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) {
+        return new Promise<Response>((resolve) => { pending.push(resolve) })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    // The limits line only renders once capabilities have landed, so waiting for it is
+    // what makes the refusal below a decision rather than a race with that read.
+    await screen.findByTestId('caps-note')
+
+    // A file small enough to be sent, and its preview is held open.
+    await userEvent.upload(screen.getByTestId('bundle-file'), tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    // The oversize file is chosen while that answer is still on its way, and is refused
+    // locally -- no second request goes out.
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    expect(pending).toHaveLength(1)
+
+    // The old answer lands. It is about a file that is no longer on the card, so none of
+    // it may come back: no plan, no armed write, and the refusal keeps the card's only
+    // word. Without the retirement in the oversize branch this is the line that fails.
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap')
+    // And the card is not left wedged on the first file's spinner: the retired answer
+    // cannot clear the flag in its own `finally`, so the refusal had to take it down.
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 })

@@ -186,6 +186,33 @@ function asPlan(body: unknown, askedFor: RestoreMode): Plan | null {
  * so it says what is true and where to look instead. */
 const UNCONFIRMED_RESTORE = 'The restore could not be confirmed, so it cannot be tried again from this page. Reload the page to see what it wrote.';
 
+/** What a confirmed write reported: what it inserted, and — for `replace` — what its
+ * deletes actually removed, or `null` when the answer carried no such field. */
+interface RestoreResult {
+  inserted: Counts;
+  deleted: Counts | null;
+}
+
+/** The record a committed write leaves on the card, in one sentence.
+ *
+ * `deleted` is the server's own `rows_affected` total for the delete, not a recount of
+ * the plan that was on screen, so a plan that went stale between the preview and the
+ * write cannot misreport what was actually removed. It is named in parentheses because
+ * it is the cost of the write rather than the write: "Restored 1 portfolio, 2 assets,
+ * 3 transactions (replaced 2 portfolios, 4 assets, 6 transactions)."
+ *
+ * Copy mode deletes nothing, and every count on it is zero. Printing `(replaced 0
+ * portfolios, 0 assets, 0 transactions)` there reads like a warning about nothing, and
+ * "replaced nothing" reads like an apology, so the clause appears only when something
+ * really was replaced. A body that carried no `deleted` at all gets the plain sentence:
+ * `inserted` is what confirms the write, and a missing decoration may not unsay that. */
+function restoreSentence(result: RestoreResult): string {
+  const head = `Restored ${countList(result.inserted)}`;
+  const d = result.deleted;
+  if (!d || (d.portfolios === 0 && d.assets === 0 && d.transactions === 0)) return `${head}.`;
+  return `${head} (replaced ${countList(d)}).`;
+}
+
 /** The bundle's text.
  *
  * `FileReader` rather than `file.text()`: the latter is missing from jsdom's `File`,
@@ -255,7 +282,7 @@ export default function BackupPanel({ portfolios }: Props) {
   const [previewing, setPreviewing] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
-  const [restoreResult, setRestoreResult] = useState<{ inserted: Counts } | null>(null);
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   // What the database says it holds, read back once a write has committed, and whether
   // that read failed. Both are decoration beside `restoreResult` and nothing else: they
   // gate no button and no control, because a committed write must never be made to look
@@ -272,14 +299,32 @@ export default function BackupPanel({ portfolios }: Props) {
   // counter, and a superseded answer is dropped rather than displayed.
   const previewSeq = useRef(0);
 
+  // The one way to retire a preview that has not answered yet. A write uses it at both
+  // ends — before it starts, and again when it finishes — and so does a preview that is
+  // refused before it ever goes out, because the answer still in flight is then the
+  // *previous* file's. Bumping the sequence is what makes an in-flight answer fail the
+  // guard in `runPreview` instead of being displayed; the flag has to come down here
+  // too, because that answer's `finally` clears it only for the sequence number that is
+  // current, and this has just made it not current.
+  const retireInFlightPreview = () => {
+    previewSeq.current += 1;
+    setPreviewing(false);
+  };
+
   // The one place that asks for a plan. Both callers are user actions — choosing a
   // file, and choosing a mode — so the request goes out when the user changes
   // something rather than from an effect chasing that change after the fact.
   async function runPreview(target: File, forMode: RestoreMode) {
-    // Checked before the sequence advances, so an oversized file never becomes the
-    // current request: there is no in-flight answer to retire and no flag to clear.
+    // Refused here rather than at the server, and before this file becomes the current
+    // request — but not before there is nothing to retire. The answer in flight is the
+    // *previous* file's preview, and its sequence number is still the current one, so
+    // left alone it lands, passes its own guard, and puts the old file's counts back on
+    // the card under this file's refusal, with Restore armed to write them. Retiring it
+    // also takes `previewing` down: that answer's `finally` clears the flag only for the
+    // sequence it believes is current, and this bump is what makes it not current.
     const oversize = oversizeReason(target, caps);
     if (oversize) {
+      retireInFlightPreview();
       setPlan(null);
       setRestoreError(oversize);
       return;
@@ -350,16 +395,6 @@ export default function BackupPanel({ portfolios }: Props) {
     if (file) void runPreview(file, next);
   };
 
-  // A write retires every preview that has not answered yet, at both ends of the write:
-  // before it starts, and again when it finishes. Bumping the sequence is what makes an
-  // in-flight answer fail the guard in `runPreview` instead of being displayed; the flag
-  // has to come down here too, because that answer's `finally` clears it only for the
-  // sequence number that is current, and this has just made it not current.
-  const retireInFlightPreview = () => {
-    previewSeq.current += 1;
-    setPreviewing(false);
-  };
-
   // Take the card apart at the end of a write: no plan and no words, so there is
   // nothing left to press. Both callers are the end of a restore — one that wrote, and
   // one whose outcome cannot be read.
@@ -409,7 +444,8 @@ export default function BackupPanel({ portfolios }: Props) {
         setRestoreError(describeFailure(await readFailure(res)));
         return;
       }
-      const written = ((await res.json()) as { inserted?: unknown } | null)?.inserted;
+      const body = (await res.json()) as { inserted?: unknown; deleted?: unknown } | null;
+      const written = body?.inserted;
       if (!isCounts(written)) {
         // A 200 whose body is not the outcome is an answer that cannot be read, which
         // is the same unknown as no answer at all.
@@ -423,7 +459,11 @@ export default function BackupPanel({ portfolios }: Props) {
       // would duplicate the portfolios with nothing in the way. The result line stays as
       // the record, and Preview arms the card again for anyone who means to go on.
       disarmRestore();
-      setRestoreResult({ inserted: written });
+      // The deleted counts are decoration on a sentence the write already earned, so an
+      // answer that omitted them costs the clause and nothing more — see `RestoreResult`.
+      const rawDeleted = body?.deleted;
+      const replaced = isCounts(rawDeleted) ? rawDeleted : null;
+      setRestoreResult({ inserted: written, deleted: replaced });
       // The write is committed and the panel is now describing it, so the readback is
       // decoration: if it fails, the counts the restore itself returned stay on screen
       // with one honest line beside them. Nothing here may make a committed write look
@@ -605,7 +645,7 @@ export default function BackupPanel({ portfolios }: Props) {
         )}
         {restoreResult && (
           <div data-testid="restore-result" role="status" style={{ marginTop: '12px' }}>
-            {`Restored ${countList(restoreResult.inserted)}.`}
+            {restoreSentence(restoreResult)}
           </div>
         )}
         {restoreResult && owned && (

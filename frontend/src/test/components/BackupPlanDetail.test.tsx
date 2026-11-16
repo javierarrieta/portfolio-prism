@@ -137,6 +137,34 @@ describe('PlanSideView', () => {
       .toContain('across all assets: zero-price ×3');
   });
 
+  /** One code, two units. On a `PlanAsset` `zero_price` counts that asset's zero-price
+   * *transactions*; in `asset_flags` it counts flagged *assets*. Nothing pinned the row
+   * form, so both printed `zero-price ×N` and the two numbers read as the same kind of
+   * thing twice. The header is disambiguated by its prefix; the row has no prefix, so it
+   * names its own unit. */
+  it('spells the same flag code with the unit each scope counts', () => {
+    render(
+      <PlanSideView
+        title="Will insert"
+        side={side({
+          shown: [{
+            name: 'Wide', currency: 'USD', assets: 318, transactions: 9120,
+            shown: [asset({ zero_price: 4, flags: ['zero_price'] })],
+            more_assets: 312, asset_flags: { zero_price: 3 }, flags: [],
+          }],
+        })}
+      />,
+    );
+    // The row: four of this one asset's transactions carry a zero price.
+    expect(screen.getByTestId('plan-asset').textContent).toContain('zero-price rows ×4');
+    // The header: three of the portfolio's 318 assets carry one. Same code, and the two
+    // sentences must not be able to say it in the same words.
+    expect(screen.getByTestId('plan-portfolio-header').textContent)
+      .toContain('across all assets: zero-price ×3');
+    expect(screen.getByTestId('plan-portfolio-header').textContent)
+      .not.toContain('zero-price rows');
+  });
+
   it('pluralises the per-asset transaction count', () => {
     render(
       <PlanSideView
