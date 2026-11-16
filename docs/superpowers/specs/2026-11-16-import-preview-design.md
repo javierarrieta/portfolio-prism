@@ -143,9 +143,12 @@ New route:
 | --- | --- |
 | `GET /api/backup/owned` | `PlanSide` for everything the caller owns right now |
 
-It takes `AuthedUser` and calls a `require*` function like every other data route, so
-`scripts/check_access_gate.sh` covers it. It reads and writes nothing, so it is safe to call after
-a restore and safe to call by accident.
+It takes `AuthedUser`, which is what Rule C of `scripts/check_access_gate.sh` checks for. It calls
+no `require*` function, and that is correct rather than a gap: `require*` answers "may this caller
+see portfolio N", and this route takes no portfolio id — it scopes by `owner_id`, exactly as
+`preview`'s delete side does. `preview` and `restore` are in the same position. What does bind it
+is `tests/route_coverage_test.rs`: a mounted route missing from `PROTECTED_ROUTES` fails that
+test, and that inventory is the gate that actually catches a new route.
 
 `RestoreOutcome` gains `pub deleted: Counts`.
 
@@ -177,9 +180,20 @@ Computed identically on both sides, so one renderer handles both.
 | `no_assets` | portfolio | zero assets |
 | `no_transactions` | asset | asset present, no transactions |
 | `zero_price` | asset | any `BUY` or `SELL` at `price = 0.0` |
-| `future_dated` | asset | a transaction dated after today |
+| `future_dated` | asset | a transaction dated after today, **in UTC** — otherwise the same portfolio is future-dated in one timezone and not in another |
 | `currency_mismatch` | asset | asset currency differs from its portfolio's |
-| `duplicate_symbol` | portfolio | the same symbol appears twice |
+| `duplicate_symbol` | portfolio | the same symbol appears twice; reported as a portfolio flag, and counted as *how many symbols are duplicated*, so three copies of one symbol is one flag — the same thing on both sides |
+
+Two rules bind both producers, and they are the ones a later refactor is most likely to
+break quietly:
+
+- **Zero is a text match, not a cast.** `price::numeric = 0` would make one unparseable
+  price row fail every preview for that user, because Postgres does not promise to
+  evaluate a guard before a cast. `0`, `0.0` and `0.0000` are all zero; a string compare
+  against `"0.0"` catches one of the three.
+- **A code means one thing on both sides.** `asset_flags` is filled by a full walk on the
+  bundle side and by a grouped aggregate on the database side, and the round-trip test
+  compares the maps, not just the counts.
 
 `negative_quantity` is deliberately absent. Deciding it honestly needs the split-aware holdings
 arithmetic that lives in the tax engine; a naive `SUM(quantity) < 0` raises false alarms on any
