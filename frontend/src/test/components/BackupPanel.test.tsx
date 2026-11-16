@@ -736,6 +736,11 @@ describe('restore card', () => {
     // delete, so the line below is the plan for the request about to be sent.
     await waitFor(() => expect(screen.getByTestId('preview-summary'))
       .toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.'))
+    // Scoped inside `preview-delete`, and naming that half's own counts. The summary
+    // above only proves the words are somewhere on screen, so swapping the two `side`
+    // props -- "Will delete" reading the insert side -- leaves it standing.
+    expect(within(screen.getByTestId('preview-delete')).getByTestId('plan-side'))
+      .toHaveTextContent('Will delete 2 portfolios, 4 assets, 6 transactions.')
     await userEvent.type(screen.getByTestId('replace-confirm'), 'REPLACE')
     await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
 
@@ -1114,6 +1119,24 @@ describe('restore card', () => {
     expect(screen.getByTestId('restore-button')).toBeEnabled()
   })
 
+  it('says "1 price row" about a bundle carrying exactly one', async () => {
+    // The singular branch is the one no other price test touches -- both of them count
+    // in the thousands -- so "1 price rows" is a live regression, and the sort a later
+    // tidy-up of the plural introduces quietly.
+    render(<BackupPanel portfolios={portfolios} />)
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody({ prices: 1 }))
+      return jsonResponse({}, 404)
+    })
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('preview-prices'))
+      .toHaveTextContent('This bundle carries 1 price row.'))
+    expect(screen.getByTestId('preview-prices')).not.toHaveTextContent('price rows')
+  })
+
   it('posts the bytes of the file that was chosen, to both routes', async () => {
     render(<BackupPanel portfolios={portfolios} />)
     await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile('mine.json', 'The Chosen One'))
@@ -1162,7 +1185,10 @@ describe('restore card', () => {
     await waitFor(() => expect(screen.getByTestId('preview-insert')).toBeInTheDocument())
     expect(screen.getByTestId('preview-insert')).toHaveTextContent('Alpha Fund')
     expect(screen.getByTestId('preview-insert')).toHaveTextContent('AAA')
-    expect(screen.getByTestId('preview-delete')).toBeInTheDocument()
+    // What the delete half says, not merely that a delete half is there: presence
+    // alone passes even if the wrapper rendered the insert side, which is the one
+    // wrong-side failure nothing else in this file would notice in `copy`.
+    expect(screen.getByTestId('preview-delete')).toHaveTextContent('Will delete nothing.')
   })
 
   /** A 200 that is not a plan — a proxy envelope, a truncated body, a renamed field.
@@ -1212,6 +1238,43 @@ describe('restore card', () => {
       .toHaveTextContent('not a plan this app could read'))
     expect(screen.queryByTestId('preview-summary')).toBeNull()
     expect(screen.queryByTestId('preview-insert')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  /** The delete half on its own, in the one mode that renders it. Every other refusal
+   * test here has a valid delete half or a flat delete beside a flat insert, so the
+   * delete arm of `asPlan` is nothing but this test: drop it and a `replace` body with
+   * a good `insert` and `delete: 'two'` passes the guard, arms Restore, and hands
+   * `'two'` to `PlanSideView`, which reads `side.counts` off a string. That is a throw
+   * during render, and with no error boundary in this app it is the blank page the
+   * fail-closed path exists to prevent -- at the moment the user is deciding whether to
+   * delete everything they own. */
+  it('refuses a replace plan whose delete half is not a plan', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          schema_version: 1, mode: 'replace', prices: 0, warnings: [],
+          delete: 'two',
+          insert: sideOf({ portfolios: 1, assets: 2, transactions: 3 }),
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    // Mode first, file second, so the one preview that runs is asked for as `replace`
+    // and the echoed mode matches. Otherwise the refusal below would be about the mode
+    // guard and this branch would go untested.
+    await userEvent.click(screen.getByRole('radio', { name: /replace/i }))
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    // The half that could not be read is the half that is not on screen, and the write
+    // that would have destroyed the account against it never arms.
+    expect(screen.queryByTestId('preview-delete')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
     expect(screen.getByTestId('restore-button')).toBeDisabled()
   })
 
