@@ -261,7 +261,8 @@ export default function BackupPanel({ portfolios }: Props) {
   // gate no button and no control, because a committed write must never be made to look
   // like a failure by a second read that did not land. Cleared with the result line they
   // belong to, and by any fresh preview: a readback describes the write it followed, never
-  // the plan that is on screen afterwards.
+  // the plan that is on screen afterwards — and one that lands after a newer question went
+  // out never lands at all, because `runRestore` guards it the way previews are guarded.
   const [owned, setOwned] = useState<PlanSide | null>(null);
   const [ownedFailed, setOwnedFailed] = useState(false);
 
@@ -428,21 +429,33 @@ export default function BackupPanel({ portfolios }: Props) {
       // with one honest line beside them. Nothing here may make a committed write look
       // like a failure — that is how the same bundle gets restored twice.
       //
-      // This request stays inside the `restoring` bracket on purpose, and moving it below
-      // the `finally` to shave a frame off the busy state would be a real regression, not
-      // a latency fix. `restoring` is what disables the file input and the mode radios
-      // until the read lands, so it is what keeps a second restore from starting while
-      // the first readback is still in flight. Two readbacks overlapping means the older
-      // response can arrive last and overwrite the newer one, and the card would then
-      // state what the database held *before* the second write as though it were the
-      // answer about what it holds now — the one sentence here that is not allowed to be
-      // wrong about the present tense.
+      // What makes an out-of-order answer safe is the generation guard below, not the
+      // `restoring` bracket this request sits inside. The bracket still matters — it is
+      // what disables the file input and the mode radios until the read lands, so today
+      // it is what keeps two readbacks from overlapping at all — but a safety property
+      // that travelled with a disabled control would vanish the moment someone moved this
+      // request below the `finally` to shave a frame off the busy state, and the card
+      // would then state what the database held *before* the newer write as though it
+      // were the answer about what it holds now. That is the one sentence here that is
+      // not allowed to be wrong about the present tense, so the guard retires a stale
+      // answer whatever the busy state happens to allow.
+      //
+      // The guard is the counter that already decides which preview may display, and for
+      // the same reason: Preview is gated only on `previewing`, so it can be pressed in
+      // the window between this write committing and this read landing. That preview is a
+      // fresh question, and `runPreview` has just dropped the readback as the answer to
+      // the old one — so an answer from a retired generation lands on top of the new
+      // plan and reprints the account as it stood before the write. It is dropped whole:
+      // no counts, no failure line, no change to what is on screen.
+      const readback = previewSeq.current;
       try {
         const back = await apiFetch(`${API_BASE}/backup/owned`);
         const body = back.ok ? (await back.json()) as unknown : null;
+        if (readback !== previewSeq.current) return;
         if (isPlanSide(body)) setOwned(body);
         else setOwnedFailed(true);
       } catch {
+        if (readback !== previewSeq.current) return;
         setOwnedFailed(true);
       }
     } catch {

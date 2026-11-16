@@ -1321,7 +1321,8 @@ describe('restore card', () => {
   // decoration -- a read that fails may not make a committed write look like a failure,
   // and it may not gate anything the user can press. A third rule decides how long it
   // stays: it belongs to the write it describes, so a fresh preview drops it rather than
-  // leaving the old answer on screen beside a new plan for the same account.
+  // leaving the old answer on screen beside a new plan for the same account -- and a
+  // readback that lands after such a preview is retired with it, rather than returning.
 
   it('shows what the database holds after a restore', async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -1485,6 +1486,65 @@ describe('restore card', () => {
     expect(screen.getByTestId('restore-result')).toBeInTheDocument()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(ownedCalls()).toBe(1)
+  })
+
+  it('drops a readback that lands after a newer preview has answered', async () => {
+    // The race the generation guard retires. A write commits, the readback goes out, and
+    // the read is slow. Preview is gated only on `previewing` -- not on `restoring` -- so
+    // it is pressable in that window: the new plan lands, the card is answering a fresh
+    // question, and then the old read arrives and reprints the account as it stood before
+    // the write, right beside a plan that counts it differently. That is the same defect
+    // the last commit fixed, arriving by a different route: not a readback that outlived a
+    // preview, but one that came back after it. Both answers name a portfolio, and only
+    // the preview's name may ever be on screen.
+    const freshSide = sideFixture('Named By The New Plan')
+    const staleSide = sideFixture('Written Before The Preview')
+    let releaseOwned: ((res: Response) => void) | null = null
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          insert: freshSide, delete: emptySide() })
+      }
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) {
+        return new Promise<Response>((resolve) => { releaseOwned = resolve })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    // The readback is in flight and has said nothing yet -- so anything the test finds
+    // later came from the response it is about to release, and from nowhere else.
+    await waitFor(() => expect(releaseOwned).not.toBeNull())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+
+    // The preview that window allows, and it answers with a different portfolio.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('preview-insert'))
+      .toHaveTextContent('Named By The New Plan'))
+
+    // The stale read lands last. It describes the account this new plan is about to
+    // change, so none of it may print: not the name, not the counts, not a failure line
+    // beside them. Without the guard this is the line that fails -- `setOwned` runs on an
+    // answer a whole question behind the screen and the old portfolio reappears under
+    // "Your portfolios now".
+    const held = releaseOwned as unknown as (res: Response) => void
+    await answer([held], 0, jsonResponse(staleSide))
+    expect(screen.queryByText('Written Before The Preview')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('restore-owned-failed')).not.toBeInTheDocument()
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('Named By The New Plan')
+    // And discarding it does not wedge the card: the write bracket still closed, so the
+    // plan the user is reading is pressable.
+    expect(screen.getByTestId('restore-button')).toBeEnabled()
   })
 })
 
