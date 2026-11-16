@@ -26,7 +26,7 @@ Start at the repository root. All of these are expected to pass on
 load-bearing because three of the steps read the schema the step before them created.
 
 ```fish
-# 0. A database, first. Five of the ten backend steps below need DATABASE_URL and five do
+# 0. A database, first. Five of the eleven backend steps below need DATABASE_URL and six do
 # not read it at all; the one that needs it most is `cargo test`, which creates one real
 # database per test (src/test_db.rs). dev-db.sh prints the URL and creates `prism`; run it
 # inside `nix-shell -p postgresql_18` when initdb is not on PATH.
@@ -48,6 +48,10 @@ bash scripts/check_access_gate.sh
 # Pricing seam and engine portability: both print what they inspected
 bash scripts/check_pricing_seam.sh
 bash scripts/check_backup_portability.sh
+
+# The upload path: the proxy must not refuse a bundle the API would accept. Reads
+# frontend/nginx.conf, so it needs no database. CI runs it too.
+bash scripts/check_upload_path.sh
 
 # Schema drift and prepare-cache drift. Both inspect the database DATABASE_URL names, not
 # migrations/ and not .sqlx/ on disk, so each one means something only after the migrate
