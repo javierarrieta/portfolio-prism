@@ -1843,6 +1843,55 @@ async fn a_replace_that_fails_partway_deletes_nothing_either() {
     );
 }
 
+/// A plan is a statement about a moment. If rows appeared between the preview and the
+/// restore, `replace` deletes what is there now — so the outcome has to report the
+/// deletes it actually made, not repeat the plan's number.
+#[tokio::test]
+async fn restore_reports_the_rows_it_actually_deleted() {
+    let (pool, user) = db_with_user("restore_reports_the_rows_it_actually_deleted").await;
+    let pid = seed_portfolio(&pool, user, "Existing", "USD").await;
+    let aid = seed_asset(&pool, pid, "EX", "Existing").await;
+    seed_transaction(&pool, aid, "BUY", 1.0, 3.0, 0.0).await;
+    seed_transaction(&pool, aid, "BUY", 1.0, 4.0, 0.0).await;
+
+    let c = client(pool.clone(), user).await;
+    let res = c
+        .post("/api/backup/restore?mode=replace")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_size(1, 1, 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let out: Value = res.into_json().await.unwrap();
+
+    assert_eq!(out["deleted"]["portfolios"], 1);
+    assert_eq!(out["deleted"]["assets"], 1);
+    assert_eq!(out["deleted"]["transactions"], 2);
+    assert_eq!(out["inserted"]["portfolios"], 1);
+}
+
+#[tokio::test]
+async fn copy_mode_reports_nothing_deleted() {
+    let (pool, user) = db_with_user("copy_mode_reports_nothing_deleted").await;
+    seed_portfolio(&pool, user, "Kept", "USD").await;
+
+    let c = client(pool.clone(), user).await;
+    let res = c
+        .post("/api/backup/restore?mode=copy")
+        .header(session())
+        .header(rocket::http::ContentType::JSON)
+        .body(bundle_with_size(1, 1, 1))
+        .dispatch()
+        .await;
+    assert_eq!(res.status(), Status::Ok);
+    let out: Value = res.into_json().await.unwrap();
+
+    assert_eq!(out["deleted"]["portfolios"], 0);
+    assert_eq!(out["deleted"]["assets"], 0);
+    assert_eq!(out["deleted"]["transactions"], 0);
+}
+
 // ---------------------------------------------------------------------------
 // The `apply_prices` parameter.
 //

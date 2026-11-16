@@ -123,6 +123,9 @@ pub async fn plan_for(
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoreOutcome {
     pub inserted: Counts,
+    /// Rows the `replace` deletes actually removed, from `rows_affected`, not from
+    /// the plan. A plan describes a moment and the database may have moved.
+    pub deleted: Counts,
     /// The database ids the restore allocated, in bundle order. Returned so the UI
     /// can link straight to what appeared — and as proof that the ids are new.
     pub portfolio_ids: Vec<i64>,
@@ -221,9 +224,17 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
+    let mut deleted = Counts::default();
+
     if mode == Mode::Replace {
         // Reverse dependency order, scoped by `owner_id` and by nothing else: no
         // caller-supplied id is involved, so no bundle value can widen the delete.
+        //
+        // The three counted deletes below report `rows_affected` from inside this
+        // transaction, because that is the only moment that matches the deletes: a
+        // count re-queried after `commit` would describe a database another writer
+        // may have moved on, and reporting the plan's numbers would describe the
+        // preview rather than the restore.
         //
         // `split_sync` goes first, and now for the same reason as everything else:
         // `split_sync.asset_id` is `REFERENCES assets(id)` in `0001_init.sql`, so
@@ -238,6 +249,11 @@ pub async fn apply(
         // and `split_sync.asset_id` to `assets` — and none of them declares
         // `ON DELETE CASCADE`, so deleting a parent with children still attached is an
         // error, not a cascade.
+        //
+        // Uncounted on purpose: `Counts` counts the three tables a bundle has rows in,
+        // and `split_sync` is throttle state no bundle describes, so there is no field
+        // for its number to go in. The plan already warns that it is cleared
+        // (`plan_for`), which is where the user learns about it.
         sqlx::query!(
             "DELETE FROM split_sync WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
@@ -248,7 +264,7 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!(
+        let txns = sqlx::query!(
             "DELETE FROM transactions WHERE asset_id IN \
              (SELECT id FROM assets WHERE portfolio_id IN \
               (SELECT id FROM portfolios WHERE owner_id = $1))",
@@ -258,7 +274,7 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!(
+        let assets = sqlx::query!(
             "DELETE FROM assets WHERE portfolio_id IN \
              (SELECT id FROM portfolios WHERE owner_id = $1)",
             user_id
@@ -267,10 +283,16 @@ pub async fn apply(
         .await
         .map_err(classify)?;
 
-        sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
+        let ports = sqlx::query!("DELETE FROM portfolios WHERE owner_id = $1", user_id)
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
+
+        deleted = Counts {
+            portfolios: ports.rows_affected() as usize,
+            assets: assets.rows_affected() as usize,
+            transactions: txns.rows_affected() as usize,
+        };
     }
 
     let mut portfolio_ids = Vec::with_capacity(bundle.portfolios.len());
@@ -386,6 +408,7 @@ pub async fn apply(
 
     Ok(RestoreOutcome {
         inserted,
+        deleted,
         portfolio_ids,
         prices_inserted,
     })
