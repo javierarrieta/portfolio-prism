@@ -259,8 +259,9 @@ export default function BackupPanel({ portfolios }: Props) {
   // What the database says it holds, read back once a write has committed, and whether
   // that read failed. Both are decoration beside `restoreResult` and nothing else: they
   // gate no button and no control, because a committed write must never be made to look
-  // like a failure by a second read that did not land. Cleared wherever the result line
-  // it belongs to is cleared, so a readback never outlives the restore it describes.
+  // like a failure by a second read that did not land. Cleared with the result line they
+  // belong to, and by any fresh preview: a readback describes the write it followed, never
+  // the plan that is on screen afterwards.
   const [owned, setOwned] = useState<PlanSide | null>(null);
   const [ownedFailed, setOwnedFailed] = useState(false);
 
@@ -285,6 +286,14 @@ export default function BackupPanel({ portfolios }: Props) {
     const seq = ++previewSeq.current;
     setPreviewing(true);
     setRestoreError(null);
+    // A preview is a fresh question about what the next write would do, and the readback
+    // beside the last write's result line is the answer to the *previous* question. Left
+    // up, the card reads "Will delete 2 portfolios…" directly above "Your portfolios now
+    // 1 portfolio…" — two present-tense answers about the same account, and the stale one
+    // is the one that looks like current state. It goes with the plan it was read against,
+    // exactly as the confirmation goes with the plan it was typed against.
+    setOwned(null);
+    setOwnedFailed(false);
     // The words belong to the plan on screen, so they go with the plan this request is
     // about to replace. Retrying a preview is not a no-op: the second answer can count
     // more to delete than the first, and a confirmation carried across it is one the
@@ -418,6 +427,16 @@ export default function BackupPanel({ portfolios }: Props) {
       // decoration: if it fails, the counts the restore itself returned stay on screen
       // with one honest line beside them. Nothing here may make a committed write look
       // like a failure — that is how the same bundle gets restored twice.
+      //
+      // This request stays inside the `restoring` bracket on purpose, and moving it below
+      // the `finally` to shave a frame off the busy state would be a real regression, not
+      // a latency fix. `restoring` is what disables the file input and the mode radios
+      // until the read lands, so it is what keeps a second restore from starting while
+      // the first readback is still in flight. Two readbacks overlapping means the older
+      // response can arrive last and overwrite the newer one, and the card would then
+      // state what the database held *before* the second write as though it were the
+      // answer about what it holds now — the one sentence here that is not allowed to be
+      // wrong about the present tense.
       try {
         const back = await apiFetch(`${API_BASE}/backup/owned`);
         const body = back.ok ? (await back.json()) as unknown : null;
@@ -581,7 +600,11 @@ export default function BackupPanel({ portfolios }: Props) {
             <PlanSideView title="Your portfolios now" side={owned} />
           </div>
         )}
-        {restoreResult && ownedFailed && (
+        {/* Mutually exclusive with the line above, and success wins: `owned` and
+            `ownedFailed` are set in one `if`/`else` today, but two independent conditions
+            would print "Your portfolios now …" and "could not be read back" about the
+            same write the moment that ever stops holding. */}
+        {restoreResult && !owned && ownedFailed && (
           <p data-testid="restore-owned-failed" className="text-muted" style={{ marginTop: '8px' }}>
             The restore succeeded, but your data could not be read back to confirm it. Reload to see what is there.
           </p>

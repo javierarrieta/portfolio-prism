@@ -1319,7 +1319,9 @@ describe('restore card', () => {
   // with is the panel's own account of what the database now holds. Two rules govern it:
   // it is the database's answer rather than the write's own counts shown twice, and it is
   // decoration -- a read that fails may not make a committed write look like a failure,
-  // and it may not gate anything the user can press.
+  // and it may not gate anything the user can press. A third rule decides how long it
+  // stays: it belongs to the write it describes, so a fresh preview drops it rather than
+  // leaving the old answer on screen beside a new plan for the same account.
 
   it('shows what the database holds after a restore', async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -1331,7 +1333,23 @@ describe('restore card', () => {
           deleted: { portfolios: 0, assets: 0, transactions: 0 },
           portfolio_ids: [7], prices_inserted: 0 })
       }
-      if (url.includes('/backup/owned')) return jsonResponse(sideFixture('Renamed After Restore'))
+      if (url.includes('/backup/owned')) {
+        // Counts that differ from the write's 1/1/2 above. With identical counts the
+        // portfolio name is the only thing telling the readback apart from the restore
+        // outcome shown twice, and the sentence below would pass even if the panel had
+        // rendered the write's counts in the readback slot. Coherent on its own terms:
+        // one portfolio shown, holding all of it.
+        return jsonResponse({
+          counts: { portfolios: 2, assets: 3, transactions: 4 },
+          shown: [{
+            name: 'Renamed After Restore', currency: 'USD', assets: 3, transactions: 4,
+            shown: [{ symbol: 'AAA', name: 'Alpha', currency: 'USD', transactions: 4,
+                      first_date: '2026-01-05', last_date: '2026-02-05', zero_price: 0, flags: [] }],
+            more_assets: 0, asset_flags: {}, flags: [],
+          }],
+          more_portfolios: 0, transactions_in_shown: 4,
+        })
+      }
       return jsonResponse({}, 404)
     })
     render(<BackupPanel portfolios={portfolios} />)
@@ -1341,12 +1359,13 @@ describe('restore card', () => {
 
     await waitFor(() => expect(screen.getByTestId('restore-owned'))
       .toHaveTextContent('Renamed After Restore'))
-    // The readback body and not the restore outcome shown twice: the restore response
-    // carries three counts and no names at all, so nothing but `/backup/owned` can put
-    // that portfolio on screen. Scoped inside the wrapper because `plan-side` renders
-    // once per side -- an unscoped query reads whichever renders first, or throws.
+    // The readback body and not the restore outcome shown twice: the counts differ from
+    // the write's, so this sentence can only have come from `/backup/owned` -- and the
+    // line below can only have come from the restore response. Each assertion now
+    // discriminates in both directions. Scoped inside the wrapper because `plan-side`
+    // renders once per side -- an unscoped query reads whichever renders first, or throws.
     expect(within(screen.getByTestId('restore-owned')).getByTestId('plan-side'))
-      .toHaveTextContent('Your portfolios now 1 portfolio, 1 asset, 2 transactions.')
+      .toHaveTextContent('Your portfolios now 2 portfolios, 3 assets, 4 transactions.')
     // The write's own line is untouched beside it: the readback is a second account, not
     // a replacement for the first.
     expect(screen.getByTestId('restore-result'))
@@ -1387,19 +1406,23 @@ describe('restore card', () => {
     expect(screen.queryByTestId('restore-error')).not.toBeInTheDocument()
     // And it offers no retry that would re-run the write. The card is disarmed for the
     // reason it is always disarmed after a write -- the plan is gone -- and not because
-    // the readback failed; a preview, which only ever reads, is still on offer.
+    // the readback failed; a preview, which only ever reads, is still on offer. These are
+    // read while the failed read is on the screen, because that is the only moment a read
+    // that gated something could be caught gating it -- a fresh preview drops the readback.
     expect(screen.queryByTestId('preview-summary')).toBeNull()
     expect(screen.getByTestId('restore-button')).toBeDisabled()
     expect(screen.getByTestId('preview-button')).toBeEnabled()
-    // Informational to the end. A fresh preview re-arms the write with the readback
-    // still unread, and the mode selector and the file input are untouched -- a failed
-    // read that disabled any of them would be the readback gating the restore, which is
-    // the one thing it is not allowed to do.
-    await userEvent.click(screen.getByTestId('preview-button'))
-    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
-    expect(screen.getByTestId('restore-owned-failed')).toBeInTheDocument()
     expect(screen.getByRole('radio', { name: /replace/i })).toBeEnabled()
     expect(screen.getByTestId('bundle-file')).toBeEnabled()
+    // Informational to the end. A fresh preview re-arms the write to the same enabled
+    // state it reaches after a read that worked (compare the last test), so nothing about
+    // the failed read decided whether the write could be pressed. What the fresh preview
+    // does take is the stale readback -- the line above described the account before this
+    // new plan, and beside "Will delete …" it reads as current state.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.queryByTestId('restore-owned-failed')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
   })
 
   it('treats a readback that is not a plan side as unread, not as an empty account', async () => {
@@ -1444,15 +1467,22 @@ describe('restore card', () => {
       .toHaveTextContent('Read Back'))
     // Once per completed restore -- not once per render, and not on a timer.
     expect(ownedCalls()).toBe(1)
-
-    // Informational to the end: the card is disarmed because the write happened, not
-    // because of anything the readback said, so the read-only way back still re-arms it,
-    // with the readback left on screen and no second request behind it.
-    await userEvent.click(screen.getByTestId('preview-button'))
-    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    // Free while the answer is on screen -- the only moment a read that gated something
+    // could be caught gating it, since a fresh preview drops the readback -- and disarmed
+    // for the plan reason, not because of anything the read said.
     expect(screen.getByRole('radio', { name: /copy/i })).toBeEnabled()
     expect(screen.getByTestId('bundle-file')).toBeEnabled()
-    expect(screen.getByTestId('restore-owned')).toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+
+    // Informational to the end: the read-only way back re-arms the write to the same
+    // enabled state the failed-readback test ends in, so the answer changes nothing about
+    // the write. It does drop the readback, because a fresh plan is a fresh question and
+    // "Your portfolios now …" answered the old one; the result line it belonged to stays.
+    // And no second request goes out for a preview.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(ownedCalls()).toBe(1)
   })
