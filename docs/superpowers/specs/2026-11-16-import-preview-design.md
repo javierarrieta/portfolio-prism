@@ -179,7 +179,7 @@ Computed identically on both sides, so one renderer handles both.
 | --- | --- | --- |
 | `no_assets` | portfolio | zero assets |
 | `no_transactions` | asset | asset present, no transactions |
-| `zero_price` | asset | any `BUY` or `SELL` at `price = 0.0` |
+| `zero_price` | asset | any transaction on the asset whose `price` text matches the zero rule below — neither producer filters by transaction type, and a zero-price `SPLIT` reaches neither input anyway: bundle validation and the ordinary write path both refuse one |
 | `future_dated` | asset | a transaction dated after today, **in UTC** — otherwise the same portfolio is future-dated in one timezone and not in another |
 | `currency_mismatch` | asset | asset currency differs from its portfolio's |
 | `duplicate_symbol` | portfolio | the same symbol appears twice; reported as a portfolio flag, and counted as *how many symbols are duplicated*, so three copies of one symbol is one flag — the same thing on both sides |

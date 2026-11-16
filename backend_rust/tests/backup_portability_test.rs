@@ -96,7 +96,7 @@ fn the_real_tree_passes_the_gate() {
         "the gate should account for the module's four INSERTs, said:\n{text}"
     );
     // Per file, not just in total: a scanner that silently produced nothing for
-    // three of the four files would still add up to four here.
+    // four of the five files would still add up to four here.
     assert!(
         text.contains("inspected src/backup/restore.rs: 4 INSERT statement(s)"),
         "restore.rs holds the module's four INSERTs, said:\n{text}"
@@ -110,7 +110,7 @@ fn the_real_tree_passes_the_gate() {
         text.contains("Transaction starts inspected: 2"),
         "the gate should account for the module's two transaction starts, said:\n{text}"
     );
-    for file in ["export.rs", "mod.rs", "schema.rs"] {
+    for file in ["detail.rs", "export.rs", "mod.rs", "schema.rs"] {
         assert!(
             text.contains(&format!("inspected src/backup/{file}: 0 INSERT statement(s)")),
             "the scanner reported nothing for {file}, said:\n{text}"

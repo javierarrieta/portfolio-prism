@@ -83,18 +83,41 @@ impl PlanSide {
     }
 }
 
-/// `true` when a decimal-as-string price is zero. Parsed, never string-compared:
-/// `0`, `0.0` and `0.0000` are the same price and a `== "0.0"` would call two of
-/// them clean. A price that does not parse is not counted — validation owns whether
-/// a bundle gets this far at all.
+/// `true` when a decimal-as-string price is zero.
+///
+/// Deliberately textual, not parsed. The database side of the preview (Task 2) runs the
+/// same test in SQL as `price ~ '^-?0+(\.0+)?$'` over a TEXT column, and the binding
+/// rule for the whole feature is that one flag code means exactly one thing on both
+/// sides. Parsing to a number here would be a *superset* of that rule: `+0`, `0.` and
+/// `0e0` all parse to `0.0` in Rust but fail the text rule, and a restored `+0` is
+/// reachable — bundle validation accepts it (`Decimal::from_str_exact` takes a leading
+/// `+`) and `restore.rs:399` writes the bundle's price string verbatim into the column.
+/// So the two producers would disagree about the same row.
+///
+/// The accepted shape is exactly the regex's: optional surrounding whitespace, an
+/// optional `-`, one or more `0`, then optionally a `.` and one or more `0`, and
+/// nothing else. A price that is not a number is therefore **not** zero — it is
+/// unparseable, which is a different fact, and the zero test must not swallow it.
 fn is_zero(price: &str) -> bool {
-    price.trim().parse::<f64>().is_ok_and(|v| v == 0.0)
+    let trimmed = price.trim();
+    let digits = trimmed.strip_prefix('-').unwrap_or(trimmed);
+    match digits.split_once('.') {
+        None => !digits.is_empty() && digits.bytes().all(|b| b == b'0'),
+        Some((int, frac)) => {
+            !int.is_empty()
+                && int.bytes().all(|b| b == b'0')
+                && !frac.is_empty()
+                && frac.bytes().all(|b| b == b'0')
+        }
+    }
 }
 
 /// The `YYYY-MM-DD` prefix of an RFC 3339 timestamp. Validation guarantees the shape;
-/// anything shorter contributes no date rather than panicking in a preview.
+/// anything shorter contributes no date rather than panicking in a preview. Sliced
+/// with `get`, not indexing: `len() >= 10` is a byte count, so indexing byte 10 would
+/// panic on a multi-byte character straddling it.
 fn date_part(rfc3339: &str) -> Option<String> {
-    (rfc3339.len() >= 10).then(|| rfc3339[..10].to_string())
+    rfc3339.get(..10).map(str::to_string)
 }
 
 fn asset_detail(a: &BundleAsset, portfolio_currency: &str, today: NaiveDate) -> PlanAsset {
@@ -104,7 +127,6 @@ fn asset_detail(a: &BundleAsset, portfolio_currency: &str, today: NaiveDate) -> 
         .transactions
         .iter()
         .filter_map(|t| date_part(&t.date))
-        .filter(|d| d.len() == 10)
         .collect();
     let first_date = dates.iter().min().cloned();
     let last_date = dates.iter().max().cloned();
@@ -152,9 +174,11 @@ fn portfolio_detail(p: &BundlePortfolio, today: NaiveDate) -> PlanPortfolio {
     if p.assets.is_empty() {
         flags.push(flag::NO_ASSETS.to_string());
     }
-    // A portfolio fact, not an asset fact: it lands in `flags`, not `asset_flags`, and
-    // counts *how many symbols are duplicated* — the same thing the SQL side counts.
-    // Two producers disagreeing about what one code means is exactly the drift the
+    // A portfolio fact, not an asset fact: it lands in `flags`, not `asset_flags`. It
+    // records *that* a symbol is duplicated, once per duplicated symbol — three copies
+    // of one symbol set the flag once, which is what the SQL side reports too. Nothing
+    // here counts how many symbols are duplicated, and the flag is not a count. Two
+    // producers disagreeing about what one code means is exactly the drift the
     // round-trip test in Task 5 is there to catch.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut dupes: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -310,6 +334,9 @@ mod tests {
         assert_eq!(p.assets, 0);
         assert_eq!(p.flags, vec![flag::NO_ASSETS.to_string()]);
         assert_eq!(side.counts.assets, 0);
+        // The "still counted" half of the name: an empty portfolio is a portfolio the
+        // restore will create, so the total says one even though it holds nothing.
+        assert_eq!(side.counts.portfolios, 1);
     }
 
     #[test]
@@ -326,20 +353,40 @@ mod tests {
     }
 
     /// `0`, `0.0` and `0.0000` are one price. A `price == "0.0"` string compare catches
-    /// one of the three and reports the other two as clean.
+    /// one of the three and reports the other two as clean. A price that is not a
+    /// number at all is not one of those spellings of zero and must not be counted —
+    /// the row is still counted as a transaction, which is why both numbers are asserted.
     #[test]
     fn zero_price_counts_every_spelling_of_zero() {
         let side = detail_from_bundle(
             &bundle(vec![portfolio("P", "USD", vec![asset(
                 "AAA",
                 "USD",
-                vec![tx("0", "2026-01-05"), tx("0.0", "2026-01-06"), tx("0.0000", "2026-01-07"), tx("12.5", "2026-01-08")],
+                vec![tx("0", "2026-01-05"), tx("0.0", "2026-01-06"), tx("0.0000", "2026-01-07"), tx("12.5", "2026-01-08"), tx("n/a", "2026-01-09")],
             )])]),
             today(),
         );
         let a = &side.shown[0].shown[0];
         assert_eq!(a.zero_price, 3);
+        assert_eq!(a.transactions, 5);
         assert!(a.flags.contains(&flag::ZERO_PRICE.to_string()));
+    }
+
+    /// The rule itself, pinned on the function that implements it, because the drift it
+    /// prevents is invisible from the outside: Task 2's SQL producer matches the same
+    /// TEXT column against `^-?0+(\.0+)?$`, so a price string the two producers judge
+    /// differently is one flag meaning two things. Everything in the second list parses
+    /// to `0.0` as a float — `+0` reaches this code for real, since bundle validation
+    /// accepts it and `restore.rs:399` writes the string verbatim — and `not-a-number`
+    /// is the row the text match exists to leave alone.
+    #[test]
+    fn zero_price_is_the_text_rule_not_a_float_parse() {
+        for zero in ["0", "-0", "0.0", "-0.00"] {
+            assert!(is_zero(zero), "{zero} must read as zero");
+        }
+        for not_zero in ["+0", "0.", "0e0", "0.0.0", "not-a-number", "1e-400"] {
+            assert!(!is_zero(not_zero), "{not_zero} must not read as zero");
+        }
     }
 
     #[test]
@@ -375,9 +422,10 @@ mod tests {
             today(),
         );
         let p = &side.shown[0];
-        // Portfolio-level, and present/absent rather than a count: three copies of one
-        // symbol is one duplicated symbol, which is what the SQL side reports too.
-        assert!(p.flags.contains(&flag::DUPLICATE_SYMBOL.to_string()));
+        // Exactly one flag entry for three copies of one symbol — `contains` could not
+        // tell that apart from the flag being pushed once per duplicate, which is the
+        // thing this test's name claims and the thing the SQL side must agree about.
+        assert_eq!(p.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
         assert!(!p.asset_flags.contains_key(flag::DUPLICATE_SYMBOL));
     }
 
