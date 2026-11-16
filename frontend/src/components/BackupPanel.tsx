@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
+import { PlanSideView, isPlanSide, isCounts, countList, type Counts, type PlanSide } from './BackupPlanDetail';
 
 /**
  * Export and restore for the signed-in user's own portfolios: one card per half, in
@@ -33,24 +34,22 @@ interface PortfolioOption {
   name: string;
 }
 
-/** Rows counted by the server, in the three tables a bundle touches. One type for
- * both what a plan counts and what a restore reports having written, because the
- * server uses one shape for both. */
-interface Counts {
-  portfolios: number;
-  assets: number;
-  transactions: number;
-}
-
 /** What `/backup/preview?mode=` answers: what the bundle would write and — for
- * `replace` — what it would delete. Read from the server and never recomputed here:
- * counts a UI works out itself are counts of what the UI guessed the bundle holds,
- * and the guess is what the user reads as a promise. */
+ * `replace` — what it would delete. Each half is a `PlanSide`: the counts the server
+ * made plus the bounded listing under them. `PlanSide`, and `Counts` for the restore
+ * outcome below, come from `BackupPlanDetail` along with `countList` and the readers
+ * below — the panel spells the plan sentence and checks an untrusted body with the
+ * same functions the detail view does, and two copies of either is how they start
+ * disagreeing.
+ *
+ * The plan is read from the server and never recomputed here: counts a UI works out
+ * itself are counts of what the UI guessed the bundle holds, and the guess is what the
+ * user reads as a promise. */
 interface Plan {
   schema_version: number;
   mode: string;
-  delete: Counts;
-  insert: Counts;
+  delete: PlanSide;
+  insert: PlanSide;
   prices: number;
   warnings: string[];
 }
@@ -136,13 +135,6 @@ function asCapabilities(body: unknown): Capabilities | null {
   return c as Capabilities;
 }
 
-/** One set of the three counts a plan carries, read off an untrusted body. */
-function isCounts(value: unknown): value is Counts {
-  const c = value as Partial<Counts> | null;
-  return !!c && typeof c === 'object'
-    && Number.isFinite(c.portfolios) && Number.isFinite(c.assets) && Number.isFinite(c.transactions);
-}
-
 /** Why this file cannot be sent, or `null` when it can.
  *
  * The number is the server's own, read from `/backup/capabilities`; refusing here is
@@ -171,12 +163,19 @@ function oversizeReason(file: File, caps: Capabilities | null): string | null {
  * one operation are read from two places: the delete sentence is rendered from the
  * plan and the write is sent from the component's own mode. If they ever disagree the
  * card would be describing one operation while performing the other, and that is the
- * one disagreement a user cannot see. */
+ * one disagreement a user cannot see.
+ *
+ * Each half is checked as a whole `PlanSide`, not as its counts: the listing beside
+ * them is rendered too, so a body that counts correctly and carries `shown: null` is
+ * as unrenderable as one that counts wrongly, and `isPlanSide` is the function that
+ * knows what renderable means. A body in the old flat shape — three bare counts per
+ * side, which is what this panel read before the plan grew its listings — fails here
+ * on purpose. Accepting it would mean reading `side.counts` off `undefined`. */
 function asPlan(body: unknown, askedFor: RestoreMode): Plan | null {
   const p = body as Partial<Plan> | null;
   if (!p || typeof p !== 'object') return null;
   if (p.mode !== askedFor) return null;
-  if (!isCounts(p.delete) || !isCounts(p.insert)) return null;
+  if (!isPlanSide(p.delete) || !isPlanSide(p.insert)) return null;
   if (!Number.isFinite(p.prices)) return null;
   if (!Array.isArray(p.warnings) || !p.warnings.every((w) => typeof w === 'string')) return null;
   return p as Plan;
@@ -201,17 +200,6 @@ function readFileText(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error('the file could not be read'));
     reader.readAsText(file);
   });
-}
-
-/** `{n} {noun}` with the plural spelled out, so the plan reads "1 portfolio, 2
- * assets, 3 transactions". The counts are the server's; only the English is here. */
-function countList(counts: Counts): string {
-  const named = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
-  return [
-    named(counts.portfolios, 'portfolio'),
-    named(counts.assets, 'asset'),
-    named(counts.transactions, 'transaction'),
-  ].join(', ');
 }
 
 /** The name the server chose, off its `Content-Disposition`. The route names the
@@ -515,18 +503,29 @@ export default function BackupPanel({ portfolios }: Props) {
 
         {plan && (
           <div data-testid="preview-summary" role="status" style={{ marginTop: '12px' }}>
-            <p>
+            {/* One `PlanSideView` per side, so the sentence the summary used to be is
+                the first line of the detail rather than a second copy of it. The
+                listing under it is the server's own bounded one — this renders what
+                arrived in the preview response and nothing more, so a bigger plan
+                costs a bigger response and never a re-read of the bundle. */}
+            <div data-testid="preview-delete">
               {plan.mode === 'replace'
-                ? `Will delete ${countList(plan.delete)}.`
-                : 'Will delete nothing.'}
-            </p>
-            <p>{`Will insert ${countList(plan.insert)}.`}</p>
+                ? <PlanSideView title="Will delete" side={plan.delete} />
+                : <p>Will delete nothing.</p>}
+            </div>
+            <div data-testid="preview-insert">
+              <PlanSideView title="Will insert" side={plan.insert} />
+            </div>
             {/* The card never sends `apply_prices`, so a bundle carrying price history
                 restores without it. That is a decision the user should not have to guess
-                at, and `prices` is the server's own count of what is being left out. */}
+                at, and `prices` is the server's own count of what is being left out. It
+                is stated as the operator flow it is: this panel will never grow the
+                control, so "will be left alone" read as a feature it was one checkbox
+                short of. */}
             {plan.prices > 0 && (
               <p data-testid="preview-prices" className="text-muted">
-                {`${plan.prices} price row${plan.prices === 1 ? '' : 's'} in this bundle will be left alone — this panel does not restore price history.`}
+                {`This bundle carries ${plan.prices} price row${plan.prices === 1 ? '' : 's'}. `
+                  + 'Price history is shared market data and is restored by an operator, not from this panel.'}
               </p>
             )}
             {plan.warnings.map((w) => (

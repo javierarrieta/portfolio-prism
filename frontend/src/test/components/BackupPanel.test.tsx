@@ -17,14 +17,29 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const CAPS = { schema_versions: [1], allow_price_restore: false, max_bytes: 8388608, max_rows: 50000 }
 
-/** A plan body. The echoed `mode` is the mode that was asked for, because the card now
+/** A plan side that counts exactly what the test names and lists nothing under it.
+ * The counts are what the summary sentence reads and the listing is what the detail
+ * under it renders, so a test about counts should not have to invent a portfolio. */
+const sideOf = (counts: Counts) => ({
+  counts, shown: [], more_portfolios: 0, transactions_in_shown: 0,
+})
+
+/** The side that does nothing: what `replace` deletes from an empty account, and what
+ * an empty bundle inserts. */
+const emptySide = () => sideOf({ portfolios: 0, assets: 0, transactions: 0 })
+
+/** A plan body. Both halves are `PlanSide`s now — counts plus a bounded listing — and
+ * the counts still arrive as the flat triples the tests name, so a test that only
+ * cares about a count does not carry a listing it will never read.
+ *
+ * The echoed `mode` is the mode that was asked for, because the card now
  * refuses a plan whose echo disagrees with the request — and a mock that always said
  * `copy` would hide that check, and would have the summary reading "Will delete
  * nothing." at the moment the write sends `mode=replace`. */
 function planBody(over: {
   mode?: string
-  insert?: { portfolios: number; assets: number; transactions: number }
-  delete?: { portfolios: number; assets: number; transactions: number }
+  insert?: Counts
+  delete?: Counts
   prices?: number
   warnings?: string[]
 } = {}) {
@@ -32,10 +47,10 @@ function planBody(over: {
   return {
     schema_version: 1,
     mode,
-    delete: over.delete ?? (mode === 'replace'
+    delete: sideOf(over.delete ?? (mode === 'replace'
       ? { portfolios: 2, assets: 4, transactions: 6 }
-      : { portfolios: 0, assets: 0, transactions: 0 }),
-    insert: over.insert ?? { portfolios: 1, assets: 2, transactions: 3 },
+      : { portfolios: 0, assets: 0, transactions: 0 })),
+    insert: sideOf(over.insert ?? { portfolios: 1, assets: 2, transactions: 3 }),
     prices: over.prices ?? 0,
     warnings: over.warnings ?? [],
   }
@@ -992,16 +1007,16 @@ describe('restore card', () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
-      // The right mode, the right prices, and an `insert` that is not three counts: a
+      // The right mode, the right prices, and an `insert` that is not a plan side: a
       // proxy that echoed the request and mangled the body on the way past it. The
-      // failure this prevents is the quiet one: `countList(plan.insert)` reading
-      // `portfolios` off the string 'two' throws during render, and with no error
-      // boundary anywhere in this app the page would go blank at the moment the user is
+      // failure this prevents is the quiet one: `PlanSideView` reading `side.counts`
+      // off the string 'two' throws during render, and with no error boundary anywhere
+      // in this app the page would go blank at the moment the user is
       // deciding whether to destroy their data.
       if (url.includes('/backup/preview')) {
         return jsonResponse({
           mode: 'copy', prices: 0, warnings: [], ok: true,
-          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          delete: emptySide(),
           insert: 'two',
         })
       }
@@ -1022,11 +1037,13 @@ describe('restore card', () => {
       const url = String(input)
       if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
       // Every count on it is fine; the array the summary maps over is simply not there.
+      // Both halves are real plan sides here so that the refusal below is about
+      // `warnings` and not about a half the test forgot to upgrade.
       if (url.includes('/backup/preview')) {
         return jsonResponse({
           schema_version: 1, mode: 'copy', prices: 0,
-          delete: { portfolios: 0, assets: 0, transactions: 0 },
-          insert: { portfolios: 1, assets: 2, transactions: 3 },
+          delete: emptySide(),
+          insert: sideOf({ portfolios: 1, assets: 2, transactions: 3 }),
         })
       }
       return jsonResponse({}, 404)
@@ -1086,9 +1103,12 @@ describe('restore card', () => {
 
     // The card never sends `apply_prices`, so these rows are not coming. Saying so is
     // the difference between a bundle restored and a bundle restored except for the
-    // part nobody mentioned.
+    // part nobody mentioned -- and it is said as the operator flow it is, not as a
+    // feature this panel is one checkbox short of.
     await waitFor(() => expect(screen.getByTestId('preview-prices'))
-      .toHaveTextContent('4200 price rows in this bundle will be left alone'))
+      .toHaveTextContent('This bundle carries 4200 price rows'))
+    expect(screen.getByTestId('preview-prices'))
+      .toHaveTextContent('restored by an operator, not from this panel')
     // Still a plan, still restorable: naming what is left out is not a refusal.
     expect(screen.getByTestId('preview-summary')).toBeInTheDocument()
     expect(screen.getByTestId('restore-button')).toBeEnabled()
@@ -1112,6 +1132,103 @@ describe('restore card', () => {
     for (const body of bodies) {
       expect(JSON.parse(body).portfolios[0].name).toBe('The Chosen One')
     }
+  })
+
+  /** The body both halves of the plan now carry. Built here rather than imported from
+   * the component's test helper so a change to the server shape lands as a failing
+   * assertion, not as a shared fixture that quietly moves with it. */
+  const sideFixture = (name = 'Alpha Fund') => ({
+    counts: { portfolios: 1, assets: 1, transactions: 2 },
+    shown: [{
+      name, currency: 'USD', assets: 1, transactions: 2,
+      shown: [{ symbol: 'AAA', name: 'Alpha', currency: 'USD', transactions: 2,
+                first_date: '2026-01-05', last_date: '2026-02-05', zero_price: 0, flags: [] }],
+      more_assets: 0, asset_flags: {}, flags: [],
+    }],
+    more_portfolios: 0, transactions_in_shown: 2,
+  })
+
+  it('names the portfolios and the securities on both sides', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          insert: sideFixture(), delete: emptySide() })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('preview-insert')).toBeInTheDocument())
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('Alpha Fund')
+    expect(screen.getByTestId('preview-insert')).toHaveTextContent('AAA')
+    expect(screen.getByTestId('preview-delete')).toBeInTheDocument()
+  })
+
+  /** A 200 that is not a plan — a proxy envelope, a truncated body, a renamed field.
+   * Rendering half of one means reading `.map` off `undefined`, and with no error
+   * boundary in this app a throw during render is a blank page at the worst possible
+   * moment. The existing guard catches this; this test keeps it there. */
+  it('refuses a 200 whose body is not a plan, and does not arm the write', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ data: { message: 'ok' } })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-insert')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).not.toBeEnabled()
+  })
+
+  /** The exact body this panel read before the plan grew its listings: `delete` and
+   * `insert` as three bare counts. The risk is not hypothetical — a browser still
+   * holding the previous build of this frontend sends and receives that body, and the
+   * tempting "fix" for a stale client is a guard widened to take either shape. This
+   * refuses it: a plan this panel cannot fully describe must not arm a write, and a
+   * half accepted as counts and rendered as a side reads `side.counts` off
+   * `undefined`, which is a thrown render, not a warning. */
+  it('refuses the old flat plan shape rather than reading counts off it', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) {
+        return jsonResponse({
+          schema_version: 1, mode: 'copy', prices: 0, warnings: [],
+          delete: { portfolios: 0, assets: 0, transactions: 0 },
+          insert: { portfolios: 1, assets: 2, transactions: 3 },
+        })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('not a plan this app could read'))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.queryByTestId('preview-insert')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('describes price history as an operator flow, not a missing feature', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/backup/preview')) {
+        return jsonResponse({ schema_version: 1, mode: 'copy', prices: 1234, warnings: [],
+          insert: sideFixture(), delete: emptySide() })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+
+    expect(await screen.findByTestId('preview-prices')).toHaveTextContent(
+      'restored by an operator, not from this panel')
+    expect(screen.queryByText(/will be left alone/)).not.toBeInTheDocument()
   })
 
 })
