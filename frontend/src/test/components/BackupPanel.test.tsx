@@ -480,8 +480,23 @@ function gatedPreviews(): Array<(res: Response) => void> {
   return pending
 }
 
+/** What `/backup/owned` answers after a write: the caller's live side, in the same shape
+ * the preview uses for both halves. Its one portfolio is named something no restore
+ * response could produce, so a test that reads it knows it is reading the database's
+ * answer and not the write's own counts shown twice. */
+const OWNED_AFTER_RESTORE = {
+  counts: { portfolios: 2, assets: 3, transactions: 4 },
+  shown: [{
+    name: 'Read Back', currency: 'USD', assets: 3, transactions: 4,
+    shown: [], more_assets: 0, asset_flags: {}, flags: [],
+  }],
+  more_portfolios: 0, transactions_in_shown: 4,
+}
+
 /** Answers a successful restore, and a preview of either mode, so a test can watch
- * what a write leaves behind. */
+ * what a write leaves behind — the readback of the live database included. A restore
+ * test that asserts on the result block wants this helper rather than a bare 404 on
+ * `/backup/owned`, so that it is testing a readback that worked. */
 function restoreSucceeds(insert: Counts = { portfolios: 1, assets: 2, transactions: 3 }) {
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input)
@@ -492,6 +507,7 @@ function restoreSucceeds(insert: Counts = { portfolios: 1, assets: 2, transactio
     if (url.includes('/backup/restore')) {
       return jsonResponse({ inserted: insert, portfolio_ids: [7], prices_inserted: 0 })
     }
+    if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
     return jsonResponse({}, 404)
   })
 }
@@ -748,10 +764,14 @@ describe('restore card', () => {
     // that sent `copy` under a `replace` confirmation would delete nothing after
     // asking to be told it could delete everything.
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      if (String(input).includes('/backup/restore')) {
+      const url = String(input)
+      if (url.includes('/backup/restore')) {
         return jsonResponse({ inserted: { portfolios: 1, assets: 2, transactions: 3 },
           portfolio_ids: [7], prices_inserted: 0 })
       }
+      // The readback the panel asks for after a committed write, answered here so the
+      // result block below is a card whose readback worked.
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
       return jsonResponse({}, 404)
     })
     await userEvent.click(screen.getByTestId('restore-button'))
@@ -1074,6 +1094,7 @@ describe('restore card', () => {
       if (url.includes('/backup/restore')) {
         return new Promise<Response>((resolve) => { release = resolve })
       }
+      if (url.includes('/backup/owned')) return jsonResponse(OWNED_AFTER_RESTORE)
       return jsonResponse({}, 404)
     })
     await userEvent.click(screen.getByTestId('restore-button'))
@@ -1294,6 +1315,147 @@ describe('restore card', () => {
     expect(screen.queryByText(/will be left alone/)).not.toBeInTheDocument()
   })
 
+  // The readback. Once a write has committed the plan is gone, and what the user is left
+  // with is the panel's own account of what the database now holds. Two rules govern it:
+  // it is the database's answer rather than the write's own counts shown twice, and it is
+  // decoration -- a read that fails may not make a committed write look like a failure,
+  // and it may not gate anything the user can press.
+
+  it('shows what the database holds after a restore', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse(sideFixture('Renamed After Restore'))
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-owned'))
+      .toHaveTextContent('Renamed After Restore'))
+    // The readback body and not the restore outcome shown twice: the restore response
+    // carries three counts and no names at all, so nothing but `/backup/owned` can put
+    // that portfolio on screen. Scoped inside the wrapper because `plan-side` renders
+    // once per side -- an unscoped query reads whichever renders first, or throws.
+    expect(within(screen.getByTestId('restore-owned')).getByTestId('plan-side'))
+      .toHaveTextContent('Your portfolios now 1 portfolio, 1 asset, 2 transactions.')
+    // The write's own line is untouched beside it: the readback is a second account, not
+    // a replacement for the first.
+    expect(screen.getByTestId('restore-result'))
+      .toHaveTextContent('Restored 1 portfolio, 1 asset, 2 transactions.')
+  })
+
+  /** A failed readback is not a failed restore. The write committed, and a line saying
+   * otherwise is how someone restores the same bundle twice. */
+  it('keeps a successful restore successful when the readback fails', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          deleted: { portfolios: 0, assets: 0, transactions: 0 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) {
+        return jsonResponse({ error: 'the database is busy' }, 503)
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    // The readback's own line is what is waited for, not the result line: the result
+    // renders first, so asserting this one a tick after that would be a race and not a
+    // check.
+    await waitFor(() => expect(screen.getByTestId('restore-owned-failed'))
+      .toHaveTextContent(/could not be read back/))
+    // The success survives it, and nothing is raised as an error. The restore completed;
+    // a refusal-shaped line here is the lie that gets a bundle restored twice.
+    expect(screen.getByTestId('restore-result'))
+      .toHaveTextContent('Restored 1 portfolio, 1 asset, 2 transactions.')
+    expect(screen.queryByTestId('restore-error')).not.toBeInTheDocument()
+    // And it offers no retry that would re-run the write. The card is disarmed for the
+    // reason it is always disarmed after a write -- the plan is gone -- and not because
+    // the readback failed; a preview, which only ever reads, is still on offer.
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+    // Informational to the end. A fresh preview re-arms the write with the readback
+    // still unread, and the mode selector and the file input are untouched -- a failed
+    // read that disabled any of them would be the readback gating the restore, which is
+    // the one thing it is not allowed to do.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.getByTestId('restore-owned-failed')).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /replace/i })).toBeEnabled()
+    expect(screen.getByTestId('bundle-file')).toBeEnabled()
+  })
+
+  it('treats a readback that is not a plan side as unread, not as an empty account', async () => {
+    // The `isPlanSide` branch is the one a proxy can trip: a 200 carrying an envelope or
+    // a renamed field. Rendering half of a side is worse than admitting the read failed,
+    // and "Your portfolios now 0 portfolios" about a write that just committed is a
+    // sentence no readback is allowed to produce.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse(CAPS)
+      if (url.includes('/backup/preview')) return jsonResponse(planBody())
+      if (url.includes('/backup/restore')) {
+        return jsonResponse({ inserted: { portfolios: 1, assets: 1, transactions: 2 },
+          portfolio_ids: [7], prices_inserted: 0 })
+      }
+      if (url.includes('/backup/owned')) return jsonResponse({ data: { portfolios: 1 } })
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    await userEvent.click(screen.getByTestId('restore-button'))
+
+    await waitFor(() => expect(screen.getByTestId('restore-owned-failed')).toBeInTheDocument())
+    expect(screen.queryByTestId('restore-owned')).not.toBeInTheDocument()
+    expect(screen.getByTestId('restore-result')).toBeInTheDocument()
+  })
+
+  it('reads the database back once per restore and gates nothing on the answer', async () => {
+    const ownedCalls = () => fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/backup/owned')).length
+    restoreSucceeds()
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    // Nothing is read back before anything has been written: there is no completed
+    // restore to describe, and asking would be a request with no answer to give.
+    expect(ownedCalls()).toBe(0)
+
+    await userEvent.click(screen.getByTestId('restore-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-owned'))
+      .toHaveTextContent('Read Back'))
+    // Once per completed restore -- not once per render, and not on a timer.
+    expect(ownedCalls()).toBe(1)
+
+    // Informational to the end: the card is disarmed because the write happened, not
+    // because of anything the readback said, so the read-only way back still re-arms it,
+    // with the readback left on screen and no second request behind it.
+    await userEvent.click(screen.getByTestId('preview-button'))
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+    expect(screen.getByRole('radio', { name: /copy/i })).toBeEnabled()
+    expect(screen.getByTestId('bundle-file')).toBeEnabled()
+    expect(screen.getByTestId('restore-owned')).toBeInTheDocument()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(ownedCalls()).toBe(1)
+  })
 })
 
 

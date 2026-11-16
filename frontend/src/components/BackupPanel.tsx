@@ -256,6 +256,13 @@ export default function BackupPanel({ portfolios }: Props) {
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoreResult, setRestoreResult] = useState<{ inserted: Counts } | null>(null);
+  // What the database says it holds, read back once a write has committed, and whether
+  // that read failed. Both are decoration beside `restoreResult` and nothing else: they
+  // gate no button and no control, because a committed write must never be made to look
+  // like a failure by a second read that did not land. Cleared wherever the result line
+  // it belongs to is cleared, so a readback never outlives the restore it describes.
+  const [owned, setOwned] = useState<PlanSide | null>(null);
+  const [ownedFailed, setOwnedFailed] = useState(false);
 
   // Which preview is the current one. Two uploads in a row leave two responses in
   // flight and they may land in any order, so the response that arrives last is not
@@ -375,6 +382,8 @@ export default function BackupPanel({ portfolios }: Props) {
     setRestoring(true);
     setRestoreError(null);
     setRestoreResult(null);
+    setOwned(null);
+    setOwnedFailed(false);
     try {
       const res = await apiFetch(`${API_BASE}/backup/restore?mode=${mode}`, {
         method: 'POST',
@@ -405,6 +414,18 @@ export default function BackupPanel({ portfolios }: Props) {
       // the record, and Preview arms the card again for anyone who means to go on.
       disarmRestore();
       setRestoreResult({ inserted: written });
+      // The write is committed and the panel is now describing it, so the readback is
+      // decoration: if it fails, the counts the restore itself returned stay on screen
+      // with one honest line beside them. Nothing here may make a committed write look
+      // like a failure — that is how the same bundle gets restored twice.
+      try {
+        const back = await apiFetch(`${API_BASE}/backup/owned`);
+        const body = back.ok ? (await back.json()) as unknown : null;
+        if (isPlanSide(body)) setOwned(body);
+        else setOwnedFailed(true);
+      } catch {
+        setOwnedFailed(true);
+      }
     } catch {
       // No answer. The write may have committed, may have rolled back, or may never
       // have arrived, and nothing this client can observe tells it which, so no
@@ -455,6 +476,8 @@ export default function BackupPanel({ portfolios }: Props) {
               setPlan(null);
               setRestoreError(null);
               setRestoreResult(null);
+              setOwned(null);
+              setOwnedFailed(false);
               setConfirm('');
               setConfirmFor(null);
               if (chosen) void runPreview(chosen, mode);
@@ -552,6 +575,16 @@ export default function BackupPanel({ portfolios }: Props) {
           <div data-testid="restore-result" role="status" style={{ marginTop: '12px' }}>
             {`Restored ${countList(restoreResult.inserted)}.`}
           </div>
+        )}
+        {restoreResult && owned && (
+          <div data-testid="restore-owned" style={{ marginTop: '12px' }}>
+            <PlanSideView title="Your portfolios now" side={owned} />
+          </div>
+        )}
+        {restoreResult && ownedFailed && (
+          <p data-testid="restore-owned-failed" className="text-muted" style={{ marginTop: '8px' }}>
+            The restore succeeded, but your data could not be read back to confirm it. Reload to see what is there.
+          </p>
         )}
       </section>
     </div>
