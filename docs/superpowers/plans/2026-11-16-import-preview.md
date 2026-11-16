@@ -14,7 +14,7 @@
 
 - Postgres only. No SQLite, no dual-dialect SQL, no `COALESCE`/`IFNULL` portability hedging.
 - `sqlx::query!` (compile-time checked) in `src/`; runtime `sqlx::query`/`query_as` in `tests/`.
-- After any change to a `sqlx::query!` in `src/`, run `cargo sqlx prepare --all-targets` from `backend_rust/` and commit the refreshed `.sqlx/` cache. `scripts/check_sqlx_cache.sh` fails CI otherwise. The `--all-targets` flag is not optional — without it the cache is written from `src/` alone and the gate still fails.
+- After any change to a `sqlx::query!` in `src/`, run `cargo sqlx prepare -- --all-targets` from `backend_rust/` and commit the refreshed `.sqlx/` cache. `scripts/check_sqlx_cache.sh` fails CI otherwise. The `--all-targets` flag is not optional — without it the cache is written from `src/` alone and the gate still fails.
 - Caps are 25 portfolios and 50 assets per portfolio. They bound display only. `counts` and `asset_flags` are computed over every portfolio and asset, always.
 - Flags never block a restore and never gate a checkbox. The typed `REPLACE` confirmation is the only gate on `replace`.
 - The bundle format is unchanged: no `schema_version` bump, no edit to `docs/backup-schema/v1.json`, no new bundle field.
@@ -706,8 +706,9 @@ pub async fn owned_detail(
     .await
     .map_err(classify)?;
 
-    // Detail for the portfolios that will actually be listed. Bounded by design:
-    // 25 portfolios x 50 assets, ordered so the cap is deterministic.
+    // Detail for the portfolios that will actually be listed, ordered so the cap is
+    // deterministic. There is deliberately no LIMIT on assets: more_assets is computed from
+    // these rows, and a LIMIT would under-report it. The cap bounds the response, not the query.
     let listed: Vec<i64> = portfolios.iter().take(MAX_PORTFOLIOS_SHOWN).map(|p| p.id).collect();
     let assets = sqlx::query!(
         r#"SELECT a.portfolio_id AS "portfolio_id!", a.symbol AS "symbol!",
@@ -835,7 +836,7 @@ the RFC 3339 string, so both sides print the same way.
 
 - [ ] **Step 4: Refresh the SQLx cache**
 
-Run: `cargo sqlx prepare --all-targets`
+Run: `cargo sqlx prepare -- --all-targets`
 Expected: `.sqlx/` gains three `query-*.json` entries. Without `--all-targets` the next gate fails.
 
 - [ ] **Step 5: Run the tests to verify they pass**
@@ -1099,7 +1100,7 @@ Declare `let mut deleted = Counts::default();` before the `if mode == Mode::Repl
 
 - [ ] **Step 4: Refresh the SQLx cache**
 
-Run: `cargo sqlx prepare --all-targets`
+Run: `cargo sqlx prepare -- --all-targets`
 Expected: the three cached `DELETE` entries change. Skipping this is not caught here — it surfaces at Task 10 as a `check_sqlx_cache.sh` failure with no pointer back to this task.
 
 - [ ] **Step 5: Run the tests to verify they pass**
