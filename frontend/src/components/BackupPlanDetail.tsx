@@ -226,7 +226,13 @@ function AssetTable({ title, portfolio }: { title: string; portfolio: PlanPortfo
                 aria-expanded={!collapsed}
                 onClick={() => setExpanded((was) => !was)}
               >
-                {collapsed ? `show all ${portfolio.shown.length} assets` : 'show fewer'}
+                {/* "listed" is what makes this count agree with the server's cap under it.
+                    `shown.length` is capped by the server, so at the cap a portfolio that
+                    holds 362 assets lists 50 — and "show all 50 assets" directly above
+                    "and 312 more assets" is a totality word on a partial count. These are
+                    the 50 rows this page was given; the note below says how many it was
+                    never given. */}
+                {collapsed ? `show all ${portfolio.shown.length} listed assets` : 'show fewer'}
               </button>
             </td>
           </tr>

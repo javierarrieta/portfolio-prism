@@ -113,6 +113,22 @@ describe('the preview as two tables', () => {
     }
   })
 
+  it('names the side and the portfolio on each asset table', async () => {
+    render(<BackupPanel portfolios={[{ id: 1, name: 'Main' }]} />)
+    await userEvent.click(screen.getByRole('radio', { name: /Replace/ }))
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundle())
+    await waitFor(() => expect(screen.getByTestId('preview-insert')).toBeInTheDocument())
+
+    // The portfolio table carries its side in a caption; the asset table is one level
+    // down and carries its own name, because a reader who tabs into it has lost the
+    // heading above it. Both halves are asserted so the name cannot be a constant: an
+    // asset table that said only "assets in Alpha Fund" would be ambiguous between the
+    // two tables on the page, and one that dropped the portfolio name would not say
+    // which portfolio's assets these are.
+    expect(screen.getByRole('table', { name: 'Will delete — assets in Old Fund' })).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Will insert — assets in Alpha Fund' })).toBeInTheDocument()
+  })
+
   it('shows a portfolio row with its counts and a nested asset row with its symbol', () => {
     render(<PlanSideView title="Will insert" side={side()} />)
 
@@ -196,7 +212,11 @@ describe('the collapse toggle', () => {
     expect(screen.getAllByTestId('plan-asset')).toHaveLength(5);
     const toggle = screen.getByTestId('plan-show-all');
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
-    expect(toggle).toHaveTextContent('show all 8 assets');
+    // "listed", because the count is the server's cap on the listing, not the
+    // portfolio's holding: at the cap this reads `show all 50 listed assets` directly
+    // above `and 312 more assets`, and the two numbers are then about two different
+    // totals. Without "listed" the control claims the 50 are everything there is.
+    expect(toggle).toHaveTextContent('show all 8 listed assets');
     // The server's cap is a different fact — those 312 rows never arrived — and it is on
     // the page while collapsed, so nothing about the collapsed state hides it.
     expect(screen.getByText('and 312 more assets')).toBeInTheDocument();

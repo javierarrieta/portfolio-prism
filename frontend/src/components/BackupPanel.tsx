@@ -367,6 +367,23 @@ export default function BackupPanel({ portfolios }: Props) {
   // file, and choosing a mode — so the request goes out when the user changes
   // something rather than from an effect chasing that change after the fact.
   async function runPreview(target: File, forMode: RestoreMode) {
+    // The type check lives here, beside the oversize branch, rather than only in
+    // `chooseFile`, because `chooseFile` is not the only caller. The Preview button is
+    // gated on `previewing` alone — deliberately, so a refusal never wedges the card — so
+    // a check that lived only in the selection path would be walked straight past: the
+    // zone would refuse `notes.txt`, the button would stay enabled, and pressing it would
+    // POST the file the zone had just said was not a bundle. Refusing here means every
+    // caller meets the same answer, and it retires an in-flight preview exactly as
+    // oversize does, for the same reason: the answer on its way belongs to a file that is
+    // no longer the one on screen.
+    const wrongType = wrongTypeReason(target);
+    if (wrongType) {
+      retireInFlightPreview();
+      setPlan(null);
+      setRestoreError(wrongType);
+      setZoneRefusal(ZONE_REFUSAL.wrongType);
+      return;
+    }
     // Refused here rather than at the server, and before this file becomes the current
     // request — but not before there is nothing to retire. The answer in flight is the
     // *previous* file's preview, and its sequence number is still the current one, so
@@ -469,6 +486,11 @@ export default function BackupPanel({ portfolios }: Props) {
       retireInFlightPreview();
       return;
     }
+    // `runPreview` refuses a non-bundle too, and that is the copy that gates the Preview
+    // button. This one stays because it is the selection path's own answer: it fires at
+    // the moment the file arrives, without the request bookkeeping below it, so the zone
+    // states its refusal about *this* selection rather than about a preview that was
+    // asked for and declined.
     const wrongType = wrongTypeReason(chosen);
     if (wrongType) {
       retireInFlightPreview();
@@ -795,8 +817,9 @@ export default function BackupPanel({ portfolios }: Props) {
 
                 The two halves share a row on a wide screen because the question being
                 asked is a comparison — what goes against what — and two halves stacked
-                a screen apart cannot be read against each other. They stack below 900px,
-                where two columns would each be too narrow to hold a table. */}
+                a screen apart cannot be read against each other. They stack when the
+                card cannot give both halves a table's width, which `.plan-sides` decides
+                from the container rather than from the window. */}
             <div className="plan-sides">
               <div className="plan-side-panel" data-testid="preview-delete">
                 {plan.mode === 'replace'

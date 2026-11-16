@@ -440,6 +440,18 @@ function bundleFile(name = 'bundle.json', portfolioName = 'Restored') {
   })], name, { type: 'application/json' })
 }
 
+/** Hands the file input a file the dialog's filter would have hidden.
+ *
+ * `userEvent.upload` respects the input's `accept` and drops a non-matching file before
+ * the change event ever fires -- the right default, and the wrong thing for these tests:
+ * the wrong-type refusal exists for the "All files" escape hatch in a real dialog, and
+ * for a drag, neither of which consults `accept`. `fireEvent.change` writes the
+ * `FileList` straight onto the input, which is what the browser does when the user picks
+ * around the filter. */
+function chooseViaPicker(file: File) {
+  fireEvent.change(screen.getByTestId('bundle-file'), { target: { files: [file] } })
+}
+
 /** Rows as the server counts them -- the shape `planResponse` is built from. */
 interface Counts {
   portfolios: number
@@ -672,6 +684,56 @@ describe('restore card', () => {
       .toHaveTextContent('must not be empty'))
     expect(screen.queryByTestId('preview-summary')).toBeNull()
     expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('refuses a wrong-type file pressed through the Preview button, without sending it', async () => {
+    // The zone refused `notes.txt`, and the Preview button is gated on `previewing` alone
+    // -- on purpose, because a refusal must not wedge the card (the oversize test below
+    // pins it enabled after a refusal). So the button has to reach the same refusal the
+    // selection path reaches, or the file the zone just rejected is POSTed the moment
+    // someone presses it, and the refusal the user read becomes false.
+    render(<BackupPanel portfolios={portfolios} />)
+    const before = fetchMock.mock.calls.length
+    chooseViaPicker(notABundle())
+    await waitFor(() => expect(screen.getByTestId('dropzone-refusal'))
+      .toHaveTextContent('not a .json bundle'))
+
+    await userEvent.click(screen.getByTestId('preview-button'))
+
+    // A refusal must not leave the card in its busy state: `previewing` never goes up when
+    // nothing goes out, so the button is still an ordinary button.
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+    // And a task later, once a FileReader read and an answer would both have had their
+    // turn at the task queue: no plan, no armed write, and no preview request at all.
+    // These three are the weight of the test -- the button alone cannot tell a refusal
+    // from a request that already came back.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    const sent = fetchMock.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(sent.some((u) => u.includes('/backup/preview'))).toBe(false)
+  })
+
+  it('retires the preview still in flight when the file chosen through the picker is the wrong type', async () => {
+    // The same retirement the oversize refusal does, arriving by the picker path and the
+    // other refusal. The answer in flight belongs to the file that was on screen before
+    // `notes.txt`; a refused selection sends no request of its own, so nothing else takes
+    // that answer down. Leave it and it passes its own sequence guard, prints the
+    // previous file's counts under this refusal, and arms Restore to write them.
+    const pending = gatedPreviews()
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    chooseViaPicker(notABundle())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('"notes.txt" is not a .json bundle'))
+    expect(pending).toHaveLength(1)
+
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 
   it('renders the server reason when the preview refuses the bundle, and previews again when asked', async () => {
@@ -1712,6 +1774,37 @@ describe('oversized bundle', () => {
       .toHaveTextContent('above the 10-byte cap')
     // And the card is not left wedged on the first file's spinner: the retired answer
     // cannot clear the flag in its own `finally`, so the refusal had to take it down.
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+  })
+
+  it('retires the preview still in flight when a dropped file is refused as oversize', async () => {
+    // The same refusal and the same retirement, arriving by the drag path. Both selection
+    // paths have to end in one answer, and a retirement only the picker reaches leaves the
+    // drop free to print the previous file's counts under a refusal -- which is the half
+    // of the rule the drop zone's own promise depends on.
+    const pending: Array<(res: Response) => void> = []
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) {
+        return new Promise<Response>((resolve) => { pending.push(resolve) })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await screen.findByTestId('caps-note')
+
+    dropOnZone(tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    dropOnZone(bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    expect(pending).toHaveLength(1)
+
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
     expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 })

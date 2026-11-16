@@ -18,6 +18,7 @@
   --color-danger: #ef4444; /* Crimson Red */
   --color-danger-glow: rgba(239, 68, 68, 0.1);
   --color-warning: #f59e0b; /* Amber Orange */
+  --color-warning-glow: rgba(245, 158, 11, 0.15);
   
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
@@ -400,21 +401,32 @@ button, input, select, textarea {
 
 /* The preview comparison in the Backup tab (`BackupPanel`): the delete half and the
    insert half side by side, each a panel of the same height budget, so the two can be
-   read against each other rather than scrolled apart. Below 900px two columns cannot
-   hold a five-column table each, so they stack. */
+   read against each other rather than scrolled apart.
+
+   The split is container-driven, not viewport-driven. `auto-fit` asks how many 420px
+   tracks *this container* holds, and the container is the restore card — 260px of
+   `.app-container` sidebar, 80px of `.main-content` padding and 2px of card border
+   narrower than the window. A viewport `@media` rule measures the window instead, and
+   the two then disagree: the old `max-width: 900px` rule split at a viewport at which
+   each panel was already far too narrow for a table. At 901px the container is 559px,
+   two tracks and the 16px gap leave each panel a 271px border box, and 32px of panel
+   padding plus its own border leave 237px of table — enough for the counts columns and
+   not enough for Flags, so `zero-price` / `future_dated` / `currency_mismatch` fell off
+   the panel's own scroller. That is the one column the comparison exists to show.
+
+   Two 420px tracks plus the 16px gap need 856px of container, so the row splits at a
+   1198px viewport (856 + 342) and stacks below it, where each half gets the whole
+   container and Flags stays on screen. */
 .plan-sides {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
   gap: 16px;
   align-items: start;
 }
 
-@media (max-width: 900px) {
-  .plan-sides {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
+/* Still needed with `auto-fit`: `min-width: 0` is what stops a wide table from counting
+   as the panel's minimum size, and the scroll wrapper below is where the overflow goes
+   instead of into the track. */
 .plan-side-panel {
   min-width: 0;
   padding: 16px;
@@ -507,9 +519,11 @@ button, input, select, textarea {
 }
 
 /* Colour only: the size and shape come from the existing `.badge`, which is not
-   redefined here so that nothing outside this panel moves. */
+   redefined here so that nothing outside this panel moves. The pair is `.badge-etf`'s
+   and is read from `--color-warning-glow` rather than written out again, so a flag and
+   an ETF chip cannot drift apart the next time the warning colour moves. */
 .plan-flag {
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--color-warning-glow);
   color: var(--color-warning);
 }
 
@@ -601,7 +615,7 @@ button, input, select, textarea {
 }
 
 .badge-etf {
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--color-warning-glow);
   color: var(--color-warning);
 }
 
