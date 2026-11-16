@@ -60,50 +60,13 @@ pub struct Counts {
 pub struct Plan {
     pub schema_version: i64,
     pub mode: String,
-    pub delete: Counts,
-    pub insert: Counts,
+    /// What the caller owns today, in the same shape as `insert` so one component
+    /// renders both. Was a bare `Counts`.
+    pub delete: super::detail::PlanSide,
+    /// What the bundle holds.
+    pub insert: super::detail::PlanSide,
     pub prices: usize,
     pub warnings: Vec<String>,
-}
-
-/// Rows the caller owns today — the exact set `replace` would delete.
-///
-/// Scoped by `owner_id` and by nothing else: every count a foreign bundle can
-/// provoke is a count of the caller's own rows, because the caller's id is the
-/// only filter any of these three queries has.
-pub async fn owned_counts(pool: &DbPool, user_id: i64) -> Result<Counts, DbFailure> {
-    let portfolios: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM portfolios WHERE owner_id = $1"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    let assets: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM assets WHERE portfolio_id IN
-          (SELECT id FROM portfolios WHERE owner_id = $1)"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    let transactions: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "count!" FROM transactions WHERE asset_id IN
-          (SELECT id FROM assets WHERE portfolio_id IN
-           (SELECT id FROM portfolios WHERE owner_id = $1))"#,
-        user_id
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(classify)?;
-
-    Ok(Counts {
-        portfolios: portfolios as usize,
-        assets: assets as usize,
-        transactions: transactions as usize,
-    })
 }
 
 /// Counts in the bundle, which is what the UI shows as "will insert".
@@ -129,19 +92,23 @@ pub async fn plan_for(
     bundle: &Bundle,
     mode: Mode,
 ) -> Result<Plan, DbFailure> {
+    // One clock reading for both sides, so a preview that straddles midnight cannot
+    // call the same transaction future-dated on one side and not on the other.
+    let today = chrono::Utc::now().date_naive();
+    let insert = super::detail::detail_from_bundle(bundle, today);
     let delete = match mode {
-        Mode::Copy => Counts::default(),
-        Mode::Replace => owned_counts(pool, user_id).await?,
+        Mode::Copy => super::detail::PlanSide::empty(),
+        Mode::Replace => super::detail::owned_detail(pool, user_id, today).await?,
     };
 
     let mut warnings = Vec::new();
-    if mode == Mode::Replace && delete.portfolios > 0 {
+    if mode == Mode::Replace && delete.counts.portfolios > 0 {
         warnings.push(format!(
             "replace will delete all {} portfolio(s) you own, including any not in this bundle",
-            delete.portfolios
+            delete.counts.portfolios
         ));
     }
-    if mode == Mode::Replace && delete.assets > 0 {
+    if mode == Mode::Replace && delete.counts.assets > 0 {
         // `Counts` has three fields because those are the three tables a bundle has
         // rows in. `replace` clears a fourth that a bundle says nothing about:
         // `split_sync` throttle rows, which carry an `asset_id` with no foreign key,
@@ -162,7 +129,7 @@ pub async fn plan_for(
         schema_version: bundle.schema_version,
         mode: mode.as_str().to_string(),
         delete,
-        insert: bundle_counts(bundle),
+        insert,
         prices: bundle.prices.len(),
         warnings,
     })
