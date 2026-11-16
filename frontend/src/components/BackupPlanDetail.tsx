@@ -1,10 +1,11 @@
-/* Fast Refresh declines to hot-swap a module that exports non-components, so this file
- * would fall back to a full reload in dev. That is the whole cost, and the alternative
- * is worse: `countList`, `isCounts` and `isPlanSide` are this module's contract with
- * `BackupPanel` — the panel reads a plan body with them and spells the plan sentence with
- * the first — and splitting them into a second file would put one promise's two halves in
- * two places, which is how they start disagreeing. */
-/* eslint-disable react-refresh/only-export-components */
+/* `countList`, `isCounts` and `isPlanSide` are this module's contract with `BackupPanel`
+ * — the panel reads a plan body with them and spells the plan sentence with the first —
+ * and splitting them into a second file would put one promise's two halves in two places,
+ * which is how they start disagreeing. The cost is that Fast Refresh declines to hot-swap
+ * a module that exports non-components, so this file falls back to a full reload in dev.
+ * `eslint.config.js` names those three exports to `react-refresh/only-export-components`
+ * rather than this file switching the rule off, so the rule still bites on anything else
+ * exported from here. */
 import type { ReactNode } from 'react';
 
 /** The three counts a plan side carries. Mirrors `backup::restore::Counts`. */
@@ -45,6 +46,12 @@ export type PlanSide = {
  * contract: 25 portfolios x 50 assets is a wall, and a wall is not verification. */
 const COLLAPSE_ABOVE = 5;
 
+/** `{n} {noun}` with the English plural spelled out. `plural` covers the ones whose plural
+ * is not `noun` + `s` — `txn`/`txns`. The counts are the server's; only the English is here. */
+function one(n: number, noun: string, plural = `${noun}s`): string {
+  return `${n} ${n === 1 ? noun : plural}`;
+}
+
 /** English for a flag code. An unknown code renders as itself, so a flag added
  * server-side degrades into something readable rather than a crash. */
 const FLAG_LABELS: Record<string, string> = {
@@ -61,15 +68,13 @@ function flagLabel(code: string, count?: number): string {
   return count === undefined ? label : `${label} ×${count}`;
 }
 
-/** `{n} {noun}` with the plural spelled out. The counts are the server's; only the
- * English is here. Exported because `BackupPanel` spells the same sentence for the
+/** The plan sentence. Exported because `BackupPanel` spells the same sentence for the
  * restore outcome, and two spellings of one promise is how they drift. */
 export function countList(counts: Counts): string {
-  const named = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
   return [
-    named(counts.portfolios, 'portfolio'),
-    named(counts.assets, 'asset'),
-    named(counts.transactions, 'transaction'),
+    one(counts.portfolios, 'portfolio'),
+    one(counts.assets, 'asset'),
+    one(counts.transactions, 'transaction'),
   ].join(', ');
 }
 
@@ -110,11 +115,17 @@ export function isPlanSide(value: unknown): value is PlanSide {
     && Number.isFinite(s.more_portfolios) && Number.isFinite(s.transactions_in_shown);
 }
 
-function FlagList({ codes, counts }: { codes: string[]; counts?: Record<string, number> }) {
+/** Owns its own leading separator, so a list that renders nothing leaves no orphan `·` behind
+ * and a caller cannot forget to put one in. `prefix` labels the scope of the counts. */
+function FlagList({ codes, counts, prefix }: {
+  codes: string[];
+  counts?: Record<string, number>;
+  prefix?: string;
+}) {
   if (codes.length === 0) return null;
   return (
     <span data-testid="plan-flags" className="text-muted">
-      {codes.map((c) => flagLabel(c, counts?.[c])).join(' · ')}
+      {` · ${prefix ?? ''}${codes.map((c) => flagLabel(c, counts?.[c])).join(' · ')}`}
     </span>
   );
 }
@@ -126,16 +137,14 @@ function AssetRow({ asset }: { asset: PlanAsset }) {
   return (
     <div data-testid="plan-asset" style={{ paddingLeft: '12px' }}>
       <strong>{asset.symbol}</strong>
-      {` ${asset.name} · ${asset.currency} · ${asset.transactions} txn`}
+      {` ${asset.name} · ${asset.currency} · ${one(asset.transactions, 'txn', 'txns')}`}
       {` · ${span}`}
-      {' '}
       <FlagList codes={asset.flags} counts={{ zero_price: asset.zero_price }} />
     </div>
   );
 }
 
 function PortfolioBlock({ portfolio }: { portfolio: PlanPortfolio }) {
-  const one = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
   // The header is built from `asset_flags`, which the server counts over *every*
   // asset, and never from `portfolio.shown`. A header aggregated over the listed
   // assets would under-report a flag sitting past `MAX_ASSETS_SHOWN`, and the
@@ -144,11 +153,14 @@ function PortfolioBlock({ portfolio }: { portfolio: PlanPortfolio }) {
     <span data-testid="plan-portfolio-header">
       <strong>{portfolio.name}</strong>
       {` · ${portfolio.currency} · ${one(portfolio.assets, 'asset')} · ${one(portfolio.transactions, 'transaction')}`}
-      {' '}
       <FlagList codes={portfolio.flags} />
+      {/* `asset_flags` counts every asset the portfolio holds; the rows under the header
+        * count one asset each. Naming the scope is the only thing that stops the two
+        * reading as the same number twice. */}
       <FlagList
         codes={Object.keys(portfolio.asset_flags)}
         counts={portfolio.asset_flags}
+        prefix="across all assets: "
       />
     </span>
   );
