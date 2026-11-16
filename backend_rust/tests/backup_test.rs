@@ -1853,6 +1853,11 @@ async fn restore_reports_the_rows_it_actually_deleted() {
     let aid = seed_asset(&pool, pid, "EX", "Existing").await;
     seed_transaction(&pool, aid, "BUY", 1.0, 3.0, 0.0).await;
     seed_transaction(&pool, aid, "BUY", 1.0, 4.0, 0.0).await;
+    // A second portfolio holding a second asset, so that every count below differs from
+    // the bundle's 1/1/1. With one portfolio holding one asset only the transactions
+    // count could tell `rows_affected` from an echo of the bundle's own numbers.
+    let other = seed_portfolio(&pool, user, "Other", "USD").await;
+    seed_asset(&pool, other, "OT", "Other").await;
 
     let c = client(pool.clone(), user).await;
     let res = c
@@ -1865,8 +1870,8 @@ async fn restore_reports_the_rows_it_actually_deleted() {
     assert_eq!(res.status(), Status::Ok);
     let out: Value = res.into_json().await.unwrap();
 
-    assert_eq!(out["deleted"]["portfolios"], 1);
-    assert_eq!(out["deleted"]["assets"], 1);
+    assert_eq!(out["deleted"]["portfolios"], 2);
+    assert_eq!(out["deleted"]["assets"], 2);
     assert_eq!(out["deleted"]["transactions"], 2);
     assert_eq!(out["inserted"]["portfolios"], 1);
 }
