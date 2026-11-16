@@ -83,11 +83,13 @@ fn the_real_tree_passes_the_gate() {
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     // The counts are a tripwire in the same spirit as `access_gate_test.rs`: a
-    // fifth file or a fifth INSERT means someone has to look at this gate and say
+    // sixth file or a fifth INSERT means someone has to look at this gate and say
     // so, rather than the script quietly inspecting less than the module holds.
+    // The file count is the number of files under `src/backup/`; `detail.rs` joined
+    // them in this commit, which is also why the INSERT count did not move — it adds none.
     assert!(
-        text.contains("Portability gate passed: 4 file(s) inspected under src/backup"),
-        "the gate should account for all four files under src/backup, said:\n{text}"
+        text.contains("Portability gate passed: 5 file(s) inspected under src/backup"),
+        "the gate should account for all five files under src/backup, said:\n{text}"
     );
     assert!(
         text.contains("INSERT statements inspected: 4"),
