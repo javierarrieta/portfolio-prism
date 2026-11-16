@@ -94,13 +94,13 @@ impl PlanSide {
 /// `+`) and `restore.rs:399` writes the bundle's price string verbatim into the column.
 /// So the two producers would disagree about the same row.
 ///
-/// The accepted shape is exactly the regex's: optional surrounding whitespace, an
-/// optional `-`, one or more `0`, then optionally a `.` and one or more `0`, and
-/// nothing else. A price that is not a number is therefore **not** zero — it is
+/// The accepted shape is exactly the regex's: an optional `-`, one or more `0`, then
+/// optionally a `.` and one or more `0`, and nothing else. No trimming: the SQL side
+/// anchors with `^` and `$` and would not accept padding either, so padding makes a
+/// price not-zero here exactly as it does there. A price that is not a number is therefore **not** zero — it is
 /// unparseable, which is a different fact, and the zero test must not swallow it.
 fn is_zero(price: &str) -> bool {
-    let trimmed = price.trim();
-    let digits = trimmed.strip_prefix('-').unwrap_or(trimmed);
+    let digits = price.strip_prefix('-').unwrap_or(price);
     match digits.split_once('.') {
         None => !digits.is_empty() && digits.bytes().all(|b| b == b'0'),
         Some((int, frac)) => {
@@ -384,9 +384,22 @@ mod tests {
         for zero in ["0", "-0", "0.0", "-0.00"] {
             assert!(is_zero(zero), "{zero} must read as zero");
         }
-        for not_zero in ["+0", "0.", "0e0", "0.0.0", "not-a-number", "1e-400"] {
+        for not_zero in ["+0", "0.", "0e0", "0.0.0", "not-a-number", "1e-400", " 0", "0 "] {
             assert!(!is_zero(not_zero), "{not_zero} must not read as zero");
         }
+    }
+
+    /// The date prefix is taken by byte count, so a multi-byte character landing on the
+    /// boundary is the case that panics on a plain slice. Unreachable over HTTP —
+    /// validation requires an RFC 3339 date — but `date_part` is reachable from anything
+    /// that hands it a string, and "no date" beats a panic in a preview.
+    #[test]
+    fn a_multibyte_character_on_the_date_boundary_yields_no_date() {
+        assert_eq!(date_part("2026-01-0\u{e9}T00:00:00+00:00"), None);
+        assert_eq!(date_part("2026-01-05\u{e9}T00:00:00+00:00").as_deref(), Some("2026-01-05"));
+        assert_eq!(date_part("2026-01-0\u{e9}"), None);
+        assert_eq!(date_part("short"), None);
+        assert_eq!(date_part("2026-01-05T00:00:00+00:00").as_deref(), Some("2026-01-05"));
     }
 
     #[test]

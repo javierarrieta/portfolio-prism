@@ -182,7 +182,7 @@ Computed identically on both sides, so one renderer handles both.
 | `zero_price` | asset | any transaction on the asset whose `price` text matches the zero rule below — neither producer filters by transaction type, and a zero-price `SPLIT` reaches neither input anyway: bundle validation and the ordinary write path both refuse one |
 | `future_dated` | asset | a transaction dated after today, **in UTC** — otherwise the same portfolio is future-dated in one timezone and not in another |
 | `currency_mismatch` | asset | asset currency differs from its portfolio's |
-| `duplicate_symbol` | portfolio | the same symbol appears twice; reported as a portfolio flag, and counted as *how many symbols are duplicated*, so three copies of one symbol is one flag — the same thing on both sides |
+| `duplicate_symbol` | portfolio | present when at least one symbol appears more than once in the portfolio. It is a **presence**, not a count: three copies of one symbol is one duplicated symbol, and two symbols each copied twice is still reported the same way the other producer reports it. The SQL side counts distinct duplicated symbols only to decide whether that number is above zero |
 
 Two rules bind both producers, and they are the ones a later refactor is most likely to
 break quietly:
