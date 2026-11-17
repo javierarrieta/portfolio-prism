@@ -625,23 +625,25 @@ export default function App() {
             <span className="nav-label">Portfolio Prism</span>
           </div>
           {/*
-            A button, not a clickable div, and its accessible name is always the words: an
-            icon is a hint, not a name, and the collapsed rail leaves nothing else to
-            explain it with. `aria-expanded` carries the state, so the label stays an
-            instruction rather than a status. The glyph is PanelLeftClose/Open rather than
-            a hamburger because a hamburger means "open a menu that is hidden"; this menu
-            is always present and only narrows, which is what the panel glyph says.
+            A button, not a clickable div, showing only the glyph. The words are still
+            there -- in `aria-label`, which is the accessible name a screen reader reads,
+            and in `title`, which is the tooltip a sighted user hovers for. An icon-only
+            control still has to be named; the icon is a hint, not a name.
+            `aria-expanded` carries the state, so the label stays an instruction rather
+            than a status. The glyph is PanelLeftClose/Open rather than a hamburger because
+            a hamburger means "open a menu that is hidden"; this menu is always present and
+            only narrows, which is what the panel glyph says.
           */}
           <button
             type="button"
             className="nav-toggle"
             aria-expanded={!navCollapsed}
             aria-controls="app-nav"
+            aria-label={navCollapsed ? 'Expand navigation' : 'Collapse navigation'}
             title={navCollapsed ? 'Expand navigation' : 'Collapse navigation'}
             onClick={() => setRailCollapsed(!navCollapsed)}
           >
             {navCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-            <span className="nav-label">{navCollapsed ? 'Expand navigation' : 'Collapse navigation'}</span>
           </button>
         </div>
 

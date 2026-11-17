@@ -204,11 +204,16 @@ describe('what the collapsed rail keeps', () => {
     // whatever the rail hides, it hides from the tab order as well.
     ;(document.activeElement as HTMLElement | null)?.blur()
     const stops: string[] = []
+    // The accessible name, not the visible text: the toggle is an icon-only control whose
+    // name comes from `aria-label`, so reading `textContent` alone would report it as ""
+    // and claim a named control was unnamed. Same rule the rest of this file uses via
+    // `getByRole({ name })`.
+    const nameOf = (el: Element) => (el.getAttribute('aria-label') || el.textContent || '').trim()
     for (let i = 0; i < NAV_LABELS.length + 4; i++) {
       await user.tab()
       const el = document.activeElement
       if (!el || el === document.body || el === document.documentElement) break
-      stops.push((el.textContent ?? '').trim())
+      stops.push(nameOf(el))
     }
 
     expect(stops).toEqual([
