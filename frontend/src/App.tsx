@@ -13,8 +13,8 @@ import {
   Printer,
   Receipt,
   FolderSync,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
   Wallet,
   type LucideIcon,
 } from 'lucide-react';
@@ -625,9 +625,12 @@ export default function App() {
             <span className="nav-label">Portfolio Prism</span>
           </div>
           {/*
-            A button, not a clickable div, and its own text says which way it goes: the
-            collapsed rail leaves nothing else to explain it with. `aria-expanded` carries
-            the state, so the label stays an instruction rather than a status.
+            A button, not a clickable div, and its accessible name is always the words: an
+            icon is a hint, not a name, and the collapsed rail leaves nothing else to
+            explain it with. `aria-expanded` carries the state, so the label stays an
+            instruction rather than a status. The glyph is PanelLeftClose/Open rather than
+            a hamburger because a hamburger means "open a menu that is hidden"; this menu
+            is always present and only narrows, which is what the panel glyph says.
           */}
           <button
             type="button"
@@ -637,7 +640,7 @@ export default function App() {
             title={navCollapsed ? 'Expand navigation' : 'Collapse navigation'}
             onClick={() => setRailCollapsed(!navCollapsed)}
           >
-            {navCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+            {navCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
             <span className="nav-label">{navCollapsed ? 'Expand navigation' : 'Collapse navigation'}</span>
           </button>
         </div>
