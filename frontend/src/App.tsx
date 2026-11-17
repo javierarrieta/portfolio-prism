@@ -1,4 +1,4 @@
-import React, { useState, useEffect, ChangeEvent, FormEvent, useCallback } from 'react';
+import React, { useRef, useState, useEffect, ChangeEvent, FormEvent, useCallback } from 'react';
 import { 
   LayoutDashboard, 
   Briefcase, 
@@ -13,6 +13,10 @@ import {
   Printer,
   Receipt,
   FolderSync,
+  ChevronLeft,
+  ChevronRight,
+  Wallet,
+  type LucideIcon,
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import PortfolioDetail, { CreateTxPayload } from './components/PortfolioDetail';
@@ -39,6 +43,54 @@ import {
 
 // dashboard, portfolios, analytics, ledger, statement, report
 const DEFAULT_TAB = 'dashboard';
+
+/**
+ * The rail, in the order it renders. One list rather than seven hand-written `<li>`s
+ * because the collapsed state adds three things to every item -- the clipped label, the
+ * `title` that explains the icon once the label is clipped, and the keyboard handler --
+ * and seven copies of those is seven chances to give one of them a different spelling.
+ */
+const NAV_ITEMS: { id: string; label: string; Icon: LucideIcon }[] = [
+  { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
+  { id: 'portfolios', label: 'Holdings & Tax lots', Icon: Briefcase },
+  { id: 'analytics', label: 'Risk & Correlation', Icon: BarChart3 },
+  { id: 'ledger', label: 'Transaction Ledger', Icon: History },
+  { id: 'statement', label: 'Printable Statement', Icon: Printer },
+  { id: 'report', label: 'Tax Report', Icon: Receipt },
+  { id: 'backup', label: 'Backup', Icon: FolderSync },
+];
+
+/**
+ * Namespaced because `localStorage` is one flat bag shared by everything on the origin; a
+ * bare `collapsed` key is a collision waiting for the next app on the port.
+ */
+const NAV_COLLAPSED_KEY = 'portfolio-prism:nav-collapsed';
+
+/**
+ * The stored rail preference, read once at startup. Only the exact string `"true"` means
+ * collapsed -- absent, garbage, or a value some other build wrote all mean expanded, which
+ * is the only state this app had before the rail existed.
+ *
+ * The read is wrapped because `localStorage` does not merely return nothing when it is
+ * unavailable, it throws (Safari private mode, a blocked third-party origin). A preference
+ * store that is broken is a reason to show the wide sidebar, not a reason to render nothing.
+ */
+const readNavCollapsed = (): boolean => {
+  try {
+    return window.localStorage.getItem(NAV_COLLAPSED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+};
+
+/** The same rule on the way out: some browsers throw on write, and forgetting is survivable. */
+const writeNavCollapsed = (collapsed: boolean): void => {
+  try {
+    window.localStorage.setItem(NAV_COLLAPSED_KEY, String(collapsed));
+  } catch {
+    // Nothing to do. The next load falls back to expanded, which is the default anyway.
+  }
+};
 
 /**
  * The identity of a report request: the portfolio it is about and the window, strategy and
@@ -129,6 +181,17 @@ export default function App() {
   const [authFailed] = useState(
     () => new URLSearchParams(window.location.search).get('auth_error') === 'auth_failed',
   );
+  // The nav rail: expanded (icons and labels) or collapsed to an icon rail. Read once
+  // during initialisation for the reason `authFailed` above gives -- the answer is known
+  // before the first paint, and setting it from an effect would flash the wide sidebar and
+  // then correct it.
+  const [navCollapsed, setNavCollapsed] = useState(readNavCollapsed);
+  // The real portfolio <select> only exists while the rail is expanded, so the collapsed
+  // rail's portfolio button cannot focus it in the click that expands the rail. This says
+  // "focus it as soon as it exists". A ref, not state: nothing needs a second render to
+  // notice the request, and the consumer is the DOM, not the tree.
+  const pendingPortfolioFocus = useRef(false);
+  const portfolioSelectRef = useRef<HTMLSelectElement>(null);
 
   const [showNewPortfolioModal, setShowNewPortfolioModal] = useState(false);
   // Which sell's breakdown is open, and which portfolio it belonged to. The modal
@@ -145,6 +208,22 @@ export default function App() {
     setActiveTab(tab);
     setSellPnl(null);
   };
+  // `role="button"` on a nav item means Space activates it as well as Enter, and Space has
+  // to keep its no-scroll promise while it is doing so -- hence the preventDefault.
+  const activateNavItem = (tab: string, event: React.KeyboardEvent) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    selectTab(tab);
+  };
+  const setRailCollapsed = (collapsed: boolean) => {
+    setNavCollapsed(collapsed);
+    writeNavCollapsed(collapsed);
+  };
+  useEffect(() => {
+    if (!pendingPortfolioFocus.current || navCollapsed) return;
+    pendingPortfolioFocus.current = false;
+    portfolioSelectRef.current?.focus();
+  }, [navCollapsed]);
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [newPortfolioDesc, setNewPortfolioDesc] = useState('');
   const [newPortfolioCurrency, setNewPortfolioCurrency] = useState('USD');
@@ -498,6 +577,13 @@ export default function App() {
   const reportCsvHref = currentReport !== null && !reportLoading && reportQuery !== ''
     ? `${API_BASE}${reportQuery}&format=csv`
     : '';
+  // What the collapsed rail says about the portfolio everything on screen belongs to. The
+  // rail cannot show a <select>, and it must not pretend there is no portfolio while still
+  // acting on one, so the name travels with the icon and the control that changes it is one
+  // activation away.
+  const portfolioRailHint = currentPortfolio
+    ? `Active portfolio: ${currentPortfolio.name} — expand to change`
+    : 'No active portfolio — expand to change';
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -511,7 +597,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app-container">
+    <div className={`app-container${navCollapsed ? ' app-container--nav-collapsed' : ''}`}>
       {authFailed && (
         <div
           role="alert"
@@ -533,58 +619,101 @@ export default function App() {
       )}
       {/* Sidebar Navigation */}
       <aside className="sidebar">
-        <div className="brand">
-          <img src="/logo.svg" alt="Logo" className="brand-logo" />
-          <span>Portfolio Prism</span>
+        <div className="sidebar-head">
+          <div className="brand">
+            <img src="/logo.svg" alt="Logo" className="brand-logo" />
+            <span className="nav-label">Portfolio Prism</span>
+          </div>
+          {/*
+            A button, not a clickable div, and its own text says which way it goes: the
+            collapsed rail leaves nothing else to explain it with. `aria-expanded` carries
+            the state, so the label stays an instruction rather than a status.
+          */}
+          <button
+            type="button"
+            className="nav-toggle"
+            aria-expanded={!navCollapsed}
+            aria-controls="app-nav"
+            title={navCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+            onClick={() => setRailCollapsed(!navCollapsed)}
+          >
+            {navCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+            <span className="nav-label">{navCollapsed ? 'Expand navigation' : 'Collapse navigation'}</span>
+          </button>
         </div>
 
-        <ul className="nav-menu">
-          <li className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => selectTab('dashboard')}>
-            <LayoutDashboard size={18} /> Dashboard
-          </li>
-          <li className={`nav-item ${activeTab === 'portfolios' ? 'active' : ''}`} onClick={() => selectTab('portfolios')}>
-            <Briefcase size={18} /> Holdings & Tax lots
-          </li>
-          <li className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`} onClick={() => selectTab('analytics')}>
-            <BarChart3 size={18} /> Risk & Correlation
-          </li>
-          <li className={`nav-item ${activeTab === 'ledger' ? 'active' : ''}`} onClick={() => selectTab('ledger')}>
-            <History size={18} /> Transaction Ledger
-          </li>
-          <li className={`nav-item ${activeTab === 'statement' ? 'active' : ''}`} onClick={() => selectTab('statement')}>
-            <Printer size={18} /> Printable Statement
-          </li>
-          <li className={`nav-item ${activeTab === 'report' ? 'active' : ''}`} onClick={() => selectTab('report')}>
-            <Receipt size={18} /> Tax Report
-          </li>
-          <li className={`nav-item ${activeTab === 'backup' ? 'active' : ''}`} onClick={() => selectTab('backup')}>
-            <FolderSync size={18} /> Backup
-          </li>
+        {/*
+          The items are <li role="button" tabIndex={0}>: they were already clickable, and a
+          control that only a mouse can reach is not a control. The label is a clipped span,
+          never a conditional render and never `display: none`, so collapsing the rail hides
+          the words and keeps the accessible name -- and the `title` is what explains the
+          icon to a pointer once the words are out of the way.
+        */}
+        <ul className="nav-menu" id="app-nav">
+          {NAV_ITEMS.map(({ id, label, Icon }) => (
+            <li
+              key={id}
+              className={`nav-item ${activeTab === id ? 'active' : ''}`}
+              role="button"
+              tabIndex={0}
+              title={label}
+              onClick={() => selectTab(id)}
+              onKeyDown={(event) => activateNavItem(id, event)}
+            >
+              <Icon size={18} />
+              <span className="nav-label">{label}</span>
+            </li>
+          ))}
         </ul>
 
         {/* Portfolio Switcher */}
         <div style={{ marginTop: 'auto', paddingTop: '24px', borderTop: '1px solid var(--border-color)' }}>
-          <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600, display: 'block', marginBottom: '8px' }}>ACTIVE PORTFOLIO</label>
-          {portfolios.length > 0 ? (
-            <select 
-              value={selectedId || ''} 
-               onChange={(e: ChangeEvent<HTMLSelectElement>) => setSelectedId(parseInt(e.target.value))}
-              className="form-control"
-              style={{ marginBottom: '12px' }}
+          {navCollapsed ? (
+            <button
+              type="button"
+              className="switcher-rail-btn"
+              title={portfolioRailHint}
+              onClick={() => {
+                pendingPortfolioFocus.current = true;
+                setRailCollapsed(false);
+              }}
             >
-              {portfolios.map(p => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
+              <Wallet size={18} />
+              <span className="nav-label">{portfolioRailHint}</span>
+            </button>
           ) : (
-            <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)', marginBottom: '12px' }}>No portfolios found</p>
+            <>
+              <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600, display: 'block', marginBottom: '8px' }}>ACTIVE PORTFOLIO</label>
+              {portfolios.length > 0 ? (
+                <select 
+                  ref={portfolioSelectRef}
+                  value={selectedId || ''} 
+                   onChange={(e: ChangeEvent<HTMLSelectElement>) => setSelectedId(parseInt(e.target.value))}
+                  className="form-control"
+                  style={{ marginBottom: '12px' }}
+                >
+                  {portfolios.map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              ) : (
+                <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)', marginBottom: '12px' }}>No portfolios found</p>
+              )}
+            </>
           )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <button onClick={() => setShowNewPortfolioModal(true)} className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
-              <Plus size={14} /> New Portfolio
-            </button>
-            {portfolios.length === 0 && (
+            {/*
+              Creation is a deliberate visit, not a glance: while the rail is collapsed these
+              are gone rather than squashed to a 40px sliver, and they are not left in the
+              tab order invisible. One click on the toggle brings them back.
+            */}
+            {!navCollapsed && (
+              <button onClick={() => setShowNewPortfolioModal(true)} className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
+                <Plus size={14} /> New Portfolio
+              </button>
+            )}
+            {!navCollapsed && portfolios.length === 0 && (
               <button onClick={handleLoadDemo} className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
                 <Sparkles size={14} /> Load Demo Fund
               </button>
@@ -596,8 +725,13 @@ export default function App() {
               there. The backend clears the cookie and forwards to the provider's
               end-session endpoint.
             */}
-            <a href="/auth/logout" className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
-              <LogOut size={14} /> Sign out
+            {/*
+              Sign out stays in the rail. An account action that disappears depending on a
+              layout preference is not an account action; here the icon is always visible and
+              only its words are clipped, so the link keeps its name and its tab stop.
+            */}
+            <a href="/auth/logout" className="btn btn-secondary sign-out" style={{ width: '100%', justifyContent: 'center', fontSize: '0.875rem' }}>
+              <LogOut size={14} /> <span className="nav-label">Sign out</span>
             </a>
             {/*
               Measured against the live provider, not guessed: this clears the app
@@ -609,10 +743,12 @@ export default function App() {
               able to re-enter. Kept outside the anchor so the link's accessible name
               stays "Sign out".
             */}
-            <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.4 }}>
-              Ends this app&apos;s session. Your sign-in provider stays signed in —
-              choose its log-out option on the page that follows to end that too.
-            </p>
+            {!navCollapsed && (
+              <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.4 }}>
+                Ends this app&apos;s session. Your sign-in provider stays signed in —
+                choose its log-out option on the page that follows to end that too.
+              </p>
+            )}
           </div>
         </div>
       </aside>
