@@ -819,17 +819,36 @@ export default function BackupPanel({ portfolios }: Props) {
                 asked is a comparison — what goes against what — and two halves stacked
                 a screen apart cannot be read against each other. They stack when the
                 card cannot give both halves a table's width, which `.plan-sides` decides
-                from the container rather than from the window. */}
-            <div className="plan-sides">
-              <div className="plan-side-panel" data-testid="preview-delete">
-                {plan.mode === 'replace'
-                  ? <PlanSideView title="Will delete" side={plan.delete} />
-                  : <p>Will delete nothing.</p>}
+                from the container rather than from the window.
+
+                In `copy` there is nothing to compare against: nothing is deleted, so the
+                delete half has no listing, no counts and no table. Giving it a panel
+                anyway spent half the row on five words, so `copy` renders one panel at
+                full width and keeps the sentence as a muted note above it. The note is
+                still `preview-delete`, because it is still what the delete half says —
+                it has simply stopped being a pane, and `.plan-sides--one` stops the grid
+                reserving a track for a side that has no content. */}
+            {plan.mode === 'replace' ? (
+              <div className="plan-sides">
+                <div className="plan-side-panel" data-testid="preview-delete">
+                  <PlanSideView title="Will delete" side={plan.delete} collapsible />
+                </div>
+                <div className="plan-side-panel" data-testid="preview-insert">
+                  <PlanSideView title="Will insert" side={plan.insert} collapsible />
+                </div>
               </div>
-              <div className="plan-side-panel" data-testid="preview-insert">
-                <PlanSideView title="Will insert" side={plan.insert} />
-              </div>
-            </div>
+            ) : (
+              <>
+                <p className="text-muted plan-side-none" data-testid="preview-delete">
+                  Will delete nothing.
+                </p>
+                <div className="plan-sides plan-sides--one">
+                  <div className="plan-side-panel" data-testid="preview-insert">
+                    <PlanSideView title="Will insert" side={plan.insert} collapsible />
+                  </div>
+                </div>
+              </>
+            )}
             {/* The card never sends `apply_prices`, so a bundle carrying price history
                 restores without it. That is a decision the user should not have to guess
                 at, and `prices` is the server's own count of what is being left out. It

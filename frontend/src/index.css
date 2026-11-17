@@ -442,6 +442,83 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.02);
 }
 
+/* One side of the comparison has no content to place, so the grid stops making a track
+   for it. In `copy` nothing is deleted, and the insert listing is the whole answer. A
+   single item in an `auto-fit` row would collapse the empty tracks on its own; naming
+   the modifier is what makes that a rule a reader can find rather than a side effect of
+   how many children the wrapper happens to have. */
+.plan-sides--one {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* What the delete half says in `copy`. A line above the one panel, not a pane: the
+   colour and the size come from `.text-muted` and the card, and all this adds is the
+   spacing under it, since the global reset took every paragraph margin away. */
+.plan-side-none {
+  margin-bottom: 8px;
+}
+
+/* The counts sentence. It is the pane's heading, and in a collapsible pane it is also
+   the toggle's label, so it is a span that lays out as a block rather than a paragraph
+   that would be invalid inside a button. The 4px is the gap the sentence has always kept
+   from the listing under it. */
+.plan-side-heading {
+  display: block;
+  margin-bottom: 4px;
+}
+
+/* The whole header is the control, so there is one thing to aim at rather than an
+   arrow-sized glyph next to a sentence. `font: inherit` and `color: inherit` are what
+   keep a button's UA styling from restyling the heading it now wraps. */
+.plan-side-toggle {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* The heading's 4px is the gap to a listing that is already on the page; inside the
+   toggle the listing is behind the fold, and the panel's own padding is the gap. */
+.plan-side-toggle .plan-side-heading {
+  margin-bottom: 0;
+}
+
+/* The fold marker lives in CSS rather than in the DOM so that the button's accessible
+   name stays exactly the counts sentence, with no glyph read out in front of it. */
+.plan-side-toggle::after {
+  content: '▾';
+  flex: none;
+  color: var(--text-muted);
+  transform: rotate(-90deg);
+  transition: transform var(--transition-fast);
+}
+
+.plan-side-toggle[aria-expanded='true']::after {
+  transform: rotate(0deg);
+}
+
+/* The only hover cue: the heading is already the card's brightest text, so the marker is
+   the part that can say "this is pressable" without shouting over the counts. */
+.plan-side-toggle:hover::after {
+  color: var(--text-secondary);
+}
+
+/* Collapsing hides the body; it does not unmount it, so the per-portfolio expansions
+   inside it survive the fold. This rule only guarantees that stays true: `hidden` is
+   collapsed by the UA stylesheet, and a `display` added to the body later would
+   out-specify that. */
+.plan-side-body[hidden] {
+  display: none;
+}
+
 /* The panel is already a box inside the restore card, so it does not get the glass
    treatment too — and it scrolls its own table rather than widening the card. */
 .plan-table-scroll {

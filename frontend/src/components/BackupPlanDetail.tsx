@@ -289,35 +289,74 @@ function PortfolioGroup({ title, portfolio }: { title: string; portfolio: PlanPo
 
 /** One side of a plan — what a bundle holds, or what the database holds. Rendered
  * three times by `BackupPanel`, which is the whole reason it is a component. */
-export function PlanSideView({ title, side }: { title: string; side: PlanSide }) {
+export function PlanSideView({ title, side, collapsible = false }: {
+  title: string;
+  side: PlanSide;
+  /** Only a pane in the side-by-side preview gets the header toggle. The readback
+   * listing under a finished restore is not one half of a comparison and has nothing to
+   * collapse *against*, so it keeps the plain heading. */
+  collapsible?: boolean;
+}) {
+  // Open by default, for both panes. A preview of a destructive flow never decides for
+  // the reader which half to hide, so collapsing is opt-in and nothing starts hidden.
+  const [open, setOpen] = useState(true);
+
+  // The counts sentence is the pane's heading and the toggle's label at once, which is
+  // what gives the button an accessible name that says which side it folds and how much
+  // is behind it. It is also the one part of the pane a collapse must never take away:
+  // a collapsed pane that hides its own totals cannot be read against the pane still
+  // open beside it, which is the only reason to collapse one.
+  const heading = <span className="plan-side-heading">{`${title} ${countList(side.counts)}.`}</span>;
+
   return (
     <div data-testid="plan-side">
-      <p style={{ marginBottom: '4px' }}>{`${title} ${countList(side.counts)}.`}</p>
-      {side.more_portfolios > 0 && (
-        <p className="text-muted" data-testid="plan-cap">
-          {`showing ${side.shown.length} of ${side.counts.portfolios} portfolios · `
-            + `the portfolios shown hold ${side.transactions_in_shown} of ${side.counts.transactions} transactions`}
-        </p>
-      )}
-      {/* No table at all when there are no portfolios to list: a header over an empty body
-          * is the shape this component refuses one row down, at the portfolio. */}
-      {side.shown.length > 0 && (
-        <div className="plan-table-scroll">
-          <table className="plan-table" data-testid="plan-portfolio-table">
-            <caption className="plan-sr-only">{`${title} — portfolios`}</caption>
-            <thead data-testid="plan-portfolio-head">
-              <tr>
-                <th scope="col">Portfolio</th>
-                <th scope="col">Currency</th>
-                <th scope="col">Assets</th>
-                <th scope="col">Transactions</th>
-                <th scope="col">Flags</th>
-              </tr>
-            </thead>
-            {side.shown.map((p, i) => <PortfolioGroup key={`${p.name}-${i}`} title={title} portfolio={p} />)}
-          </table>
-        </div>
-      )}
+      {collapsible ? (
+        /* A button, not a clickable div: it has to be reachable by Tab and fire on Enter
+           * and Space without this component re-implementing either, and `aria-expanded`
+           * is the one thing that makes the heading say what pressing it does. */
+        <button
+          type="button"
+          className="plan-side-toggle"
+          data-testid="plan-side-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((was) => !was)}
+        >
+          {heading}
+        </button>
+      ) : heading}
+      {/* Hidden rather than unmounted, and that choice is the whole contract: the
+          * per-portfolio "show all N listed assets" expansions live inside these rows, so
+          * unmounting them on a collapse would silently reset every one the reader had
+          * opened. Re-expanding shows the same rows in the same state they were left in.
+          * Nothing here is read by the Restore button or by the REPLACE confirmation —
+          * folding a pane is a way of looking at the plan, not a change to it. */}
+      <div className="plan-side-body" hidden={!open}>
+        {side.more_portfolios > 0 && (
+          <p className="text-muted" data-testid="plan-cap">
+            {`showing ${side.shown.length} of ${side.counts.portfolios} portfolios · `
+              + `the portfolios shown hold ${side.transactions_in_shown} of ${side.counts.transactions} transactions`}
+          </p>
+        )}
+        {/* No table at all when there are no portfolios to list: a header over an empty
+            * body is the shape this component refuses one row down, at the portfolio. */}
+        {side.shown.length > 0 && (
+          <div className="plan-table-scroll">
+            <table className="plan-table" data-testid="plan-portfolio-table">
+              <caption className="plan-sr-only">{`${title} — portfolios`}</caption>
+              <thead data-testid="plan-portfolio-head">
+                <tr>
+                  <th scope="col">Portfolio</th>
+                  <th scope="col">Currency</th>
+                  <th scope="col">Assets</th>
+                  <th scope="col">Transactions</th>
+                  <th scope="col">Flags</th>
+                </tr>
+              </thead>
+              {side.shown.map((p, i) => <PortfolioGroup key={`${p.name}-${i}`} title={title} portfolio={p} />)}
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
