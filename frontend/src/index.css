@@ -336,7 +336,14 @@ button, input, select, textarea {
    Tinted with the app's own accent rather than a new colour: a neutral grey dashed box
    looks like a disabled placeholder, and this is the one control the user is meant to
    notice. The channels are held as a triple so the four alpha steps below are one token
-   and not four hand-typed rgba values that can drift apart. */
+   and not four hand-typed rgba values that can drift apart.
+
+   The alpha form is `rgba(var(--dz-accent), a)`, with commas, and that is not a style
+   choice: `--dz-accent` substitutes as `99, 102, 241`, so the modern space-and-slash form
+   expands to `rgb(99, 102, 241 / 0.45)`, which is invalid, and an invalid value discards
+   the whole declaration -- border and fill both, silently, leaving a box with nothing
+   around it. If you modernise these to `rgb(... / a)`, change the token to space-separated
+   channels in the same edit. */
 .bundle-dropzone-target {
   --dz-accent: 99, 102, 241; /* == --color-primary, as channels for alpha stepping */
   display: flex;
@@ -347,16 +354,16 @@ button, input, select, textarea {
   gap: 8px;
   min-height: 104px;
   padding: 22px 24px;
-  border: 2px dashed rgb(var(--dz-accent) / 0.45);
+  border: 2px dashed rgba(var(--dz-accent), 0.45);
   border-radius: 12px;
-  background: rgb(var(--dz-accent) / 0.07);
+  background: rgba(var(--dz-accent), 0.07);
   cursor: pointer;
   transition: var(--transition-fast);
 }
 
 .bundle-dropzone-target:hover {
-  border-color: rgb(var(--dz-accent) / 0.75);
-  background: rgb(var(--dz-accent) / 0.12);
+  border-color: rgba(var(--dz-accent), 0.75);
+  background: rgba(var(--dz-accent), 0.12);
 }
 
 .bundle-dropzone-target:focus-visible {
@@ -395,7 +402,7 @@ button, input, select, textarea {
 .bundle-dropzone-drag.bundle-dropzone-target {
   border-color: var(--border-focus);
   background: var(--color-primary-glow);
-  box-shadow: 0 0 0 3px rgb(var(--dz-accent) / 0.2);
+  box-shadow: 0 0 0 3px rgba(var(--dz-accent), 0.2);
 }
 
 /* Refused. Solid rather than dashed, and tinted, so the state reads without colour; the
