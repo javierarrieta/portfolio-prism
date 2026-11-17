@@ -111,7 +111,8 @@ const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } })
 
 try {
   await page.goto(BASE_URL, { waitUntil: 'networkidle' })
-  // The nav items are <li onClick> with no role, so getByText is the only handle.
+  // The nav items carry role="button" and an accessible name now, but the click still
+  // goes by text because that is what a person on the screen is looking at.
   await page.getByText('Printable Statement').click()
   const statement = page.locator('[data-print="statement"]')
   await statement.waitFor({ state: 'visible' })

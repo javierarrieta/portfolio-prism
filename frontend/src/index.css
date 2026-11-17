@@ -446,9 +446,10 @@ button, input, select, textarea {
 
    The split is container-driven, not viewport-driven. `auto-fit` asks how many 420px
    tracks *this container* holds, and the container is the restore card — 260px of
-   `.app-container` sidebar, 80px of `.main-content` padding and 2px of card border
-   narrower than the window. A viewport `@media` rule measures the window instead, and
-   the two then disagree: the old `max-width: 900px` rule split at a viewport at which
+   `.app-container` sidebar (64px once the rail below is collapsed), 80px of
+   `.main-content` padding and 2px of card border narrower than the window. A viewport
+   `@media` rule measures the window instead, and the two then disagree: the old
+   `max-width: 900px` rule split at a viewport at which
    each panel was already far too narrow for a table. At 901px the container is 559px,
    two tracks and the 16px gap leave each panel a 271px border box, and 32px of panel
    padding plus its own border leave 237px of table — enough for the counts columns and
@@ -456,15 +457,18 @@ button, input, select, textarea {
    the panel's own scroller. That is the one column the comparison exists to show.
 
    Two 420px tracks plus the 16px gap need 856px of container, so the row splits at a
-   1198px viewport (856 + 342) and stacks below it, where each half gets the whole
-   container and Flags stays on screen.
+   1198px viewport with the nav rail expanded (856 + 342, and 342 is 260 sidebar + 80
+   padding + 2 border) and at a 1002px viewport with it collapsed (856 + 146, and 146 is
+   64 + 80 + 2 -- see `.app-container--nav-collapsed` at the foot of this file). Below the
+   split each half gets the whole container and Flags stays on screen.
 
    The floor is `min(420px, 100%)` rather than a bare 420px. A hard floor is a promise the
-   container cannot always keep: below a 420px container — a viewport under roughly 762px,
-   where `.app-container` has already given `.main-content` the leftovers of a 260px
-   sidebar — a 420px track refuses to shrink and pushes the card wider than the page,
-   which is a worse failure than the narrow-and-scrolling one it replaces. With `min()`
-   the track gives way and the panel's own scroll wrapper absorbs the overflow. */
+   container cannot always keep: below a 420px container — a viewport under roughly 762px
+   expanded, or 566px with the rail collapsed, where `.app-container` has already given
+   `.main-content` the leftovers of the sidebar — a 420px track refuses to shrink and
+   pushes the card wider than the page, which is a worse failure than the narrow-and-
+   scrolling one it replaces. With `min()` the track gives way and the panel's own scroll
+   wrapper absorbs the overflow. */
 .plan-sides {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
@@ -785,4 +789,150 @@ button, input, select, textarea {
 .animate-spin {
   animation: pp-spin 1s linear infinite;
   display: inline-block;
+}
+
+/* ==== Collapsible nav rail ==== */
+
+/* A nav item is a control now (role="button", tabIndex 0), so it needs a focus ring the
+   browser will not have to guess at: the item's own background is a 5% white wash and the
+   active item's is a 15% indigo one, neither of which reads as "focused". */
+.nav-item:focus-visible,
+.nav-toggle:focus-visible,
+.switcher-rail-btn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* Brand and the collapse toggle share the top row so the toggle sits next to the name
+   rather than floating under it. `.brand` keeps its own 40px gap below it only when it is
+   the row's only occupant, which it no longer is. */
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 40px;
+}
+
+.sidebar-head .brand {
+  margin-bottom: 0;
+}
+
+.nav-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.nav-toggle:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* The collapsed rail's portfolio control: a square the same width as the nav icons above
+   it, named "Active portfolio: <name> — expand to change". Rendered only while collapsed,
+   so it needs no collapsed- state selector of its own. */
+.switcher-rail-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 10px 0;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.switcher-rail-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/*
+ * The collapsed rail.
+ *
+ * One class on `.app-container` is the whole state, because the grid track, the sidebar's
+ * padding, the nav items and the content cap all have to move together and a second source
+ * of truth for "is it collapsed" is how those four drift apart.
+ *
+ * 64px = 12px of sidebar padding on each side plus a 40px icon box, which is what the 18px
+ * glyphs already in the nav items need and nothing more.
+ *
+ * The track is 64px and the sidebar's own 1px right border lives inside it (the global
+ * `box-sizing: border-box`), so the content column gains exactly 196px.
+ *
+ * `.main-content` is capped at 1400px and centred, so without raising the cap the 196px
+ * would only re-centre the same column on a wide monitor and the rail would buy nothing.
+ * The collapsed cap is 1600px: the expanded cap plus the 196px the rail frees, rounded
+ * down. That is a raise, not a removal — at 2560px the text-heavy tabs still stop at 1600px
+ * rather than running a measure the eye cannot follow back. Below about 1664px of viewport
+ * the cap is not what binds and the column is simply the track's width.
+ *
+ * Specificity is deliberate: `.app-container--nav-collapsed` is (0,1,0), under print.css's
+ * `.app-container:has([data-print="statement"])` at (0,2,0), so the print grid collapse
+ * wins with no `!important` however the rail is set. See NavRailCss.test.ts.
+ */
+.app-container--nav-collapsed {
+  grid-template-columns: 64px 1fr;
+}
+
+.app-container--nav-collapsed .sidebar {
+  padding: 24px 12px;
+}
+
+/* Logo above the toggle: 28px and 24px both fit the 40px column, side by side they do not. */
+.app-container--nav-collapsed .sidebar-head {
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+/* Centred on the icon alone. The label is out of the flow (below), and the item's own 16px
+   side padding would leave an 8px box for an 18px glyph. */
+.app-container--nav-collapsed .nav-item {
+  justify-content: center;
+  padding: 12px 0;
+}
+
+.app-container--nav-collapsed .sign-out {
+  padding: 10px;
+}
+
+/*
+ * The label, hidden the way `.bundle-file-input` hides a file input: clipped to 1px, not
+ * `display: none` and not unmounted. The words stay in the accessibility tree, so a
+ * collapsed item is still "Tax Report" to a screen reader and still a tab stop, and the
+ * `title` on the item is what explains the glyph to a pointer.
+ *
+ * Scoped to the collapsed container, so the same span is ordinary inline text when the rail
+ * is open and there is one spelling of "nav label" in the markup either way.
+ */
+.app-container--nav-collapsed .nav-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The other half of the rail paying for itself. (0,2,0) against `.main-content`'s (0,1,0),
+   so it wins the cap with no `!important`. */
+.app-container--nav-collapsed .main-content {
+  max-width: 1600px;
 }

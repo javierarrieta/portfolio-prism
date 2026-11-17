@@ -12,8 +12,10 @@ describe('statement tab', () => {
   it('navigates by the nav item a person can actually see', async () => {
     const user = userEvent.setup()
     const { container } = render(<App />)
-    // These are <li onClick> with no role, so there is no accessible name to query.
-    // getByText is the idiom the smoke uses too (sell-pnl.smoke.mjs:107).
+    // The nav items are `<li role="button" tabIndex={0}>` now, so they do have accessible
+    // names; getByText is kept because it is the idiom the smoke uses too
+    // (sell-pnl.smoke.mjs:107) and this test is about where the statement lands, not about
+    // how the tab was reached.
     await user.click(await screen.findByText('Printable Statement'))
     await waitFor(() => expect(screen.getByTestId('print-button')).toBeInTheDocument())
     expect(container.querySelector('[data-print="statement"]')).not.toBeNull()
