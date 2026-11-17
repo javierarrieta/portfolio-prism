@@ -3,6 +3,8 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
@@ -150,6 +152,50 @@ function oversizeReason(file: File, caps: Capabilities | null): string | null {
     'would be refused before anything is read.';
 }
 
+/** The one type this card takes, spelled the way the picker's `accept` spells it. Named
+ * once so the zone's promise and the input's filter cannot drift apart. */
+const BUNDLE_ACCEPT = 'application/json,.json';
+
+/** Why this file is not a bundle, or `null` when it is.
+ *
+ * The picker filters to `.json`, but a filter is not a refusal: "All files" is one menu
+ * away in the dialog, and a drag has no filter at all. Checked by name as well as by MIME
+ * type because a real bundle is reported as `application/json` by some browsers and as an
+ * empty type by others — refusing a bundle over a missing type field would be worse than
+ * the mistake this catches. */
+function wrongTypeReason(file: File): string | null {
+  if (file.name.toLowerCase().endsWith('.json')) return null;
+  if (file.type === 'application/json' || file.type === 'text/json') return null;
+  return `"${file.name}" is not a .json bundle, so it was not read. Choose a file this panel exported.`;
+}
+
+/** The zone's own one line about a refusal.
+ *
+ * The panel's refusal slot below carries the full sentence — what happened and what to do
+ * about it — and the zone carries the state, so the two say different things about one
+ * event instead of the same sentence twice. The word "Refused" is in it on purpose: a
+ * red border alone is the only signal a colour-blind user would get. */
+const ZONE_REFUSAL = {
+  wrongType: 'Refused — not a .json bundle.',
+  oversize: 'Refused — larger than the cap this server accepts.',
+} as const;
+
+/** A size a person can read, next to the file's name.
+ *
+ * Decoration beside the byte count the refusal quotes, never a replacement for it: the
+ * cap is a byte count and rounding it to "8 MB" would invite a file that is one byte
+ * over and would be refused. */
+function humanSize(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
 /** The preview body, or `null` when it is not a plan for the mode that was asked for.
  *
  * The reason `asCapabilities` gives for existing applies harder here: a `200` that is
@@ -283,6 +329,12 @@ export default function BackupPanel({ portfolios }: Props) {
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  // The drop zone's own two transient states: a file is over it right now, and the last
+  // selection that arrived here was refused. Both belong to the zone and to nothing else
+  // — they gate no button, and they are cleared by the next selection either way.
+  const [dragging, setDragging] = useState(false);
+  const [zoneRefusal, setZoneRefusal] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   // What the database says it holds, read back once a write has committed, and whether
   // that read failed. Both are decoration beside `restoreResult` and nothing else: they
   // gate no button and no control, because a committed write must never be made to look
@@ -315,6 +367,23 @@ export default function BackupPanel({ portfolios }: Props) {
   // file, and choosing a mode — so the request goes out when the user changes
   // something rather than from an effect chasing that change after the fact.
   async function runPreview(target: File, forMode: RestoreMode) {
+    // The type check lives here, beside the oversize branch, rather than only in
+    // `chooseFile`, because `chooseFile` is not the only caller. The Preview button is
+    // gated on `previewing` alone — deliberately, so a refusal never wedges the card — so
+    // a check that lived only in the selection path would be walked straight past: the
+    // zone would refuse `notes.txt`, the button would stay enabled, and pressing it would
+    // POST the file the zone had just said was not a bundle. Refusing here means every
+    // caller meets the same answer, and it retires an in-flight preview exactly as
+    // oversize does, for the same reason: the answer on its way belongs to a file that is
+    // no longer the one on screen.
+    const wrongType = wrongTypeReason(target);
+    if (wrongType) {
+      retireInFlightPreview();
+      setPlan(null);
+      setRestoreError(wrongType);
+      setZoneRefusal(ZONE_REFUSAL.wrongType);
+      return;
+    }
     // Refused here rather than at the server, and before this file becomes the current
     // request — but not before there is nothing to retire. The answer in flight is the
     // *previous* file's preview, and its sequence number is still the current one, so
@@ -327,11 +396,13 @@ export default function BackupPanel({ portfolios }: Props) {
       retireInFlightPreview();
       setPlan(null);
       setRestoreError(oversize);
+      setZoneRefusal(ZONE_REFUSAL.oversize);
       return;
     }
     const seq = ++previewSeq.current;
     setPreviewing(true);
     setRestoreError(null);
+    setZoneRefusal(null);
     // A preview is a fresh question about what the next write would do, and the readback
     // beside the last write's result line is the answer to the *previous* question. Left
     // up, the card reads "Will delete 2 portfolios…" directly above "Your portfolios now
@@ -381,6 +452,83 @@ export default function BackupPanel({ portfolios }: Props) {
       if (seq === previewSeq.current) setPreviewing(false);
     }
   }
+
+  /** One bundle selection, whichever way it arrived — the picker or a drop.
+   *
+   * Both paths go through here so that both refuse the same way: a drop that behaved
+   * differently from a click would be a second set of rules to learn, and the one the drop
+   * zone advertises ("Accepts .json") would be a promise only half the card kept. The
+   * refusal is not merely a message: a refused selection retires the preview that was
+   * asked for by the file that is now gone, exactly as an accepted one does, because a
+   * plan beside a file that was never read is the stale plan this card exists to make
+   * impossible. */
+  const chooseFile = (chosen: File | null) => {
+    // Everything the old file and the old mode were true about goes with them, including
+    // the confirmation: a plan beside a different file is the one thing this card exists
+    // to make impossible. The new file is previewed straight away for the same reason —
+    // the counts on screen have to be the counts of what is actually chosen — and the
+    // Preview button below stays as the explicit retry of the same call.
+    setFile(chosen);
+    setPlan(null);
+    setRestoreError(null);
+    setRestoreResult(null);
+    setOwned(null);
+    setOwnedFailed(false);
+    setConfirm('');
+    setConfirmFor(null);
+    setDragging(false);
+    setZoneRefusal(null);
+
+    if (!chosen) {
+      // Clearing the selection retires the answer still on its way for the file that just
+      // went away; nothing else would, because no new request goes out to bump the
+      // sequence the way `runPreview` does.
+      retireInFlightPreview();
+      return;
+    }
+    // `runPreview` refuses a non-bundle too, and that is the copy that gates the Preview
+    // button. This one stays because it is the selection path's own answer: it fires at
+    // the moment the file arrives, without the request bookkeeping below it, so the zone
+    // states its refusal about *this* selection rather than about a preview that was
+    // asked for and declined.
+    const wrongType = wrongTypeReason(chosen);
+    if (wrongType) {
+      retireInFlightPreview();
+      setRestoreError(wrongType);
+      setZoneRefusal(ZONE_REFUSAL.wrongType);
+      return;
+    }
+    void runPreview(chosen, mode);
+  };
+
+  // The picker is opened programmatically because the thing the user aims at is the zone,
+  // not the 1px input. A disabled input ignores `click()`, and the guard here is what
+  // makes a keyboard activation during a write do nothing rather than half something.
+  const openPicker = () => {
+    if (restoring) return;
+    fileInput.current?.click();
+  };
+
+  const onZoneKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    // Space as well as Enter, because that is what a `button` does and this is standing in
+    // for one; without the preventDefault, Space scrolls the page instead.
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    openPicker();
+  };
+
+  const onZoneDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    // Always prevented: a drop this zone does not act on is otherwise a drop the browser
+    // acts on by navigating away from the app to the file.
+    event.preventDefault();
+    setDragging(false);
+    if (restoring) return;
+    const dropped = event.dataTransfer?.files[0];
+    // A drag carrying no file — selected text, a link — is not a bundle selection, and
+    // refusing it would have the zone comment on something the user never dropped.
+    if (!dropped) return;
+    chooseFile(dropped);
+  };
 
   // Changing the mode changes what will be deleted, so the plan goes with it and a
   // fresh one is fetched for the mode now chosen — relabelling the old counts is the
@@ -528,34 +676,97 @@ export default function BackupPanel({ portfolios }: Props) {
           applied in one transaction or not at all.
         </p>
 
-        <label style={{ display: 'block', marginBottom: '12px' }}>
-          Bundle file
-          <input
-            data-testid="bundle-file"
-            className="form-control"
-            type="file"
-            accept="application/json,.json"
-            disabled={restoring}
-            onChange={(e) => {
-              // Everything the old file and the old mode were true about goes with
-              // them, including the confirmation: a plan beside a different file is
-              // the one thing this card exists to make impossible. The new file is
-              // previewed straight away for the same reason — the counts on screen
-              // have to be the counts of what is actually chosen — and the Preview
-              // button below stays as the explicit retry of the same call.
-              const chosen = e.target.files?.[0] ?? null;
-              setFile(chosen);
-              setPlan(null);
-              setRestoreError(null);
-              setRestoreResult(null);
-              setOwned(null);
-              setOwnedFailed(false);
-              setConfirm('');
-              setConfirmFor(null);
-              if (chosen) void runPreview(chosen, mode);
+        <div className="bundle-field">
+          <label className="bundle-field-label" htmlFor="bundle-file">Bundle file</label>
+          {/* The zone is the affordance; the real input stays in the DOM underneath it,
+              clipped to 1px rather than hidden, so it keeps its label, its place in the
+              tab order and the browser's own file dialog. The click and keyboard paths
+              open that input; the drop path hands it nothing and goes straight to
+              `chooseFile`, because a dropped file never was in the input and pretending
+              otherwise would mean writing to a `FileList` no browser lets you write. */}
+          <div
+            className={[
+              'bundle-dropzone',
+              dragging ? 'bundle-dropzone-drag' : '',
+              zoneRefusal ? 'bundle-dropzone-refused' : '',
+              restoring ? 'bundle-dropzone-disabled' : '',
+            ].filter(Boolean).join(' ')}
+            data-testid="bundle-dropzone"
+            onDragOver={(event) => {
+              // Prevented even while disabled: without it the browser refuses the drop and
+              // answers by opening the file in the tab instead.
+              event.preventDefault();
+              if (!restoring) setDragging(true);
             }}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              if (!restoring) setDragging(true);
+            }}
+            onDragLeave={(event) => {
+              // `dragleave` fires on the way into a child element too, which would flicker
+              // the drag state every time the pointer crossed the file name.
+              if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+              setDragging(false);
+            }}
+            onDrop={onZoneDrop}
+          >
+            <div
+              className="bundle-dropzone-target"
+              data-testid="bundle-dropzone-target"
+              role="button"
+              tabIndex={restoring ? -1 : 0}
+              aria-disabled={restoring || undefined}
+              aria-label={file
+                ? `Bundle file ${file.name}, ${humanSize(file.size)}. Activate to choose a different file.`
+                : 'Choose a bundle file. Drop a .json file here, or press Enter to open the file picker.'}
+              onClick={openPicker}
+              onKeyDown={onZoneKeyDown}
+            >
+              {file ? (
+                <span className="bundle-dropzone-file">
+                  <span className="bundle-dropzone-name" data-testid="bundle-name">{file.name}</span>
+                  <span className="bundle-dropzone-size text-muted" data-testid="bundle-size">
+                    {humanSize(file.size)}
+                  </span>
+                </span>
+              ) : (
+                <span className="bundle-dropzone-prompt">
+                  <span>Drop a bundle here, or click to choose a file</span>
+                  <span className="text-muted">Accepts .json</span>
+                </span>
+              )}
+            </div>
+
+            {file && (
+              <button
+                type="button"
+                className="btn btn-secondary bundle-dropzone-clear"
+                data-testid="clear-bundle"
+                onClick={() => chooseFile(null)}
+                disabled={restoring}
+              >
+                Clear
+              </button>
+            )}
+
+            {zoneRefusal && (
+              <p className="bundle-dropzone-refusal" data-testid="dropzone-refusal">
+                {zoneRefusal}
+              </p>
+            )}
+          </div>
+
+          <input
+            id="bundle-file"
+            ref={fileInput}
+            data-testid="bundle-file"
+            className="bundle-file-input"
+            type="file"
+            accept={BUNDLE_ACCEPT}
+            disabled={restoring}
+            onChange={(e) => chooseFile(e.target.files?.[0] ?? null)}
           />
-        </label>
+        </div>
 
         <fieldset style={{ border: 0, padding: 0, marginBottom: '12px' }}>
           <legend>Mode</legend>
@@ -602,15 +813,42 @@ export default function BackupPanel({ portfolios }: Props) {
                 the first line of the detail rather than a second copy of it. The
                 listing under it is the server's own bounded one — this renders what
                 arrived in the preview response and nothing more, so a bigger plan
-                costs a bigger response and never a re-read of the bundle. */}
-            <div data-testid="preview-delete">
-              {plan.mode === 'replace'
-                ? <PlanSideView title="Will delete" side={plan.delete} />
-                : <p>Will delete nothing.</p>}
-            </div>
-            <div data-testid="preview-insert">
-              <PlanSideView title="Will insert" side={plan.insert} />
-            </div>
+                costs a bigger response and never a re-read of the bundle.
+
+                The two halves share a row on a wide screen because the question being
+                asked is a comparison — what goes against what — and two halves stacked
+                a screen apart cannot be read against each other. They stack when the
+                card cannot give both halves a table's width, which `.plan-sides` decides
+                from the container rather than from the window.
+
+                In `copy` there is nothing to compare against: nothing is deleted, so the
+                delete half has no listing, no counts and no table. Giving it a panel
+                anyway spent half the row on five words, so `copy` renders one panel at
+                full width and keeps the sentence as a muted note above it. The note is
+                still `preview-delete`, because it is still what the delete half says —
+                it has simply stopped being a pane, and `.plan-sides--one` stops the grid
+                reserving a track for a side that has no content. */}
+            {plan.mode === 'replace' ? (
+              <div className="plan-sides">
+                <div className="plan-side-panel" data-testid="preview-delete">
+                  <PlanSideView title="Will delete" side={plan.delete} collapsible />
+                </div>
+                <div className="plan-side-panel" data-testid="preview-insert">
+                  <PlanSideView title="Will insert" side={plan.insert} collapsible />
+                </div>
+              </div>
+            ) : (
+              <>
+                <p className="text-muted plan-side-none" data-testid="preview-delete">
+                  Will delete nothing.
+                </p>
+                <div className="plan-sides plan-sides--one">
+                  <div className="plan-side-panel" data-testid="preview-insert">
+                    <PlanSideView title="Will insert" side={plan.insert} collapsible />
+                  </div>
+                </div>
+              </>
+            )}
             {/* The card never sends `apply_prices`, so a bundle carrying price history
                 restores without it. That is a decision the user should not have to guess
                 at, and `prices` is the server's own count of what is being left out. It

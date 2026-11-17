@@ -440,6 +440,18 @@ function bundleFile(name = 'bundle.json', portfolioName = 'Restored') {
   })], name, { type: 'application/json' })
 }
 
+/** Hands the file input a file the dialog's filter would have hidden.
+ *
+ * `userEvent.upload` respects the input's `accept` and drops a non-matching file before
+ * the change event ever fires -- the right default, and the wrong thing for these tests:
+ * the wrong-type refusal exists for the "All files" escape hatch in a real dialog, and
+ * for a drag, neither of which consults `accept`. `fireEvent.change` writes the
+ * `FileList` straight onto the input, which is what the browser does when the user picks
+ * around the filter. */
+function chooseViaPicker(file: File) {
+  fireEvent.change(screen.getByTestId('bundle-file'), { target: { files: [file] } })
+}
+
 /** Rows as the server counts them -- the shape `planResponse` is built from. */
 interface Counts {
   portfolios: number
@@ -672,6 +684,56 @@ describe('restore card', () => {
       .toHaveTextContent('must not be empty'))
     expect(screen.queryByTestId('preview-summary')).toBeNull()
     expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('refuses a wrong-type file pressed through the Preview button, without sending it', async () => {
+    // The zone refused `notes.txt`, and the Preview button is gated on `previewing` alone
+    // -- on purpose, because a refusal must not wedge the card (the oversize test below
+    // pins it enabled after a refusal). So the button has to reach the same refusal the
+    // selection path reaches, or the file the zone just rejected is POSTed the moment
+    // someone presses it, and the refusal the user read becomes false.
+    render(<BackupPanel portfolios={portfolios} />)
+    const before = fetchMock.mock.calls.length
+    chooseViaPicker(notABundle())
+    await waitFor(() => expect(screen.getByTestId('dropzone-refusal'))
+      .toHaveTextContent('not a .json bundle'))
+
+    await userEvent.click(screen.getByTestId('preview-button'))
+
+    // A refusal must not leave the card in its busy state: `previewing` never goes up when
+    // nothing goes out, so the button is still an ordinary button.
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+    // And a task later, once a FileReader read and an answer would both have had their
+    // turn at the task queue: no plan, no armed write, and no preview request at all.
+    // These three are the weight of the test -- the button alone cannot tell a refusal
+    // from a request that already came back.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    const sent = fetchMock.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(sent.some((u) => u.includes('/backup/preview'))).toBe(false)
+  })
+
+  it('retires the preview still in flight when the file chosen through the picker is the wrong type', async () => {
+    // The same retirement the oversize refusal does, arriving by the picker path and the
+    // other refusal. The answer in flight belongs to the file that was on screen before
+    // `notes.txt`; a refused selection sends no request of its own, so nothing else takes
+    // that answer down. Leave it and it passes its own sequence guard, prints the
+    // previous file's counts under this refusal, and arms Restore to write them.
+    const pending = gatedPreviews()
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    chooseViaPicker(notABundle())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('"notes.txt" is not a .json bundle'))
+    expect(pending).toHaveLength(1)
+
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
   })
 
   it('renders the server reason when the preview refuses the bundle, and previews again when asked', async () => {
@@ -1713,5 +1775,182 @@ describe('oversized bundle', () => {
     // And the card is not left wedged on the first file's spinner: the retired answer
     // cannot clear the flag in its own `finally`, so the refusal had to take it down.
     expect(screen.getByTestId('preview-button')).toBeEnabled()
+  })
+
+  it('retires the preview still in flight when a dropped file is refused as oversize', async () => {
+    // The same refusal and the same retirement, arriving by the drag path. Both selection
+    // paths have to end in one answer, and a retirement only the picker reaches leaves the
+    // drop free to print the previous file's counts under a refusal -- which is the half
+    // of the rule the drop zone's own promise depends on.
+    const pending: Array<(res: Response) => void> = []
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) {
+        return new Promise<Response>((resolve) => { pending.push(resolve) })
+      }
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await screen.findByTestId('caps-note')
+
+    dropOnZone(tinyBundle())
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    dropOnZone(bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    expect(pending).toHaveLength(1)
+
+    await answer(pending, 0, planResponse({ portfolios: 7, assets: 8, transactions: 9 }))
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    expect(screen.getByTestId('preview-button')).toBeEnabled()
+  })
+})
+
+/** Drops `file` on the zone the way a drag does: a `drop` event whose `dataTransfer`
+ * carries it. These tests aim at the zone rather than at the input underneath it because
+ * the zone is what they are about -- the input is what every upload test above already
+ * drives, and a drop never touches it. */
+function dropOnZone(file: File) {
+  fireEvent.drop(screen.getByTestId('bundle-dropzone'), { dataTransfer: { files: [file] } })
+}
+
+/** A drag that carries something that is not a bundle. `text/plain` and a `.txt` name, so
+ * it fails the check on both counts rather than on whichever one the code happens to read. */
+function notABundle() {
+  return new File(['not json at all'], 'notes.txt', { type: 'text/plain' })
+}
+
+describe('bundle drop zone', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('previews a bundle dropped on the zone', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    dropOnZone(bundleFile())
+
+    // The same observable the click tests assert on, so a drop that only looked busy and
+    // never asked the server for a plan fails here rather than passing on a spinner.
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+    expect(screen.getByTestId('preview-summary')).toHaveTextContent('1 portfolio')
+    expect(screen.getByTestId('restore-button')).toBeEnabled()
+  })
+
+  it('shows the dropped file\'s name and its size in a unit a person reads', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    dropOnZone(new File(['x'.repeat(2048)], 'two-kib.json', { type: 'application/json' }))
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+
+    expect(screen.getByTestId('bundle-name')).toHaveTextContent('two-kib.json')
+    // 2,048 bytes printed as a byte count is a number the user has to do arithmetic on.
+    expect(screen.getByTestId('bundle-size')).toHaveTextContent('2.0 KiB')
+  })
+
+  it('refuses a dropped file over the advertised cap, and shows no plan', async () => {
+    // A cap below any real file, so the test does not build an 8 MiB string. The number is
+    // the server's own, read from capabilities, exactly as the click path reads it.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/backup/capabilities')) return jsonResponse({ ...CAPS, max_bytes: 10 })
+      if (url.includes('/backup/preview')) return jsonResponse({ error: 'never reached' }, 413)
+      return jsonResponse({}, 404)
+    })
+    render(<BackupPanel portfolios={portfolios} />)
+    await screen.findByTestId('caps-note')
+    const before = fetchMock.mock.calls.length
+
+    dropOnZone(bundleFile())
+
+    await waitFor(() => expect(screen.getByTestId('restore-error'))
+      .toHaveTextContent('above the 10-byte cap this server advertises'))
+    // The zone says why in its own state, not only in the panel's refusal line below it.
+    expect(screen.getByTestId('dropzone-refusal')).toHaveTextContent('Refused')
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    // Refused locally: the bytes never left the browser, which is the whole point.
+    const sent = fetchMock.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(sent.some((u) => u.includes('/backup/preview'))).toBe(false)
+  })
+
+  it('refuses a dropped file that is not a .json bundle, with a reason', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    const before = fetchMock.mock.calls.length
+
+    dropOnZone(notABundle())
+
+    await waitFor(() => expect(screen.getByTestId('dropzone-refusal'))
+      .toHaveTextContent('not a .json bundle'))
+    // The reason names the file, and it is words rather than a border colour.
+    expect(screen.getByTestId('dropzone-refusal').textContent).toContain('Refused')
+    expect(screen.getByTestId('restore-error')).toHaveTextContent('"notes.txt" is not a .json bundle')
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    const sent = fetchMock.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(sent.some((u) => u.includes('/backup/preview'))).toBe(false)
+  })
+
+  it('retires the plan on screen when a dropped file is refused', async () => {
+    // The rule the card states as absolute, arriving by the drag path: the plan on screen
+    // is the plan for the file on screen, or there is no plan at all. A refused drop
+    // sends no request, so nothing else would take the old plan down.
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('restore-button')).toBeEnabled())
+
+    dropOnZone(notABundle())
+
+    await waitFor(() => expect(screen.getByTestId('dropzone-refusal')).toBeInTheDocument())
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+  })
+
+  it('opens the file picker when the zone is clicked', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    const input = screen.getByTestId('bundle-file')
+    const opened = vi.spyOn(input, 'click').mockImplementation(() => {})
+
+    await userEvent.click(screen.getByTestId('bundle-dropzone-target'))
+
+    expect(opened).toHaveBeenCalledTimes(1)
+    // The input is still the real one, still labelled, still in the document -- the zone is
+    // an affordance over it, not a replacement for it.
+    expect(input).toBeInTheDocument()
+    expect(input).toHaveAttribute('id', 'bundle-file')
+    expect(screen.getByLabelText('Bundle file')).toBe(input)
+  })
+
+  it('opens the file picker from the keyboard, with Enter and with Space', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    const input = screen.getByTestId('bundle-file')
+    const opened = vi.spyOn(input, 'click').mockImplementation(() => {})
+    const zone = screen.getByRole('button', { name: /choose a bundle file/i })
+    expect(zone).toHaveAttribute('tabindex', '0')
+
+    zone.focus()
+    await userEvent.keyboard('{Enter}')
+    expect(opened).toHaveBeenCalledTimes(1)
+
+    // Space, because the zone stands in for a button and a button answers to both.
+    await userEvent.keyboard(' ')
+    expect(opened).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the selection, and the plan with it', async () => {
+    render(<BackupPanel portfolios={portfolios} />)
+    await userEvent.upload(screen.getByTestId('bundle-file'), bundleFile())
+    await waitFor(() => expect(screen.getByTestId('preview-summary')).toBeInTheDocument())
+    expect(screen.getByTestId('bundle-name')).toHaveTextContent('bundle.json')
+
+    await userEvent.click(screen.getByTestId('clear-bundle'))
+
+    expect(screen.queryByTestId('bundle-name')).toBeNull()
+    expect(screen.queryByTestId('bundle-size')).toBeNull()
+    // The plan went with the file it was drawn from, so there is nothing to write.
+    expect(screen.queryByTestId('preview-summary')).toBeNull()
+    expect(screen.getByTestId('restore-button')).toBeDisabled()
+    // And the zone offers the choice again rather than sitting empty.
+    expect(screen.getByTestId('bundle-dropzone-target'))
+      .toHaveTextContent('Drop a bundle here, or click to choose a file')
   })
 })

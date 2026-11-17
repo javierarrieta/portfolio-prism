@@ -18,6 +18,7 @@
   --color-danger: #ef4444; /* Crimson Red */
   --color-danger-glow: rgba(239, 68, 68, 0.1);
   --color-warning: #f59e0b; /* Amber Orange */
+  --color-warning-glow: rgba(245, 158, 11, 0.15);
   
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
@@ -288,6 +289,404 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.08);
 }
 
+/* The bundle drop zone in the Backup tab (BackupPanel). The real file input stays in the
+   DOM and stays reachable: it is clipped to 1px rather than hidden, because `display: none`
+   or `visibility: hidden` would take it out of the tab order and break the label's
+   association, and the input is still what opens the browser's own file dialog. */
+.bundle-field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.bundle-field-label {
+  display: block;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.bundle-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The drop area is deliberately narrower than the card. A dashed rectangle that spans the
+   whole card reads as a section of the page, not as a target; a bounded one reads as
+   something you can put a file into. 560px is roughly the width of the prompt plus a
+   realistic file name, so the box is sized to its content rather than to the viewport. */
+.bundle-dropzone {
+  max-width: 560px;
+  padding: 0;
+  transition: var(--transition-fast);
+}
+
+/* The demarcation lives on the inner target, inset from the card edge, so the dashed line
+   is the thing being activated rather than decoration drawn around it. Two pixels of
+   dashed border with a filled interior: one pixel of dashed on a dark background was the
+   previous state and it read as a divider, not an affordance.
+
+   Tinted with the app's own accent rather than a new colour: a neutral grey dashed box
+   looks like a disabled placeholder, and this is the one control the user is meant to
+   notice. The channels are held as a triple so the four alpha steps below are one token
+   and not four hand-typed rgba values that can drift apart.
+
+   The alpha form is `rgba(var(--dz-accent), a)`, with commas, and that is not a style
+   choice: `--dz-accent` substitutes as `99, 102, 241`, so the modern space-and-slash form
+   expands to `rgb(99, 102, 241 / 0.45)`, which is invalid, and an invalid value discards
+   the whole declaration -- border and fill both, silently, leaving a box with nothing
+   around it. If you modernise these to `rgb(... / a)`, change the token to space-separated
+   channels in the same edit. */
+.bundle-dropzone-target {
+  --dz-accent: 99, 102, 241; /* == --color-primary, as channels for alpha stepping */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 8px;
+  min-height: 104px;
+  padding: 22px 24px;
+  border: 2px dashed rgba(var(--dz-accent), 0.45);
+  border-radius: 12px;
+  background: rgba(var(--dz-accent), 0.07);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.bundle-dropzone-target:hover {
+  border-color: rgba(var(--dz-accent), 0.75);
+  background: rgba(var(--dz-accent), 0.12);
+}
+
+.bundle-dropzone-target:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 3px;
+}
+
+.bundle-dropzone-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bundle-dropzone-file {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bundle-dropzone-name {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.bundle-dropzone-size {
+  font-size: 0.8rem;
+}
+
+/* Dragged over: idle is already tinted now, so the drag state has to be a step up rather
+   than a colour swap -- full-strength border, stronger fill, and a ring outside it. The
+   border keeps its weight so the box does not jump under the file being dragged. */
+.bundle-dropzone-drag .bundle-dropzone-target,
+.bundle-dropzone-drag.bundle-dropzone-target {
+  border-color: var(--border-focus);
+  background: var(--color-primary-glow);
+  box-shadow: 0 0 0 3px rgba(var(--dz-accent), 0.2);
+}
+
+/* Refused. Solid rather than dashed, and tinted, so the state reads without colour; the
+   line under it spells the reason out. */
+.bundle-dropzone-refused .bundle-dropzone-target,
+.bundle-dropzone-refused.bundle-dropzone-target {
+  border-style: solid;
+  border-color: var(--color-danger);
+  background: var(--color-danger-glow);
+}
+
+.bundle-dropzone-refusal {
+  margin: 8px 4px 0;
+  color: var(--color-danger);
+  font-size: 0.8125rem;
+}
+
+.bundle-dropzone-clear {
+  margin-top: 10px;
+}
+
+.bundle-dropzone-disabled .bundle-dropzone-target,
+.bundle-dropzone-disabled.bundle-dropzone-target {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.bundle-dropzone-disabled .bundle-dropzone-target {
+  cursor: not-allowed;
+}
+
+.bundle-dropzone-clear {
+  margin: 4px 16px 2px;
+  padding: 4px 12px;
+  font-size: 0.75rem;
+}
+
+/* The preview comparison in the Backup tab (`BackupPanel`): the delete half and the
+   insert half side by side, each a panel of the same height budget, so the two can be
+   read against each other rather than scrolled apart.
+
+   The split is container-driven, not viewport-driven. `auto-fit` asks how many 420px
+   tracks *this container* holds, and the container is the restore card — 260px of
+   `.app-container` sidebar, 80px of `.main-content` padding and 2px of card border
+   narrower than the window. A viewport `@media` rule measures the window instead, and
+   the two then disagree: the old `max-width: 900px` rule split at a viewport at which
+   each panel was already far too narrow for a table. At 901px the container is 559px,
+   two tracks and the 16px gap leave each panel a 271px border box, and 32px of panel
+   padding plus its own border leave 237px of table — enough for the counts columns and
+   not enough for Flags, so `zero-price` / `future_dated` / `currency_mismatch` fell off
+   the panel's own scroller. That is the one column the comparison exists to show.
+
+   Two 420px tracks plus the 16px gap need 856px of container, so the row splits at a
+   1198px viewport (856 + 342) and stacks below it, where each half gets the whole
+   container and Flags stays on screen.
+
+   The floor is `min(420px, 100%)` rather than a bare 420px. A hard floor is a promise the
+   container cannot always keep: below a 420px container — a viewport under roughly 762px,
+   where `.app-container` has already given `.main-content` the leftovers of a 260px
+   sidebar — a 420px track refuses to shrink and pushes the card wider than the page,
+   which is a worse failure than the narrow-and-scrolling one it replaces. With `min()`
+   the track gives way and the panel's own scroll wrapper absorbs the overflow. */
+.plan-sides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+/* Still needed with `auto-fit`: `min-width: 0` is what stops a wide table from counting
+   as the panel's minimum size, and the scroll wrapper below is where the overflow goes
+   instead of into the track. */
+.plan-side-panel {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* One side of the comparison has no content to place, so the grid stops making a track
+   for it. In `copy` nothing is deleted, and the insert listing is the whole answer. A
+   single item in an `auto-fit` row would collapse the empty tracks on its own; naming
+   the modifier is what makes that a rule a reader can find rather than a side effect of
+   how many children the wrapper happens to have. */
+.plan-sides--one {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* What the delete half says in `copy`. A line above the one panel, not a pane: the
+   colour and the size come from `.text-muted` and the card, and all this adds is the
+   spacing under it, since the global reset took every paragraph margin away. */
+.plan-side-none {
+  margin-bottom: 8px;
+}
+
+/* The counts sentence. It is the pane's heading, and in a collapsible pane it is also
+   the toggle's label, so it is a span that lays out as a block rather than a paragraph
+   that would be invalid inside a button. The 4px is the gap the sentence has always kept
+   from the listing under it. */
+.plan-side-heading {
+  display: block;
+  margin-bottom: 4px;
+}
+
+/* The whole header is the control, so there is one thing to aim at rather than an
+   arrow-sized glyph next to a sentence. `font: inherit` and `color: inherit` are what
+   keep a button's UA styling from restyling the heading it now wraps. */
+.plan-side-toggle {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* The heading's 4px is the gap to a listing that is already on the page; inside the
+   toggle the listing is behind the fold, and the panel's own padding is the gap. */
+.plan-side-toggle .plan-side-heading {
+  margin-bottom: 0;
+}
+
+/* The fold marker lives in CSS rather than in the DOM so that the button's accessible
+   name stays exactly the counts sentence, with no glyph read out in front of it. */
+.plan-side-toggle::after {
+  content: '▾';
+  flex: none;
+  color: var(--text-muted);
+  transform: rotate(-90deg);
+  transition: transform var(--transition-fast);
+}
+
+.plan-side-toggle[aria-expanded='true']::after {
+  transform: rotate(0deg);
+}
+
+/* The only hover cue: the heading is already the card's brightest text, so the marker is
+   the part that can say "this is pressable" without shouting over the counts. */
+.plan-side-toggle:hover::after {
+  color: var(--text-secondary);
+}
+
+/* Collapsing hides the body; it does not unmount it, so the per-portfolio expansions
+   inside it survive the fold. This rule only guarantees that stays true: `hidden` is
+   collapsed by the UA stylesheet, and a `display` added to the body later would
+   out-specify that. */
+.plan-side-body[hidden] {
+  display: none;
+}
+
+/* The panel is already a box inside the restore card, so it does not get the glass
+   treatment too — and it scrolls its own table rather than widening the card. */
+.plan-table-scroll {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.875rem;
+}
+
+.plan-table th,
+.plan-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  vertical-align: top;
+}
+
+.plan-table thead th {
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* The portfolio row is the row a reader scans first, and it is the row that carries the
+   aggregated flags, so it is set apart from the asset rows under it. */
+.plan-portfolio-row > th {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.plan-portfolio-row > td,
+.plan-portfolio-row > th {
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* The asset table sits inside the portfolio row's cell, so it reads as the detail of
+   that row rather than as a peer table. */
+.plan-table--assets {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+}
+
+.plan-assets-row > td {
+  padding: 4px 10px 12px;
+}
+
+/* The flags column is the one that grows — a portfolio can carry several badges — so it
+   keeps enough width to hold one without squeezing the counts column beside it. */
+.plan-cell-flags {
+  min-width: 140px;
+}
+
+/* A note row (the toggle, the server's cap, the no-assets row) belongs to the rows above
+   it rather than standing as another row of its own, so it carries no separator. */
+.plan-note-row > td {
+  border-bottom: 0;
+  padding-top: 6px;
+}
+
+.plan-cell-num,
+.plan-cell-date {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.plan-cell-muted {
+  color: var(--text-muted);
+}
+
+.plan-flags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Colour only: the size and shape come from the existing `.badge`, which is not
+   redefined here so that nothing outside this panel moves. The pair is `.badge-etf`'s
+   and is read from `--color-warning-glow` rather than written out again, so a flag and
+   an ETF chip cannot drift apart the next time the warning colour moves. */
+.plan-flag {
+  background: var(--color-warning-glow);
+  color: var(--color-warning);
+}
+
+.plan-flag-scope {
+  font-size: 0.75rem;
+}
+
+.plan-toggle {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.plan-toggle:hover {
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* A caption a screen reader reads and an eye does not lay out: the table already says
+   what it holds in its columns, and the sentence above it already says which side it is.
+   Naming the side is for the reader that loses that context the moment it enters a table. */
+.plan-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -341,7 +740,7 @@ button, input, select, textarea {
 }
 
 .badge-etf {
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--color-warning-glow);
   color: var(--color-warning);
 }
 

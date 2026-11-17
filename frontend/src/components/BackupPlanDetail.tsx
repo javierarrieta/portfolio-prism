@@ -6,7 +6,7 @@
  * `eslint.config.js` names those three exports to `react-refresh/only-export-components`
  * rather than this file switching the rule off, so the rule still bites on anything else
  * exported from here. */
-import type { ReactNode } from 'react';
+import { useState } from 'react';
 
 /** The three counts a plan side carries. Mirrors `backup::restore::Counts`. */
 export type Counts = { portfolios: number; assets: number; transactions: number };
@@ -42,9 +42,24 @@ export type PlanSide = {
   transactions_in_shown: number;
 };
 
-/** Above this many assets a portfolio starts collapsed. A display choice, not a
- * contract: 25 portfolios x 50 assets is a wall, and a wall is not verification. */
+/** Above this many assets a portfolio starts collapsed, and the rows under it wait behind
+ * a "show all N" control rather than being truncated away. A display choice, not a
+ * contract: 25 portfolios x 50 assets is a wall, and a wall is not verification.
+ *
+ * This is *not* the server's cap. `more_assets` / `more_portfolios` are rows that never
+ * reached this browser at all; this threshold only holds back rows already in hand, and
+ * expanding shows exactly the ones the response carried. */
 const COLLAPSE_ABOVE = 5;
+
+/** Column counts, so a spanning note row cannot silently disagree with the header it
+ * sits under. */
+const PORTFOLIO_COLUMNS = 5;
+const ASSET_COLUMNS = 7;
+
+/** What a date cell says when there is no date to show — an asset with no transactions
+ * has no first and no last. A dash rather than a word, because a word would read as a
+ * value of a different kind. */
+const NO_DATE = '—';
 
 /** `{n} {noun}` with the English plural spelled out. `plural` covers the ones whose plural
  * is not `noun` + `s` — `txn`/`txns`. The counts are the server's; only the English is here. */
@@ -122,9 +137,12 @@ export function isPlanSide(value: unknown): value is PlanSide {
     && Number.isFinite(s.more_portfolios) && Number.isFinite(s.transactions_in_shown);
 }
 
-/** Owns its own leading separator, so a list that renders nothing leaves no orphan `·` behind
- * and a caller cannot forget to put one in. `prefix` labels the scope of the counts,
- * `labels` renames a code for this caller alone. */
+/** The flags of one row, each a badge. `prefix` labels the scope of the counts,
+ * `labels` renames a code for this caller alone.
+ *
+ * The prefix is its own element rather than a run of prose so the flags can be badges and
+ * still read as one sentence: the wrapper's `textContent` is `across all assets:
+ * zero-price ×3`, which is the only thing keeping the two scopes distinguishable. */
 function FlagList({ codes, counts, prefix, labels }: {
   codes: string[];
   counts?: Record<string, number>;
@@ -133,84 +151,212 @@ function FlagList({ codes, counts, prefix, labels }: {
 }) {
   if (codes.length === 0) return null;
   return (
-    <span data-testid="plan-flags" className="text-muted">
-      {` · ${prefix ?? ''}${codes.map((c) => flagLabel(c, counts?.[c], labels)).join(' · ')}`}
+    <span data-testid="plan-flags" className="plan-flags">
+      {prefix && <span className="plan-flag-scope text-muted">{prefix}</span>}
+      {codes.map((c) => (
+        <span key={c} className="badge plan-flag">{flagLabel(c, counts?.[c], labels)}</span>
+      ))}
     </span>
   );
 }
 
 function AssetRow({ asset }: { asset: PlanAsset }) {
-  const span = asset.first_date && asset.last_date
-    ? `${asset.first_date} – ${asset.last_date}`
-    : 'no transactions';
   return (
-    <div data-testid="plan-asset" style={{ paddingLeft: '12px' }}>
-      <strong>{asset.symbol}</strong>
-      {` ${asset.name} · ${asset.currency} · ${one(asset.transactions, 'txn', 'txns')}`}
-      {` · ${span}`}
-      <FlagList codes={asset.flags} counts={{ zero_price: asset.zero_price }} labels={ASSET_ROW_LABELS} />
-    </div>
+    <tr data-testid="plan-asset">
+      <th scope="row">{asset.symbol}</th>
+      <td>{asset.name}</td>
+      <td>{asset.currency}</td>
+      <td className="plan-cell-num">{one(asset.transactions, 'txn', 'txns')}</td>
+      <td className="plan-cell-date">{asset.first_date ?? NO_DATE}</td>
+      <td className="plan-cell-date">{asset.last_date ?? NO_DATE}</td>
+      <td className="plan-cell-flags">
+        <FlagList codes={asset.flags} counts={{ zero_price: asset.zero_price }} labels={ASSET_ROW_LABELS} />
+      </td>
+    </tr>
   );
 }
 
-function PortfolioBlock({ portfolio }: { portfolio: PlanPortfolio }) {
-  // The header is built from `asset_flags`, which the server counts over *every*
-  // asset, and never from `portfolio.shown`. A header aggregated over the listed
-  // assets would under-report a flag sitting past `MAX_ASSETS_SHOWN`, and the
-  // collapsed case is exactly where that under-report would be invisible.
-  const header = (
-    <span data-testid="plan-portfolio-header">
-      <strong>{portfolio.name}</strong>
-      {` · ${portfolio.currency} · ${one(portfolio.assets, 'asset')} · ${one(portfolio.transactions, 'transaction')}`}
-      <FlagList codes={portfolio.flags} />
-      {/* `asset_flags` counts every asset the portfolio holds; the rows under the header
-        * count one asset each. Naming the scope is the only thing that stops the two
-        * reading as the same number twice. */}
-      <FlagList
-        codes={Object.keys(portfolio.asset_flags)}
-        counts={portfolio.asset_flags}
-        prefix="across all assets: "
-      />
-    </span>
-  );
-
-  const rows: ReactNode[] = portfolio.shown.map((a, i) => <AssetRow key={`${a.symbol}-${i}`} asset={a} />);
-  const more = portfolio.more_assets > 0
-    ? <div className="text-muted">{`and ${portfolio.more_assets} more asset${portfolio.more_assets === 1 ? '' : 's'}`}</div>
-    : null;
-
-  if (portfolio.shown.length <= COLLAPSE_ABOVE) {
-    return (
-      <div data-testid="plan-portfolio" style={{ marginBottom: '8px' }}>
-        <div>{header}</div>
-        {rows}
-        {more}
-      </div>
-    );
-  }
+/** The assets of one portfolio, as a table of their own inside the portfolio's row.
+ *
+ * They are a second table rather than more columns on the portfolio row because the two
+ * count different things — a portfolio row is one portfolio, an asset row is one asset —
+ * and forcing seven asset columns onto five portfolio columns would leave half the cells
+ * in each row meaning nothing. */
+function AssetTable({ title, portfolio }: { title: string; portfolio: PlanPortfolio }) {
+  // `expanded` only ever reveals rows the response already delivered. It cannot invent
+  // rows, which is the difference between this control and `more_assets` below.
+  const [expanded, setExpanded] = useState(false);
+  const collapsible = portfolio.shown.length > COLLAPSE_ABOVE;
+  const collapsed = collapsible && !expanded;
+  const visible = collapsed ? portfolio.shown.slice(0, COLLAPSE_ABOVE) : portfolio.shown;
 
   return (
-    <details data-testid="plan-portfolio" style={{ marginBottom: '8px' }}>
-      <summary>{header}</summary>
-      {rows}
-      {more}
-    </details>
+    <table className="plan-table plan-table--assets" aria-label={`${title} — assets in ${portfolio.name}`}>
+      <thead data-testid="plan-asset-head">
+        <tr>
+          <th scope="col">Symbol</th>
+          <th scope="col">Name</th>
+          <th scope="col">Currency</th>
+          <th scope="col">Txns</th>
+          <th scope="col">First</th>
+          <th scope="col">Last</th>
+          <th scope="col">Flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        {/* A portfolio with no assets still gets a row, because an empty body reads as a
+            * table that failed to fill in rather than as an answer. The wording is
+            * deliberately not the `no_assets` badge's words, which are a warning on a
+            * portfolio that is listed above this table, not a count of what is in it. */}
+        {visible.length === 0 && (
+          <tr className="plan-note-row">
+            <td colSpan={ASSET_COLUMNS} className="plan-cell-muted" data-testid="plan-no-assets">
+              No assets in this portfolio.
+            </td>
+          </tr>
+        )}
+        {visible.map((a, i) => <AssetRow key={`${a.symbol}-${i}`} asset={a} />)}
+        {collapsible && (
+          <tr className="plan-note-row">
+            <td colSpan={ASSET_COLUMNS}>
+              <button
+                type="button"
+                className="plan-toggle"
+                data-testid="plan-show-all"
+                aria-expanded={!collapsed}
+                onClick={() => setExpanded((was) => !was)}
+              >
+                {/* "listed" is what makes this count agree with the server's cap under it.
+                    `shown.length` is capped by the server, so at the cap a portfolio that
+                    holds 362 assets lists 50 — and "show all 50 assets" directly above
+                    "and 312 more assets" is a totality word on a partial count. These are
+                    the 50 rows this page was given; the note below says how many it was
+                    never given. */}
+                {collapsed ? `show all ${portfolio.shown.length} listed assets` : 'show fewer'}
+              </button>
+            </td>
+          </tr>
+        )}
+        {/* The server's cap, and a different fact from the control above: these rows were
+            * never sent, so nothing done on this page will produce them. */}
+        {portfolio.more_assets > 0 && (
+          <tr className="plan-note-row">
+            <td colSpan={ASSET_COLUMNS} className="plan-cell-muted">
+              {`and ${portfolio.more_assets} more asset${portfolio.more_assets === 1 ? '' : 's'}`}
+            </td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+/** One portfolio: its own row, and the asset table under it, in one row group so the
+ * two travel together and stay visually bound. */
+function PortfolioGroup({ title, portfolio }: { title: string; portfolio: PlanPortfolio }) {
+  return (
+    <tbody data-testid="plan-portfolio">
+      {/* The portfolio row is built from `asset_flags`, which the server counts over
+        * *every* asset, and never from `portfolio.shown`. A row aggregated over the
+        * listed assets would under-report a flag sitting past `MAX_ASSETS_SHOWN`, and
+        * the collapsed case is exactly where that under-report would be invisible — so
+        * this row is never the thing that collapses. */}
+      <tr data-testid="plan-portfolio-header" className="plan-portfolio-row">
+        <th scope="row">{portfolio.name}</th>
+        <td>{portfolio.currency}</td>
+        <td className="plan-cell-num">{one(portfolio.assets, 'asset')}</td>
+        <td className="plan-cell-num">{one(portfolio.transactions, 'transaction')}</td>
+        <td className="plan-cell-flags">
+          <FlagList codes={portfolio.flags} />
+          {/* `asset_flags` counts every asset the portfolio holds; the rows under this
+            * one count a single asset each. Naming the scope is the only thing that stops
+            * the two reading as the same number twice. */}
+          <FlagList
+            codes={Object.keys(portfolio.asset_flags)}
+            counts={portfolio.asset_flags}
+            prefix="across all assets: "
+          />
+        </td>
+      </tr>
+      <tr className="plan-assets-row">
+        <td colSpan={PORTFOLIO_COLUMNS}>
+          <AssetTable title={title} portfolio={portfolio} />
+        </td>
+      </tr>
+    </tbody>
   );
 }
 
 /** One side of a plan — what a bundle holds, or what the database holds. Rendered
  * three times by `BackupPanel`, which is the whole reason it is a component. */
-export function PlanSideView({ title, side }: { title: string; side: PlanSide }) {
+export function PlanSideView({ title, side, collapsible = false }: {
+  title: string;
+  side: PlanSide;
+  /** Only a pane in the side-by-side preview gets the header toggle. The readback
+   * listing under a finished restore is not one half of a comparison and has nothing to
+   * collapse *against*, so it keeps the plain heading. */
+  collapsible?: boolean;
+}) {
+  // Open by default, for both panes. A preview of a destructive flow never decides for
+  // the reader which half to hide, so collapsing is opt-in and nothing starts hidden.
+  const [open, setOpen] = useState(true);
+
+  // The counts sentence is the pane's heading and the toggle's label at once, which is
+  // what gives the button an accessible name that says which side it folds and how much
+  // is behind it. It is also the one part of the pane a collapse must never take away:
+  // a collapsed pane that hides its own totals cannot be read against the pane still
+  // open beside it, which is the only reason to collapse one.
+  const heading = <span className="plan-side-heading">{`${title} ${countList(side.counts)}.`}</span>;
+
   return (
     <div data-testid="plan-side">
-      <p style={{ marginBottom: '4px' }}>{`${title} ${countList(side.counts)}.`}</p>
-      {side.more_portfolios > 0 && (
-        <p className="text-muted" data-testid="plan-cap">
-          {`showing ${side.shown.length} of ${side.counts.portfolios} portfolios · `
-            + `the portfolios shown hold ${side.transactions_in_shown} of ${side.counts.transactions} transactions`}
-        </p>
-      )}
-      {side.shown.map((p, i) => <PortfolioBlock key={`${p.name}-${i}`} portfolio={p} />)}
+      {collapsible ? (
+        /* A button, not a clickable div: it has to be reachable by Tab and fire on Enter
+           * and Space without this component re-implementing either, and `aria-expanded`
+           * is the one thing that makes the heading say what pressing it does. */
+        <button
+          type="button"
+          className="plan-side-toggle"
+          data-testid="plan-side-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((was) => !was)}
+        >
+          {heading}
+        </button>
+      ) : heading}
+      {/* Hidden rather than unmounted, and that choice is the whole contract: the
+          * per-portfolio "show all N listed assets" expansions live inside these rows, so
+          * unmounting them on a collapse would silently reset every one the reader had
+          * opened. Re-expanding shows the same rows in the same state they were left in.
+          * Nothing here is read by the Restore button or by the REPLACE confirmation —
+          * folding a pane is a way of looking at the plan, not a change to it. */}
+      <div className="plan-side-body" hidden={!open}>
+        {side.more_portfolios > 0 && (
+          <p className="text-muted" data-testid="plan-cap">
+            {`showing ${side.shown.length} of ${side.counts.portfolios} portfolios · `
+              + `the portfolios shown hold ${side.transactions_in_shown} of ${side.counts.transactions} transactions`}
+          </p>
+        )}
+        {/* No table at all when there are no portfolios to list: a header over an empty
+            * body is the shape this component refuses one row down, at the portfolio. */}
+        {side.shown.length > 0 && (
+          <div className="plan-table-scroll">
+            <table className="plan-table" data-testid="plan-portfolio-table">
+              <caption className="plan-sr-only">{`${title} — portfolios`}</caption>
+              <thead data-testid="plan-portfolio-head">
+                <tr>
+                  <th scope="col">Portfolio</th>
+                  <th scope="col">Currency</th>
+                  <th scope="col">Assets</th>
+                  <th scope="col">Transactions</th>
+                  <th scope="col">Flags</th>
+                </tr>
+              </thead>
+              {side.shown.map((p, i) => <PortfolioGroup key={`${p.name}-${i}`} title={title} portfolio={p} />)}
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
