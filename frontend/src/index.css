@@ -318,28 +318,44 @@ button, input, select, textarea {
   border: 0;
 }
 
+/* The drop area is deliberately narrower than the card. A dashed rectangle that spans the
+   whole card reads as a section of the page, not as a target; a bounded one reads as
+   something you can put a file into. 560px is roughly the width of the prompt plus a
+   realistic file name, so the box is sized to its content rather than to the viewport. */
 .bundle-dropzone {
-  border: 1px dashed var(--border-color);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.03);
-  padding: 8px;
+  max-width: 560px;
+  padding: 0;
   transition: var(--transition-fast);
 }
 
+/* The demarcation lives on the inner target, inset from the card edge, so the dashed line
+   is the thing being activated rather than decoration drawn around it. Two pixels of
+   dashed border with a filled interior: one pixel of dashed on a dark background was the
+   previous state and it read as a divider, not an affordance. */
 .bundle-dropzone-target {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   align-items: center;
+  justify-content: center;
+  text-align: center;
   gap: 8px;
-  min-height: 56px;
-  padding: 12px 16px;
-  border-radius: 6px;
+  min-height: 104px;
+  padding: 22px 24px;
+  border: 2px dashed var(--border-color);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
   cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.bundle-dropzone-target:hover {
+  border-color: var(--border-focus);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .bundle-dropzone-target:focus-visible {
   outline: 2px solid var(--border-focus);
-  outline-offset: 2px;
+  outline-offset: 3px;
 }
 
 .bundle-dropzone-prompt {
@@ -351,6 +367,8 @@ button, input, select, textarea {
 .bundle-dropzone-file {
   display: inline-flex;
   align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
 }
@@ -364,29 +382,37 @@ button, input, select, textarea {
   font-size: 0.8rem;
 }
 
-/* Dragged over: the same weight of border as the idle state, so the change is the glow
-   rather than a jump in the layout. */
-.bundle-dropzone-drag {
+/* Dragged over: the border keeps its weight and only its colour and the fill change, so
+   the box does not jump under the file being dragged. */
+.bundle-dropzone-drag .bundle-dropzone-target,
+.bundle-dropzone-drag.bundle-dropzone-target {
   border-color: var(--border-focus);
   background: var(--color-primary-glow);
 }
 
-/* Refused. Solid rather than dashed, and darker, so the state reads without colour; the
+/* Refused. Solid rather than dashed, and tinted, so the state reads without colour; the
    line under it spells the reason out. */
-.bundle-dropzone-refused {
+.bundle-dropzone-refused .bundle-dropzone-target,
+.bundle-dropzone-refused.bundle-dropzone-target {
   border-style: solid;
   border-color: var(--color-danger);
   background: var(--color-danger-glow);
 }
 
 .bundle-dropzone-refusal {
-  margin: 4px 16px 2px;
+  margin: 8px 4px 0;
   color: var(--color-danger);
   font-size: 0.8125rem;
 }
 
-.bundle-dropzone-disabled {
+.bundle-dropzone-clear {
+  margin-top: 10px;
+}
+
+.bundle-dropzone-disabled .bundle-dropzone-target,
+.bundle-dropzone-disabled.bundle-dropzone-target {
   opacity: 0.5;
+  cursor: default;
 }
 
 .bundle-dropzone-disabled .bundle-dropzone-target {
