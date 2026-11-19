@@ -77,6 +77,17 @@ fallen into:
 7. The preview reaches the human complete. A preview that the client truncates in transit is
    not a control — see *The client, and the preview's size budget*.
 
+### Scale
+
+The primary user's largest portfolio is roughly 20 assets with 1–2 transactions each, so a
+real batch is 20–40 rows. Larger statements are expected later, from other people; they are
+not specified here. Nothing in this design is sized for volume. The display caps, the 16 KB
+preview budget and the 30-second deadline are guards that stop a future large import from
+becoming an incident, not machinery the current user needs — and a batch of 40 rows is why
+there is no chunking, no progress protocol, and no asynchronous job in this design. Building
+for volume that does not exist yet is out of scope on the same argument that removed
+`stage_edit`.
+
 ## Non-goals
 
 - **`backup/*` is not exposed.** No export, no preview, no restore. There is no
@@ -512,6 +523,14 @@ equals the pool's `statement_timeout` — and there would be no way to retry it.
   cannot share one deserializer. The browser importer's multi-format
   auto-detection exists because a human sits in front of dropdowns; the agent has no
   dropdowns.
+- **The model is the parser, so the preview is the only check.** Nothing server-side can
+  distinguish a correct `1234.56` from a misread `1.234,56`, and a decimal-comma misparse is
+  a 1000× error on a tax figure. At the current scale every row fits in the preview, so a
+  misparse is visible to a human before apply — which is why the preview renders rows and not
+  only totals, and why the 16 KB budget is a safety property rather than a performance one.
+  The server's contribution is that the wire format cannot lie: money is a strict decimal
+  string, dates are strict `YYYY-MM-DD`, so anything that reaches the preview has already
+  survived validation.
 - ISIN, when present, passes a mod-10 checksum. A Rust validator already exists —
   `api_routes::lookup::is_valid_isin` (`lookup.rs:186`), shape only, already used by the REST
   lookup route and by bundle validation (`backup/mod.rs:442`) — so it is strengthened in
