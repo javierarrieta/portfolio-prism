@@ -549,3 +549,62 @@ Each item is labelled with how to settle it. None of these can be closed by read
 | What a bind failure on the agent listener should do (refuse boot vs log and continue), given no probe can see it | Operator decision; record in the root E subsection. |
 | Whether the 30-second per-call deadline is right, given it equals the pool's per-statement `statement_timeout` | Measure `get_performance` and a 5,000-row apply against the real pool; then set the value and make it configurable. |
 | Whether the 25 / 200 / 5,000 caps are proxy-driven or memory-driven, and whether they must be re-checked if the proxy changes | Re-derive from the 256 Mi limit and the proxy body limit (`af17064`'s incident); state the derivation in the limits table. |
+
+---
+
+## 14. Disposition after remediation
+
+Recorded against the spec after remediation. The sections above are left as written; this is
+the closing record, not an edit of the findings.
+
+| Root problem | Status | Where it landed |
+|---|---|---|
+| **A** — confirming signal travels through the party under review | **Closed** | Decision C. `staged → approved → applied`; approve is a session-only `/api` route; `apply_staged` requires `approved` and returns `not_approved`; the flip is inside the write transaction. No nonce relayed to the agent. Spec *The approval gate*. |
+| **B** — WS0 sold as a no-op | **Closed** | WS0 relabelled as a live API change with six items. Item 3 became "verify, do not add" once the audit found the bundle schema already constrains the set. The frontend money migration is a named prerequisite PR with a deploy order. |
+| **C** — load-bearing claims that did not survive the repo | **Closed** | 15 corrections, commit `c6a0166`. All 8 WRONG items plus the load-bearing PARTLY ones. |
+| **D** — central mechanism unspecified | **Closed** | Decision 2: WS0 item 6 extracts `services::transactions::insert` and `services::assets::insert`, both taking `&mut tx`. `check_backup_portability.sh` is a required PR check, not a note. |
+| **E** — in-process priced only in panics | **Partly** | Pool, CPU, memory and probe costs now appear in *Limits* and *Failure modes*, including the honest line that pool contention is the cost of sharing a process and no flag removes it. Still open: bind-failure policy and the k8s exposure route, both blocked on the spike. |
+| **F** — nothing bounds a normally-working agent | **Closed** | *Limits*: one table, one owner per row, and the rule that a limit not in the table does not exist. Caps re-derived from real scale — 50 assets / 500 transactions, superseding 25 / 200 / 5,000. No rate limiter, with the reason and the trigger that would change it. |
+| **G** — no home for decisions, no actor named | **Closed** | *Limits*, *Failure modes*, *Rollout and rollback*, *Alternatives considered* added. New sections name who does each thing. |
+| **H** — multiple sources of truth | **Partly** | *Limits* and the error-code list now declare themselves authoritative over prose, and preview rendering delegates to `backup::detail` instead of forking a vocabulary. Not done: a sweep for every remaining duplicated rule. |
+| **I** — wire contracts not implementable as written | **Closed for the write path** | `stage_import` is real JSON with the serde mapping (internally tagged on `kind`, `deny_unknown_fields`); the error payload is real JSON with a path-not-id `field`; list page size named. |
+
+### The three open decisions from §10
+
+1. **Approval mechanism — resolved, option C.** A state transition only a session cookie can
+   cause, not a scope. One token, one agent, no second credential.
+2. **Shared write/preview service — resolved.** Workstream 0, its own `refactor/` PR.
+3. **Stateless-mode spike — recorded, not run.** It is a Verification item with a named
+   payoff and a stop condition in *Rollout and rollback*. Workstream 2's plan is gated on its
+   result.
+
+### Facts the review did not have
+
+- **The client is pi** (Hermes Agent secondary, MCP support unverified). pi truncates tool
+  results over 20 KB by removing the middle, which is why the preview has a 16 KB budget, why
+  requirement 7 exists, and why the Access screen is the only copy that cannot be truncated in
+  transit. pi rejects the legacy SSE transport and defaults to a 60 s per-request timeout, so
+  the server's 30 s deadline is now deliberately below it rather than accidentally.
+- **Real scale is 20–40 rows.** No chunking, no progress protocol, no async job, and the caps
+  came down accordingly.
+- **Broker format is the client's problem**, stated as a total boundary. The server's side of
+  that bargain is written down: a schema that cannot be guessed at, errors actionable in one
+  turn, and an explicit statement of what it cannot catch.
+
+### Still unverified after remediation
+
+- The spike itself, and with it the second listener, its manifest dependencies and the k8s
+  exposure choice.
+- rmcp's dependency resolution: `tower` version, and whether `schemars` pulls a third copy.
+- **Whether a real model turns a real statement into correct rows.** The operator declined to
+  supply statements and gave the scale instead, so the founding premise is now an explicit
+  assumption whose only control is a human reading a preview that fits — not a measured fact.
+  That is a decision, recorded as one.
+- Bind-failure policy, and the exposure route.
+- Whether live rows violate the `CHECK`; the pre-flight audit answers this at deploy time.
+
+### Verdict
+
+Workstreams 0 and 1 remain plan-ready. **Workstream 2 is plan-ready once the stateless-mode
+spike result is recorded** — decisions 1 and 2 are now in the spec, and the third is the only
+one still open.
