@@ -11,8 +11,8 @@ Add a Model Context Protocol server to Portfolio Prism so an AI agent can answer
 about a user's portfolios and record data into them, including importing a whole portfolio
 from a broker statement the agent has read.
 
-The MCP server is **a module of the existing backend, not a separate program**. It is a
-second HTTP listener inside the `backend_rust` process speaking MCP streamable HTTP,
+The MCP server is **a module of the existing backend, not a separate program**. It is an MCP
+streamable-HTTP endpoint mounted as an ordinary route inside the `backend_rust` process,
 authenticated by a new scoped personal access token. There is no Node.js anywhere in the
 design, and nothing runs on the user's workstation.
 
@@ -105,7 +105,9 @@ for volume that does not exist yet is out of scope on the same argument that rem
 - **No stdio transport.** Streamable HTTP only. A stdio shim for clients that cannot speak
   HTTP is a separate decision with its own spec.
 - **No MCP resources, prompts, sampling, or subscriptions.** Tools only.
-- **No multi-replica session sharing.** The session manager is in-memory; see *Sessions*.
+- **No MCP sessions.** The service runs statelessly — `NeverSessionManager` plus
+  `legacy_session_mode = false` — so there is no in-memory session to lose or to pin; see
+  *Sessions*.
 - **No apply from the web UI.** The staged-batches screen lists batches and renders the
   stored preview; its only write is the approval itself. The human does not edit rows there
   and the browser never writes a portfolio row. The agent reads the preview in the chat
@@ -125,32 +127,38 @@ against the API it fronts, and no second process holding a credential on a lapto
 call `engines::` and `services::` directly — no HTTP hop, no second serializer, money
 stays `rust_decimal` end to end.
 
-**`rmcp`'s HTTP transport is a tower service, so it cannot mount into Rocket.** PR #228
-reshaped it as `StreamableHttpService` specifically so it works with any tower-compatible
-server, and PR #642 then removed the axum dependency because axum was never used. Rocket
-0.5 is not tower-based. The chosen realization is a **second listener in the same
-process**: at launch, spawn a `hyper` server on a second port serving the tower service.
-`hyper 1.10.1`, `hyper-util 0.1.20`, `http 1.4.2` and `tower 0.5.3` are already in
-`Cargo.lock` via reqwest — the `0.6.11` in that lock belongs to `tower-http`, not `tower`.
-None of the four is a direct dependency of `backend_rust/Cargo.toml` today, so adding `rmcp`
-means adding them to the manifest with the features the transport needs, at whatever
-versions its resolution forces; whether `rmcp` needs `tower` ≥ 0.6 is a verification item,
-not an assumption. Rejected: hand-writing the streamable-HTTP transport on rmcp's
-`Transport` trait, which would mean owning protocol negotiation, session ids and SSE.
-Mounting the tower service inside Rocket is **not** rejected — and the spike that asked the
-question has since run and passed, so it is now the cheaper proven option awaiting a decision;
-see *Verification items* and `../spikes/2026-11-19-mcp-in-rocket.md`. The grounds this document
-originally gave for rejecting it (hand-rolling SSE through a Rocket `Responder`) do not apply:
-`2026-07-28` clients are served statelessly, and `json_response(true)` replies with a plain
-JSON body.
+**`rmcp`'s HTTP transport is a tower service and Rocket 0.5 is not tower-based — which turns
+out not to matter.** PR #228 reshaped it as `StreamableHttpService` so it works with any
+tower-compatible server, and PR #642 removed the axum dependency because axum was never used.
+`StreamableHttpService::handle()` is generic over the request body (`RequestBody:
+http_body::Body`) and returns `Response<BoxBody<Bytes, Infallible>>`, so a Rocket route can
+bridge it directly: capture method, URI and headers, buffer the body into
+`http::Request<Full<Bytes>>`, call `handle()`, copy the response back. The spike in
+`../spikes/2026-11-19-mcp-in-rocket.md` does exactly this in about 120 lines and drives
+`initialize` → `tools/list` → `tools/call` through it.
 
-**Two listeners, two credential types.** The Rocket API accepts only session cookies; the
-agent listener accepts only bearer tokens. Neither reads the other's header. An agent
-cannot call a write endpoint on `/api`, because those handlers do not look at bearer
-tokens — and by the same construction a human approval cannot be forged from the agent
+The manifest gains `rmcp` plus the four small crates the bridge needs — `http`,
+`http-body-util`, `bytes`, `tower-service` — all already in `Cargo.lock` at compatible
+versions, and `cargo tree -d -e normal` reports no duplicate versions after the addition. No
+HTTP framework is added: `axum` is a dev-dependency of rmcp and never enters the build, and
+`tower` itself is not required, only `tower-service 0.3.3`. Rejected: hand-writing the
+streamable-HTTP transport on rmcp's `Transport` trait, which would mean owning protocol
+negotiation, session ids and SSE. Also rejected, **after being proven viable**: a second
+`hyper` listener in the same process — see *Alternatives considered*.
+
+**One listener, two credential types, separated by route.** The `/api` surface accepts only
+session cookies; the `/mcp` route accepts only bearer tokens. Neither reads the other's
+header. An agent cannot call a write endpoint on `/api`, because those handlers do not look at
+bearer tokens — and by the same construction a human approval cannot be forged from the agent
 side, because `POST /api/staged-batches/<handle>/approve` is reachable only with a session
 cookie the agent never holds (see *The approval gate*). It also requires no change to the 21
 existing route handlers.
+
+The mount costs one thing a second listener did not: **the `/mcp` route must check the bearer
+token itself, and must reject a session cookie.** `AuthFairing` protects by the `/api/` prefix
+(`auth/fairing.rs:40`), so `/mcp` sits outside its reach and is unauthenticated by default.
+That is no longer a structural property of a socket; it is one assertion in one place, and it
+is a required test — see *Testing and gates*.
 
 **Staging is server-side state, not a client-side promise.** A staged batch is a row in
 Postgres holding the canonicalized payload and the rendered preview. A handle is an opaque
@@ -167,7 +175,7 @@ visibility of what exists — so the UI shows staleness instead of the server en
 calendar.
 
 **Minting is self-service in the UI, and the backend owns the lifecycle.** `auth::pat`
-implements every operation; the API routes and the listener both call it; nothing else
+implements every operation; the API routes and the MCP route both call it; nothing else
 implements any of them.
 
 ---
@@ -301,7 +309,7 @@ quantity/price rules and the 1900-01-01 … 2100-01-01 date bound already in
 `resolve_caller` (`auth/guard.rs`) already owns "turn a request into an `AuthedUser`", is
 already the only path shared by `AuthFairing` and the `/auth/me` guard, and already keeps
 `Ok(None)` (deny) distinct from `Err` (503). It gains a `CredentialKind` parameter —
-`SessionOnly` from the fairing, `TokenOnly` from the agent listener. Both branches converge
+`SessionOnly` from the fairing, `TokenOnly` from the `/mcp` route. Both branches converge
 on a new `user_by_id(pool, uid)` extracted from today's guard, which keeps the `is_active`
 check and the `token_version` comparison in one place. A token yields a `uid` and falls
 through to that same lookup, so a deactivated account loses its tokens for free.
@@ -331,7 +339,7 @@ CREATE INDEX api_token_user_idx ON api_token (user_id);
 
 Secret: `pp_` + 32 random bytes, base62. Stored as SHA-256 hex, returned exactly once.
 32 bytes is 256 bits of entropy at the source, which makes online guessing impractical, so
-the agent listener adds no attempt throttling; do not add throttling later without stating a
+the MCP route adds no attempt throttling; do not add throttling later without stating a
 reason in a new spec. Base62 changes only the encoded length (≈43 characters), not the
 entropy.
 
@@ -360,7 +368,7 @@ do not each pay a write.
   into a response type.
 - `revoke(pool, user_id, token_id)` — sets `revoked_at`, effective on the next call because
   every request looks the row up live.
-- `lookup(pool, secret) -> Option<AuthedUser>` — the agent listener's only entry point.
+- `lookup(pool, secret) -> Option<AuthedUser>` — the `/mcp` route's only entry point.
 
 ### `api_routes/tokens.rs` — session-authenticated
 
@@ -413,7 +421,14 @@ Contract flows the normal way: `utoipa` annotations, then
   calls `require*` before touching a row, then calls `services::` for writes (extracted in
   Workstream 0, item 6) and `engines::` for reads. There is no second write path: if a tool
   needs an INSERT and no `services::` function performs it, that function is written first.
-- `listener.rs` — binds the streamable-HTTP tower service on the second port at launch.
+- `mount.rs` — the Rocket bridge: a request guard capturing method, URI and headers, the
+  buffered body handed to `StreamableHttpService::handle()`, and the response copied back.
+  The spike is the reference shape. Two configuration lines in here are load-bearing and both
+  fail quietly if omitted: `legacy_session_mode = false` (the default is `true`, and with
+  `NeverSessionManager` a pre-`2026-07-28` client then fails `500`), and `json_response = true`.
+  The body is read through `Data::open(1.mebibytes())` rather than a `Vec<u8>` parameter,
+  because Rocket's default `bytes` limit is 8 KiB and would silently cap requests below the
+  1 MiB this design allows.
 
 Two things outside `agent/` are prerequisites, not follow-ups, because nothing can be applied
 without them:
@@ -428,9 +443,9 @@ without them:
   outside the `currentPortfolio ? …` branch in `App.tsx`, or it is a blank page whenever no
   portfolio is selected.
 
-Off by default: `listener.rs` binds only when `AGENT_LISTEN` is set, following the
+Off by default: the `/mcp` route is mounted only when `AGENT_MCP_MOUNT` is set, following the
 precedent at `lib.rs:270` where the OIDC routes are mounted only when there is a provider
-to talk to.
+to talk to. Unset means the route does not exist, so there is nothing to reach.
 
 ### Schema — `0004_agent_staged_batch.sql`
 
@@ -469,12 +484,12 @@ transition only a session cookie can cause.
 
 | Step | Surface | Credential | Effect |
 |---|---|---|---|
-| `stage_import` | agent listener | PAT with `import` | inserts a row at `status='staged'`, returns handle and preview |
+| `stage_import` | `/mcp` route | PAT with `import` | inserts a row at `status='staged'`, returns handle and preview |
 | `GET /api/staged-batches` | `/api` | session cookie | lists batches: handle, counts, status, expiry |
 | `GET /api/staged-batches/<handle>` | `/api` | session cookie | renders the stored `preview` JSONB verbatim |
 | `POST /api/staged-batches/<handle>/approve` | `/api` | session cookie | `staged → approved`; records `approved_at`, `approved_by` |
-| `apply_staged` | agent listener | PAT with `import` | `approved → applied`, writes the rows |
-| `discard_staged` | agent listener | PAT with `import` | `→ discarded`; no approval required |
+| `apply_staged` | `/mcp` route | PAT with `import` | `approved → applied`, writes the rows |
+| `discard_staged` | `/mcp` route | PAT with `import` | `→ discarded`; no approval required |
 
 Three consequences, stated here rather than discovered in implementation:
 
@@ -723,10 +738,17 @@ what keeps the `access.rs` surface and the gate script's job small.
 
 ### Sessions
 
-`LocalSessionManager` is in-memory: MCP sessions do not survive a process restart and do
-not work across replicas. The deployment is `replicas: 1`, which makes this acceptable
-**only because all semantic state lives in Postgres** — a restart drops the MCP session but
-not a pending staged batch. Any future change to `replicas` must revisit this.
+There are no MCP sessions. `StreamableHttpService` runs with `NeverSessionManager` and
+`legacy_session_mode = false`, so every request is independent, no `Mcp-Session-Id` is minted,
+and nothing is pinned to a process. This is not the library default: `legacy_session_mode`
+defaults to `true`, and leaving it there routes any client negotiating a pre-`2026-07-28`
+protocol version onto the session path, where `NeverSessionManager` answers `500 — Session
+management is not supported`. The spike reproduced exactly that failure before the flag was
+set, which is why it is written down.
+
+The consequence for the deployment is that `replicas: 1` no longer constrains this feature.
+All state — staged batches, tokens, everything a request needs — lives in Postgres, so a second
+replica would work without any change here.
 
 ---
 
@@ -769,10 +791,10 @@ human, re-stage.
 Never leaked: SQL text, stack traces, another user's data. Rows that do not exist yet are
 named by index in the submitted payload, not by internal id.
 
-**Fault isolation must be paid for explicitly.** The listener runs in the same process as
+**Fault isolation must be paid for explicitly.** The MCP route runs in the same process as
 the API, so a panic in a tool handler would take the whole application down, not just the
-MCP session. Every tool call is wrapped in `catch_unwind` with a 30-second per-call
-deadline — so a hung pricing lookup cannot wedge a session — and the listener survives
+MCP call. Every tool call is wrapped in `catch_unwind` with a 30-second per-call
+deadline — so a hung pricing lookup cannot wedge a request — and the route survives
 both. This is the price of the in-process decision; it is cheap to pay knowingly and
 expensive to discover.
 
@@ -801,9 +823,17 @@ like the other five gates.
   path.
 - **The approval gate is the control, so it gets its own tests.** A bearer token cannot
   reach the three `/api/staged-batches` routes at all (they are session-only, and this is
-  the mirror of the two-listener invariant); a session cannot approve a handle belonging to
+  the mirror of the route-separation invariant); a session cannot approve a handle belonging to
   another user; `approved_by` records the approving session's user and nothing else changes
   it; and no agent tool exists that can set `status='approved'`.
+- **The route-separation invariant is asserted from both sides, because the mount no longer
+  gives it for free.** A request to `/api/portfolios/` carrying only an `Authorization` header
+  is denied (already required below), **and** a request to `/mcp` carrying only a session
+  cookie is denied. The second one is the new obligation created by mounting inside Rocket;
+  `AuthFairing` does not cover `/mcp`, so nothing else catches it.
+- **`tools/list` must return the tools, asserted by name.** `#[tool_router]` without
+  `#[tool_handler]` on the `ServerHandler` impl yields `{"tools":[]}` under a perfectly healthy
+  `200` — observed in the spike. A status-code assertion would pass; only the names catch it.
 - **Extend `tests/isolation_test.rs`** with the agent tools: user B cannot apply A's
   handle, stage into A's portfolio, or read A's preview through `get_staged`; and user B's
   session cannot approve A's handle. The gate
@@ -815,11 +845,13 @@ like the other five gates.
   `tests/agent_gate_test.rs` running the real script against a throwaway tree, mirroring
   `tests/access_gate_test.rs`. Added to the CI gate list in `AGENTS.md` order.
 - **PAT tests**: mint → lookup → revoke → lookup yields `None`; expired rejected; a
-  deactivated user's token rejected; and the two-listener invariant tested directly — a
+  deactivated user's token rejected; and the separation tested directly — a
   request to `/api/portfolios/` carrying only an `Authorization` header is denied.
 - **`tests/route_coverage_test.rs`** gains the three token routes and the three
   staged-batch routes in `PROTECTED_ROUTES`, so
-  the published OpenAPI document and the mounted surface cannot drift apart.
+  the published OpenAPI document and the mounted surface cannot drift apart. `/mcp` is not an
+  `/api` route, so it belongs in `PUBLIC_NAMESPACES` (`route_coverage_test.rs:181`) — an
+  explicit, reviewed amendment to that list, never a widening of the prefix rule.
 - **Workstream 0 tests**: the migration aborts on a junk `type` (proven by mutation), serde
   rejects an unknown type, and a restore bundle with a junk type is a `422` at preview
   rather than a `CHECK` violation mid-restore. The write-service extraction is proven by
@@ -827,11 +859,11 @@ like the other five gates.
   `refactor/` PR — plus one new assertion that the SPLIT rules and the date bound still
   reject what they rejected before, so the seam cannot silently drop a validation on the way
   out of the handler.
-- **End-to-end over the real transport**: rmcp's own client
-  (`StreamableHttpClientTransport`) against the listener bound to an ephemeral port —
+- **End-to-end over the mounted route**: Rocket's local client with explicit JSON-RPC bodies,
   `initialize` → `tools/list` → `stage_import` → approve through `/api` with a session →
-  `apply_staged` → assert the rows exist. The approval step is in the path, not skipped,
-  or the test proves a flow the product does not have.
+  `apply_staged` → assert the rows exist. The spike test is the working shape, including the
+  `Host` header Rocket's local client does not send. The approval step is in the path, not
+  skipped, or the test proves a flow the product does not have.
 - **One run against the real client**, not only rmcp's test client:
   `pi mcp add prism --url https://<host>/mcp --bearer-token-env-var PRISM_PAT`, then a full
   import through it. Third-party clients are where transport assumptions break — pi rejects
@@ -850,12 +882,14 @@ Out of scope for tests, stated: a real OIDC provider (already manual, per
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `AGENT_LISTEN` | bind the agent listener on this `host:port`; unset means the module does not exist | unset |
+| `AGENT_MCP_MOUNT` | mount the `/mcp` route at all; unset means the route does not exist | unset |
 | `AGENT_BATCH_TTL_MINUTES` | staged-batch lifetime | `60` |
 
-`k8s/configmap.yaml` gains no `AGENT_LISTEN`; enabling the feature is an explicit operator
-edit, and the ingress needs a route for the second port before the endpoint is reachable
-from outside the cluster.
+`k8s/configmap.yaml` gains no `AGENT_MCP_MOUNT`; enabling the feature is an explicit operator
+edit. Because the endpoint shares the backend's existing port, exposure is one nginx location
+beside the existing `location /api` (`frontend/nginx.conf:34-35`) — `location /mcp { proxy_pass
+http://127.0.0.1:8000; }` — which means a frontend image change and inherits whatever policy
+the host already has, rather than a new containerPort, Service port and ingress path.
 
 ## Limits
 
@@ -867,7 +901,7 @@ exist, and a limit in this table is not enforced anywhere else.
 | Rows per staged batch | 500 | A real batch is 20–40 rows; 500 is a full history for a large portfolio, and it bounds the JSONB row and the preview | `staging::validate`, before insert |
 | Pending batches per user | 5 | Stops abandoned batches accumulating rows; a legitimate user does not have six imports in flight | `staging::stage`, same transaction as the insert |
 | Batch lifetime | `AGENT_BATCH_TTL_MINUTES`, default 60 | A human approves in the same sitting or the batch is stale | `expires_at`, compared in `apply_staged` |
-| Request body | 1 MiB | Bounds memory per call against the container's 256 Mi limit | listener, before deserialization |
+| Request body | 1 MiB | Bounds memory per call against the container's 256 Mi limit. Enforced twice, deliberately: `Data::open(1.mebibytes())` at the route — Rocket's default `bytes` limit is **8 KiB** and would otherwise reject a legitimate import long before 1 MiB — and rmcp's own `max_request_body_bytes` (default 4 MiB) inside the service | `agent/mount.rs`, then rmcp |
 | Per-call deadline | 30 s | Deliberately below pi's 60 s client timeout, so the agent gets a named server error | `tokio::time::timeout` around the handler |
 | Preview payload | 16 KB | pi truncates results over 20 KB by removing the middle | measured on the rendered string, before the response is built |
 | Display caps | 25 portfolios, 50 assets | Existing constants in `backup::detail`; reused, not reinvented | `backup::detail` |
@@ -887,7 +921,9 @@ deployment, is the same speculative volume the rest of this document refuses.
 
 | Failure | Effect | Containment |
 |---|---|---|
-| Tool handler panics | `catch_unwind` at the dispatch boundary turns it into a tool error; the listener survives | that call only; a panic inside a write transaction drops it, so it rolls back |
+| Tool handler panics | `catch_unwind` at the dispatch boundary turns it into a tool error; the route survives | that call only; a panic inside a write transaction drops it, so it rolls back |
+| `/mcp` mounted without the bearer check, or accepting a session cookie | the agent surface becomes reachable with a browser session — the exact separation this design exists to enforce | the route does the check in one function, and a required test asserts a session cookie alone is denied; `AuthFairing` will not catch it, because `/mcp` is outside the `/api/` prefix |
+| A legitimate `stage_import` rejected before rmcp sees it | Rocket's default 8 KiB `bytes` limit truncates the body and the route answers `413` with no MCP error payload | the route reads the body with an explicit `Data::open(1.mebibytes())`; a test posts a batch larger than 8 KiB and asserts it reaches validation |
 | Pool exhausted by agent calls | web UI requests queue, then fail `acquire_timeout` after 5 s | the 30 s deadline bounds how long one call can hold a connection; revoke the token. This is the cost of sharing a process and no flag removes it |
 | Pod restarts mid-batch | staged rows survive — they are rows in Postgres; an in-flight apply is one transaction, so it either happened or did not | stateless mode means the client simply POSTs again; see *Verification items* |
 | Migration `0002` aborts on a junk `type` | app refuses to start and crashloops | the pre-flight audit runs first; the abort is one transaction, so schema and data are untouched; reverting the image is enough |
@@ -912,13 +948,14 @@ requires them — that second one is `docs/postgres-cutover.md`, not this spec.
 2. **Workstream 1**: `0003_api_token.sql`, `auth/pat.rs`, `/api/tokens`, the Access panel.
    Inert until someone mints a token.
 3. **Workstream 2**: `0004_agent_staged_batch.sql`, the staged-batch routes and the Access
-   screen's batch list, then the agent module — deployed with `AGENT_LISTEN` unset, so the
-   listener never binds and no MCP endpoint exists.
-4. Only then: set `AGENT_LISTEN`, expose the port, mint the first token, run the pi
-   acceptance test.
+   screen's batch list, then the agent module — deployed with `AGENT_MCP_MOUNT` unset, so the
+   route is not mounted and there is no MCP endpoint to reach.
+4. Only then: set `AGENT_MCP_MOUNT`, add the nginx `location /mcp`, mint the first token, run
+   the pi acceptance test.
 
-**Turning it off.** Unset `AGENT_LISTEN` and roll. The listener never binds, so the endpoint
-is absent rather than firewalled. Revoke every token in the Access screen. Staged-batch rows
+**Turning it off.** Unset `AGENT_MCP_MOUNT` and roll. The route is never mounted, so the
+endpoint is absent rather than firewalled; removing the nginx location is optional cleanup.
+Revoke every token in the Access screen. Staged-batch rows
 are inert data and may stay.
 
 **Rolling back.** Revert the image. Migrations are additive — `0003` and `0004` add tables,
@@ -927,13 +964,11 @@ exception worth stating: if it aborted, nothing changed; if it applied, revertin
 does not remove the `CHECK`, deliberately, because the constraint is correct on its own
 terms and does not travel back with the feature that motivated it.
 
-**Stop condition.** The stateless-mode spike has run and passed, so Workstream 2 does not stop
-on it. What it turns on is the operator's choice between two transports: this document is
-written against the second listener, and the in-Rocket mount is now the proven-cheaper
-alternative. If the mount is adopted, the transport subsection of Workstream 2, the k8s
-exposure step and the *Sessions* section are rewritten, and the bearer-token check moves into
-the route — which then needs a test of its own, because it no longer has a listener protecting
-it.
+**Stop condition.** None outstanding. The stateless-mode spike ran and passed, and the operator
+adopted the mount on 2026-11-19, so this document is written against it: Workstream 2's
+transport is `agent/mount.rs`, exposure is an nginx location beside `/api`, and there is no
+*Sessions* state to pin. The bearer-token check now lives in the route rather than in a socket,
+which is covered by a required test on both sides — see *Testing and gates*.
 
 ## Alternatives considered
 
@@ -945,8 +980,13 @@ it.
   be a second runtime in the image for the same reason.
 - **stdio transport.** Rejected for v1: the deployment is a remote cluster pod, and stdio
   serves a local client. See *Non-goals*.
-- **Mount inside Rocket rather than a second listener.** Not rejected — an open spike with a
-  named payoff. See *Verification items*.
+- **A second `hyper` listener in the same process.** Proven viable and then declined. It was
+  the original design, and the spike beat it: the mount removes the listener and its bind
+  logic, the direct `hyper`/`hyper-util` manifest entries, the new containerPort / Service
+  port / ingress path and its TLS decision, the open question of what a bind failure should
+  do, and any session-pinning concern. What it costs is that the bearer-token check moves from
+  a socket that cannot accept anything else into a route that must remember to check — so the
+  check is required, in one function, with a test on both sides.
 - **A nonce relayed to the agent as proof of approval.** Rejected: a code that travels
   through the model is evidence of nothing, because the model needing proof is the one
   holding it. The control is a state transition only a session cookie can cause.
@@ -965,8 +1005,8 @@ it.
 3. **Workstream 2** — `0004_agent_staged_batch.sql`, then the staged-batch `/api` routes and
    the Access screen's pending-batches list, which are prerequisites because nothing can be
    applied without them, then `agent/protocol.rs`, `agent/staging.rs`, `agent/tools.rs`,
-   `agent/listener.rs`.
-4. Enable `AGENT_LISTEN` in the cluster and mint the first token.
+   `agent/mount.rs`.
+4. Set `AGENT_MCP_MOUNT` and the nginx location in the cluster, and mint the first token.
 
 Workstream 0 is not MCP work at all — it is a live API behaviour change that MCP happens to
 depend on, which is why it ships as separate PRs rather than as part of the agent module.
@@ -999,11 +1039,8 @@ live data.
   document assumed: `legacy_session_mode` defaults to **true**, so statelessness is an explicit
   opt-in and a client negotiating a pre-`2026-07-28` version otherwise fails `500` against
   `NeverSessionManager`; and `#[tool_router]` without `#[tool_handler]` returns an empty tool
-  list under a perfectly healthy `200`. **Adopting the mount is an open operator decision.** It
-  removes the second listener, the `hyper`/`hyper-util` manifest entries, the k8s exposure work
-  and the `replicas: 1` session coupling — and it moves the bearer-token check from a listener
-  that structurally cannot accept anything else into a route that must remember to check, which
-  is a real weakening of the two-credential separation.
+  list under a perfectly healthy `200`. **Adopted 2026-11-19**: the mount is the design, and
+  the second listener is recorded in *Alternatives considered* as proven viable and declined.
 - Whether `catch_unwind` around a tool call is sufficient given `tokio` task panics, or
   whether the call must run in its own spawned task.
 - Whether any live row violates the `type` `CHECK` after normalization — the pre-flight

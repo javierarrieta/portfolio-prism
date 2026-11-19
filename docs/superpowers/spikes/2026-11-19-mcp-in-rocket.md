@@ -78,10 +78,15 @@ coupling — there is no session to keep sticky.
   started. The static gates that do not need it (`access_gate_test`, 8 tests) pass with rmcp
   added.
 
-## Decision this hands back
+## Decision — recorded 2026-11-19
 
-The mount is now the proven-cheaper option and the second listener is the fallback, which is
-the reverse of what the spec currently says. Choosing it rewrites Workstream 2's transport
-section and moves the auth obligation from "a listener that only accepts bearer tokens" to "a
-route that must check the token itself" — a real weakening of the structural guarantee, since
-the two-credential separation currently rests on two listeners rather than on code review.
+**Adopted.** The spec now describes the mount: `agent/mount.rs` instead of a listener, exposure
+as an nginx location beside `/api`, no session state, and the bearer-token check moved into the
+route with a required test on both sides. The second listener is recorded in the spec's
+*Alternatives considered* as proven viable and declined, so nobody rediscovers it and re-litigates
+it.
+
+The honest cost, restated: the mount moves the bearer-token check from a socket that structurally
+cannot accept anything else into a route that must remember to check. The half of the separation
+that mattered most — a PAT cannot touch the interactive `/api` surface, because those handlers
+never read an `Authorization` header — is untouched by the transport choice.
