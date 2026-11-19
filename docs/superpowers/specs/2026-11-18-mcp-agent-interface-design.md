@@ -151,7 +151,7 @@ implements any of them.
 
 ---
 
-## Workstream 0 — prerequisite: close the transaction-type and number boundary
+## Workstream 0 — prerequisites: transaction type, the number boundary, and the write seam
 
 Ships and deploys **before** the agent module, because it changes live API behaviour.
 
@@ -236,9 +236,36 @@ becoming a `Decimal`.
    unit per row is wrong on tax figures — and `scripts/check_migrations.sh` fails the build
    if any of those columns is not `text`. The fix is at the boundary, never in the storage
    type.
-5. **`asset_type` stays free text.** Same shape, but nothing computes on it — no engine
-   reads it. Constraining it now would be unrelated refactoring with a migration attached.
-   It gets a roadmap note.
+5. **`asset_type` stays free text.** Same shape, but no engine reads it. Bundle validation
+   and the bundle schema already constrain it (`backup/mod.rs:431-434`, `v1.json:6-15`),
+   which is the only reason that is safe. Constraining it now would be unrelated refactoring
+   with a migration attached. Add a roadmap entry to `AGENTS.md` → *Roadmap / Current
+   Focus*: `asset_type` is unconstrained at the database, and constraining it needs an
+   inventory of live values first.
+6. **Extract the shared write services.** This is the prerequisite the rest of the design
+   had assumed but never named. `services/` currently holds only `currency_service.rs`;
+   transaction and asset inserts live inline in `api_routes/transactions.rs`. Extract
+   `services::transactions::insert(pool, &mut tx, asset_id, &TxCreate)` from
+   `api_routes/transactions.rs:239-262` — type canonicalisation, the SPLIT quantity/price
+   rule (`:240-243`), fee zeroing for SPLIT (`:244`), the 1900-01-01 … 2100-01-01 bound
+   (`:248-252`), the INSERT (`:254-262`) — and `services::assets::insert(pool, &mut tx,
+   portfolio_id, &AssetCreate)` from `:31-96` (ISIN shape check, duplicate-ISIN conflict,
+   currency detection, INSERT). Both take `&mut tx`, so a caller can compose them inside one
+   transaction. The Rocket handlers call them with no behaviour change; `staging::apply`
+   calls them inside the same transaction as the single-use flip. They become the only code
+   in the repo that inserts a transaction or an asset outside `backup::restore`.
+
+   **Ship it as its own `refactor/` PR in this workstream.** It is independently
+   revertible, the existing suite is the proof it changed nothing, and Workstream 2 cannot
+   be built before it exists.
+
+   **Required check, in the same PR:** `check_backup_portability.sh` asserts that inserts
+   live in `src/backup/`. If the extraction moves any INSERT out of that directory, that
+   gate's coverage shrinks silently. The PR must show the gate's inspected-file list before
+   and after, and extend its scope to the new directory in the same commit if anything
+   moved. `check_access_gate.sh` is unaffected — Rule A is file-level and the handlers keep
+   their `require*` calls — but `tests/access_gate_test.rs:87` pins the inspected-handler
+   count, so any new route file moves that number too.
 
 Existing validation that the agent module **reuses rather than re-invents**: the SPLIT
 quantity/price rules and the 1900-01-01 … 2100-01-01 date bound already in
@@ -362,8 +389,9 @@ Contract flows the normal way: `utoipa` annotations, then
 - `staging.rs` — the staged-batch lifecycle: validate a proposal, persist it, hand out a
   handle, expire it, apply it. Owns `agent_staged_batch` and nothing else.
 - `tools.rs` — the `ServerHandler` and the `#[tool]` handlers. Each resolves its caller,
-  calls `require*` before touching a row, then calls the same `engines::` and
-  `services::` functions the Rocket handlers call.
+  calls `require*` before touching a row, then calls `services::` for writes (extracted in
+  Workstream 0, item 6) and `engines::` for reads. There is no second write path: if a tool
+  needs an INSERT and no `services::` function performs it, that function is written first.
 - `listener.rs` — binds the streamable-HTTP tower service on the second port at launch.
 
 Two things outside `agent/` are prerequisites, not follow-ups, because nothing can be applied
@@ -494,6 +522,13 @@ equals the pool's `statement_timeout` — and there would be no way to retry it.
 
 Follows `2026-11-16-import-preview-design.md`: exact totals always, display bounded,
 anomalies flagged and never blocking.
+
+Rendered by `backup::detail` and its `flag` codes, not by a second renderer with its own
+vocabulary: `staging` hands that module a one-portfolio sub-bundle and stores what comes
+back. The two genuinely new flags (`assumed_currency`, `duplicate_candidate`) are added to
+`detail::flag` rather than invented at the call site. If `detail_from_bundle` turns out to be
+coupled to whole-bundle shape, reuse its `PlanSide`/`PlanAsset` types and flag codes behind a
+thin adapter instead, and record that here rather than forking the vocabulary.
 
 Per portfolio: name, currency, asset count, transaction count, date span. Per security:
 symbol, ISIN, counts, span. An explicit **matched vs will-auto-create** split for assets.
@@ -651,10 +686,16 @@ like the other five gates.
   the published OpenAPI document and the mounted surface cannot drift apart.
 - **Workstream 0 tests**: the migration aborts on a junk `type` (proven by mutation), serde
   rejects an unknown type, and a restore bundle with a junk type is a `422` at preview
-  rather than a `CHECK` violation mid-restore.
+  rather than a `CHECK` violation mid-restore. The write-service extraction is proven by
+  the existing suite staying green — that is the whole point of landing it as its own
+  `refactor/` PR — plus one new assertion that the SPLIT rules and the date bound still
+  reject what they rejected before, so the seam cannot silently drop a validation on the way
+  out of the handler.
 - **End-to-end over the real transport**: rmcp's own client
   (`StreamableHttpClientTransport`) against the listener bound to an ephemeral port —
-  `initialize` → `tools/list` → `stage_import` → `apply_staged` → assert the rows exist.
+  `initialize` → `tools/list` → `stage_import` → approve through `/api` with a session →
+  `apply_staged` → assert the rows exist. The approval step is in the path, not skipped,
+  or the test proves a flow the product does not have.
   The only test that proves the tower-service wiring rather than the logic behind it.
 - **Golden preview fixture**: an anonymized broker statement → the preview JSON, asserting
   exact counts, spans and flags. Guards "exact totals are always exact".
@@ -677,19 +718,25 @@ from outside the cluster.
 
 ## Sequencing
 
-1. **Workstream 0** — `TxType`, the `CHECK` migration, the bundle-schema constraint,
-   money-as-string. Merge, deploy, confirm the live database passes the audit.
+1. **Workstream 0** — `TxType`; the `CHECK` migration with its audit script and abort test;
+   the frontend money-as-string migration; the backend strict deserializer, which cannot
+   merge before that frontend change is deployed; and the write-service extraction. Each is
+   its own PR.
 2. **Workstream 1** — `0003_api_token.sql`, `auth/pat.rs`, `api_routes/tokens.rs`, the
    Access panel.
-3. **Workstream 2** — `0004_agent_staged_batch.sql`, `agent/protocol.rs`,
-   `agent/staging.rs`, `agent/tools.rs`, `agent/listener.rs`, the agent gate script and its
-   mutation test.
+3. **Workstream 2** — `0004_agent_staged_batch.sql`, then the staged-batch `/api` routes and
+   the Access screen's pending-batches list, which are prerequisites because nothing can be
+   applied without them, then `agent/protocol.rs`, `agent/staging.rs`, `agent/tools.rs`,
+   `agent/listener.rs`.
 4. Enable `AGENT_LISTEN` in the cluster and mint the first token.
 
-Each workstream is independently shippable and independently revertible. Workstream 0 is
-not MCP work at all — it is a live API behaviour change that MCP depends on — and it may
-just as well be executed as its own plan and its own PR; nothing in Workstreams 1 or 2
-waits on it beyond the enum's existence.
+Workstream 0 is not MCP work at all — it is a live API behaviour change that MCP happens to
+depend on, which is why it ships as separate PRs rather than as part of the agent module.
+Workstream 2's plan is not started until three things are recorded in this document: the
+approval mechanism (above), the shared write service (Workstream 0, item 6), and the
+outcome of the stateless-mode spike in *Verification items*. Reverting Workstream 0 means
+dropping the `CHECK`; rows written after deploy are unaffected because the accepted set does
+not widen.
 
 ## Verification items to confirm during implementation
 
