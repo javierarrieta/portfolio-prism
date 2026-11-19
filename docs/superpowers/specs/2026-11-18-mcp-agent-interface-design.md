@@ -16,8 +16,12 @@ second HTTP listener inside the `backend_rust` process speaking MCP streamable H
 authenticated by a new scoped personal access token. There is no Node.js anywhere in the
 design, and nothing runs on the user's workstation.
 
-The agent is allowed to *propose*. It is not allowed to *silently write*. Every write goes
-through a staged batch that a human sees before it is applied.
+No agent tool call writes a row directly. Every agent write creates a staged batch, and a
+staged batch becomes a write only after a human has approved it in the web UI, over a
+session cookie. The agent can stage, re-render, discard, and — once a human has approved —
+apply. The backend cannot prove that a human read a preview, and this spec does not claim it
+does; it guarantees two things instead. The preview exists somewhere the agent did not
+write, and no token can move a batch out of `staged` on its own.
 
 ## Why this shape
 
@@ -45,10 +49,11 @@ fallen into:
 - An agent with a read-only token can answer "what is my realized gain in 2025?" and
   "which lots are oldest?" without any credential capable of writing a row.
 - An agent handed a broker statement can stage a full portfolio import, show a preview
-  that names what it holds, and apply it on confirmation — with exact counts, exact
-  decimal values, and duplicates flagged rather than silently dropped.
-- A staged batch cannot be applied twice, cannot be applied by the user who did not stage
-  it, and cannot be applied after it expires.
+  that names what it holds, and — after a human has approved that preview in the web UI —
+  apply it, with exact counts, exact decimal values, and duplicates flagged rather than
+  silently dropped.
+- A staged batch cannot be applied before a human approves it, cannot be applied twice,
+  cannot be applied by a different user, and cannot be applied after it expires.
 - A personal access token cannot call the interactive `/api` surface at all. Not denied by
   a scope check — structurally unable, because that surface never reads an
   `Authorization` header.
@@ -59,8 +64,8 @@ fallen into:
 
 1. Read access to portfolios, assets, transactions, tax summaries, the dated tax report,
    performance, and sell P&L, through MCP tools.
-2. Write access to portfolios, assets, and transactions, only through a staged batch with
-   a human-visible preview.
+2. Write access to portfolios, assets, and transactions, only through a staged batch that a
+   human has approved in the web UI.
 3. Bulk import of a full portfolio (portfolios, assets, transactions) from rows the agent
    normalized out of a broker statement, with the same preview discipline.
 4. Scoped, individually revocable credentials, self-service from the web UI.
@@ -81,7 +86,10 @@ fallen into:
   HTTP is a separate decision with its own spec.
 - **No MCP resources, prompts, sampling, or subscriptions.** Tools only.
 - **No multi-replica session sharing.** The session manager is in-memory; see *Sessions*.
-- **No UI panel for staged batches in v1.** The preview is read in the agent chat.
+- **No apply from the web UI.** The staged-batches screen lists batches and renders the
+  stored preview; its only write is the approval itself. The human does not edit rows there
+  and the browser never writes a portfolio row. The agent reads the preview in the chat
+  *and* in that screen — the screen is the copy the model did not write.
 - **No `asset_type` constraint.** See Workstream 0, item 5.
 
 ## Decisions and rationale
@@ -103,15 +111,18 @@ dependency. Rejected: a Rocket↔tower request adapter (hand-rolling SSE through
 rmcp's `Transport` trait (would mean owning protocol negotiation, session ids and SSE).
 
 **Two listeners, two credential types.** The Rocket API accepts only session cookies; the
-agent listener accepts only bearer tokens. Neither reads the other's header. This is what
-makes the staging gate non-bypassable: an agent cannot curl a raw write endpoint because
-the raw write endpoints do not look at bearer tokens. It also requires no change to the 21
+agent listener accepts only bearer tokens. Neither reads the other's header. An agent
+cannot call a write endpoint on `/api`, because those handlers do not look at bearer
+tokens — and by the same construction a human approval cannot be forged from the agent
+side, because `POST /api/staged-batches/<handle>/approve` is reachable only with a session
+cookie the agent never holds (see *The approval gate*). It also requires no change to the 21
 existing route handlers.
 
 **Staging is server-side state, not a client-side promise.** A staged batch is a row in
 Postgres holding the canonicalized payload and the rendered preview. A handle is an opaque
-random string, not the row id. The gate cannot be skipped by a client that chooses to, and
-it survives an MCP session dropping.
+random string, not the row id. A client cannot bypass the gate by omitting a step:
+`apply_staged` accepts only a handle whose row is `status='approved'`, and only a session
+cookie can put it there. It also survives an MCP session dropping.
 
 **Token expiry is opt-in, not mandatory.** Expiry protects against a forgotten credential
 sitting in a config file; it does nothing against the risk this feature actually creates,
@@ -221,9 +232,11 @@ Secret: `pp_` + 32 random bytes, base62. Stored as SHA-256 hex, returned exactly
 256 bits of entropy means there is no guessing attack, so no attempt throttling is added —
 stated so nobody adds one later.
 
-**Scopes:** `read`, `write`, `import`. No `backup` scope exists. `apply_staged` requires the
-scope matching the batch's kind, so a `read`-only token can preview an import and do
-nothing with it.
+**Scopes:** `read`, `write`, `import`. No `backup` scope exists. Scopes are a ceiling on
+what a token may do; they are not a record of who is sitting in front of it. The human step
+is the approval state, not a scope — see *The approval gate*. Staging requires `import`, so
+a `read`-only token cannot create a staged batch at all; there is deliberately no
+preview-only path that writes a row under a read credential.
 
 **Expiry** is enforced in `pat::lookup` with one comparison, the same shape as the session
 `exp` check already in `guard.rs`. Default at mint is no expiry. Enforced at lookup only:
@@ -296,6 +309,19 @@ Contract flows the normal way: `utoipa` annotations, then
   `services::` functions the Rocket handlers call.
 - `listener.rs` — binds the streamable-HTTP tower service on the second port at launch.
 
+Two things outside `agent/` are prerequisites, not follow-ups, because nothing can be applied
+without them:
+
+- `api_routes/staged_batches.rs` — the three session-authenticated routes in *The approval
+  gate*. Ordinary `/api` handlers: `AuthedUser`, a `require*` call before touching a row,
+  entries in the `lib.rs` mount list and the `openapi.rs` inventory, and the usual
+  `PROTECTED_ROUTES` and `check_access_gate.sh` obligations.
+- `frontend/src/components/StagedBatchesPanel.tsx` — the list, the rendered preview, and the
+  Approve button. It renders the stored `preview` JSONB; it does not recompute it, so what a
+  human reads is byte-for-byte what the agent was shown. Like `backup`, its view must render
+  outside the `currentPortfolio ? …` branch in `App.tsx`, or it is a blank page whenever no
+  portfolio is selected.
+
 Off by default: `listener.rs` binds only when `AGENT_LISTEN` is set, following the
 precedent at `lib.rs:268` where the OIDC routes are mounted only when there is a provider
 to talk to.
@@ -311,9 +337,11 @@ agent_staged_batch(
   payload    JSONB NOT NULL,              -- canonicalized proposal
   preview    JSONB NOT NULL,              -- what the human was shown
   status     TEXT NOT NULL DEFAULT 'staged'
-             CHECK (status IN ('staged','applied','discarded')),
+             CHECK (status IN ('staged','approved','applied','discarded')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL,
+  approved_at TIMESTAMPTZ,          -- the human act; NULL until a session approves
+  approved_by BIGINT,               -- users(id) of the session that approved it
   applied_at TIMESTAMPTZ
 )
 CREATE INDEX agent_staged_batch_user_status_idx ON agent_staged_batch (user_id, status);
@@ -321,14 +349,62 @@ CREATE INDEX agent_staged_batch_user_status_idx ON agent_staged_batch (user_id, 
 
 **Handle rules.** Bound to its `user_id`, and resolved through
 `access.rs::require_own_staged_batch` — a caller-supplied id resolving to a row goes
-through the chokepoint, same rule as tokens. TTL 60 minutes, checked lazily at apply;
-stale rows are swept when that user stages the next batch, so there is no cron.
+through the chokepoint, same rule as tokens. Lifetime: `AGENT_BATCH_TTL_MINUTES` (default
+60). `apply_staged` compares `expires_at` and rejects an expired handle. When a user stages
+a new batch, the same transaction deletes that user's rows with `status IN ('staged',
+'approved') AND expires_at < now()`. There is no scheduled job, so rows belonging to a user
+who never stages again remain until that user stages again.
 
-**Single use is a conditional update**:
-`UPDATE agent_staged_batch SET status='applied', applied_at=now() WHERE handle=$1 AND
-status='staged' RETURNING id`. Zero rows means already applied or expired. An agent that
-retries after a timeout cannot double-post, which is the failure mode that actually
-happens.
+### The approval gate
+
+The staging gate is a control only if the step that turns a proposal into a write is one the
+agent cannot perform. That step is therefore **not a scope**: a token holding a scope can
+use it whenever it likes, which is the hole a scope-shaped control leaves open. It is a state
+transition only a session cookie can cause.
+
+| Step | Surface | Credential | Effect |
+|---|---|---|---|
+| `stage_import` / `stage_edit` | agent listener | PAT with `import` | inserts a row at `status='staged'`, returns handle and preview |
+| `GET /api/staged-batches` | `/api` | session cookie | lists batches: handle, kind, counts, status, expiry |
+| `GET /api/staged-batches/<handle>` | `/api` | session cookie | renders the stored `preview` JSONB verbatim |
+| `POST /api/staged-batches/<handle>/approve` | `/api` | session cookie | `staged → approved`; records `approved_at`, `approved_by` |
+| `apply_staged` | agent listener | PAT with `import` | `approved → applied`, writes the rows |
+| `discard_staged` | agent listener | PAT with `import` | `→ discarded`; no approval required |
+
+Three consequences, stated here rather than discovered in implementation:
+
+- **The web UI never writes a portfolio row.** Its only write is the approval. That is what
+  the non-goal means, and it is why the screen is a prerequisite rather than a deferred
+  convenience: without it, nothing can ever be applied.
+- **No nonce is handed to the agent.** The agent does not carry a code relayed from the
+  human, because a code that travelled through the model is evidence of nothing. It calls
+  `apply_staged` and the server checks the row's state; the agent may poll `get_staged`
+  until it changes.
+- **Six new `/api` routes in total** — three token routes in Workstream 1, three
+  staged-batch routes here — move the cardinality pins in `tests/route_coverage_test.rs`
+  at `:169` and `:291` from 21 to 27, and `with_level` at `:304` from 15 to 18, counting
+  `GET /api/staged-batches/<handle>` and its `approve` as `Owner`-level and the list route
+  as level-less. `access.rs` also gains `require_own_staged_batch`, which widens its
+  documented remit beyond portfolio, asset and transaction; say so in its header.
+
+**Single use is a conditional update inside the write transaction**, not a step before it:
+
+```
+BEGIN;
+UPDATE agent_staged_batch
+   SET status='applied', applied_at=now()
+ WHERE handle=$1 AND user_id=$2 AND status='approved'
+ RETURNING id;
+-- zero rows: ROLLBACK, return already_applied (or not_approved / expired);
+-- nothing else in the transaction runs.
+<inserts>;
+COMMIT;
+```
+
+Carrying `user_id` in the same statement makes ownership and state transition one check.
+Committing the flip before the inserts would leave a batch marked `applied` with zero rows
+written if the write then failed — including on the 30-second per-call deadline, which
+equals the pool's `statement_timeout` — and there would be no way to retry it.
 
 ### Validation, deterministic and server-side
 
@@ -374,9 +450,9 @@ scale, an assumed currency. Display caps always read "showing 25 of 1,204".
 | `lookup_asset` | read | symbol / ISIN resolution, for normalizing before staging |
 | `stage_import` | import | the flagship, below |
 | `stage_edit` | write | batched create / update / delete of portfolios, assets, transactions |
-| `apply_staged` | matches batch kind | requires the batch's scope; destructive elements must be echoed back by name |
-| `discard_staged` | matches batch kind | |
-| `get_staged` | matches batch kind | re-renders a preview after a dropped MCP session |
+| `apply_staged` | import | writes a batch a session has already approved; returns `not_approved` until then |
+| `discard_staged` | import | discards without writing; no approval required |
+| `get_staged` | import | re-renders the stored preview, so the agent can report what a human approved |
 
 Every tool carries rmcp annotations (`readOnlyHint`, `destructiveHint`) so a client that
 honours them prompts independently of our own gate.
@@ -415,9 +491,12 @@ honours them prompts independently of our own gate.
   delete_transactions: [{id}] }
 ```
 
-Every id in it is caller-supplied and resolves through `access.rs`. Any delete must be
-echoed back by name in the `apply_staged` call, mirroring the reasoning behind
-`mode=replace`: an absent mode is a `422` because neither mode is safe to guess.
+Every id in it is caller-supplied and resolves through `access.rs`. Deletes are named
+explicitly in the stored preview — resource type, id, and the human-readable name or, for a
+transaction, its date, symbol and quantity — because the human approving the batch confirms
+against that rendering, not against a string the agent repeated back. The reasoning behind
+`mode=replace` still applies: an absent mode is a `422`, because guessing between two unsafe
+options is worse than refusing.
 
 ### Sessions
 
@@ -478,14 +557,23 @@ like the other five gates.
 - **`protocol.rs` deserialization**, table-driven: comma decimal rejected, JSON-number
   money rejected, unknown field rejected, `"DIVIDEND"` rejected, `01/02/2025` rejected,
   `"142.30"` round-trips to exactly `142.30`.
-- **`staging.rs` against a real database**: apply-twice returns `already_applied` and
-  writes nothing the second time; expired handle rejected; payload round-trip preserves
+- **`staging.rs` against a real database**: `apply_staged` before a session has approved
+  returns `not_approved` and writes nothing; apply-twice returns `already_applied` and
+  writes nothing the second time; expired handle rejected; a failed write after the flip
+  leaves the row `approved`, not `applied` — the rollback assertion that proves the flip and
+  the inserts are one transaction; payload round-trip preserves
   decimal scale byte-for-byte — assert the stored string equals the input string, which is
   the proof no float was ever involved. `tests/decimal_migration_test.rs` already asserts
   that invariant for the interactive write path; this is the same assertion for the agent
   path.
+- **The approval gate is the control, so it gets its own tests.** A bearer token cannot
+  reach the three `/api/staged-batches` routes at all (they are session-only, and this is
+  the mirror of the two-listener invariant); a session cannot approve a handle belonging to
+  another user; `approved_by` records the approving session's user and nothing else changes
+  it; and no agent tool exists that can set `status='approved'`.
 - **Extend `tests/isolation_test.rs`** with the agent tools: user B cannot apply A's
-  handle, stage into A's portfolio, or read A's preview through `get_staged`. The gate
+  handle, stage into A's portfolio, or read A's preview through `get_staged`; and user B's
+  session cannot approve A's handle. The gate
   script's own comments say the isolation matrix is the real gate, not the script.
 - **New gate `scripts/check_agent_gate.sh`**: every `#[tool]` handler takes the caller and
   calls `require*` before any row access. Necessary because `check_access_gate.sh` anchors
@@ -496,7 +584,8 @@ like the other five gates.
 - **PAT tests**: mint → lookup → revoke → lookup yields `None`; expired rejected; a
   deactivated user's token rejected; and the two-listener invariant tested directly — a
   request to `/api/portfolios/` carrying only an `Authorization` header is denied.
-- **`tests/route_coverage_test.rs`** gains the three token routes in `PROTECTED_ROUTES`, so
+- **`tests/route_coverage_test.rs`** gains the three token routes and the three
+  staged-batch routes in `PROTECTED_ROUTES`, so
   the published OpenAPI document and the mounted surface cannot drift apart.
 - **Workstream 0 tests**: the migration aborts on a junk `type` (proven by mutation), serde
   rejects an unknown type, and a restore bundle with a junk type is a `422` at preview
