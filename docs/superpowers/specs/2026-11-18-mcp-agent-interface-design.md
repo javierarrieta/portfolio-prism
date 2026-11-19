@@ -74,6 +74,8 @@ fallen into:
    working unchanged.
 6. The whole feature is off unless explicitly configured on. An existing deployment must
    not grow a public MCP endpoint by upgrading.
+7. The preview reaches the human complete. A preview that the client truncates in transit is
+   not a control — see *The client, and the preview's size budget*.
 
 ## Non-goals
 
@@ -532,9 +534,48 @@ thin adapter instead, and record that here rather than forking the vocabulary.
 
 Per portfolio: name, currency, asset count, transaction count, date span. Per security:
 symbol, ISIN, counts, span. An explicit **matched vs will-auto-create** split for assets.
-Anomaly list: unknown symbol, duplicate-looking row (same date + asset + type + quantity +
-price), currency differing from the portfolio base currency, future-dated, unusual price
-scale, an assumed currency. Display caps always read "showing 25 of 1,204".
+Anomaly list, each with a computable rule: `unknown_symbol` (no asset matches the ISIN, or
+the symbol plus currency, within the target); `duplicate_candidate` (same date, asset, type,
+quantity, price and fee as another row in this batch, compared as `Decimal`, never as
+strings); `currency_differs` (row currency differs from the portfolio base currency);
+`assumed_currency` (currency defaulted rather than supplied); `future_dated` (date later
+than today); `price_out_of_range` (price more than 10× above or 1/10 below the other rows of
+the same asset in this batch, and only when that asset has at least two other rows). When a
+list is truncated the label reads `showing 25 of 1,204`.
+
+### The client, and the preview's size budget
+
+The client is a coding agent, not a chat window. **pi** is the primary client and Hermes
+Agent the secondary. That is a hard constraint, because the preview *is* the human control
+surface and it travels through this software.
+
+pi's documented behaviour (`docs/mcp.md`):
+
+- **Text results over 20 KB reach the model with their middle removed**, around a
+  `…N chars truncated…` marker, with the full text written to a temporary file on the user's
+  disk. A preview larger than that is not a preview: the human reads a mangled version with
+  no signal that anything is missing. **The rendered preview therefore has a 16 KB budget**,
+  deliberately below the threshold. If a batch would exceed it, `stage_import` returns the
+  totals, the anomaly list, as many rows as fit, and the handle, with the instruction that
+  the complete preview is in the Access screen. This is a second, independent reason the
+  out-of-band copy exists: it is the only copy that cannot be truncated in transit.
+- Streamable HTTP only; the legacy SSE transport is **rejected** — an `sse` entry is
+  refused outright. That matches the stateless spike: `json_response(true)` keeps replies
+  plain JSON and nothing depends on a server-initiated stream.
+- Per-request `timeout` defaults to **60 seconds**, reset by progress notifications. The
+  server's 30-second per-call deadline stays deliberately below it, so the agent receives a
+  named server error rather than a client-side give-up. Do not raise the server deadline
+  above the client's.
+- Bearer tokens come from an environment variable or a header, which is exactly the PAT
+  model: `pi mcp add prism --url https://<host>/mcp --bearer-token-env-var PRISM_PAT`.
+- Tools register as `mcp__prism__<tool>`, and the default exposure is `codemode`, where
+  tools are not declared to the model but discovered by search. Tool descriptions therefore
+  carry the entire discovery burden — which is why `get_performance`'s description must name
+  the constants it does not measure rather than leave the model to notice.
+
+**Unverified for Hermes Agent:** whether it supports MCP at all, and if so its transport,
+timeout and truncation behaviour. Until that is checked the acceptance gate is a run against
+pi, and Hermes is an open item rather than an assumed-compatible client.
 
 ### Tool inventory
 
@@ -696,6 +737,11 @@ like the other five gates.
   `initialize` → `tools/list` → `stage_import` → approve through `/api` with a session →
   `apply_staged` → assert the rows exist. The approval step is in the path, not skipped,
   or the test proves a flow the product does not have.
+- **One run against the real client**, not only rmcp's test client:
+  `pi mcp add prism --url https://<host>/mcp --bearer-token-env-var PRISM_PAT`, then a full
+  import through it. Third-party clients are where transport assumptions break — pi rejects
+  the SSE transport outright and truncates results over 20 KB, neither of which a
+  same-vendor client would ever show.
   The only test that proves the tower-service wiring rather than the logic behind it.
 - **Golden preview fixture**: an anonymized broker statement → the preview JSON, asserting
   exact counts, spans and flags. Guards "exact totals are always exact".
@@ -767,3 +813,7 @@ live data.
   whether the call must run in its own spawned task.
 - Whether any live row violates the `type` `CHECK` after normalization — the pre-flight
   audit answers this before deploy, not after.
+- Whether Hermes Agent supports MCP at all, and if so its transport, per-request timeout and
+  output-truncation limit. The 16 KB preview budget is derived from pi's documented 20 KB; a
+  client that truncates lower lowers the budget with it. Do not declare a second client
+  supported before this is answered.
