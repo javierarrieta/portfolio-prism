@@ -17,6 +17,7 @@ pub mod access;
 pub mod report_csv;
 pub mod auth;
 pub mod backup;
+pub mod agent_spike;
 pub mod api_routes {
     pub mod portfolios;
     pub mod transactions;
