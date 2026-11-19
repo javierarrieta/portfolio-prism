@@ -29,7 +29,7 @@ build** — dev-dependencies of a dependency are not resolved downstream, verifi
 | Does the mount work at all? | Yes. `tests/agent_spike_test.rs` passes: 200, `application/json`, no `Mcp-Session-Id`, tool executed and returned `pong`. |
 | Is `tower ≥ 0.6` required? | **No — `tower` is not required at all.** rmcp needs `tower-service 0.3.3`, already in the lock. The spec's worry was about a crate it does not use. |
 | Does `schemars` pull a third copy? | No. It resolves to the `1.2.3` already in the lock. `cargo tree -d -e normal` reports **no duplicate versions** after adding rmcp. |
-| What does rmcp actually add? | ~10 lock entries (113 lines). Of its 15 normal dependencies, 14 were already present; only `unicode-general-category` is new. |
+| What does rmcp actually add? | **Eight new crates in `Cargo.lock`**: rmcp, rmcp-macros, chacha20, rand, pastey, sse-stream, unicode-general-category, futures-macro. `cargo tree -p rmcp -e normal --depth 1` lists 29 direct dependencies with the server features enabled (15 non-optional in its manifest); everything else was already in the lock. |
 | What must the manifest gain for the bridge? | `http`, `http-body-util`, `bytes`, `tower-service` — all small, all already in the lock at compatible versions. "rmcp is the only new dependency" was false; "rmcp plus four small already-present crates" is true. |
 | Is there a body cap? | Built in: `max_request_body_bytes` (default 4 MiB). The spec's 1 MiB is a config line, not code. |
 

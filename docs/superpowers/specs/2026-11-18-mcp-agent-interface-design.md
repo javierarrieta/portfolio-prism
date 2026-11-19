@@ -37,9 +37,12 @@ fallen into:
    `rmcp` is the official Rust SDK (`modelcontextprotocol/rust-sdk`), v3.11.0 as of
    2026-11-17, Apache-2.0, MSRV 1.88, implementing the `2026-07-28` spec revision. The
    local toolchain is `rustc 1.98.1`; the binding floor is the build image's
-   `rust:1.92-slim` (`backend_rust/Dockerfile:4`), which clears that MSRV. Cost:
-   `cargo tree -p rmcp -e normal` lists 43 direct dependencies, against the 449 packages
-   already in `backend_rust/Cargo.lock`, under the same lockfile and audit posture as the
+   `rust:1.92-slim` (`backend_rust/Dockerfile:4`), which clears that MSRV. Cost, measured on
+   the spike branch rather than estimated: `cargo tree -p rmcp -e normal --depth 1` lists 29
+   direct dependencies with the server features enabled, and adding rmcp introduces exactly
+   **eight** new crates into `Cargo.lock` — rmcp, rmcp-macros, chacha20, rand, pastey,
+   sse-stream, unicode-general-category, futures-macro. Everything else it needs was already
+   among the 449 packages in the lock, under the same lockfile and audit posture as the
    rest of the crate.
 3. **The chokepoint stays the chokepoint.** `access.rs` is the only module permitted to
    resolve a caller-supplied id, and `check_access_gate.sh` enforces it. Any design that
@@ -316,9 +319,9 @@ through to that same lookup, so a deactivated account loses its tokens for free.
 
 `AuthedUser` gains a `credential` field: `Credential::Session` or
 `Credential::Token { id, scopes }`. `require_scope(&caller, Scope::Import)` returns ok for a
-session credential, and for a token credential only when that scope is present. There are
-two scopes, `read` and `import`; the enum has no `Write` variant, because the agent creates
-rows and does nothing else.
+session credential, and for a token credential only when that scope is present. The scope set
+is defined once, in **Scopes** below; the enum has no `Write` variant, because the agent
+creates rows and does nothing else.
 
 ### Schema — `0003_api_token.sql`
 
@@ -343,7 +346,8 @@ the MCP route adds no attempt throttling; do not add throttling later without st
 reason in a new spec. Base62 changes only the encoded length (≈43 characters), not the
 entropy.
 
-**Scopes:** `read` and `import`. No `backup` scope exists, and there is no `write` scope:
+**Scopes** (authoritative — every other mention of the scope set means this one):
+`read` and `import`. No `backup` scope exists, and there is no `write` scope:
 the agent only ever creates rows, so `import` already covers every write it can attempt, and
 a third scope would name nothing. Scopes are a ceiling on what a token may do; they are not
 a record of who is sitting in front of it. The human step is the approval state, not a
@@ -469,8 +473,8 @@ CREATE INDEX agent_staged_batch_user_status_idx ON agent_staged_batch (user_id, 
 
 **Handle rules.** Bound to its `user_id`, and resolved through
 `access.rs::require_own_staged_batch` — a caller-supplied id resolving to a row goes
-through the chokepoint, same rule as tokens. Lifetime: `AGENT_BATCH_TTL_MINUTES` (default
-60). `apply_staged` compares `expires_at` and rejects an expired handle. When a user stages
+through the chokepoint, same rule as tokens. Lifetime: `AGENT_BATCH_TTL_MINUTES`, whose value
+lives in *Limits*. `apply_staged` compares `expires_at` and rejects an expired handle. When a user stages
 a new batch, the same transaction deletes that user's rows with `status IN ('staged',
 'approved') AND expires_at < now()`. There is no scheduled job, so rows belonging to a user
 who never stages again remain until that user stages again.
@@ -648,7 +652,7 @@ pi, and Hermes is an open item rather than an assumed-compatible client.
 |---|---|---|
 | `list_portfolios` | read | id, name, currency, asset and transaction counts |
 | `get_portfolio` | read | portfolio plus its assets with symbol / ISIN / currency |
-| `list_transactions` | read | filters: portfolio, asset, type, date range; paginated |
+| `list_transactions` | read | filters: portfolio, asset, type, date range; paginated, page size in *Limits* |
 | `get_tax_summary` | read | the tax summary, or the dated report with `from`/`to` |
 | `get_performance` | read | weekly value series and cumulative TWR — the published series is aggregated at `stats_engine.rs:317-320`, though its items still carry a field named `daily_return`. Volatility, Sharpe, beta **and** `realized_pnl` / `unrealized_pnl` are **not** measurements: `stats_engine.rs:108-110` and `:323-325` return constants on both paths. This tool omits the two P&L fields and its description names the three constants; realized gain is answered by `get_tax_summary`, not here |
 | `get_transaction_pnl` | read | the sell P&L breakdown |
@@ -731,7 +735,8 @@ JSON number is rejected here exactly as it is at `/api` after Workstream 0.
 
 `stage_import` is the **only** staging entry point. Single-row entry from a chat — "add a
 buy of 1.5 shares of NOC on 3 March" — is one `stage_import` call with one asset and one
-transaction; there is no separate `stage_edit` tool, and no update or delete path at all.
+transaction; there is no separate `stage_edit` tool, and the update-or-delete prohibition in
+*Non-goals* applies here as it does everywhere else.
 The payload carries exactly two caller-supplied ids: the target portfolio id in
 `target.existing`, and the staged-batch handle. Both resolve through `access.rs`, which is
 what keeps the `access.rs` surface and the gate script's job small.
@@ -793,8 +798,8 @@ named by index in the submitted payload, not by internal id.
 
 **Fault isolation must be paid for explicitly.** The MCP route runs in the same process as
 the API, so a panic in a tool handler would take the whole application down, not just the
-MCP call. Every tool call is wrapped in `catch_unwind` with a 30-second per-call
-deadline — so a hung pricing lookup cannot wedge a request — and the route survives
+MCP call. Every tool call is wrapped in `catch_unwind` with the per-call deadline from *Limits*
+— so a hung pricing lookup cannot wedge a request — and the route survives
 both. This is the price of the in-process decision; it is cheap to pay knowingly and
 expensive to discover.
 
@@ -899,19 +904,20 @@ exist, and a limit in this table is not enforced anywhere else.
 | Limit | Value | Why this value | Enforced where |
 |---|---|---|---|
 | Rows per staged batch | 500 | A real batch is 20–40 rows; 500 is a full history for a large portfolio, and it bounds the JSONB row and the preview | `staging::validate`, before insert |
+| Assets per staged batch | 50 | Twenty assets is the real largest portfolio; 50 leaves room for a year of new holdings without letting a malformed payload allocate freely | `staging::validate`, before insert |
 | Pending batches per user | 5 | Stops abandoned batches accumulating rows; a legitimate user does not have six imports in flight | `staging::stage`, same transaction as the insert |
 | Batch lifetime | `AGENT_BATCH_TTL_MINUTES`, default 60 | A human approves in the same sitting or the batch is stale | `expires_at`, compared in `apply_staged` |
 | Request body | 1 MiB | Bounds memory per call against the container's 256 Mi limit. Enforced twice, deliberately: `Data::open(1.mebibytes())` at the route — Rocket's default `bytes` limit is **8 KiB** and would otherwise reject a legitimate import long before 1 MiB — and rmcp's own `max_request_body_bytes` (default 4 MiB) inside the service | `agent/mount.rs`, then rmcp |
 | Per-call deadline | 30 s | Deliberately below pi's 60 s client timeout, so the agent gets a named server error | `tokio::time::timeout` around the handler |
 | Preview payload | 16 KB | pi truncates results over 20 KB by removing the middle | measured on the rendered string, before the response is built |
-| Display caps | 25 portfolios, 50 assets | Existing constants in `backup::detail`; reused, not reinvented | `backup::detail` |
+| Preview display caps | 25 portfolios, 50 assets shown before "showing 25 of 1,204" | Existing constants in `backup::detail`; reused, not reinvented. **Unrelated to the 50-asset input cap above** — the coincidence of number is accidental and the two must not be merged | `backup::detail` |
 | Pool | `max_connections(5)`, `acquire_timeout` 5 s, `statement_timeout` 30 s (`db.rs:20,44,70`) | **Unchanged on purpose.** The agent shares the existing pool; raising it is a separate decision with its own trade-offs | `db.rs`, existing |
 | List page size | 100 default, 500 max | Keeps a read response under the same client truncation limit the preview has to respect | `agent::tools`, every listing tool |
 | Model token budget | not enforceable here | The server sees one `tools/call`, not the agent's context | client side; out of scope |
 
 **No rate limiter in v1.** The bounds above cap storage and memory, which is all a
 normally-working agent can grow. A runaway loop is a different failure: it costs pool
-connections and CPU, and the container is `cpu: 500m / memory: 256Mi` with `replicas: 1`.
+connections and CPU, and the container is `cpu: 500m / memory: 256Mi` on a single replica.
 The answer is named rather than built: revoke the token in the Access screen, which
 Workstream 1 already provides, and if a loop is ever actually observed, add a per-token
 token bucket then. Throttling for a loop that has not happened, on a single-user
