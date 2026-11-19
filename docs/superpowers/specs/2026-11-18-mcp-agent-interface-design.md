@@ -137,10 +137,12 @@ means adding them to the manifest with the features the transport needs, at what
 versions its resolution forces; whether `rmcp` needs `tower` ≥ 0.6 is a verification item,
 not an assumption. Rejected: hand-writing the streamable-HTTP transport on rmcp's
 `Transport` trait, which would mean owning protocol negotiation, session ids and SSE.
-Mounting the tower service inside Rocket is **not** rejected — see *Verification items*. The
-grounds this document originally gave for rejecting it (hand-rolling SSE through a Rocket
-`Responder`) do not apply: `2026-07-28` clients are served statelessly, and
-`json_response(true)` replies with a plain JSON body.
+Mounting the tower service inside Rocket is **not** rejected — and the spike that asked the
+question has since run and passed, so it is now the cheaper proven option awaiting a decision;
+see *Verification items* and `../spikes/2026-11-19-mcp-in-rocket.md`. The grounds this document
+originally gave for rejecting it (hand-rolling SSE through a Rocket `Responder`) do not apply:
+`2026-07-28` clients are served statelessly, and `json_response(true)` replies with a plain
+JSON body.
 
 **Two listeners, two credential types.** The Rocket API accepts only session cookies; the
 agent listener accepts only bearer tokens. Neither reads the other's header. An agent
@@ -925,9 +927,13 @@ exception worth stating: if it aborted, nothing changed; if it applied, revertin
 does not remove the `CHECK`, deliberately, because the constraint is correct on its own
 terms and does not travel back with the feature that motivated it.
 
-**Stop condition.** If the stateless-mode spike fails, Workstream 2 stops and returns to this
-document. The second-listener design is the fallback that the spike must beat, not an
-assumption to discover late.
+**Stop condition.** The stateless-mode spike has run and passed, so Workstream 2 does not stop
+on it. What it turns on is the operator's choice between two transports: this document is
+written against the second listener, and the in-Rocket mount is now the proven-cheaper
+alternative. If the mount is adopted, the transport subsection of Workstream 2, the k8s
+exposure step and the *Sessions* section are rewritten, and the bearer-token check moves into
+the route — which then needs a test of its own, because it no longer has a listener protecting
+it.
 
 ## Alternatives considered
 
@@ -980,21 +986,24 @@ live data.
   and the `StreamableHttpServerConfig` fields for stateful mode and SSE keep-alive.
 - Whether `hyper-util`'s `TowerToHyperService` composes with the `hyper 1.10.1` already in
   the lockfile without a version bump, or whether `rmcp` requires a newer `hyper`.
-- Whether rmcp's `schemars` integration resolves to the 1.2.3 already in the lock. The lock
-  carries **two** versions today — 0.9.0 (`Cargo.lock:2867`, via utoipa 4.2) and 1.2.3
-  (`:2879`) — against `Cargo.toml:20`'s `schemars = "1.0"`. A third copy is a blocker for
-  the PR.
-- Whether `rmcp` builds against `tower 0.5.3`, the version in the lock, or requires 0.6, and
-  whether `hyper` / `hyper-util` need bumping.
-- **Spike, before Workstream 2 is planned:** can `StreamableHttpService` be mounted as a
-  Rocket route in stateless mode? Bridge one POST (method, URI, headers, buffered body in;
-  status, headers, bytes out) with `legacy_session_mode(false)` and `json_response(true)`,
-  and drive it with rmcp's own client through `initialize` → `tools/list` → one tool call.
-  Adopt it only if there is no SSE and no `Mcp-Session-Id` anywhere, the adapter stays in one
-  bounded file, `AuthFairing`'s prefix rule (`auth/fairing.rs:40`) needs no exemption, and
-  `tests/route_coverage_test.rs:181 PUBLIC_NAMESPACES` admits the namespace by explicit
-  amendment. If it lands, the second listener, its direct `hyper`/`tower` manifest entries,
-  the k8s exposure work and the `replicas: 1` session coupling all disappear.
+- **RESOLVED — rmcp's `schemars` resolves to the 1.2.3 already in the lock.** The lock carries
+  two versions today (0.9.0 at `Cargo.lock:2867` via utoipa 4.2, and 1.2.3 at `:2879`) against
+  `Cargo.toml:20`'s `schemars = "1.0"`; adding rmcp introduces no third, and
+  `cargo tree -d -e normal` reports no duplicate versions at all.
+- **RESOLVED — `tower` is not required.** rmcp needs `tower-service 0.3.3`, already present.
+  The question of `tower 0.5.3` versus `0.6` was about a crate rmcp does not use.
+- **RESOLVED — the in-Rocket mount works.** Run 2026-11-19 on branch `spike/mcp-in-rocket`;
+  full result in `../spikes/2026-11-19-mcp-in-rocket.md`. A Rocket route served
+  `initialize` → `tools/list` → `tools/call` with a plain JSON body and no `Mcp-Session-Id`,
+  in roughly 120 lines, with no axum and no hyper in the tree. Two corrections to what this
+  document assumed: `legacy_session_mode` defaults to **true**, so statelessness is an explicit
+  opt-in and a client negotiating a pre-`2026-07-28` version otherwise fails `500` against
+  `NeverSessionManager`; and `#[tool_router]` without `#[tool_handler]` returns an empty tool
+  list under a perfectly healthy `200`. **Adopting the mount is an open operator decision.** It
+  removes the second listener, the `hyper`/`hyper-util` manifest entries, the k8s exposure work
+  and the `replicas: 1` session coupling — and it moves the bearer-token check from a listener
+  that structurally cannot accept anything else into a route that must remember to check, which
+  is a real weakening of the two-credential separation.
 - Whether `catch_unwind` around a tool call is sufficient given `tokio` task panics, or
   whether the call must run in its own spawned task.
 - Whether any live row violates the `type` `CHECK` after normalization — the pre-flight
