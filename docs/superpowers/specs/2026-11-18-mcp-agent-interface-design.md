@@ -641,17 +641,50 @@ pi, and Hermes is an open item rather than an assumed-compatible client.
 | `discard_staged` | import | discards without writing; no approval required |
 | `get_staged` | import | re-renders the stored preview, so the agent can report what a human approved |
 
-Every tool sets `readOnlyHint`; none sets `destructiveHint`, because no agent tool deletes
-anything. A client that honours the annotations prompts on its own; the server-side gate
-does not depend on it.
+The three tools that change state — `stage_import`, `apply_staged`, `discard_staged` — set
+`readOnlyHint: false`; the rest set it true. None sets `destructiveHint`, because no agent
+tool deletes anything. A client that honours the annotations prompts on its own; the
+server-side gate does not depend on it.
 
 ### `stage_import`
 
+```json
+{
+  "target": { "kind": "new", "name": "Depot", "base_currency": "EUR" },
+  "assets": [
+    {
+      "symbol": "IWDA",
+      "isin": "IE00B4L5Y983",
+      "name": "iShares Core MSCI World",
+      "asset_type": "ETF",
+      "currency": "EUR",
+      "transactions": [
+        { "type": "BUY", "date": "2024-03-01",
+          "quantity": "1.5", "price": "82.3400", "fee": "0.00" }
+      ]
+    }
+  ]
+}
 ```
-{ target: { new: {name, base_currency} } | { existing: <portfolio_id> },
-  assets: [ { symbol, name?, isin?, asset_type, currency?,
-              transactions: [ { type, date, quantity, price, fee } ] } ] }
+
+The shape is the contract, so it maps to serde without interpretation:
+
+```rust
+#[serde(tag = "kind", rename_all = "lowercase", deny_all_fields)]
+enum Target {
+    New      { name: String, base_currency: String },
+    Existing { portfolio_id: i64 },
+}
 ```
+
+Internally tagged with a `kind` discriminator — one field, no ambiguity for the client, and
+`deny_unknown_fields` on every struct so a misspelled key is an error rather than a silently
+dropped value. `Existing` carries `portfolio_id` and nothing else; `New` carries name and
+currency and no id. `base_currency` and `asset_type` are required, `isin` and `name` and
+`currency` optional; `transactions` must hold at least one row, because an asset with no
+transactions has nothing to import and its presence is a mistake worth naming. `type` is
+`TxType`, `date` is strict `YYYY-MM-DD`, and `quantity`, `price` and `fee` are strings — a
+JSON number is rejected here exactly as it is at `/api` after Workstream 0.
 
 - **New versus merge.** `target.new` creates the portfolio. `target.existing` merges, and
   there exact-duplicate rows are listed in the preview and skipped on apply. This is **new
@@ -668,9 +701,13 @@ does not depend on it.
   assets auto-create. Currency defaults to the portfolio's `base_currency` and the preview
   flags the assumption — deliberately different from the browser importer, which hardcodes
   USD, and wrong for a EUR statement.
-- **Hard caps.** 25 portfolios, 200 assets, 5,000 transactions per stage, rejected with a
-  named error rather than streamed. Not hypothetical: this deployment's proxy already
-  refused one oversized body (`af17064`).
+- **Hard caps.** 50 assets and 500 transactions per batch, from *Limits* — checked in
+  `staging::validate` before anything is inserted, and rejected with a named error rather
+  than streamed. An earlier draft said 200 assets and 5,000 transactions, which cannot be
+  reconciled with the 16 KB preview budget, and listed a 25-portfolio cap this payload cannot
+  even express: a batch targets exactly one portfolio. That a body limit is needed at all is
+  not hypothetical — this deployment's proxy already refused one oversized bundle
+  (`af17064`).
 - **Apply.** Re-validates — the target portfolio may have been deleted between stage and
   apply — then writes in one Postgres transaction, all or nothing, and returns the created
   portfolio ids, asset ids and transaction count.
@@ -678,8 +715,9 @@ does not depend on it.
 `stage_import` is the **only** staging entry point. Single-row entry from a chat — "add a
 buy of 1.5 shares of NOC on 3 March" — is one `stage_import` call with one asset and one
 transaction; there is no separate `stage_edit` tool, and no update or delete path at all.
-The payload therefore carries no caller-supplied row ids except the staged-batch handle,
-which is what keeps the `access.rs` surface and the gate script's job small.
+The payload carries exactly two caller-supplied ids: the target portfolio id in
+`target.existing`, and the staged-batch handle. Both resolve through `access.rs`, which is
+what keeps the `access.rs` surface and the gate script's job small.
 
 ### Sessions
 
@@ -706,18 +744,25 @@ payload), never a JSON-RPC error: a protocol-level error can tear down the sessi
 "row 47 has a comma in the price" is content the model should read and act on. JSON-RPC
 errors are reserved for malformed protocol.
 
-Payload shape, defined once in `protocol.rs`:
+Payload shape, defined once in `protocol.rs` — this is the authoritative list of codes, and
+wherever this document names one in prose it means the code in this list:
 
-```
-{ error: { code, message, row?, field?, hint? } }
+```json
+{ "error": {
+    "code": "non_canonical_decimal",
+    "message": "assets[0].transactions[3].price must be a decimal string",
+    "field": "assets[0].transactions[3].price",
+    "hint": "expected a decimal string such as \"82.34\"; the value contains a comma — if the source uses a decimal comma, replace it with a period before sending"
+} }
 ```
 
-Stable codes: `non_canonical_decimal`, `unknown_transaction_type`, `unknown_asset`,
-`portfolio_not_found`, `stale_handle`, `already_applied`, `scope_missing`,
-`batch_too_large`. `hint` exists because the consumer retries — `"money must be a string:
-\"142.30\", not 142.3"` stops the thrashing a bare 422 causes. `already_applied` and
-`stale_handle` are distinct because the model's correct response differs: report success
-versus re-stage.
+`field` is a path into the submitted payload, never an internal id. Stable codes:
+`non_canonical_decimal`, `unknown_transaction_type`, `unknown_asset`, `portfolio_not_found`,
+`not_approved`, `stale_handle`, `expired`, `already_applied`, `scope_missing`,
+`batch_too_large`. `hint` exists because the consumer retries — the text above stops the
+thrashing a bare 422 causes. `already_applied`, `not_approved` and `expired` are distinct
+codes because the model's correct response differs for each: report success, wait for the
+human, re-stage.
 
 Never leaked: SQL text, stack traces, another user's data. Rows that do not exist yet are
 named by index in the submitted payload, not by internal id.
@@ -825,6 +870,7 @@ exist, and a limit in this table is not enforced anywhere else.
 | Preview payload | 16 KB | pi truncates results over 20 KB by removing the middle | measured on the rendered string, before the response is built |
 | Display caps | 25 portfolios, 50 assets | Existing constants in `backup::detail`; reused, not reinvented | `backup::detail` |
 | Pool | `max_connections(5)`, `acquire_timeout` 5 s, `statement_timeout` 30 s (`db.rs:20,44,70`) | **Unchanged on purpose.** The agent shares the existing pool; raising it is a separate decision with its own trade-offs | `db.rs`, existing |
+| List page size | 100 default, 500 max | Keeps a read response under the same client truncation limit the preview has to respect | `agent::tools`, every listing tool |
 | Model token budget | not enforceable here | The server sees one `tools/call`, not the agent's context | client side; out of scope |
 
 **No rate limiter in v1.** The bounds above cap storage and memory, which is all a
