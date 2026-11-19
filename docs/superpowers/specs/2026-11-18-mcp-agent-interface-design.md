@@ -94,8 +94,14 @@ for volume that does not exist yet is out of scope on the same argument that rem
   `backup` scope, so it is not a policy an agent can forget — it is a capability that
   cannot be minted. `restore` with `mode=replace` deletes everything a user owns and stays
   in the web UI.
-- **No broker-statement parser.** No CSV dialect mapping, no PDF extraction. The agent
-  supplies structured rows.
+- **No broker-statement parser, and no knowledge of statement formats.** No CSV dialect
+  mapping, no PDF extraction, no per-broker configuration, no encoding sniffing, no date-format
+  auto-detection. The boundary is total: **the client owns turning a statement into rows; the
+  server owns saying precisely what a valid row is.** A broker's column names, decimal comma
+  and `DD.MM.YYYY` dates are the agent's problem. Giving the server a second normalization
+  path would create two places where a number can be wrong, and the one nobody is reviewing.
+  What the server owes the agent instead is a schema that cannot be guessed at and errors that
+  can be acted on — see *What the server owes the agent*.
 - **No stdio transport.** Streamable HTTP only. A stdio shim for clients that cannot speak
   HTTP is a separate decision with its own spec.
 - **No MCP resources, prompts, sampling, or subscriptions.** Tools only.
@@ -539,6 +545,29 @@ equals the pool's `statement_timeout` — and there would be no way to retry it.
   which is a behaviour change to call out in that PR. A bad ISIN is a named rejection,
   not a silently unmatched asset.
 
+### What the server owes the agent
+
+Dropping format knowledge on the client side is only safe if the server's side of that
+boundary is exact. Three obligations, all cheap:
+
+- **The schema cannot be guessed at.** Field names, strict types, required-versus-optional
+  spelled out, and one complete worked example inside the tool description. In pi the default
+  exposure is `codemode`, so the description is often the only documentation the model ever
+  sees; a field whose meaning lives in a wiki page is a field that will be sent wrong.
+- **Every rejection is actionable in one turn.** The message names the field, states the
+  expected form, and states the fix — because the agent gets one round trip to correct before
+  a human sees a failure instead of a preview. `"invalid string"` is a defect even when the
+  status code is right. For the decimal case specifically: *expected a decimal string such as
+  `"1234.56"`; the value contains a comma — if the source uses a decimal comma, replace it
+  with a period before sending*. Same rule for a bare date, an unknown type, and an ISIN that
+  fails its checksum.
+- **Say what the server cannot catch.** A misparse that is *well-formed* — `1.234,56` read as
+  `1.23` — passes the strict decimal rule, the date rule and every other check, because the
+  bytes are valid. Nothing server-side detects it. The only control is a human reading the
+  rendered preview, which is a real control at 40 rows where every row is visible and a weak
+  one at 1,200 rows where they are not. That is the honest limit of "the model normalizes", and
+  it is stated here rather than left for someone to discover.
+
 ### The preview
 
 Follows `2026-11-16-import-preview-design.md`: exact totals always, display bounded,
@@ -780,6 +809,98 @@ Out of scope for tests, stated: a real OIDC provider (already manual, per
 `k8s/configmap.yaml` gains no `AGENT_LISTEN`; enabling the feature is an explicit operator
 edit, and the ingress needs a route for the second port before the endpoint is reachable
 from outside the cluster.
+
+## Limits
+
+Every bound this design imposes, in one place. A limit that is not in this table does not
+exist, and a limit in this table is not enforced anywhere else.
+
+| Limit | Value | Why this value | Enforced where |
+|---|---|---|---|
+| Rows per staged batch | 500 | A real batch is 20–40 rows; 500 is a full history for a large portfolio, and it bounds the JSONB row and the preview | `staging::validate`, before insert |
+| Pending batches per user | 5 | Stops abandoned batches accumulating rows; a legitimate user does not have six imports in flight | `staging::stage`, same transaction as the insert |
+| Batch lifetime | `AGENT_BATCH_TTL_MINUTES`, default 60 | A human approves in the same sitting or the batch is stale | `expires_at`, compared in `apply_staged` |
+| Request body | 1 MiB | Bounds memory per call against the container's 256 Mi limit | listener, before deserialization |
+| Per-call deadline | 30 s | Deliberately below pi's 60 s client timeout, so the agent gets a named server error | `tokio::time::timeout` around the handler |
+| Preview payload | 16 KB | pi truncates results over 20 KB by removing the middle | measured on the rendered string, before the response is built |
+| Display caps | 25 portfolios, 50 assets | Existing constants in `backup::detail`; reused, not reinvented | `backup::detail` |
+| Pool | `max_connections(5)`, `acquire_timeout` 5 s, `statement_timeout` 30 s (`db.rs:20,44,70`) | **Unchanged on purpose.** The agent shares the existing pool; raising it is a separate decision with its own trade-offs | `db.rs`, existing |
+| Model token budget | not enforceable here | The server sees one `tools/call`, not the agent's context | client side; out of scope |
+
+**No rate limiter in v1.** The bounds above cap storage and memory, which is all a
+normally-working agent can grow. A runaway loop is a different failure: it costs pool
+connections and CPU, and the container is `cpu: 500m / memory: 256Mi` with `replicas: 1`.
+The answer is named rather than built: revoke the token in the Access screen, which
+Workstream 1 already provides, and if a loop is ever actually observed, add a per-token
+token bucket then. Throttling for a loop that has not happened, on a single-user
+deployment, is the same speculative volume the rest of this document refuses.
+
+## Failure modes
+
+| Failure | Effect | Containment |
+|---|---|---|
+| Tool handler panics | `catch_unwind` at the dispatch boundary turns it into a tool error; the listener survives | that call only; a panic inside a write transaction drops it, so it rolls back |
+| Pool exhausted by agent calls | web UI requests queue, then fail `acquire_timeout` after 5 s | the 30 s deadline bounds how long one call can hold a connection; revoke the token. This is the cost of sharing a process and no flag removes it |
+| Pod restarts mid-batch | staged rows survive — they are rows in Postgres; an in-flight apply is one transaction, so it either happened or did not | stateless mode means the client simply POSTs again; see *Verification items* |
+| Migration `0002` aborts on a junk `type` | app refuses to start and crashloops | the pre-flight audit runs first; the abort is one transaction, so schema and data are untouched; reverting the image is enough |
+| `apply_staged` called twice | second call's flip matches zero rows | returns `already_applied`, writes nothing |
+| Approved but never applied | batch sits at `approved` | expires at TTL, shows as stale in the Access screen, purged on that user's next stage |
+| Postgres unreachable | agent gets a named internal error | the guard's `Err` path stays distinct from a denial, so an outage never looks like a permissions problem |
+| Token leaks | attacker holds a live credential until revoked | hashed at rest, so a database dump yields nothing usable; revocation takes effect on the next call |
+| Rows staged into the wrong portfolio | — | `access.rs` limits resolution to the caller's own portfolios, and the preview names the target before apply |
+| Model misparses a figure into valid bytes | nothing server-side catches it | a human reading the preview is the only control; see *What the server owes the agent* |
+| Client truncates the preview | the human approves a partial document | the 16 KB budget makes this structurally impossible for pi; over budget the tool points at the Access screen |
+
+## Rollout and rollback
+
+Order matters in exactly two places: the frontend money change must deploy before the backend
+that rejects numbers, and the cluster database objects must exist before the image that
+requires them — that second one is `docs/postgres-cutover.md`, not this spec.
+
+1. **Workstream 0**, as separate PRs: the write-service extraction (no behaviour change) →
+   the frontend money-as-string change → deploy it → the backend strict deserializer →
+   `TxType` plus migration `0002`, run only after `audit_transaction_types.sh` passes
+   against the live database.
+2. **Workstream 1**: `0003_api_token.sql`, `auth/pat.rs`, `/api/tokens`, the Access panel.
+   Inert until someone mints a token.
+3. **Workstream 2**: `0004_agent_staged_batch.sql`, the staged-batch routes and the Access
+   screen's batch list, then the agent module — deployed with `AGENT_LISTEN` unset, so the
+   listener never binds and no MCP endpoint exists.
+4. Only then: set `AGENT_LISTEN`, expose the port, mint the first token, run the pi
+   acceptance test.
+
+**Turning it off.** Unset `AGENT_LISTEN` and roll. The listener never binds, so the endpoint
+is absent rather than firewalled. Revoke every token in the Access screen. Staged-batch rows
+are inert data and may stay.
+
+**Rolling back.** Revert the image. Migrations are additive — `0003` and `0004` add tables,
+`0002` adds a `CHECK` — so an older image runs against the newer schema. `0002` is the
+exception worth stating: if it aborted, nothing changed; if it applied, reverting the image
+does not remove the `CHECK`, deliberately, because the constraint is correct on its own
+terms and does not travel back with the feature that motivated it.
+
+**Stop condition.** If the stateless-mode spike fails, Workstream 2 stops and returns to this
+document. The second-listener design is the fallback that the spike must beat, not an
+assumption to discover late.
+
+## Alternatives considered
+
+- **Separate process or sidecar.** Rejected by decision: the server is a module of the
+  existing backend. A sidecar would isolate the pool and the panic surface at the cost of a
+  second deployment, a second health check, and a second place where `access.rs` could be
+  bypassed.
+- **TypeScript or Python SDK.** Rejected: no Node in the backend runtime, and Python would
+  be a second runtime in the image for the same reason.
+- **stdio transport.** Rejected for v1: the deployment is a remote cluster pod, and stdio
+  serves a local client. See *Non-goals*.
+- **Mount inside Rocket rather than a second listener.** Not rejected — an open spike with a
+  named payoff. See *Verification items*.
+- **A nonce relayed to the agent as proof of approval.** Rejected: a code that travels
+  through the model is evidence of nothing, because the model needing proof is the one
+  holding it. The control is a state transition only a session cookie can cause.
+- **A separate `write` scope gating apply.** Rejected: it would force a second token or a
+  second agent onto the confirm step, ruled out on ergonomics. The approval gate gets the
+  same separation without a second credential.
 
 ## Sequencing
 
