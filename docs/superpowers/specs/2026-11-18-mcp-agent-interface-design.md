@@ -33,11 +33,12 @@ fallen into:
    reason the write path is staged: a model that misreads `1.5` as `15` produces a
    *plausible* portfolio and a wrong tax report, and nothing downstream would notice.
    The deterministic gate therefore sits **after** the model, in the backend.
-2. **No Node.** The concern is supply-chain exposure and install-time code execution, the
-   npm incident class that bites hardest. `rmcp` is the official Rust SDK
-   (`modelcontextprotocol/rust-sdk`), v3.11.0 as of 2026-11-17, Apache-2.0, MSRV 1.88,
-   implementing the `2026-07-28` spec revision. The toolchain here is `rustc 1.98.1`.
-   Its cost is honest and bounded: ~43 direct dependencies, against the 449 packages
+2. **No Node.** The concern is supply-chain exposure and code execution at install time.
+   `rmcp` is the official Rust SDK (`modelcontextprotocol/rust-sdk`), v3.11.0 as of
+   2026-11-17, Apache-2.0, MSRV 1.88, implementing the `2026-07-28` spec revision. The
+   local toolchain is `rustc 1.98.1`; the binding floor is the build image's
+   `rust:1.92-slim` (`backend_rust/Dockerfile:4`), which clears that MSRV. Cost:
+   `cargo tree -p rmcp -e normal` lists 43 direct dependencies, against the 449 packages
    already in `backend_rust/Cargo.lock`, under the same lockfile and audit posture as the
    rest of the crate.
 3. **The chokepoint stays the chokepoint.** `access.rs` is the only module permitted to
@@ -110,11 +111,17 @@ reshaped it as `StreamableHttpService` specifically so it works with any tower-c
 server, and PR #642 then removed the axum dependency because axum was never used. Rocket
 0.5 is not tower-based. The chosen realization is a **second listener in the same
 process**: at launch, spawn a `hyper` server on a second port serving the tower service.
-`hyper 1.10.1`, `hyper-util 0.1.20`, `tower 0.6.11` and `http 1.4.2` are already in
-`Cargo.lock` via reqwest, so **no new HTTP framework is added** — `rmcp` is the only new
-dependency. Rejected: a Rocket↔tower request adapter (hand-rolling SSE through a Rocket
-`Responder` fights the framework) and hand-writing the streamable-HTTP transport on
-rmcp's `Transport` trait (would mean owning protocol negotiation, session ids and SSE).
+`hyper 1.10.1`, `hyper-util 0.1.20`, `http 1.4.2` and `tower 0.5.3` are already in
+`Cargo.lock` via reqwest — the `0.6.11` in that lock belongs to `tower-http`, not `tower`.
+None of the four is a direct dependency of `backend_rust/Cargo.toml` today, so adding `rmcp`
+means adding them to the manifest with the features the transport needs, at whatever
+versions its resolution forces; whether `rmcp` needs `tower` ≥ 0.6 is a verification item,
+not an assumption. Rejected: hand-writing the streamable-HTTP transport on rmcp's
+`Transport` trait, which would mean owning protocol negotiation, session ids and SSE.
+Mounting the tower service inside Rocket is **not** rejected — see *Verification items*. The
+grounds this document originally gave for rejecting it (hand-rolling SSE through a Rocket
+`Responder`) do not apply: `2026-07-28` clients are served statelessly, and
+`json_response(true)` replies with a plain JSON body.
 
 **Two listeners, two credential types.** The Rocket API accepts only session cookies; the
 agent listener accepts only bearer tokens. Neither reads the other's header. An agent
@@ -149,42 +156,80 @@ implements any of them.
 Ships and deploys **before** the agent module, because it changes live API behaviour.
 
 Two findings from the current schema motivate this. `transactions.type` is `TEXT` with no
-`CHECK` and there is no Rust enum: `create_transaction` (`api_routes/transactions.rs:238`)
+`CHECK` and there is no Rust enum: `create_transaction` (`api_routes/transactions.rs:239`)
 does `tx.r#type.to_uppercase()`, compares against `"SPLIT"`, and stores the result. Any
-other string passes — `"DIVIDEND"` is stored and the tax engine reads it as a
-positive-quantity lot, because the only three literals in `src/` are `BUY`, `SELL` and
-`SPLIT`. Separately, `transactions.quantity`, `price` and `fee` are `TEXT`, not `NUMERIC`;
+other string passes — `"DIVIDEND"` is stored and then **silently ignored**:
+`tax_engine.rs:665-771` is `if BUY / else if SELL / else if SPLIT` with no terminal `else`,
+and `stats_engine.rs:250-256` is the same shape, so a junk type produces no lot and no
+position change. Invisible tax data is worse than a wrong lot, because nothing looks wrong.
+The closed set already exists as a constant: `backup/mod.rs:222` `KNOWN_TRANSACTION_TYPES`. Separately, `transactions.quantity`, `price` and `fee` are `TEXT`, not `NUMERIC`;
 the app preserves exactness by storing `Decimal::to_string()`, which is correct — but it
 means a value that entered as a JSON *number* has already passed through `f64` before
 becoming a `Decimal`.
 
-1. **`TxType` enum.** In `models.rs`: `#[serde(rename_all = "uppercase")] enum TxType {
-   Buy, Sell, Split }` with `Display`. `TransactionCreate.type` becomes `TxType`; the
-   `to_uppercase()` call disappears because the value is canonical by construction.
-   Anything else is a serde `422`. No frontend change is required:
-   `csvValidator.ts:99` already rejects everything outside `BUY|SELL|SPLIT`, so this
-   formalizes the contract the browser importer has always enforced.
+1. **`TxType` enum.** `#[serde(rename_all = "UPPERCASE")] enum TxType { Buy, Sell, Split }`
+   with `Display` — serde matches the style name exactly, so the lowercase spelling is a
+   compile error. Defined in `models.rs`; `schemas::TransactionCreate.r#type` (`schemas.rs:18`)
+   becomes `TxType`, and the `to_uppercase()` call disappears because the accepted wire values
+   are exactly `BUY|SELL|SPLIT`. Anything else is a serde `422`. **The read side stays
+   `String`**: `models::Transaction.r#type` and `schemas::TransactionOut.r#type` are `FromRow`
+   decode targets for rows the `CHECK` below still accepts in any case, and converting them
+   would fail to decode every legacy lowercase row. No frontend change is required for the
+   type: `csvValidator.ts:98-100` already rejects everything outside `BUY|SELL|SPLIT`.
 2. **Migration `0002_transaction_type_check.sql`.** Normalize existing rows with
    `upper(btrim(type))` — case and surrounding whitespace are not semantic changes. Then
    **abort, listing the offending values**, if anything is still outside the set; rewriting
-   `DIVIDEND` to `BUY` would be inventing tax data. Then add
-   `CHECK (upper(btrim(type)) IN ('BUY','SELL','SPLIT'))`. Case-insensitive on purpose: it
-   keeps the engine's existing `.to_uppercase()` comparisons honest without a data
-   rewrite. `sqlx::migrate!` runs at startup, so a failing migration means the app does not
-   boot — the audit query
+   `DIVIDEND` to `BUY` would be inventing tax data. A `.sql` file cannot abort and list
+   without plpgsql, so the check is a `DO $$ … RAISE EXCEPTION … END $$;` block, and because
+   sqlx runs each file in one transaction the normalization rolls back with the abort. Then
+   add `CHECK (upper(btrim(type)) IN ('BUY','SELL','SPLIT'))`. Case-insensitive on purpose:
+   rows written before this migration may hold `buy`, and the `CHECK` must accept them
+   without a data rewrite.
+
+   Note the case-sensitivity triangle this leaves. The partial index
+   `uq_split_asset_date` is `WHERE type = 'SPLIT'` (`migrations/0001_init.sql:89-91`) and is
+   case-sensitive, and `scripts/check_migrations.sh:169-175` pins that predicate literally.
+   A `'split'` row would satisfy the `CHECK` yet escape the split dedupe, so the pre-flight
+   audit must also look for `(asset_id, day)` duplicates among `SPLIT` rows after
+   normalization. The only lowercase writer in the tree is a test seed (`src/access.rs:260`).
+
+   `sqlx::migrate!` runs at startup, so a failing migration means the app does not boot
+   (`main.rs:74-76` → `refuse()` → exit 1 → crashloop). The audit query
    (`SELECT DISTINCT type FROM transactions WHERE upper(btrim(type)) NOT IN ('BUY','SELL','SPLIT')`)
-   is a pre-flight step in the runbook, and `check_migrations.sh` gains a case proving it
-   fails on a junk value.
-3. **The bundle schema gets the same closed set.** `backup/restore.rs:367` inserts the same
-   column, so `docs/backup-schema/v1.json` must constrain `type` — otherwise a junk type
-   is a `CHECK` violation mid-restore instead of a `422` at preview. Confirm no shipped
-   bundle fixture violates it. `services/currency_service.rs:138` inserts the literal
-   `'SPLIT'` and is unaffected.
-4. **Money arrives as a string, enforced.** A deserializer used by both the agent DTOs and
-   `TransactionCreate` accepts a JSON string matching `^-?\d+(\.\d{1,12})?$` and rejects a
-   JSON number outright, with an error naming the fix. `frontend/src/utils/decimal.ts`
-   already sends strings. Scale is capped at 12 decimal places as a validation rule, not
-   inferred from a column, because the column is `TEXT` and will hold anything.
+   is run by the operator from `backend_rust/scripts/audit_transaction_types.sh` before the
+   deploy that carries `0002`: exit `0` clean, `1` out-of-set rows found (printing
+   `SELECT DISTINCT type`), `2` could not run. The abort itself is proven by
+   `tests/migration_type_check_test.rs`, which loads migrations at runtime with
+   `sqlx::migrate::Migrator::new`, applies `0001`, inserts a `'DIVIDEND'` row, applies
+   `0002`, and asserts the error names the value. It cannot use `test_db::test_pool`, which
+   runs the embedded `sqlx::migrate!` before the test body, and it cannot live in
+   `check_migrations.sh`, which inspects a database and cannot observe a migration aborting.
+3. **The bundle schema already constrains this set — verify, do not add.**
+   `docs/backup-schema/v1.json:134-142` enumerates `type` from `KNOWN_TRANSACTION_TYPES`,
+   `backup/mod.rs:467` refuses an out-of-set type during `validate()` — so a junk type is
+   already a `422` at preview, not a mid-restore `CHECK` violation — and
+   `backup/schema.rs:49-56` pins the artifact against the constant. The remaining work is
+   the database `CHECK` and confirming no shipped bundle fixture violates it.
+   `backup/restore.rs:365-371` inserts the same column; `services/currency_service.rs:139`
+   inserts the literal `'SPLIT'` and is unaffected.
+4. **Money arrives as a JSON string; the deserializer rejects JSON numbers.** Add
+   `db_types::strict_decimal_json` (string-only, `^-?\d+(\.\d{1,12})?$`, error names the
+   fix) and apply it to the three `TransactionCreate` fields and the agent DTOs. **Do not
+   modify `db_types::decimal_json`** — that is the *response* serializer at roughly 55 sites
+   in `schemas.rs`, and its `visit_f64` arm is load-bearing for `TaxLot` and
+   `AssetTaxSummary` round-trips. Scale is capped at 12 decimal places as a validation rule,
+   not inferred from a column, because the column is `TEXT` and will hold anything.
+
+   **This breaks the browser CSV importer, which must move first.**
+   `frontend/src/utils/decimal.ts` is a *read-side* normalizer: it turns decimal strings
+   into JS numbers (`:16-23`, `:97-104`) and sends nothing. The manual form already sends
+   strings (`PortfolioDetail.tsx:15-21,171-177`), but the CSV importer sends JSON numbers —
+   `csvValidator.ts:187-189` types `quantity`/`price`/`fee` as `number` and
+   `CsvImportModal.tsx:170-176` posts them. A prerequisite frontend PR makes `parseNumeric`
+   return a canonical decimal string, updates `ValidatedRow`, the dedup key at
+   `CsvImportModal.tsx:163`, `test/mocks/handlers.ts:105-111`, the assertions in
+   `csvValidator.test.ts`, and the contract comment at `frontend/src/types.ts:8` that
+   currently permits either form. Land and deploy it before the backend rejects numbers.
 
    **The `TEXT` columns are not to be changed to `NUMERIC`.** `tests/decimal_migration_test.rs`
    documents why — a binary float cannot hold 9.99, and cost basis drifting by a rounding
@@ -237,8 +282,10 @@ CREATE INDEX api_token_user_idx ON api_token (user_id);
 ```
 
 Secret: `pp_` + 32 random bytes, base62. Stored as SHA-256 hex, returned exactly once.
-256 bits of entropy means there is no guessing attack, so no attempt throttling is added —
-stated so nobody adds one later.
+32 bytes is 256 bits of entropy at the source, which makes online guessing impractical, so
+the agent listener adds no attempt throttling; do not add throttling later without stating a
+reason in a new spec. Base62 changes only the encoded length (≈43 characters), not the
+entropy.
 
 **Scopes:** `read` and `import`. No `backup` scope exists, and there is no `write` scope:
 the agent only ever creates rows, so `import` already covers every write it can attempt, and
@@ -333,7 +380,7 @@ without them:
   portfolio is selected.
 
 Off by default: `listener.rs` binds only when `AGENT_LISTEN` is set, following the
-precedent at `lib.rs:268` where the OIDC routes are mounted only when there is a provider
+precedent at `lib.rs:270` where the OIDC routes are mounted only when there is a provider
 to talk to.
 
 ### Schema — `0004_agent_staged_batch.sql`
@@ -427,12 +474,20 @@ equals the pool's `statement_timeout` — and there would be no way to retry it.
 - `quantity > 0`, `price >= 0`, `fee >= 0`. Zero price is legitimate rather than junk:
   `2026-11-16-import-preview-design.md` treats zero-price rows as the valid output of a
   stock-dividend flow, which is why they are accepted and flagged, never rejected.
-- Dates are strict ISO `YYYY-MM-DD`, resolved to UTC midnight, bounded 1900-01-01 …
-  2100-01-01 as `create_transaction` already does. The browser importer's multi-format
+- Dates are strict ISO `YYYY-MM-DD`, stored as `TIMESTAMPTZ` at UTC midnight. The
+  1900-01-01 … 2100-01-01 bound is reused from `create_transaction`, but the **format is
+  not**: the interactive endpoint takes `DateTime<Utc>` and deliberately rejects a bare date
+  (`schemas.rs:25`, pinned by `tests/date_boundary_test.rs:46-57` — "a bare date must not
+  silently become midnight UTC"). The agent DTO needs its own date type; the two paths
+  cannot share one deserializer. The browser importer's multi-format
   auto-detection exists because a human sits in front of dropdowns; the agent has no
   dropdowns.
-- ISIN, when present, passes a mod-10 checksum implemented in Rust. `isinValidator.ts`
-  lives in the browser and this path cannot depend on it. A bad ISIN is a named rejection,
+- ISIN, when present, passes a mod-10 checksum. A Rust validator already exists —
+  `api_routes::lookup::is_valid_isin` (`lookup.rs:186`), shape only, already used by the REST
+  lookup route and by bundle validation (`backup/mod.rs:442`) — so it is strengthened in
+  place rather than duplicated; a second rule would make the agent reject rows the API
+  accepts. Adding the checksum also tightens lookup and restore for bundles that pass today,
+  which is a behaviour change to call out in that PR. A bad ISIN is a named rejection,
   not a silently unmatched asset.
 
 ### The preview
@@ -454,7 +509,7 @@ scale, an assumed currency. Display caps always read "showing 25 of 1,204".
 | `get_portfolio` | read | portfolio plus its assets with symbol / ISIN / currency |
 | `list_transactions` | read | filters: portfolio, asset, type, date range; paginated |
 | `get_tax_summary` | read | the tax summary, or the dated report with `from`/`to` |
-| `get_performance` | read | daily value series and cumulative TWR. Volatility, Sharpe and beta are **not** measurements — `stats_engine.rs:108-110` returns constants, and the tool description says so |
+| `get_performance` | read | weekly value series and cumulative TWR — the published series is aggregated at `stats_engine.rs:317-320`, though its items still carry a field named `daily_return`. Volatility, Sharpe, beta **and** `realized_pnl` / `unrealized_pnl` are **not** measurements: `stats_engine.rs:108-110` and `:323-325` return constants on both paths. This tool omits the two P&L fields and its description names the three constants; realized gain is answered by `get_tax_summary`, not here |
 | `get_transaction_pnl` | read | the sell P&L breakdown |
 | `lookup_asset` | read | symbol / ISIN resolution, for normalizing before staging |
 | `stage_import` | import | the only staging entry point; single-row entry is a batch of one |
@@ -475,9 +530,15 @@ does not depend on it.
 ```
 
 - **New versus merge.** `target.new` creates the portfolio. `target.existing` merges, and
-  there exact-duplicate rows are flagged in the preview and skipped on apply — the same
-  rule `csvValidator.ts` applies to browser CSV imports, so re-importing an updated
-  statement does not double the ledger. Matching by portfolio *name* is not offered: two
+  there exact-duplicate rows are listed in the preview and skipped on apply. This is **new
+  behaviour, not precedent**: the browser importer's dedupe (`CsvImportModal.tsx:163-168`) is
+  in-memory within one run, never compares against stored rows, and keys on `fee` too.
+  Matching against the database is the capability `backup::restore` deliberately refused
+  (`restore.rs:22-24`: "which transaction is a duplicate?" has no clean answer, and a wrong
+  guess silently corrupts a tax ledger), so it is reviewed as new code. Duplicate matching is
+  `Decimal` equality over `(date, asset_id, type, quantity, price, fee)` — never string
+  equality, which fails on a re-exported `10` against a stored `10.0` and would break the
+  re-import guarantee in the common case. Matching by portfolio *name* is not offered: two
   portfolios named "Depot" is a real thing and guessing wrong writes into the wrong one.
 - **Asset matching.** ISIN first, then symbol plus currency within the target. Missing
   assets auto-create. Currency defaults to the portfolio's `base_currency` and the preview
@@ -508,8 +569,11 @@ not a pending staged batch. Any future change to `replicas` must revisit this.
 ## Error handling
 
 The repo already has the right discipline and this module inherits it. `guard.rs` keeps
-`Ok(None)` (deny) strictly apart from `Err(db)` (503 via `UNAVAILABLE_PATH`) because
-collapsing an outage into a denial once put a signed-in user in an OIDC redirect loop.
+`Ok(None)` (deny) strictly apart from `Err(db)`, because
+collapsing an outage into a denial once put a signed-in user in an OIDC redirect loop. The
+split lives in two places, not one: `AuthFairing` rewrites `Err` into a 503 at
+`/_auth/unavailable` (`auth/fairing.rs:32,110`), while the `FromRequest` guard answers 500
+(`guard.rs:187-190`).
 `access.rs::deny()` answers **not-found, never forbidden**, because a 403 is an existence
 oracle. Both rules carry over to agent tools.
 
@@ -629,14 +693,29 @@ waits on it beyond the enum's existence.
 
 ## Verification items to confirm during implementation
 
-These are unknowns about external APIs, not open design questions.
+Some of these are questions about external crate behaviour; others are not — the
+`catch_unwind` scope is an internal design choice, and the `type` audit is a query against
+live data.
 
 - Exact `rmcp` 3.11 feature-flag names for the server and streamable-HTTP-server transports,
   and the `StreamableHttpServerConfig` fields for stateful mode and SSE keep-alive.
 - Whether `hyper-util`'s `TowerToHyperService` composes with the `hyper 1.10.1` already in
   the lockfile without a version bump, or whether `rmcp` requires a newer `hyper`.
-- Whether rmcp's `schemars` integration matches the `schemars 1.0` already in
-  `Cargo.toml`, or pulls a second version.
+- Whether rmcp's `schemars` integration resolves to the 1.2.3 already in the lock. The lock
+  carries **two** versions today — 0.9.0 (`Cargo.lock:2867`, via utoipa 4.2) and 1.2.3
+  (`:2879`) — against `Cargo.toml:20`'s `schemars = "1.0"`. A third copy is a blocker for
+  the PR.
+- Whether `rmcp` builds against `tower 0.5.3`, the version in the lock, or requires 0.6, and
+  whether `hyper` / `hyper-util` need bumping.
+- **Spike, before Workstream 2 is planned:** can `StreamableHttpService` be mounted as a
+  Rocket route in stateless mode? Bridge one POST (method, URI, headers, buffered body in;
+  status, headers, bytes out) with `legacy_session_mode(false)` and `json_response(true)`,
+  and drive it with rmcp's own client through `initialize` → `tools/list` → one tool call.
+  Adopt it only if there is no SSE and no `Mcp-Session-Id` anywhere, the adapter stays in one
+  bounded file, `AuthFairing`'s prefix rule (`auth/fairing.rs:40`) needs no exemption, and
+  `tests/route_coverage_test.rs:181 PUBLIC_NAMESPACES` admits the namespace by explicit
+  amendment. If it lands, the second listener, its direct `hyper`/`tower` manifest entries,
+  the k8s exposure work and the `replicas: 1` session coupling all disappear.
 - Whether `catch_unwind` around a tool call is sufficient given `tokio` task panics, or
   whether the call must run in its own spawned task.
 - Whether any live row violates the `type` `CHECK` after normalization — the pre-flight
