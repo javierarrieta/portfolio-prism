@@ -64,8 +64,8 @@ fallen into:
 
 1. Read access to portfolios, assets, transactions, tax summaries, the dated tax report,
    performance, and sell P&L, through MCP tools.
-2. Write access to portfolios, assets, and transactions, only through a staged batch that a
-   human has approved in the web UI.
+2. Create access to portfolios, assets, and transactions, only through a staged batch that a
+   human has approved in the web UI. Updating and deleting stay in the web UI.
 3. Bulk import of a full portfolio (portfolios, assets, transactions) from rows the agent
    normalized out of a broker statement, with the same preview discipline.
 4. Scoped, individually revocable credentials, self-service from the web UI.
@@ -90,6 +90,12 @@ fallen into:
   stored preview; its only write is the approval itself. The human does not edit rows there
   and the browser never writes a portfolio row. The agent reads the preview in the chat
   *and* in that screen — the screen is the copy the model did not write.
+- **No update or delete from the agent.** The agent creates; it never revises or removes.
+  This is not a policy an agent can forget — there is no tool that does it. The reason is
+  scope, not safety: no requirement asks for it, and every update or delete needs a
+  caller-supplied id, which would widen `access.rs`, the gate script's job, and the
+  isolation matrix for a capability nothing has asked for. Reinstatement needs a reason
+  first, and an update tool would need the same approval discipline as a create.
 - **No `asset_type` constraint.** See Workstream 0, item 5.
 
 ## Decisions and rationale
@@ -208,8 +214,10 @@ check and the `token_version` comparison in one place. A token yields a `uid` an
 through to that same lookup, so a deactivated account loses its tokens for free.
 
 `AuthedUser` gains a `credential` field: `Credential::Session` or
-`Credential::Token { id, scopes }`. `require_scope(&caller, Scope::Write)` allows
-`Session` always and `Token` only when the scope is present.
+`Credential::Token { id, scopes }`. `require_scope(&caller, Scope::Import)` returns ok for a
+session credential, and for a token credential only when that scope is present. There are
+two scopes, `read` and `import`; the enum has no `Write` variant, because the agent creates
+rows and does nothing else.
 
 ### Schema — `0003_api_token.sql`
 
@@ -232,11 +240,13 @@ Secret: `pp_` + 32 random bytes, base62. Stored as SHA-256 hex, returned exactly
 256 bits of entropy means there is no guessing attack, so no attempt throttling is added —
 stated so nobody adds one later.
 
-**Scopes:** `read`, `write`, `import`. No `backup` scope exists. Scopes are a ceiling on
-what a token may do; they are not a record of who is sitting in front of it. The human step
-is the approval state, not a scope — see *The approval gate*. Staging requires `import`, so
-a `read`-only token cannot create a staged batch at all; there is deliberately no
-preview-only path that writes a row under a read credential.
+**Scopes:** `read` and `import`. No `backup` scope exists, and there is no `write` scope:
+the agent only ever creates rows, so `import` already covers every write it can attempt, and
+a third scope would name nothing. Scopes are a ceiling on what a token may do; they are not
+a record of who is sitting in front of it. The human step is the approval state, not a
+scope — see *The approval gate*. Staging requires `import`, so a `read`-only token cannot
+create a staged batch at all; there is deliberately no preview-only path that writes a row
+under a read credential.
 
 **Expiry** is enforced in `pat::lookup` with one comparison, the same shape as the session
 `exp` check already in `guard.rs`. Default at mint is no expiry. Enforced at lookup only:
@@ -333,7 +343,6 @@ agent_staged_batch(
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   handle     TEXT NOT NULL UNIQUE,        -- 32 random bytes, not the row id
   user_id    BIGINT NOT NULL REFERENCES users(id),
-  kind       TEXT NOT NULL CHECK (kind IN ('edit','import')),
   payload    JSONB NOT NULL,              -- canonicalized proposal
   preview    JSONB NOT NULL,              -- what the human was shown
   status     TEXT NOT NULL DEFAULT 'staged'
@@ -364,8 +373,8 @@ transition only a session cookie can cause.
 
 | Step | Surface | Credential | Effect |
 |---|---|---|---|
-| `stage_import` / `stage_edit` | agent listener | PAT with `import` | inserts a row at `status='staged'`, returns handle and preview |
-| `GET /api/staged-batches` | `/api` | session cookie | lists batches: handle, kind, counts, status, expiry |
+| `stage_import` | agent listener | PAT with `import` | inserts a row at `status='staged'`, returns handle and preview |
+| `GET /api/staged-batches` | `/api` | session cookie | lists batches: handle, counts, status, expiry |
 | `GET /api/staged-batches/<handle>` | `/api` | session cookie | renders the stored `preview` JSONB verbatim |
 | `POST /api/staged-batches/<handle>/approve` | `/api` | session cookie | `staged → approved`; records `approved_at`, `approved_by` |
 | `apply_staged` | agent listener | PAT with `import` | `approved → applied`, writes the rows |
@@ -448,14 +457,14 @@ scale, an assumed currency. Display caps always read "showing 25 of 1,204".
 | `get_performance` | read | daily value series and cumulative TWR. Volatility, Sharpe and beta are **not** measurements — `stats_engine.rs:108-110` returns constants, and the tool description says so |
 | `get_transaction_pnl` | read | the sell P&L breakdown |
 | `lookup_asset` | read | symbol / ISIN resolution, for normalizing before staging |
-| `stage_import` | import | the flagship, below |
-| `stage_edit` | write | batched create / update / delete of portfolios, assets, transactions |
+| `stage_import` | import | the only staging entry point; single-row entry is a batch of one |
 | `apply_staged` | import | writes a batch a session has already approved; returns `not_approved` until then |
 | `discard_staged` | import | discards without writing; no approval required |
 | `get_staged` | import | re-renders the stored preview, so the agent can report what a human approved |
 
-Every tool carries rmcp annotations (`readOnlyHint`, `destructiveHint`) so a client that
-honours them prompts independently of our own gate.
+Every tool sets `readOnlyHint`; none sets `destructiveHint`, because no agent tool deletes
+anything. A client that honours the annotations prompts on its own; the server-side gate
+does not depend on it.
 
 ### `stage_import`
 
@@ -481,22 +490,11 @@ honours them prompts independently of our own gate.
   apply — then writes in one Postgres transaction, all or nothing, and returns the created
   portfolio ids, asset ids and transaction count.
 
-`stage_edit` is the same machinery with a smaller payload:
-
-```
-{ create_portfolios: [...], update_portfolios: [{id, name?, base_currency?}],
-  delete_portfolios: [<id>],
-  create_assets: [...], delete_assets: [{id}],
-  create_transactions: [{portfolio_id, asset_id, type, date, quantity, price, fee}],
-  delete_transactions: [{id}] }
-```
-
-Every id in it is caller-supplied and resolves through `access.rs`. Deletes are named
-explicitly in the stored preview — resource type, id, and the human-readable name or, for a
-transaction, its date, symbol and quantity — because the human approving the batch confirms
-against that rendering, not against a string the agent repeated back. The reasoning behind
-`mode=replace` still applies: an absent mode is a `422`, because guessing between two unsafe
-options is worse than refusing.
+`stage_import` is the **only** staging entry point. Single-row entry from a chat — "add a
+buy of 1.5 shares of NOC on 3 March" — is one `stage_import` call with one asset and one
+transaction; there is no separate `stage_edit` tool, and no update or delete path at all.
+The payload therefore carries no caller-supplied row ids except the staged-batch handle,
+which is what keeps the `access.rs` surface and the gate script's job small.
 
 ### Sessions
 
