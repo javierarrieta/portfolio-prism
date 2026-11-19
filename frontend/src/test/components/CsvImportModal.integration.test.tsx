@@ -230,4 +230,44 @@ describe('CsvImportModal integration', () => {
     expect(confirmButton).not.toBeDisabled();
     expect(confirmButton.textContent).toContain('Confirm and Import');
   });
+
+  test('a row reaches the API in the form the API accepts', async () => {
+    // Everything else in this file stops at the button; none of it looks at what
+    // gets posted. The whole point of carrying money as decimal strings is the
+    // payload, so one row is driven all the way to the mock server here. The mock
+    // answers 400 to a JSON number exactly as the real backend will, so a revert
+    // to `Number(row.quantity)` fails this test with that message instead of
+    // passing quietly while production rejects the same import.
+    const csvContent = 'date,symbol,type,qty,price\n2024-01-15,AAPL,BUY,10,150.00';
+    const file = new File([csvContent], 'transactions.csv', { type: 'text/csv' });
+
+    render(
+      <CsvImportModal
+        portfolioId={1}
+        assets={[{ id: 1, portfolio_id: 1, symbol: 'AAPL', name: 'Apple Inc.', asset_type: 'STOCK', sector: 'Technology', currency: 'USD', isin: null, transactions: [] }]}
+        onClose={() => {}}
+        onImportComplete={() => {}}
+      />
+    );
+
+    const dropZone = screen.getByText(/drag and drop/i).closest('div');
+    fireEvent.drop(dropZone!, { dataTransfer: { files: [file] } });
+
+    await waitFor(() => {
+      expect(screen.getByText(/column mapping/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /validate data/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /import \d+ transactions$/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /import \d+ transactions$/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /confirm and import/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /confirm and import/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 transactions imported successfully/i)).toBeInTheDocument();
+    });
+  });
 });

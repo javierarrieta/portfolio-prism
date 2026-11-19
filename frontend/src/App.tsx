@@ -506,25 +506,25 @@ export default function App() {
 
       // 3. Log transactions over the past months to build history
       const now = new Date();
-       const txs: Array<{ symbol: string; type: TransactionType; qty: number; price: number; fee: number; daysAgo: number }> = [
+       const txs: Array<{ symbol: string; type: TransactionType; qty: string; price: string; fee: string; daysAgo: number }> = [
         // AAPL Buys
-        { symbol: 'AAPL', type: 'BUY', qty: 20, price: 175.0, fee: 5.0, daysAgo: 60 },
-        { symbol: 'AAPL', type: 'BUY', qty: 15, price: 185.0, fee: 5.0, daysAgo: 30 },
-        { symbol: 'AAPL', type: 'BUY', qty: 10, price: 190.0, fee: 5.0, daysAgo: 10 },
-        { symbol: 'AAPL', type: 'SELL', qty: 8, price: 210.0, fee: 8.0, daysAgo: 2 }, // triggers tax matching
+        { symbol: 'AAPL', type: 'BUY', qty: '20', price: '175', fee: '5', daysAgo: 60 },
+        { symbol: 'AAPL', type: 'BUY', qty: '15', price: '185', fee: '5', daysAgo: 30 },
+        { symbol: 'AAPL', type: 'BUY', qty: '10', price: '190', fee: '5', daysAgo: 10 },
+        { symbol: 'AAPL', type: 'SELL', qty: '8', price: '210', fee: '8', daysAgo: 2 }, // triggers tax matching
         
         // BTC Buys
-        { symbol: 'BTC-USD', type: 'BUY', qty: 0.25, price: 60000.0, fee: 15.0, daysAgo: 45 },
-        { symbol: 'BTC-USD', type: 'BUY', qty: 0.15, price: 65000.0, fee: 10.0, daysAgo: 15 },
-        { symbol: 'BTC-USD', type: 'SELL', qty: 0.10, price: 69000.0, fee: 12.0, daysAgo: 1 },
+        { symbol: 'BTC-USD', type: 'BUY', qty: '0.25', price: '60000', fee: '15', daysAgo: 45 },
+        { symbol: 'BTC-USD', type: 'BUY', qty: '0.15', price: '65000', fee: '10', daysAgo: 15 },
+        { symbol: 'BTC-USD', type: 'SELL', qty: '0.1', price: '69000', fee: '12', daysAgo: 1 },
 
          // SPY Buys
-         { symbol: 'SPY', type: 'BUY', qty: 30, price: 500.0, fee: 0.0, daysAgo: 90 },
-         { symbol: 'SPY', type: 'BUY', qty: 10, price: 520.0, fee: 0.0, daysAgo: 25 },
+         { symbol: 'SPY', type: 'BUY', qty: '30', price: '500', fee: '0', daysAgo: 90 },
+         { symbol: 'SPY', type: 'BUY', qty: '10', price: '520', fee: '0', daysAgo: 25 },
 
          // SAP.DE Buys
-         { symbol: 'SAP.DE', type: 'BUY', qty: 5, price: 170.0, fee: 2.0, daysAgo: 40 },
-         { symbol: 'SAP.DE', type: 'BUY', qty: 5, price: 175.0, fee: 2.0, daysAgo: 10 }
+         { symbol: 'SAP.DE', type: 'BUY', qty: '5', price: '170', fee: '2', daysAgo: 40 },
+         { symbol: 'SAP.DE', type: 'BUY', qty: '5', price: '175', fee: '2', daysAgo: 10 }
        ];
 
       for (const tx of txs) {
