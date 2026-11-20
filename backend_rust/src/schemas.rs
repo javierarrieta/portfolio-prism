@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use chrono::{DateTime, NaiveDate, Utc};
 use utoipa::ToSchema;
 use rust_decimal::Decimal;
-use crate::db_types::{decimal_json, decimal_opt_json};
+use crate::db_types::{decimal_json, decimal_opt_json, strict_decimal_json};
 use crate::models::{Asset, Transaction, TxType};
 
 // Every id in this file is `i64` because every id in the schema is `BIGINT GENERATED
@@ -23,11 +23,15 @@ pub struct TransactionCreate {
     // the document shipped a dangling reference. `Asset` and `Transaction` are bare for
     // the same reason.
     pub r#type: TxType,
-    #[serde(with = "decimal_json")]
+    // `strict_decimal_json`, not `decimal_json`: a JSON number has already been through
+    // `f64` by the time it becomes a `Decimal`, and these three columns are cost basis.
+    // The response side keeps the lenient codec — see that module's comment for why
+    // tightening it there would break every tax figure the app answers with.
+    #[serde(with = "strict_decimal_json")]
     pub quantity: Decimal,
-    #[serde(with = "decimal_json")]
+    #[serde(with = "strict_decimal_json")]
     pub price: Decimal,
-    #[serde(with = "decimal_json")]
+    #[serde(with = "strict_decimal_json")]
     pub fee: Decimal,
     pub date: DateTime<Utc>,
 }
