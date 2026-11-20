@@ -26,6 +26,7 @@ const NAV_LABELS = [
   'Printable Statement',
   'Tax Report',
   'Backup',
+  'Agent staging',
 ]
 
 async function renderApp() {

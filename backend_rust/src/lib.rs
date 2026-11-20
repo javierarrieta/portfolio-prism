@@ -24,6 +24,7 @@ pub mod api_routes {
     pub mod analytics;
     pub mod lookup;
     pub mod backup;
+    pub mod staged_batches;
 }
 
 /// Test-only stand-in for the pricing provider, compiled into the library's own
@@ -332,6 +333,9 @@ pub fn build_rocket(
             api_routes::backup::preview,
             api_routes::backup::restore,
             api_routes::backup::owned,
+            api_routes::staged_batches::list_batches,
+            api_routes::staged_batches::get_batch,
+            api_routes::staged_batches::approve_batch,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same

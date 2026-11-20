@@ -1,5 +1,11 @@
-//! The chokepoint: the only module permitted to resolve a portfolio, asset or
-//! transaction from a caller-supplied id.
+//! The chokepoint: the only module permitted to resolve a portfolio, asset, transaction
+//! or staged batch from a caller-supplied id.
+//!
+//! Staged batches widen that remit beyond the three portfolio tables, and deliberately:
+//! a handle is a caller-supplied identifier naming a row whose whole purpose is to become
+//! a write, so it needs the same single place that answers "may this caller touch this
+//! one". It differs in one respect — the id is a 64-hex-character string, not an `i64`,
+//! and the answer is 404 for "does not exist" and "not yours" alike.
 //!
 //! Everything else in `api_routes` handles business logic and takes the caller as
 //! given. Concentrating ownership resolution here is what makes the rule
@@ -207,6 +213,44 @@ pub async fn require_transaction(
     // `a_transaction_whose_asset_is_gone_is_not_found` constructs that case by
     // dropping the constraint, because nothing else can.
     require_asset(pool, user_id, asset_id, min).await
+}
+
+/// May this caller touch the staged batch this handle names?
+///
+/// Answers 404 and never 403, for the reason every `require*` here has that rule: a 403
+/// would confirm that the handle exists and belongs to somebody else. The handle namespace
+/// is 32 random bytes, so guessing is not the threat — but a token that has *seen* a handle
+/// elsewhere (a log line, a shared screenshot of the Access panel) must not be able to
+/// confirm it is real by probing an endpoint.
+///
+/// The handle is a string where every other id here is `i64`. That is the one way this
+/// function differs from its neighbours, and it is why the comparison is on `user_id`
+/// rather than a join through a portfolio: a staged batch belongs to a user directly, not
+/// to a portfolio, because it may create the portfolio it is going to fill.
+pub async fn require_own_staged_batch(
+    pool: &DbPool,
+    user_id: i64,
+    handle: &str,
+    min: Access,
+) -> Result<Access, Status> {
+    let owner: Option<i64> =
+        sqlx::query_scalar!("SELECT user_id FROM agent_staged_batch WHERE handle = $1", handle)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                eprintln!("ERROR: could not look up a staged batch for user {user_id}: {e}");
+                Status::InternalServerError
+            })?;
+
+    match owner {
+        Some(uid) if uid == user_id => Ok(min),
+        // One message for both cases, so the two cannot be told apart from this side of the
+        // network either — including in the logs an operator reads.
+        _ => {
+            eprintln!("DENY: staged batch not available to user {user_id}");
+            Err(Status::NotFound)
+        }
+    }
 }
 
 #[cfg(test)]

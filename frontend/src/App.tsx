@@ -13,6 +13,7 @@ import {
   Printer,
   Receipt,
   FolderSync,
+  Bot,
   PanelLeftClose,
   PanelLeftOpen,
   Wallet,
@@ -25,6 +26,7 @@ import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
 import BackupPanel from './components/BackupPanel';
+import StagedBatchesPanel from './components/StagedBatchesPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
 import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
@@ -58,6 +60,10 @@ const NAV_ITEMS: { id: string; label: string; Icon: LucideIcon }[] = [
   { id: 'statement', label: 'Printable Statement', Icon: Printer },
   { id: 'report', label: 'Tax Report', Icon: Receipt },
   { id: 'backup', label: 'Backup', Icon: FolderSync },
+  // Outside the portfolio branch like Backup: a staged batch may create the portfolio it
+  // is going to fill, so there may be no portfolio to select yet when there is something
+  // to approve.
+  { id: 'staged', label: 'Agent staging', Icon: Bot },
 ];
 
 /**
@@ -790,6 +796,8 @@ export default function App() {
         */}
         {activeTab === 'backup' ? (
           <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : activeTab === 'staged' ? (
+          <StagedBatchesPanel />
         ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (

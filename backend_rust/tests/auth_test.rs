@@ -52,7 +52,19 @@ async fn all_api_routes(caller: &str) -> Vec<(Method, String)> {
                 .unwrap()
                 .replace("<id>", "1")
                 .replace("<portfolio_id>", "1")
-                .replace("<asset_id>", "1");
+                .replace("<asset_id>", "1")
+                // A staged-batch handle is 64 hex characters, and the sweep sends a real
+                // one so the route is exercised rather than its parser. This list is a
+                // hand-maintained mirror of the router's parameter names, which is why the
+                // assertion below refuses to continue when a new parameter is added to a
+                // route and not here: an unsubstituted `<handle>` is not a valid URI, so
+                // Rocket answers 400 before routing, and the sweep would "pass" its 401
+                // check on a request that never reached the guard.
+                .replace("<handle>", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert!(
+            !path.contains('<'),
+            "route template {path} has a parameter this sweep does not substitute"
+        );
             // The tax routes default `strategy` and `threshold_days`; the parameters are
             // here so the sweep exercises the same shape the UI sends, not because the
             // route requires them.
@@ -273,7 +285,7 @@ async fn every_api_route_is_unauthenticated_without_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 21,
+        checked, 24,
         "the sweep must cover the whole mounted surface"
     );
 }
@@ -328,7 +340,7 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 20,
+        checked, 23,
         "the sweep covers the mounted surface bar the network route"
     );
 }

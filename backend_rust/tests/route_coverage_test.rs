@@ -91,6 +91,20 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // Reads the caller's own portfolios and nothing else; scoped by `owner_id`
     // inside `owned_detail`, pinned by two users in `tests/backup_detail_test.rs`.
     ("GET", "/api/backup/owned", None),
+    // The three routes a human uses to look at and approve what an agent staged. They are
+    // here because they are authenticated `/api` routes like every other one, and the
+    // inventory is an inventory, not a list of the interesting ones.
+    //
+    // The list takes no level: the caller *is* the selector, so there is no id for
+    // `access.rs` to resolve and nothing to grade.
+    ("GET", "/api/staged-batches", None),
+    // A handle is a caller-supplied id naming a row that is about to become a write, so it
+    // goes through the chokepoint like any other. `Owner` because the only thing a
+    // non-owner could do with a handle is learn that somebody else has one.
+    ("GET", "/api/staged-batches/<handle>", Some(Access::Owner)),
+    // The state transition itself. Same resolution, same reason: approving someone else's
+    // batch would be the whole control defeated by guessing a handle.
+    ("POST", "/api/staged-batches/<handle>/approve", Some(Access::Owner)),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -166,7 +180,7 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 21, "the mounted /api surface is 21 operations");
+    assert_eq!(checked, 24, "the mounted /api surface is 24 operations");
 }
 
 #[tokio::test]
@@ -288,7 +302,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 21);
+    assert_eq!(PROTECTED_ROUTES.len(), 24);
 }
 
 #[test]
@@ -302,8 +316,8 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 15,
-        "six routes authenticate without checking an id"
+        with_level, 17,
+        "seven routes authenticate without checking an id"
     );
 }
 

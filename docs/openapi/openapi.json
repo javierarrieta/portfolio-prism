@@ -1002,6 +1002,109 @@
         }
       }
     },
+    "/api/staged-batches": {
+      "get": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "List the caller's staged batches, newest first.",
+        "description": "No caller-supplied id: the caller *is* the selector, so there is nothing for\n`access.rs` to resolve.",
+        "operationId": "list_batches",
+        "responses": {
+          "200": {
+            "description": "This user's staged batches, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BatchOut"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/staged-batches/<handle>": {
+      "get": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "The stored preview, rendered verbatim.",
+        "description": "The UI renders this JSON and does not recompute it. That is not a rendering preference:\nif the preview were derived at render time, what a human read and what the agent was\nshown could differ, and the approval would be an approval of something else.",
+        "operationId": "get_batch",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored preview, byte for byte",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such batch for this user"
+          }
+        }
+      }
+    },
+    "/api/staged-batches/<handle>/approve": {
+      "post": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "`staged -> approved`. The human act, and the only write this UI performs.",
+        "description": "A conditional update inside `staging::approve`, so two tabs cannot both succeed; the\nloser gets 409 naming the current status rather than a silent second success.",
+        "operationId": "approve_batch",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Approved",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such batch for this user"
+          },
+          "409": {
+            "description": "Not in a state that can be approved"
+          }
+        }
+      }
+    },
     "/api/transactions/<id>": {
       "delete": {
         "tags": [
@@ -1359,6 +1462,57 @@
           },
           "unrealized_at_end": {
             "type": "string"
+          }
+        }
+      },
+      "BatchOut": {
+        "type": "object",
+        "description": "One row of the list. No payload and no preview: the list is a menu, and the detail route\nis where the bytes are.",
+        "required": [
+          "handle",
+          "status",
+          "created_at",
+          "expires_at",
+          "asset_count",
+          "transaction_count",
+          "expired"
+        ],
+        "properties": {
+          "applied_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "approved_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "asset_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Computed here rather than stored, because \"is this still approvable\" is a fact about\nthe clock and not about the row: an `approved` batch past `expires_at` can never be\napplied, and showing it as approvable invites a human to approve something that will\nthen be refused."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "transaction_count": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

@@ -31,6 +31,9 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::backup::preview,
         crate::api_routes::backup::restore,
         crate::api_routes::backup::owned,
+        crate::api_routes::staged_batches::list_batches,
+        crate::api_routes::staged_batches::get_batch,
+        crate::api_routes::staged_batches::approve_batch,
     ),
     components(schemas(
         models::Portfolio,
@@ -64,6 +67,10 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::ErrorBody,
         schemas::MissingRate,
         AssetLookupResult,
+        // Only the list route's row needs a schema. The detail route answers the stored
+        // preview, whose shape is the agent's choosing, and `serde_json::Value` resolves to
+        // a free-form object on its own — naming it would imply a shape that does not exist.
+        crate::api_routes::staged_batches::BatchOut,
     ))
 )]
 pub struct ApiDoc;
