@@ -118,19 +118,42 @@ function validateType(
  *   thousands separator: `1,500` → `1500`.
  * - A comma with one, two, or four-or-more digits after it cannot be a group of
  *   three, so it is a decimal comma: `1,50` → `1.5`, `1,5000` → `1.5`.
- * - When both `.` and `,` appear, the **later** one is the decimal separator and
- *   everything before it must group in threes: `1.234,56` → `1234.56`,
- *   `1,500.25` → `1500.25`.
+ * - When both `.` and `,` appear, the **later** one is the decimal separator.
+ *
+ * The **head** — everything before the decimal separator — is then either plain
+ * digits, or groups of three separated by the separator that is *not* the decimal
+ * one. One separator never does both jobs:
+ *
+ * | head | decimal separator | read |
+ * |---|---|---|
+ * | `1234` | `,` | plain digits → `1234,56` = `1234.56` |
+ * | `1.234` | `,` | grouped by `.` → `1.234,56` = `1234.56` |
+ * | `1,500` | `.` | grouped by `,` → `1,500.25` = `1500.25` |
+ * | `1,500` | `,` | `,` is already the decimal separator → refused |
+ * | `1234` | `.` | plain digits → `1234.56` = `1234.56` |
+ *
+ * The plain-digits arm is not a looseness, and the `{1,3}` leading-group rule it
+ * replaces was the bug: a head with no separator has no grouping to be wrong
+ * about, and `1234,56` is exactly what a European export looks like when the
+ * broker emits no thousands separator — DEGIRO, Scalable Capital and Trade
+ * Republic all write amounts that way. Requiring a leading group of one to three
+ * digits refused that common case while still accepting `1,500,25`, which is
+ * illegal under both conventions. Strictness aimed at the wrong side of the rule.
  *
  * `1,500` is the one shape where both readings are legal. It keeps the reading it
  * has always had, because that is the status quo and the overwhelmingly common
  * intent — and because changing it silently would be the same mistake this fixes.
  *
- * What is illegal under both conventions is refused rather than guessed:
- * `12,34,567`, `1,5.25`, `1234,567` and `,5` all return `null`. Refusing is the
- * right default for money: a refused row is shown with a message naming it, while
- * a misread row is shown as a plausible, wrong portfolio, and nothing downstream
- * can tell the difference.
+ * Refused rather than guessed: `12,34,567`, `1,5.25`, `1234,567`, `,5`.
+ *
+ * `1234,567` is the deliberate one, and the one likely to be "fixed" later. Its
+ * three-digit tail takes the thousands reading — the same rule that keeps `1,500`
+ * at `1500` — and `1234` is not a legal leading group, so no legal thousands
+ * spelling of it exists. Reading it as `1234.567` instead would let the tail's
+ * length decide one way here and the other way in `1,500`, which is a coin toss
+ * dressed as a rule. Refuse it. Refusing is the right default for money: a refused
+ * row is shown with a message naming it, while a misread row is shown as a
+ * plausible, wrong portfolio, and nothing downstream can tell the difference.
  */
 function resolveSeparators(value: string): string | null {
   if (!value) return null;
@@ -164,8 +187,14 @@ function resolveSeparators(value: string): string | null {
       const tail = body.slice(decPos + 1);
       const head = body.slice(0, decPos);
       if (!/^\d+$/.test(tail)) return null;
-      // The head is digits grouped by either separator, in threes.
-      if (!/^\d{1,3}([.,]\d{3})*$/.test(head)) return null;
+      // Which separator may group the head depends on which one `decPos` landed on,
+      // so this one cannot be a literal: `.` groups when the decimal separator is
+      // `,`, and `,` groups when it is `.`. Either the head is plain digits, or it
+      // is a leading group of one to three and then groups of exactly three.
+      const group = body[decPos] === ',' ? '.' : ',';
+      if (!new RegExp('^(?:\\d+|\\d{1,3}(?:\\' + group + '\\d{3})+)$').test(head)) {
+        return null;
+      }
       out = head.replace(/[.,]/g, '') + '.' + tail;
     }
   }
