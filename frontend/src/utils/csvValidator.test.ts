@@ -5,6 +5,35 @@ import { validateCsvRow, validateCsvFile } from './csvValidator';
 
 const columnMapping = detectColumns(['date', 'symbol', 'type', 'qty', 'price', 'fee']);
 
+describe('separator handling', () => {
+  const row = (qty: string, price = '150.00') =>
+    validateCsvRow({ date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty, price, fee: '5.00' }, columnMapping, 1);
+
+  test('a decimal comma is a decimal comma, not a stripped thousands separator', () => {
+    // The bug this pins: commas were deleted, so each of these was multiplied by a
+    // power of ten and imported silently wrong.
+    expect(row('1,5').quantity).toBe(1.5);
+    expect(row('1,50').quantity).toBe(1.5);
+    expect(row('0,25').quantity).toBe(0.25);
+    expect(row('1,5000').quantity).toBe(1.5);
+    expect(row('1.234,56').quantity).toBe(1234.56);
+  });
+
+  test('a three-digit group after a comma is still a thousands separator', () => {
+    // Status quo, deliberately unchanged.
+    expect(row('1,500').quantity).toBe(1500);
+    expect(row('1,234,567').quantity).toBe(1234567);
+    expect(row('1,500.25').quantity).toBe(1500.25);
+  });
+
+  test('illegal grouping is reported as an invalid cell, not guessed', () => {
+    for (const bad of ['12,34,567', '1,5.25', '1234,567', ',5']) {
+      const result = row(bad);
+      expect(result.errors.map((e) => e.field), bad).toContain('quantity');
+    }
+  });
+});
+
 describe('validateCsvRow', () => {
   test('valid row passes with no errors', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '150.00', fee: '5.00' };

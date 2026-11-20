@@ -103,9 +103,86 @@ function validateType(
   return errors;
 }
 
+/**
+ * Fold thousands separators and decimal commas into a plain dot-decimal, or return
+ * `null` when the cell cannot be read either way.
+ *
+ * The old code stripped every comma. That is not a simplification, it is a
+ * corruption: `1,50` — one and a half, in the convention most European broker
+ * exports use — became `150`. A hundredfold error on a cost-basis figure, applied
+ * silently, on the row the tax engine will later trust. `1.234,56` became `123456`.
+ *
+ * Position decides this, not locale:
+ *
+ * - A comma with exactly three digits after it, and nothing after those, is a
+ *   thousands separator: `1,500` → `1500`.
+ * - A comma with one, two, or four-or-more digits after it cannot be a group of
+ *   three, so it is a decimal comma: `1,50` → `1.5`, `1,5000` → `1.5`.
+ * - When both `.` and `,` appear, the **later** one is the decimal separator and
+ *   everything before it must group in threes: `1.234,56` → `1234.56`,
+ *   `1,500.25` → `1500.25`.
+ *
+ * `1,500` is the one shape where both readings are legal. It keeps the reading it
+ * has always had, because that is the status quo and the overwhelmingly common
+ * intent — and because changing it silently would be the same mistake this fixes.
+ *
+ * What is illegal under both conventions is refused rather than guessed:
+ * `12,34,567`, `1,5.25`, `1234,567` and `,5` all return `null`. Refusing is the
+ * right default for money: a refused row is shown with a message naming it, while
+ * a misread row is shown as a plausible, wrong portfolio, and nothing downstream
+ * can tell the difference.
+ */
+function resolveSeparators(value: string): string | null {
+  if (!value) return null;
+  const negative = value.startsWith('-');
+  const body = negative ? value.slice(1) : value;
+  if (!body) return null;
+
+  let out: string;
+  if (!body.includes(',')) {
+    // No comma: leave it alone and let parseFloat do what it has always done with it.
+    out = body;
+  } else {
+    const lastDot = body.lastIndexOf('.');
+    const lastComma = body.lastIndexOf(',');
+
+    // Where is the decimal separator? With both present it is whichever comes
+    // later. With commas only, a three-digit tail means there is none at all.
+    let decPos: number;
+    if (lastDot >= 0) {
+      decPos = Math.max(lastDot, lastComma);
+    } else {
+      decPos = /^\d{3}$/.test(body.slice(lastComma + 1)) ? -1 : lastComma;
+    }
+
+    if (decPos === -1) {
+      // Every comma is a thousands separator, so every group after the first must
+      // be three digits. `12,34,567` fails here instead of becoming `1234567`.
+      if (!/^\d{1,3}(,\d{3})*$/.test(body)) return null;
+      out = body.replace(/,/g, '');
+    } else {
+      const tail = body.slice(decPos + 1);
+      const head = body.slice(0, decPos);
+      if (!/^\d+$/.test(tail)) return null;
+      // The head is digits grouped by either separator, in threes.
+      if (!/^\d{1,3}([.,]\d{3})*$/.test(head)) return null;
+      out = head.replace(/[.,]/g, '') + '.' + tail;
+    }
+  }
+
+  return negative ? `-${out}` : out;
+}
+
 function parseNumeric(val: string): number {
-  const cleaned = val.replace(/[$€£¥₹,\s]/g, '');
-  return parseFloat(cleaned);
+  // The comma is deliberately not in the strip class any more; `resolveSeparators`
+  // needs to see it. Currency symbols and whitespace carry no ambiguity and still go.
+  const cleaned = (val ?? '').replace(/[$€£¥₹\s]/g, '');
+  const resolved = resolveSeparators(cleaned);
+  // `NaN` is the callers' existing "not a number" signal — every caller tests it
+  // with `isNaN`, so an unresolvable grouping reports as an invalid cell rather
+  // than throwing its way through the validator.
+  if (resolved === null) return NaN;
+  return parseFloat(resolved);
 }
 
 function validateQuantity(
