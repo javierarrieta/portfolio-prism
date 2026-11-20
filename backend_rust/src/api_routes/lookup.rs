@@ -268,7 +268,7 @@ mod tests {
             "US0378331005", // Apple
             "US5949181045", // Microsoft
             "US88160R1014", // Tesla — body contains a letter
-            "DE000BAY0017", // Puma SE — body contains letters
+            "DE000BAY0017", // Bayer AG — body contains letters
             "DE0007164600", // Deutsche Telekom
             "FR0000131906", // Renault
             "GB0002634946", // Shell

@@ -17,6 +17,8 @@ describe('separator handling', () => {
     expect(row('0,25').quantity).toBe(0.25);
     expect(row('1,5000').quantity).toBe(1.5);
     expect(row('1.234,56').quantity).toBe(1234.56);
+    // A leading `+` carries no information and parseFloat always accepted it.
+    expect(row('+1,5').quantity).toBe(1.5);
   });
 
   test('a three-digit group after a comma is still a thousands separator', () => {

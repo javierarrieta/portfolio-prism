@@ -158,7 +158,10 @@ function validateType(
 function resolveSeparators(value: string): string | null {
   if (!value) return null;
   const negative = value.startsWith('-');
-  const body = negative ? value.slice(1) : value;
+  // A leading `+` carries no information, and `parseFloat` always accepted it, so
+  // refusing one here would be a new rejection rather than a fixed one.
+  const signed = negative || value.startsWith('+');
+  const body = signed ? value.slice(1) : value;
   if (!body) return null;
 
   let out: string;

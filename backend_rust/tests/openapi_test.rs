@@ -23,12 +23,18 @@ fn document() -> Value {
         .expect("the document serialises to valid JSON")
 }
 
-/// Every `#/components/schemas/X` string anywhere in the document.
+/// Every `#/components/<section>/<name>` reference anywhere in the document.
 ///
 /// Walked as text rather than through a typed model on purpose: a `$ref` can appear in a
 /// request body, a response, a query parameter's schema, or nested inside an `allOf`, and a
 /// walker that only visits the paths it knows about would miss the rest.
-fn referenced(document: &Value) -> Vec<String> {
+///
+/// The section is kept rather than discarded, because `#/components/` is not only schemas —
+/// utoipa also emits `responses`, `parameters` and `securitySchemes`. A checker that looked
+/// under `schemas` alone would call a dangling `#/components/responses/X` clean, which is
+/// this file's own bug one key over. Today the document contains schema references only; the
+/// walker does not depend on that staying true.
+fn referenced(document: &Value) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut stack = vec![document];
     while let Some(value) = stack.pop() {
@@ -36,11 +42,14 @@ fn referenced(document: &Value) -> Vec<String> {
             Value::Object(map) => {
                 for (key, child) in map {
                     if key == "$ref" {
-                        if let Some(name) = child
+                        if let Some(rest) = child
                             .as_str()
-                            .and_then(|s| s.strip_prefix("#/components/schemas/"))
+                            .and_then(|s| s.strip_prefix("#/components/"))
                         {
-                            found.push(name.to_string());
+                            let mut parts = rest.splitn(2, '/');
+                            if let (Some(section), Some(name)) = (parts.next(), parts.next()) {
+                                found.push((section.to_string(), name.to_string()));
+                            }
                         }
                     } else {
                         stack.push(child);
@@ -57,22 +66,35 @@ fn referenced(document: &Value) -> Vec<String> {
 }
 
 #[test]
-fn no_reference_points_at_a_schema_that_was_never_registered() {
+fn no_reference_points_at_a_component_that_was_never_registered() {
     let document = document();
-    let defined = document["components"]["schemas"]
+    let components = document["components"]
         .as_object()
-        .expect("the document has a components.schemas object");
+        .expect("the document has a components object");
 
     let references = referenced(&document);
-    let dangling: Vec<&String> = references
+    // A walker that matched nothing would pass the assertion below vacuously, so prove it is
+    // reading the document at all before believing its silence.
+    assert!(
+        !references.is_empty(),
+        "the walker found no `#/components/...` reference anywhere in the document, which \n\
+         means the walker is broken rather than that the document is clean"
+    );
+    let dangling: Vec<&(String, String)> = references
         .iter()
-        .filter(|name| !defined.contains_key(name.as_str()))
+        .filter(|(section, name)| {
+            !components
+                .get(section)
+                .and_then(|set| set.as_object())
+                .is_some_and(|set| set.contains_key(name))
+        })
         .collect();
 
     assert!(
         dangling.is_empty(),
-        "these schemas are referenced but never registered in openapi.rs's components list: \
-         {dangling:?}. Add them to `components(schemas(...))`."
+        "these components are referenced but never registered in openapi.rs's components \
+         list: {dangling:?}. Add each to `components(schemas(...))` or to the section it \
+         belongs to."
     );
 }
 
