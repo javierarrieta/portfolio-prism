@@ -201,7 +201,21 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
     if (hasSuccess) {
       onImportComplete();
     }
-  }, [validationReport, assets, portfolioId, onImportComplete]);
+  }, [
+    validationReport,
+    assets,
+    portfolioId,
+    onImportComplete,
+    // Both feed `effectiveFormat` above, and the UI lets the user change
+    // `overrideFormat` after the callback was last built (the ambiguous-format
+    // picker). Left out, the memoized callback parsed dates with whatever format was
+    // selected when it happened to be recreated — a wrong `date` on every row, sent
+    // to the API as a plausible ISO string. This was an eslint warning because
+    // react-hooks/exhaustive-deps reports staleness rather than proof of a miss;
+    // the miss is real, it just needs the user to change the format last.
+    dateFormat,
+    overrideFormat,
+  ]);
 
   // The predicate, not just the truthiness filter: without it `field` keeps the null member
   // of CsvTransactionField and every consumer below has to re-narrow it.
