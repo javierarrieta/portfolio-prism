@@ -1594,6 +1594,53 @@ async fn a_lowercase_isin_is_stored_upper_cased_like_the_write_path_stores_it() 
 }
 
 #[tokio::test]
+async fn a_bundle_carrying_an_isin_with_a_wrong_check_digit_is_refused() {
+    // This is the **restore** path, not the write path, and it is the reason the check
+    // digit reaching `is_valid_isin` needed an audit of stored data: `collect` runs it
+    // over every ISIN a bundle carries, and `export::build` copies ISINs straight out
+    // of the `assets` table (`export.rs:305`). A stored row with a wrong digit would
+    // therefore make its own backup fail here — a backup that cannot be restored is
+    // not a backup.
+    //
+    // It cannot happen today: production stores no ISINs at all, and after this
+    // change the write path refuses one. This test is what keeps that from rotting if
+    // either stops being true.
+    let (pool, user) = db_with_user("a_bundle_carrying_an_isin_with_a_wrong_check_digit_is_refused").await;
+    let c = client(pool, user).await;
+
+    let mut v = bundle_value("Wrong digit");
+    // Twelve shape-valid characters, Apple's body, the digit decremented. Before the
+    // digit was computed this bundle validated.
+    v["portfolios"][0]["assets"][0]["isin"] = json!("US0378331004");
+    let res = c.post("/api/backup/preview?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
+    assert_eq!(res.status(), Status::UnprocessableEntity, "a wrong check digit is a client data error");
+    let body: Value = res.into_json().await.unwrap();
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "only the ISIN is at fault: {body}");
+    assert_eq!(errors[0]["path"], "portfolios[0].assets[0].isin");
+    assert!(
+        errors[0]["reason"].as_str().unwrap().contains("US0378331004"),
+        "the reason must name the offending value: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_bundle_with_the_right_check_digit_restores() {
+    // The control. Without it the test above passes for any reason at all — shape,
+    // casing, an unrelated field — rather than for the digit.
+    let (pool, user) = db_with_user("the_same_bundle_with_the_right_check_digit_restores").await;
+    let c = client(pool, user).await;
+
+    let mut v = bundle_value("Right digit");
+    v["portfolios"][0]["assets"][0]["isin"] = json!("US0378331005");
+    let res = c.post("/api/backup/restore?mode=copy").header(session())
+        .header(rocket::http::ContentType::JSON).body(v.to_string()).dispatch().await;
+    assert_eq!(res.status(), Status::Ok, "the same bundle with a valid digit must apply: {}",
+        res.into_string().await.unwrap_or_default());
+}
+
+#[tokio::test]
 async fn a_bundle_with_no_portfolios_is_refused_by_restore() {
     // Review Focus #5, on the write path this time.
     let (pool, user) = db_with_user("a_bundle_with_no_portfolios_is_refused_by_restore").await;

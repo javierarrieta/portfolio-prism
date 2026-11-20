@@ -1362,6 +1362,17 @@
           }
         }
       },
+      "AssetUpdate": {
+        "type": "object",
+        "required": [
+          "currency"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string"
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "description": "The one body every failure returns. Validation failures carry an empty pair of lists\nand name the offending parameter in `error`; a pricing failure populates them.",
