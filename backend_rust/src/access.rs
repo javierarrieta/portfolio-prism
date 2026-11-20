@@ -14,6 +14,8 @@
 //! is the intended shape.
 
 use rocket::http::Status;
+use crate::auth::guard::{AuthedUser, Credential};
+use crate::auth::pat::Scope;
 use crate::db::DbPool;
 
 // Every id in this module is `i64`, the width of every id column in
@@ -207,6 +209,70 @@ pub async fn require_transaction(
     // `a_transaction_whose_asset_is_gone_is_not_found` constructs that case by
     // dropping the constraint, because nothing else can.
     require_asset(pool, user_id, asset_id, min).await
+}
+
+/// Check that a caller-supplied `api_token` id belongs to the caller.
+///
+/// The same shape as `require_asset_in`, for the same reason: this module is the only
+/// place a caller-supplied id resolves, and a token id is exactly such an id. Without
+/// it, `DELETE /api/tokens/<id>` would let any signed-in user revoke anyone's token by
+/// counting integers.
+///
+/// A token that is not yours answers through `deny`, i.e. 404 and not 403: the
+/// existence of someone else's token id is not information to hand out.
+pub async fn require_own_token(
+    pool: &DbPool,
+    user_id: i64,
+    token_id: i64,
+    min: Access,
+) -> Result<Access, Status> {
+    let owner: Option<i64> =
+        sqlx::query_scalar!("SELECT user_id FROM api_token WHERE id = $1", token_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                eprintln!("ERROR: could not look up token {token_id} for user {user_id}: {e}");
+                Status::InternalServerError
+            })?;
+
+    let Some(owner) = owner else {
+        return Err(deny("api_token", token_id, user_id));
+    };
+
+    if owner != user_id {
+        return Err(deny("api_token", token_id, user_id));
+    }
+
+    Ok(min)
+}
+
+/// Check that a bearer-token caller holds `scope`. A session passes unconditionally.
+///
+/// The asymmetry is the point: a human in a browser has whatever their own access
+/// allows, and asking them to also hold a scope they were never issued would be
+/// theatre. A token is a program with a subset, and the subset is the whole point of
+/// issuing it.
+///
+/// This is a ceiling on what a credential may do, not a check on who is behind it.
+/// The control that proves a human approved something is the staged-batch approval
+/// state, which no scope can substitute for.
+pub fn require_scope(user: &AuthedUser, scope: Scope) -> Result<(), Status> {
+    match &user.credential {
+        Credential::Session => Ok(()),
+        Credential::Token { id, scopes } => {
+            if scopes.contains(&scope) {
+                Ok(())
+            } else {
+                // Named by token id, never by secret: the id is what a log may carry.
+                eprintln!(
+                    "WARN: token {id} lacks scope '{}' (has {:?})",
+                    scope.as_str(),
+                    scopes
+                );
+                Err(Status::Forbidden)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

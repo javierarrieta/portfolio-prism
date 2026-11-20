@@ -31,6 +31,9 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::backup::preview,
         crate::api_routes::backup::restore,
         crate::api_routes::backup::owned,
+        crate::api_routes::tokens::create_token,
+        crate::api_routes::tokens::list_tokens,
+        crate::api_routes::tokens::revoke_token,
     ),
     components(schemas(
         models::Portfolio,

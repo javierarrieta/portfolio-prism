@@ -2,7 +2,7 @@
 # The migration is the schema. This checks a Postgres database against it, and it pins
 # four things, because each one has a different way of going wrong silently:
 #
-#   1. every column's type and NOT NULL-ness (all 36 columns of the six tables, 28 of
+#   1. every column's type and NOT NULL-ness (all 44 columns of the seven tables, 34 of
 #      them NOT NULL, not a sample — sqlx-postgres type-checks at run time, so a wrong
 #      column type is a request failing in production rather than a compile error, and a
 #      column made nullable is a `None` the Rust structs have no field for),
@@ -46,6 +46,23 @@ want() { # table column type
   [ -n "$t" ] || { echo "FAIL $1.$2 does not exist in $DATABASE_URL"; exit 1; }
   [ "$t" = "$3" ] || { echo "FAIL $1.$2 is '$t', expected '$3'"; exit 1; }
   echo "ok   $1.$2 = $3"
+}
+
+# An array column. `data_type` is the literal "ARRAY" for every array type, so
+# checking it alone would accept an int[] where a text[] is required; the element type
+# is in `udt_name`, and that is what this pins.
+want_array() { # table column element-udt-name
+  local t u
+  t=$(q "select data_type from information_schema.columns
+          where table_schema='public' and table_name='$1' and column_name='$2'") \
+    || { echo "FAIL could not read the type of $1.$2 from $DATABASE_URL"; exit 1; }
+  [ -n "$t" ] || { echo "FAIL $1.$2 does not exist in $DATABASE_URL"; exit 1; }
+  [ "$t" = "ARRAY" ] \
+    || { echo "FAIL $1.$2 is '$t', expected an array"; exit 1; }
+  u=$(q "select udt_name from information_schema.columns
+          where table_schema='public' and table_name='$1' and column_name='$2'")
+  [ "$u" = "$3" ] || { echo "FAIL $1.$2 is an array of '$u', expected '$3'"; exit 1; }
+  echo "ok   $1.$2 = $3 array"
 }
 
 want_notnull() { # table column
@@ -132,6 +149,11 @@ want_migration_ledger() {
     v=$((10#$v))
     d=${base#*_}
     d=${d%.sql}
+    # sqlx stores the description with underscores turned into spaces, so a migration
+    # whose name has more than one word in it never matched until 0003_api_token.sql
+    # came along — the first one this script had ever met. Comparing the file name
+    # verbatim reported an applied migration as missing.
+    d=${d//_/ }
     sum=$(sha384sum "$f" | cut -d' ' -f1)
     stored=$(q "select encode(checksum, 'hex') from _sqlx_migrations
                   where version = $v and description = '$d' and success") \
@@ -267,7 +289,35 @@ want split_sync covered_from   date
 want_notnull split_sync asset_id
 want_notnull split_sync last_synced_at
 
+# --- api_token ----------------------------------------------------------------------
+# `secret_hash` and not `secret`: the plaintext is shown once at mint and is
+# unrecoverable afterwards, so there is nothing in this table worth restoring or
+# cascading. `scopes` is TEXT[] rather than a CHECK over ('read','import') on purpose —
+# the vocabulary has exactly one authority, the `Scope` enum in `auth/pat.rs`, and a
+# second copy of it in a constraint is how the two drift apart.
+#
+# The three nullable timestamps are the table's whole design, so their nullability is
+# pinned as deliberately as any type: `expires_at` NULL means no expiry, `last_used_at`
+# NULL means never used, `revoked_at` NULL means live. A migration that made any of
+# them NOT NULL with a sentinel would silently change what "no expiry" means.
+want api_token id           bigint
+want api_token user_id      bigint
+want api_token secret_hash  text
+want api_token label        text
+want_array api_token scopes _text
+want api_token expires_at   "timestamp with time zone"
+want api_token last_used_at "timestamp with time zone"
+want api_token revoked_at   "timestamp with time zone"
+want api_token created_at   "timestamp with time zone"
+want_notnull api_token id
+want_notnull api_token user_id
+want_notnull api_token secret_hash
+want_notnull api_token label
+want_notnull api_token scopes
+want_notnull api_token created_at
+
 # --- keys, identity, and the ledger -------------------------------------------------
+want_identity api_token    id
 want_identity users        id
 want_identity portfolios   id
 want_identity assets       id
@@ -282,6 +332,9 @@ want_pk historical_prices "PRIMARY KEY (symbol, date)"
 # `ON CONFLICT (issuer, subj) DO NOTHING` (auth/oidc.rs:304), so without this index every
 # first login fails when the plan is built rather than writing a duplicate identity.
 want_unique users uq_users_issuer_subj "(issuer, subj)"
+# The uniqueness the token path depends on: `pat::lookup` finds exactly one row by
+# hash, and a second row with the same hash would make two tokens interchangeable.
+want_unique api_token api_token_secret_hash_key "(secret_hash)"
 
 want_split_dedupe_index
 want_migration_ledger

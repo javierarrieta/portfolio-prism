@@ -84,8 +84,13 @@ fn the_real_tree_passes_the_gate() {
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     assert!(
-        text.contains("handlers inspected: 21"),
-        "the gate should account for all 21 handlers, said:\n{text}"
+        // 21 handlers before the token routes, 24 after: `create_token`,
+        // `list_tokens`, `revoke_token`. The count is pinned rather than
+        // range-checked on purpose — a handler the script failed to see would show up
+        // here as a smaller number, which is the only way an invisible handler is ever
+        // noticed.
+        text.contains("handlers inspected: 24"),
+        "the gate should account for all 24 handlers, said:\n{text}"
     );
 }
 

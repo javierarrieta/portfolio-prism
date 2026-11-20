@@ -19,3 +19,8 @@ rocket_cors = "0.6"
 rust_decimal = { version = "1.35", features = ["serde"] }
 schemars = "1.0"
 openidconnect = "4.1"
+# Already in the tree via rustls/openidconnect, so this adds no new code to the build —
+# it only declares the use. Used for the CSPRNG and SHA-256 behind personal access
+# tokens (`auth/pat.rs`); the alternative was `rand` + `sha2`, two crates for what one
+# already-present crate does.
+ring = "0.17"

@@ -23,6 +23,7 @@ pub mod api_routes {
     pub mod analytics;
     pub mod lookup;
     pub mod backup;
+    pub mod tokens;
 }
 
 /// Test-only stand-in for the pricing provider, compiled into the library's own
@@ -331,6 +332,9 @@ pub fn build_rocket(
             api_routes::backup::preview,
             api_routes::backup::restore,
             api_routes::backup::owned,
+            api_routes::tokens::create_token,
+            api_routes::tokens::list_tokens,
+            api_routes::tokens::revoke_token,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same

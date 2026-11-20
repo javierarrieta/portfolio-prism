@@ -1002,6 +1002,96 @@
         }
       }
     },
+    "/api/tokens": {
+      "get": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "list_tokens",
+        "responses": {
+          "200": {
+            "description": "This user's tokens, newest first, without secrets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TokenOut"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Token created; the secret is shown here for the first and last time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenMinted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank label, no scopes, an unknown scope name, or an out-of-range expiry"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/tokens/<id>": {
+      "delete": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token revoked"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such token, or not yours"
+          }
+        }
+      }
+    },
     "/api/transactions/<id>": {
       "delete": {
         "tags": [

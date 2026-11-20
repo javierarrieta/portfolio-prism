@@ -1,4 +1,4 @@
-//! The four foreign keys, and what each one forbids.
+//! The five foreign keys, and what each one forbids.
 //!
 //! The claim this file replaces — "SQLite never set `PRAGMA foreign_keys`, so every
 //! `FOREIGN KEY` in `init_db` was decorative" — is false, and the correction is
@@ -20,14 +20,14 @@
 //!   `src/lib.rs:530` at the merge base) declared `asset_id INTEGER PRIMARY KEY` with
 //!   no foreign key, so a throttle row could outlive its asset indefinitely.
 //!
-//! All four are pinned here anyway. Two of them confirm something that was already
+//! All five are pinned here anyway. Two of them confirm something that was already
 //! true, and that is worth the tests rather than worth skipping: they are the reason
 //! the app's delete ordering is a continuation of existing discipline and not new
 //! behaviour to distrust. Each test names the constraint it expects, so a refusal
 //! from some *other* constraint cannot satisfy it.
 //!
-//! None of the four declares `ON DELETE CASCADE`, and
-//! [`the_schema_has_exactly_the_four_foreign_keys`] pins that too, because three
+//! None of the five declares `ON DELETE CASCADE`, and
+//! [`the_schema_has_exactly_the_five_foreign_keys_and_none_of_them_cascades`] pins that too, because three
 //! places in the app are written against it: `delete_asset`
 //! (`src/api_routes/transactions.rs`) deletes the `split_sync` row before the asset
 //! and inside one transaction, `delete_portfolio` answers 409 instead of cascading,
@@ -90,14 +90,14 @@ fn assert_fk_violation(err: sqlx::Error, constraint: &str, table: &str) {
 /// The whole foreign-key inventory, in one assertion.
 ///
 /// The four tests below each pin one constraint by refusing to write a row through
-/// it; this pins the *set*, so a fifth constraint appearing, one of these four going
+/// it; this pins the *set*, so a sixth constraint appearing, one of these five going
 /// missing, or a referential action being added to any of them is a failure here
 /// rather than a change in what some unrelated delete is allowed to do.
 ///
 /// `confdeltype` is Postgres' referential-action code: `a` is NO ACTION, which is
-/// what all four use, and `c` would be CASCADE.
+/// what all five use, and `c` would be CASCADE.
 #[tokio::test]
-async fn the_schema_has_exactly_the_four_foreign_keys_and_none_of_them_cascades() {
+async fn the_schema_has_exactly_the_five_foreign_keys_and_none_of_them_cascades() {
     let (pool, _) = db_with_user("fk_inventory").await;
 
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(
@@ -112,6 +112,15 @@ async fn the_schema_has_exactly_the_four_foreign_keys_and_none_of_them_cascades(
     .expect("pg_constraint is readable");
 
     let expected: Vec<(String, String, String, String)> = [
+        // The newest one, and the one a reader would least expect to be here: a token
+        // points at a user and nothing cascades, because `users` rows are deactivated
+        // rather than deleted and `pat::lookup` resolves the user on every call.
+        (
+            "api_token_user_id_fkey",
+            "FOREIGN KEY (user_id) REFERENCES users(id)",
+            "users",
+            "a",
+        ),
         (
             "assets_portfolio_id_fkey",
             "FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)",
