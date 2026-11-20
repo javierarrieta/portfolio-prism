@@ -183,6 +183,9 @@ export interface components {
       symbol: string;
       unrealized_at_end: string;
     };
+    AssetUpdate: {
+      currency: string;
+    };
     /**
      * @description The one body every failure returns. Validation failures carry an empty pair of lists
      * and name the offending parameter in `error`; a pricing failure populates them.
