@@ -92,6 +92,31 @@ export interface paths {
   "/api/portfolios/<portfolio_id>/transactions": {
     get: operations["list_portfolio_transactions"];
   };
+  "/api/staged-batches": {
+    /**
+     * List the caller's staged batches, newest first.
+     * @description No caller-supplied id: the caller *is* the selector, so there is nothing for
+     * `access.rs` to resolve.
+     */
+    get: operations["list_batches"];
+  };
+  "/api/staged-batches/<handle>": {
+    /**
+     * The stored preview, rendered verbatim.
+     * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
+     * if the preview were derived at render time, what a human read and what the agent was
+     * shown could differ, and the approval would be an approval of something else.
+     */
+    get: operations["get_batch"];
+  };
+  "/api/staged-batches/<handle>/approve": {
+    /**
+     * `staged -> approved`. The human act, and the only write this UI performs.
+     * @description A conditional update inside `staging::approve`, so two tabs cannot both succeed; the
+     * loser gets 409 naming the current status rather than a silent second success.
+     */
+    post: operations["approve_batch"];
+  };
   "/api/tokens": {
     get: operations["list_tokens"];
     post: operations["create_token"];
@@ -189,6 +214,33 @@ export interface components {
       split_applied: boolean;
       symbol: string;
       unrealized_at_end: string;
+    };
+    /**
+     * @description One row of the list. No payload and no preview: the list is a menu, and the detail route
+     * is where the bytes are.
+     */
+    BatchOut: {
+      /** Format: date-time */
+      applied_at?: string | null;
+      /** Format: date-time */
+      approved_at?: string | null;
+      /** Format: int64 */
+      asset_count: number;
+      /** Format: date-time */
+      created_at: string;
+      /**
+       * @description Computed here rather than stored, because "is this still approvable" is a fact about
+       * the clock and not about the row: an `approved` batch past `expires_at` can never be
+       * applied, and showing it as approvable invites a human to approve something that will
+       * then be refused.
+       */
+      expired: boolean;
+      /** Format: date-time */
+      expires_at: string;
+      handle: string;
+      status: string;
+      /** Format: int64 */
+      transaction_count: number;
     };
     /**
      * @description The one body every failure returns. Validation failures carry an empty pair of lists
@@ -1209,6 +1261,86 @@ export interface operations {
       };
       /** @description Portfolio not found */
       404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * List the caller's staged batches, newest first.
+   * @description No caller-supplied id: the caller *is* the selector, so there is nothing for
+   * `access.rs` to resolve.
+   */
+  list_batches: {
+    responses: {
+      /** @description This user's staged batches, newest first */
+      200: {
+        content: {
+          "application/json": components["schemas"]["BatchOut"][];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * The stored preview, rendered verbatim.
+   * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
+   * if the preview were derived at render time, what a human read and what the agent was
+   * shown could differ, and the approval would be an approval of something else.
+   */
+  get_batch: {
+    parameters: {
+      path: {
+        handle: string;
+      };
+    };
+    responses: {
+      /** @description The stored preview, byte for byte */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such batch for this user */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * `staged -> approved`. The human act, and the only write this UI performs.
+   * @description A conditional update inside `staging::approve`, so two tabs cannot both succeed; the
+   * loser gets 409 naming the current status rather than a silent second success.
+   */
+  approve_batch: {
+    parameters: {
+      path: {
+        handle: string;
+      };
+    };
+    responses: {
+      /** @description Approved */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such batch for this user */
+      404: {
+        content: never;
+      };
+      /** @description Not in a state that can be approved */
+      409: {
         content: never;
       };
     };
