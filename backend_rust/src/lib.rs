@@ -280,7 +280,16 @@ pub fn build_rocket(
         .attach(cors)
         .attach(AuthFairing)
         .manage(pool)
-        .manage(currency_service)
+        // Arc, not the value. Rocket resolves managed state by exact type, so anything
+        // that needs to hand a `&CurrencyService` to code outside a request — the agent
+        // mount builds its tool server inside a `'static` closure, where a borrowed `&T`
+        // cannot go — needs a shared handle rather than a borrow of the managed value.
+        //
+        // One instance, one cache, one rate limiter: the pricing provider is rate-limited
+        // and the limiter exists to keep the process under that ceiling. Two instances
+        // would double the request rate against it, which is why this is an Arc and not a
+        // second `CurrencyService::new`.
+        .manage(std::sync::Arc::new(currency_service))
         .manage(auth)
         .manage(backup_cfg)
         .mount("/", routes![index])

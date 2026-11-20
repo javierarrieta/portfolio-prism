@@ -53,7 +53,7 @@ pub async fn get_portfolio_tax_summary(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
     from: Option<String>,
@@ -252,7 +252,7 @@ pub async fn sync_portfolio_splits(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
 ) -> Result<Json<SyncSplitsOut>, ReportError> {
     // Editor, not Viewer: this writes rows that change cost basis.
     require(pool.inner(), user.id, id, Access::Editor)
@@ -305,7 +305,7 @@ pub async fn get_portfolio_performance(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
 ) -> Result<Json<serde_json::Value>, Status> {
     // Before the `WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1)`
     // subquery: that shape is invisible to the gate script's grep, so this call is
@@ -372,7 +372,7 @@ pub async fn get_transaction_sell_pnl(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
 ) -> Result<Json<SellPnlResponse>, Status> {

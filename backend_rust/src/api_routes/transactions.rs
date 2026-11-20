@@ -20,7 +20,7 @@ pub async fn create_asset(
     user: AuthedUser,
     portfolio_id: i64,
     pool: &State<DbPool>,
-    _currency_service: &State<CurrencyService>,
+    _currency_service: &State<std::sync::Arc<CurrencyService>>,
     asset: Json<AssetCreate>
 ) -> Result<Json<AssetOut>, Status> {
     // This also fixes a pre-existing hole: the insert used to accept any
