@@ -42,6 +42,7 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::SyncSplitFailure,
         schemas::PortfolioUpdate,
         schemas::AssetCreate,
+        schemas::AssetUpdate,
         schemas::AssetOut,
         schemas::TransactionCreate,
         schemas::TransactionOut,
