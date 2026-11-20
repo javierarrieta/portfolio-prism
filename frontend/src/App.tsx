@@ -16,6 +16,7 @@ import {
   Bot,
   PanelLeftClose,
   PanelLeftOpen,
+  KeyRound,
   Wallet,
   type LucideIcon,
 } from 'lucide-react';
@@ -25,6 +26,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
+import AccessTokensPanel from './components/AccessTokensPanel';
 import BackupPanel from './components/BackupPanel';
 import StagedBatchesPanel from './components/StagedBatchesPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
@@ -64,6 +66,9 @@ const NAV_ITEMS: { id: string; label: string; Icon: LucideIcon }[] = [
   // is going to fill, so there may be no portfolio to select yet when there is something
   // to approve.
   { id: 'staged', label: 'Agent staging', Icon: Bot },
+  // Account-level, like Backup: neither is about the selected portfolio, which is why
+  // both sit outside the `currentPortfolio` branch below rather than inside it.
+  { id: 'access', label: 'Access tokens', Icon: KeyRound },
 ];
 
 /**
@@ -798,6 +803,8 @@ export default function App() {
           <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
         ) : activeTab === 'staged' ? (
           <StagedBatchesPanel />
+        ) : activeTab === 'access' ? (
+          <AccessTokensPanel />
         ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (

@@ -260,6 +260,7 @@ pub async fn provision_or_update(
             name: name.map(str::to_string),
             sub: sub.to_string(),
             token_version: row.token_version,
+            credential: crate::auth::guard::Credential::Session,
         });
     }
 
@@ -298,6 +299,7 @@ pub async fn provision_or_update(
                 name: name.map(str::to_string),
                 sub: sub.to_string(),
                 token_version: handed,
+                credential: crate::auth::guard::Credential::Session,
             });
         }
     }
@@ -334,6 +336,7 @@ pub async fn provision_or_update(
         name: row.name,
         sub: sub.to_string(),
         token_version: row.token_version,
+        credential: crate::auth::guard::Credential::Session,
     })
 }
 

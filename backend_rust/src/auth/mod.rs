@@ -15,6 +15,7 @@
 pub mod fairing;
 pub mod guard;
 pub mod oidc;
+pub mod pat;
 pub mod routes;
 pub mod session;
 

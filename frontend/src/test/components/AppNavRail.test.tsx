@@ -27,6 +27,9 @@ const NAV_LABELS = [
   'Tax Report',
   'Backup',
   'Agent staging',
+  // Account-level like Backup, and pinned here because this list is the only thing
+  // that notices a nav item added without anyone deciding it belongs there.
+  'Access tokens',
 ]
 
 async function renderApp() {

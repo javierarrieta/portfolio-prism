@@ -105,6 +105,16 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // The state transition itself. Same resolution, same reason: approving someone else's
     // batch would be the whole control defeated by guessing a handle.
     ("POST", "/api/staged-batches/<handle>/approve", Some(Access::Owner)),
+    // Token routes. Mint and list resolve no caller-supplied id — the caller *is* the
+    // session, and there is no resource to authorise against — so they carry `None`,
+    // the same as `POST /api/portfolios/`.
+    ("POST", "/api/tokens", None),
+    ("GET", "/api/tokens", None),
+    // The one that does resolve a caller-supplied id, and the reason it is listed:
+    // without `require_own_token` on this path, any signed-in user revokes anyone's
+    // token by counting integers. `Owner` because a token is the caller's own
+    // credential, which is the closest thing to ownership this enum has.
+    ("DELETE", "/api/tokens/<id>", Some(Access::Owner)),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -180,7 +190,9 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 24, "the mounted /api surface is 24 operations");
+    // 21 on main, +3 token routes, +3 staged-batch routes. Both branches wrote 24
+    // from the same base; git took the identical edit and the sum is only visible now.
+    assert_eq!(checked, 27, "the mounted /api surface is 27 operations");
 }
 
 #[tokio::test]
@@ -302,7 +314,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 24);
+    assert_eq!(PROTECTED_ROUTES.len(), 27);
 }
 
 #[test]
@@ -316,8 +328,11 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 17,
-        "seven routes authenticate without checking an id"
+        // 15 on main, 17 with the staged-batch routes, 16 with the token routes, and 18
+        // with both. Each branch counted honestly from the same base; only the merge can
+        // know the sum.
+        with_level, 18,
+        "eight routes authenticate without checking an id"
     );
 }
 

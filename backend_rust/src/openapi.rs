@@ -34,6 +34,9 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::staged_batches::list_batches,
         crate::api_routes::staged_batches::get_batch,
         crate::api_routes::staged_batches::approve_batch,
+        crate::api_routes::tokens::create_token,
+        crate::api_routes::tokens::list_tokens,
+        crate::api_routes::tokens::revoke_token,
     ),
     components(schemas(
         models::Portfolio,
@@ -71,6 +74,13 @@ use utoipa::openapi::{Components, RefOr, Response};
         // preview, whose shape is the agent's choosing, and `serde_json::Value` resolves to
         // a free-form object on its own — naming it would imply a shape that does not exist.
         crate::api_routes::staged_batches::BatchOut,
+        // Registered as a set: `list_tokens` answers `[TokenOut]`, `create_token`
+        // answers `TokenMinted`, and both take `TokenCreate`. Mounting the routes
+        // without these leaves the document with `$ref`s to schemas that do not
+        // exist, which is what it did until this line.
+        crate::api_routes::tokens::TokenCreate,
+        crate::api_routes::tokens::TokenMinted,
+        crate::api_routes::tokens::TokenOut,
     ))
 )]
 pub struct ApiDoc;

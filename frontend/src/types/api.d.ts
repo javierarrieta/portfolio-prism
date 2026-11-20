@@ -92,6 +92,13 @@ export interface paths {
   "/api/portfolios/<portfolio_id>/transactions": {
     get: operations["list_portfolio_transactions"];
   };
+  "/api/tokens": {
+    get: operations["list_tokens"];
+    post: operations["create_token"];
+  };
+  "/api/tokens/<id>": {
+    delete: operations["revoke_token"];
+  };
   "/api/transactions/<id>": {
     delete: operations["delete_transaction"];
   };
@@ -468,6 +475,65 @@ export interface components {
       latent_roi: string;
       original_qty: string;
       remaining_qty: string;
+    };
+    /** @description What the owner sends to create a token. */
+    TokenCreate: {
+      /**
+       * Format: int64
+       * @description Omitted or `null` means no expiry — the default, and the honest one.
+       */
+      expires_in_days?: number | null;
+      /**
+       * @description Free text, shown in the list. The only thing that makes a token
+       * distinguishable once it is out in the world, so it is required.
+       */
+      label: string;
+      /**
+       * @description Scope names as the client spells them; `pat::mint` is what decides whether
+       * they exist.
+       */
+      scopes: string[];
+    };
+    /** @description A minted token. `secret` appears in this response and nowhere else, ever. */
+    TokenMinted: {
+      /** Format: date-time */
+      created_at: string;
+      /** Format: date-time */
+      expires_at?: string | null;
+      /** Format: int64 */
+      id: number;
+      label: string;
+      scopes: string[];
+      /**
+       * @description Shown once. There is no endpoint that can show it again, which is why the UI
+       * has to say so out loud rather than offer a reveal button later.
+       */
+      secret: string;
+    };
+    /** @description A token as listed. No secret, no hash — the query does not select either. */
+    TokenOut: {
+      /** Format: date-time */
+      created_at: string;
+      /**
+       * @description Past its expiry by the server's clock, so the list cannot show a token as live
+       * that `lookup` would refuse.
+       */
+      expired: boolean;
+      /** Format: date-time */
+      expires_at?: string | null;
+      /** Format: int64 */
+      id: number;
+      label: string;
+      /** Format: date-time */
+      last_used_at?: string | null;
+      /** Format: date-time */
+      revoked_at?: string | null;
+      scopes: string[];
+      /**
+       * @description Idle for 90 days or more (or minted then and never used). The UI renders this
+       * as a nudge; the threshold itself lives in the list query, not here.
+       */
+      stale: boolean;
     };
     Transaction: {
       /** Format: int64 */
@@ -1142,6 +1208,64 @@ export interface operations {
         content: never;
       };
       /** @description Portfolio not found */
+      404: {
+        content: never;
+      };
+    };
+  };
+  list_tokens: {
+    responses: {
+      /** @description This user's tokens, newest first, without secrets */
+      200: {
+        content: {
+          "application/json": components["schemas"]["TokenOut"][];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  create_token: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["TokenCreate"];
+      };
+    };
+    responses: {
+      /** @description Token created; the secret is shown here for the first and last time */
+      201: {
+        content: {
+          "application/json": components["schemas"]["TokenMinted"];
+        };
+      };
+      /** @description Blank label, no scopes, an unknown scope name, or an out-of-range expiry */
+      400: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  revoke_token: {
+    parameters: {
+      path: {
+        id: number;
+      };
+    };
+    responses: {
+      /** @description Token revoked */
+      204: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such token, or not yours */
       404: {
         content: never;
       };

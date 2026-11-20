@@ -1,11 +1,12 @@
-//! The chokepoint: the only module permitted to resolve a portfolio, asset, transaction
-//! or staged batch from a caller-supplied id.
+//! The chokepoint: the only module permitted to resolve a portfolio, asset, transaction,
+//! API token or staged batch from a caller-supplied id.
 //!
-//! Staged batches widen that remit beyond the three portfolio tables, and deliberately:
-//! a handle is a caller-supplied identifier naming a row whose whole purpose is to become
-//! a write, so it needs the same single place that answers "may this caller touch this
-//! one". It differs in one respect — the id is a 64-hex-character string, not an `i64`,
-//! and the answer is 404 for "does not exist" and "not yours" alike.
+//! Tokens and staged batches widen that remit beyond the three portfolio tables, and
+//! deliberately: a token id and a batch handle are caller-supplied identifiers naming rows
+//! whose whole purpose is to become authority or to become a write, so each needs the same
+//! single place that answers "may this caller touch this one". Both differ from the
+//! originals in one respect — the id is a string, not an `i64` — and both answer 404 for
+//! "does not exist" and "not yours" alike, so neither becomes an existence oracle.
 //!
 //! Everything else in `api_routes` handles business logic and takes the caller as
 //! given. Concentrating ownership resolution here is what makes the rule
@@ -20,6 +21,8 @@
 //! is the intended shape.
 
 use rocket::http::Status;
+use crate::auth::guard::{AuthedUser, Credential};
+use crate::auth::pat::Scope;
 use crate::db::DbPool;
 
 // Every id in this module is `i64`, the width of every id column in
@@ -249,6 +252,70 @@ pub async fn require_own_staged_batch(
         _ => {
             eprintln!("DENY: staged batch not available to user {user_id}");
             Err(Status::NotFound)
+        }
+    }
+}
+
+/// Check that a caller-supplied `api_token` id belongs to the caller.
+///
+/// The same shape as `require_asset_in`, for the same reason: this module is the only
+/// place a caller-supplied id resolves, and a token id is exactly such an id. Without
+/// it, `DELETE /api/tokens/<id>` would let any signed-in user revoke anyone's token by
+/// counting integers.
+///
+/// A token that is not yours answers through `deny`, i.e. 404 and not 403: the
+/// existence of someone else's token id is not information to hand out.
+pub async fn require_own_token(
+    pool: &DbPool,
+    user_id: i64,
+    token_id: i64,
+    min: Access,
+) -> Result<Access, Status> {
+    let owner: Option<i64> =
+        sqlx::query_scalar!("SELECT user_id FROM api_token WHERE id = $1", token_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                eprintln!("ERROR: could not look up token {token_id} for user {user_id}: {e}");
+                Status::InternalServerError
+            })?;
+
+    let Some(owner) = owner else {
+        return Err(deny("api_token", token_id, user_id));
+    };
+
+    if owner != user_id {
+        return Err(deny("api_token", token_id, user_id));
+    }
+
+    Ok(min)
+}
+
+/// Check that a bearer-token caller holds `scope`. A session passes unconditionally.
+///
+/// The asymmetry is the point: a human in a browser has whatever their own access
+/// allows, and asking them to also hold a scope they were never issued would be
+/// theatre. A token is a program with a subset, and the subset is the whole point of
+/// issuing it.
+///
+/// This is a ceiling on what a credential may do, not a check on who is behind it.
+/// The control that proves a human approved something is the staged-batch approval
+/// state, which no scope can substitute for.
+pub fn require_scope(user: &AuthedUser, scope: Scope) -> Result<(), Status> {
+    match &user.credential {
+        Credential::Session => Ok(()),
+        Credential::Token { id, scopes } => {
+            if scopes.contains(&scope) {
+                Ok(())
+            } else {
+                // Named by token id, never by secret: the id is what a log may carry.
+                eprintln!(
+                    "WARN: token {id} lacks scope '{}' (has {:?})",
+                    scope.as_str(),
+                    scopes
+                );
+                Err(Status::Forbidden)
+            }
         }
     }
 }

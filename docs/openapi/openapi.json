@@ -1105,6 +1105,96 @@
         }
       }
     },
+    "/api/tokens": {
+      "get": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "list_tokens",
+        "responses": {
+          "200": {
+            "description": "This user's tokens, newest first, without secrets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TokenOut"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Token created; the secret is shown here for the first and last time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenMinted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank label, no scopes, an unknown scope name, or an out-of-range expiry"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/tokens/<id>": {
+      "delete": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token revoked"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such token, or not yours"
+          }
+        }
+      }
+    },
     "/api/transactions/<id>": {
       "delete": {
         "tags": [
@@ -2191,6 +2281,126 @@
           },
           "remaining_qty": {
             "type": "string"
+          }
+        }
+      },
+      "TokenCreate": {
+        "type": "object",
+        "description": "What the owner sends to create a token.",
+        "required": [
+          "label",
+          "scopes"
+        ],
+        "properties": {
+          "expires_in_days": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Omitted or `null` means no expiry — the default, and the honest one.",
+            "nullable": true
+          },
+          "label": {
+            "type": "string",
+            "description": "Free text, shown in the list. The only thing that makes a token\ndistinguishable once it is out in the world, so it is required."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Scope names as the client spells them; `pat::mint` is what decides whether\nthey exist."
+          }
+        }
+      },
+      "TokenMinted": {
+        "type": "object",
+        "description": "A minted token. `secret` appears in this response and nowhere else, ever.",
+        "required": [
+          "id",
+          "secret",
+          "label",
+          "scopes",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "secret": {
+            "type": "string",
+            "description": "Shown once. There is no endpoint that can show it again, which is why the UI\nhas to say so out loud rather than offer a reveal button later."
+          }
+        }
+      },
+      "TokenOut": {
+        "type": "object",
+        "description": "A token as listed. No secret, no hash — the query does not select either.",
+        "required": [
+          "id",
+          "label",
+          "scopes",
+          "created_at",
+          "stale",
+          "expired"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Past its expiry by the server's clock, so the list cannot show a token as live\nthat `lookup` would refuse."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Idle for 90 days or more (or minted then and never used). The UI renders this\nas a nudge; the threshold itself lives in the list query, not here."
           }
         }
       },
