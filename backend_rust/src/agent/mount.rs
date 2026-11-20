@@ -55,6 +55,7 @@ use std::sync::Arc;
 
 use crate::agent::tools::AgentServer;
 use crate::auth::pat;
+use crate::services::currency_service::CurrencyService;
 
 /// Matches the body cap in *Limits*. rmcp enforces it itself; naming it here keeps the two
 /// documents from drifting apart silently.
@@ -142,7 +143,11 @@ impl<'r> Responder<'r, 'static> for McpResponse {
     }
 }
 
-fn service(pool: PgPool, user: crate::auth::guard::AuthedUser) -> StreamableHttpService<AgentServer, NeverSessionManager> {
+fn service(
+    pool: PgPool,
+    user: crate::auth::guard::AuthedUser,
+    pricing: Arc<CurrencyService>,
+) -> StreamableHttpService<AgentServer, NeverSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
     // The default is TRUE. Left alone, a client negotiating a pre-2026-07-28 protocol
@@ -150,7 +155,7 @@ fn service(pool: PgPool, user: crate::auth::guard::AuthedUser) -> StreamableHttp
     config.legacy_session_mode = false;
     config.max_request_body_bytes = MAX_BODY_BYTES;
     StreamableHttpService::new(
-        move || Ok(AgentServer::new(pool.clone(), user.clone())),
+        move || Ok(AgentServer::new(pool.clone(), user.clone(), pricing.clone())),
         Arc::new(NeverSessionManager::default()),
         config,
     )
@@ -158,7 +163,12 @@ fn service(pool: PgPool, user: crate::auth::guard::AuthedUser) -> StreamableHttp
 
 /// The whole door: authenticate, then hand the request to rmcp unchanged.
 #[rocket::post("/mcp", data = "<body>")]
-pub(crate) async fn mcp(parts: RawParts, body: Vec<u8>, pool: &rocket::State<PgPool>) -> Result<McpResponse, Status> {
+pub(crate) async fn mcp(
+    parts: RawParts,
+    body: Vec<u8>,
+    pool: &rocket::State<PgPool>,
+    pricing: &rocket::State<std::sync::Arc<CurrencyService>>,
+) -> Result<McpResponse, Status> {
     let secret = parts.bearer.ok_or(Status::Unauthorized)?;
 
     let user = pat::lookup(pool.inner(), &secret)
@@ -185,7 +195,9 @@ pub(crate) async fn mcp(parts: RawParts, body: Vec<u8>, pool: &rocket::State<PgP
         .body(Full::new(Bytes::from(body)))
         .map_err(|_| Status::InternalServerError)?;
 
-    let response = service(pool.inner().clone(), user).handle(http_req).await;
+    let response = service(pool.inner().clone(), user, pricing.inner().clone())
+        .handle(http_req)
+        .await;
     let (parts_out, resp_body) = response.into_parts();
     let out = resp_body
         .collect()

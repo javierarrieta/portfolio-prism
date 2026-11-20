@@ -54,20 +54,32 @@ pub async fn lookup_isin(
         return Err(Status::BadRequest);
     }
 
-    let isin_upper = isin.to_uppercase();
+    match resolve_isin(&isin.to_uppercase()).await {
+        Some(result) => Ok(Json(result)),
+        None => Err(Status::NotFound),
+    }
+}
 
+/// The two-provider fallback chain, in one place.
+///
+/// The route and the agent's `lookup_asset` tool both need exactly this order — OpenFIGI
+/// first, Yahoo as the fallback — and two copies would be two places where the order can
+/// disagree. A tool that quietly preferred a different provider would answer an agent
+/// differently from the UI, which is the kind of difference nobody notices until a
+/// normalized symbol fails to match an existing asset.
+pub async fn resolve_isin(isin_upper: &str) -> Option<AssetLookupResult> {
     // 1. Try OpenFIGI first
-    if let Some(result) = openfigi_lookup(&isin_upper).await {
-        return Ok(Json(result));
+    if let Some(result) = openfigi_lookup(isin_upper).await {
+        return Some(result);
     }
 
     // 2. Fallback to Yahoo Finance
-    if let Some(result) = yahoo_lookup(&isin_upper).await {
-        return Ok(Json(result));
+    if let Some(result) = yahoo_lookup(isin_upper).await {
+        return Some(result);
     }
 
     eprintln!("WARN: ISIN lookup failed for {} (both OpenFIGI and Yahoo)", isin_upper);
-    Err(Status::NotFound)
+    None
 }
 
 async fn openfigi_lookup(isin: &str) -> Option<AssetLookupResult> {

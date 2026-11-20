@@ -172,6 +172,11 @@ async fn a_valid_token_negotiates_and_lists_the_tools() {
     for expected in [
         "list_portfolios",
         "get_portfolio",
+        "list_transactions",
+        "get_tax_summary",
+        "get_performance",
+        "get_transaction_pnl",
+        "lookup_asset",
         "stage_import",
         "apply_staged",
         "discard_staged",
@@ -190,6 +195,17 @@ async fn a_valid_token_negotiates_and_lists_the_tools() {
     );
     let list = tools.iter().find(|t| t["name"] == "list_portfolios").unwrap();
     assert_eq!(list["annotations"]["readOnlyHint"], json!(true));
+
+    // Every tool's description is load-bearing: clients discover these by search, so a
+    // description that does not say what the tool does is a tool that is never called.
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        let desc = t["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.len() > 40,
+            "{name}'s description is too thin to be discovered: {desc:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -351,4 +367,239 @@ async fn get_staged_reports_what_a_human_actually_approved() {
     assert_eq!(body["status"], json!("staged"));
     assert_eq!(body["expired"], json!(false));
     assert!(body["preview"]["assets"].is_array(), "the preview comes back intact");
+}
+
+// --- the read tools ----------------------------------------------------------------
+
+/// A portfolio with two buys and one sell, inserted directly; the staging path has its own
+/// test and this section is about reading, not writing.
+async fn seed_rows(pool: &sqlx::PgPool, user: i64) -> (i64, i64) {
+    let (portfolio,): (i64,) = sqlx::query_as(
+        "INSERT INTO portfolios (name, currency, base_currency, owner_id)
+         VALUES ('Seed', 'EUR', 'EUR', $1) RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let (asset,): (i64,) = sqlx::query_as(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency)
+         VALUES ($1, 'IWDA', 'iShares Core MSCI World', 'ETF', 'EUR') RETURNING id",
+    )
+    .bind(portfolio)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    for (date, kind, qty, price) in [
+        ("2024-01-05", "BUY", "1.5", "80.00"),
+        ("2024-02-05", "BUY", "0.5", "90.00"),
+        ("2024-03-05", "SELL", "1.0", "95.00"),
+    ] {
+        sqlx::query(
+            "INSERT INTO transactions (asset_id, date, type, quantity, price, fee)
+             VALUES ($1, $2::timestamptz, $3, $4, $5, '0')",
+        )
+        .bind(asset)
+        .bind(date)
+        .bind(kind)
+        .bind(qty)
+        .bind(price)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    (portfolio, asset)
+}
+
+#[tokio::test]
+async fn list_transactions_returns_money_as_strings_and_reports_the_total() {
+    let (pool, user, client) = client("mcp_list_tx").await;
+    let secret = token(&pool, user, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+    let (portfolio, _) = seed_rows(&pool, user).await;
+
+    let (_, resp) = rpc(
+        &client,
+        call(2, "list_transactions", json!({"portfolio_id": portfolio})),
+        Some(&secret),
+    )
+    .await;
+    let body = payload(&resp);
+    assert_eq!(body["total"], json!(3));
+    let rows = body["transactions"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    // Newest first, so the most recent activity is what survives a truncating client.
+    assert_eq!(rows[0]["date"], json!("2024-03-05"));
+    // The project rule: money crosses a wire as a string, never a JSON number. A float
+    // here would be a silent rounding of a tax lot.
+    assert!(
+        rows[0]["price"].is_string(),
+        "price must be a string, got {}",
+        rows[0]["price"]
+    );
+    assert_eq!(rows[0]["price"], json!("95.00"));
+}
+
+#[tokio::test]
+async fn list_transactions_paginates_and_filters() {
+    let (pool, user, client) = client("mcp_page").await;
+    let secret = token(&pool, user, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+    let (portfolio, _) = seed_rows(&pool, user).await;
+
+    let (_, resp) = rpc(
+        &client,
+        call(2, "list_transactions", json!({"portfolio_id": portfolio, "limit": 2})),
+        Some(&secret),
+    )
+    .await;
+    let body = payload(&resp);
+    assert_eq!(body["total"], json!(3), "total counts the whole set, not the page");
+    assert_eq!(body["transactions"].as_array().unwrap().len(), 2);
+
+    // A date range that excludes the sell.
+    let (_, resp) = rpc(
+        &client,
+        call(3, "list_transactions",
+             json!({"portfolio_id": portfolio, "to": "2024-02-01", "type": "buy"})),
+        Some(&secret),
+    )
+    .await;
+    let body = payload(&resp);
+    assert_eq!(body["total"], json!(1));
+    assert_eq!(body["transactions"][0]["date"], json!("2024-01-05"));
+
+    // A loose date is refused rather than quietly reflowed.
+    let (_, resp) = rpc(
+        &client,
+        call(4, "list_transactions", json!({"portfolio_id": portfolio, "from": "2024-3-1"})),
+        Some(&secret),
+    )
+    .await;
+    assert_eq!(payload(&resp)["error"], json!("bad_date"));
+}
+
+#[tokio::test]
+async fn get_performance_does_not_publish_the_constants_it_cannot_measure() {
+    let (pool, user, client) = client("mcp_perf").await;
+    let secret = token(&pool, user, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+    let (portfolio, _) = seed_rows(&pool, user).await;
+
+    let (_, listed) = rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        Some(&secret),
+    )
+    .await;
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let perf = tools.iter().find(|t| t["name"] == "get_performance").unwrap();
+    let description = perf["description"].as_str().unwrap();
+    // The description carries the whole burden, so it has to name the three constants.
+    for named in ["volatility", "sharpe_ratio", "beta"] {
+        assert!(
+            description.contains(named),
+            "the description must warn about {named}: {description}"
+        );
+    }
+
+    let (_, resp) = rpc(
+        &client,
+        call(3, "get_performance", json!({"portfolio_id": portfolio})),
+        Some(&secret),
+    )
+    .await;
+    let body = payload(&resp);
+    // Absent, not zero. A field that is present gets quoted; a description telling a model
+    // to ignore a number it can see loses to the number.
+    let metrics = body["metrics"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no metrics in {body}"));
+    assert!(!metrics.contains_key("realized_pnl"), "realized_pnl must be stripped: {metrics:?}");
+    assert!(!metrics.contains_key("unrealized_pnl"), "unrealized_pnl must be stripped: {metrics:?}");
+}
+
+#[tokio::test]
+async fn get_transaction_pnl_refuses_a_buy_and_says_why() {
+    let (pool, user, client) = client("mcp_pnl").await;
+    let secret = token(&pool, user, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+    let (portfolio, _) = seed_rows(&pool, user).await;
+
+    let (buy_id, sell_id): (i64, i64) = sqlx::query_as(
+        "SELECT min(id), max(id) FROM transactions WHERE asset_id = (SELECT id FROM assets WHERE portfolio_id = $1)",
+    )
+    .bind(portfolio)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (_, resp) = rpc(
+        &client,
+        call(2, "get_transaction_pnl", json!({"transaction_id": buy_id})),
+        Some(&secret),
+    )
+    .await;
+    assert_eq!(payload(&resp)["error"], json!("not_a_sell"));
+
+    // The sell does reach the engine. Whether it matches a lot depends on pricing, which
+    // is not available here, so either a breakdown or a refusal is a correct answer — what
+    // must not happen is a protocol error.
+    let (status, resp) = rpc(
+        &client,
+        call(3, "get_transaction_pnl", json!({"transaction_id": sell_id})),
+        Some(&secret),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "body: {resp}");
+    assert!(
+        resp["result"].is_object(),
+        "a sell must produce a result, not a protocol error: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn read_tools_answer_not_found_for_someone_elses_rows() {
+    let (pool, alice, client) = client("mcp_read_iso").await;
+    let secret = token(&pool, alice, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+
+    let bob = common::seed_user(&pool, "bob").await;
+    let (bob_portfolio, bob_asset) = seed_rows(&pool, bob).await;
+    let (bob_tx,): (i64,) = sqlx::query_as(
+        "SELECT id FROM transactions WHERE asset_id = $1 LIMIT 1",
+    )
+    .bind(bob_asset)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    for (tool, args) in [
+        ("get_performance", json!({"portfolio_id": bob_portfolio})),
+        ("get_tax_summary", json!({"portfolio_id": bob_portfolio})),
+        ("get_transaction_pnl", json!({"transaction_id": bob_tx})),
+    ] {
+        let (_, resp) = rpc(&client, call(2, tool, args), Some(&secret)).await;
+        let code = payload(&resp)["error"].clone();
+        assert!(
+            matches!(code, Value::String(_)),
+            "{tool} must refuse a stranger's id, got {resp}"
+        );
+    }
+
+    // And the list is empty rather than leaky.
+    let (_, resp) = rpc(&client, call(3, "list_transactions", json!({})), Some(&secret)).await;
+    assert_eq!(payload(&resp)["total"], json!(0));
+}
+
+#[tokio::test]
+async fn lookup_asset_refuses_a_malformed_isin_without_reaching_the_network() {
+    let (pool, user, client) = client("mcp_lookup").await;
+    let secret = token(&pool, user, &["read"]).await;
+    rpc(&client, initialize(1), Some(&secret)).await;
+
+    for bad in ["", "XS012345678", "123456789012", "TOOLONGISIN"] {
+        let (_, resp) = rpc(&client, call(2, "lookup_asset", json!({"isin": bad})), Some(&secret)).await;
+        assert_eq!(payload(&resp)["error"], json!("bad_isin"), "{bad:?} should be refused");
+    }
 }
