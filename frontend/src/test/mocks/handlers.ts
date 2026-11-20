@@ -102,14 +102,26 @@ export const handlers = [
   }),
   http.post('/api/portfolios/:portfolioId/assets/:assetId/transactions', async ({ params, request }) => {
     const { assetId } = params
-    const body = (await request.json()) as { type: string; quantity: number; price: number; fee: number; date: string }
+    const raw = (await request.json()) as Record<string, unknown>
+    // Mirrors the rule the real server enforces: money travels as an exact decimal
+    // string. Answering 400 here — rather than papering over it with String() — is
+    // what makes a regression to JSON numbers fail a test loudly instead of passing
+    // quietly while the production server rejects the same payload.
+    const numericFields = ['quantity', 'price', 'fee'].filter((f) => typeof raw[f] === 'number')
+    if (numericFields.length > 0) {
+      return HttpResponse.json(
+        { message: `${numericFields.join(', ')} must be sent as a decimal string, not a JSON number` },
+        { status: 400 }
+      )
+    }
+    const body = raw as unknown as { type: string; quantity: string; price: string; fee: string; date: string }
     return HttpResponse.json({
       id: 1000,
       asset_id: Number(assetId),
       type: body.type.toUpperCase(),
-      quantity: String(body.quantity),
-      price: String(body.price),
-      fee: String(body.fee),
+      quantity: body.quantity,
+      price: body.price,
+      fee: body.fee,
       date: body.date
     }, { status: 201 })
   }),

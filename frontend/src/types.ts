@@ -3,8 +3,13 @@
  * from the API as JSON *strings* (exact Decimal transport, see backend
  * `decimal_json`). In memory the frontend stores them as *numbers*; every fetch
  * response is normalized at the boundary in `src/utils/decimal.ts`, so components
- * and these types always operate on numbers. Sending a create/update payload may
- * use either string or number for decimal fields.
+ * and these types always operate on numbers.
+ *
+ * Writes are the other direction, and the stricter one: a create or update payload
+ * sends decimal fields as **strings**, never JSON numbers. A JSON number has
+ * already been through a binary float before the server sees it, and a rounding
+ * unit on a cost basis is a wrong tax figure. The CSV importer canonicalizes each
+ * cell to a decimal string in `csvValidator.ts` rather than parsing it.
  *
  * The dated tax report (`TaxReport`) is the one exception and says so at its definition:
  * its money stays in the exact decimal strings the server sent.
