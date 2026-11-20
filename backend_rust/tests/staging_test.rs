@@ -214,6 +214,23 @@ fn the_preview_surfaces_the_currency_assumption_instead_of_making_it() {
 
 // --- the lifecycle ----------------------------------------------------------------
 
+#[test]
+fn a_real_calendar_date_outside_the_write_window_is_refused_at_staging() {
+    // 1899-12-31 is a real day in the right shape, so the format check alone lets it
+    // through — and `services::transactions::insert` refuses it. Without this check the
+    // refusal arrives at apply, after a human approved a preview promising the row.
+    for d in ["1899-12-31", "2100-01-02", "1899-01-01"] {
+        let p = proposal(vec![asset("A", vec![tx("BUY", d, "1", "1", "0")])]);
+        let err = staging::validate(&p).unwrap_err();
+        assert_eq!(err.code(), "out_of_range", "{d} must be refused at staging");
+    }
+    // The boundaries themselves are inside the window, matching `insert`.
+    for d in ["1900-01-01", "2100-01-01"] {
+        let p = proposal(vec![asset("A", vec![tx("BUY", d, "1", "1", "0")])]);
+        staging::validate(&p).unwrap_or_else(|e| panic!("{d} must be accepted: {e:?}"));
+    }
+}
+
 #[tokio::test]
 async fn staging_persists_the_payload_and_the_preview_and_hands_out_a_handle() {
     let (pool, user) = db_with_user("stage_ok").await;

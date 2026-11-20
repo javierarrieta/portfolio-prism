@@ -6,9 +6,9 @@
 //! agent re-sends. That separation is the whole control, so the state lives here and nowhere
 //! the model can edit it.
 //!
-//! `apply` is deliberately **not** in this file's first cut: it is the tool the `/mcp` mount
-//! exposes, and it lands with that mount. Everything here is reachable from a session or is
-//! the staging side of the token path, and neither needs the MCP machinery.
+//! `apply` is here too, and it is the reason the rest of the file exists. It is the only
+//! function that writes portfolio rows, and it will not do so for a handle a session has
+//! not moved to `approved`.
 //!
 //! Caps come from *Limits* in the design spec and are enforced here, before anything is
 //! inserted, rather than discovered by a body limit mid-parse. A batch that is too big is a
@@ -151,6 +151,24 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
                     field: format!("{base}.date"),
                     given: tx.date.clone(),
                 });
+            }
+
+            // The same window `services::transactions::insert` enforces, checked here as
+            // well as there. A real calendar day outside 1900–2100 passes the shape check
+            // above, so without this it is discovered at apply — after a human approved it,
+            // which is the worst possible moment to find out. Staging's job is to refuse
+            // anything that cannot apply; this was a hole in that claim, found by a test
+            // that was trying to prove something else.
+            if let Ok(day) = NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d") {
+                let min = NaiveDate::from_ymd_opt(1900, 1, 1).expect("1900-01-01 exists");
+                let max = NaiveDate::from_ymd_opt(2100, 1, 1).expect("2100-01-01 exists");
+                if day < min || day > max {
+                    return Err(StageError::OutOfRange {
+                        field: format!("{base}.date"),
+                        rule: "between 1900-01-01 and 2100-01-01",
+                        given: tx.date.clone(),
+                    });
+                }
             }
 
             for (key, value) in [
@@ -530,4 +548,421 @@ struct SummaryRow {
     applied_at: Option<DateTime<Utc>>,
     asset_count: i64,
     transaction_count: i64,
+}
+
+use crate::access::{require as require_portfolio, Access};
+use crate::services::assets as asset_service;
+use crate::services::error::WriteError;
+use crate::services::transactions as tx_service;
+use crate::schemas::{AssetCreate, TransactionCreate};
+use rust_decimal::Decimal;
+
+/// Why an apply was refused, before it wrote anything.
+///
+/// Named after the cause, like [`WriteError`], because the caller is an agent reading a
+/// machine-readable code rather than a person reading a sentence. The codes are the ones
+/// the design spec fixes; inventing a new one here means the spec's list stops being the
+/// contract.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// No batch with this handle belongs to this user. Same answer as "no such handle"
+    /// from every other route, because a handle another user holds must not be
+    /// distinguishable from one that never existed.
+    NotFound,
+    /// Still `staged`: no session has approved it. This is the gate working, not an error
+    /// in the ordinary sense, and the agent is expected to see it and go ask.
+    NotApproved,
+    /// `approved`, but past `expires_at`. Approval does not last forever, and an approval
+    /// the human has not looked at in an hour is not consent to a write now.
+    Expired,
+    /// Already `applied`. Distinct from `NotApproved` on purpose: "nobody approved that"
+    /// and "you already wrote that" are different things for an agent to do about.
+    AlreadyApplied,
+    /// `target.existing` named a portfolio that is gone, or is not this user's. Re-checked
+    /// at apply because the portfolio could have been deleted between stage and apply.
+    PortfolioNotFound,
+    /// The stored proposal no longer validates. It did at staging, so this means the world
+    /// moved — a symbol now collides, a date fell out of range — and not that the agent
+    /// sent something bad.
+    Rejected(StageError),
+    /// A row write was refused by the same seam the HTTP routes use.
+    Refused(WriteError),
+    Database,
+}
+
+impl ApplyError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApplyError::NotFound => "stale_handle",
+            ApplyError::NotApproved => "not_approved",
+            ApplyError::Expired => "expired",
+            ApplyError::AlreadyApplied => "already_applied",
+            ApplyError::PortfolioNotFound => "portfolio_not_found",
+            ApplyError::Rejected(e) => e.code(),
+            ApplyError::Refused(_) => "write_refused",
+            ApplyError::Database => "database",
+        }
+    }
+
+    /// The human-readable half, for a tool response body.
+    pub fn message(&self) -> String {
+        match self {
+            ApplyError::NotFound => "no staged batch with that handle".into(),
+            ApplyError::NotApproved => {
+                "the batch has not been approved by a session; ask a human to approve it"
+                    .into()
+            }
+            ApplyError::Expired => "the approval has expired".into(),
+            ApplyError::AlreadyApplied => "this batch has already been applied".into(),
+            ApplyError::PortfolioNotFound => "the target portfolio no longer exists".into(),
+            ApplyError::Rejected(e) => format!("the stored proposal no longer validates: {}", e.code()),
+            ApplyError::Refused(w) => format!("a row was refused: {:?}", w),
+            ApplyError::Database => "the database refused the write".into(),
+        }
+    }
+}
+
+/// What a successful apply produced.
+#[derive(Debug)]
+pub struct Applied {
+    pub portfolio_id: i64,
+    pub asset_ids: Vec<i64>,
+    pub transaction_count: i64,
+    /// Rows the proposal contained that were already in the database, and so were skipped.
+    ///
+    /// Reported rather than silent. An agent that staged 40 rows and gets back 37 has to be
+    /// told three were skipped, or it will conclude the import lost rows — and "the import
+    /// silently dropped rows" is the failure this whole interface is trying not to be.
+    pub skipped_duplicates: i64,
+}
+
+/// The identity of a transaction row, for duplicate matching.
+///
+/// `Decimal` equality, never string equality: `1.5` and `1.50` are the same cost basis and a
+/// string comparison would import both. `fee` is included, which is *stricter* than the
+/// browser importer (whose in-memory key also includes `fee`, but which never compares
+/// against stored rows at all).
+///
+/// The `fee` stored for a `SPLIT` is always zero — `services::transactions::insert`
+/// discards it, because a split is a ratio and a per-share fee is meaningless. The key is
+/// built from the value that will actually be stored, not from the value the agent sent;
+/// keying on the sent value would make every staged split look unlike the row it created
+/// and re-import on the second run.
+#[derive(PartialEq, Eq, Hash)]
+struct DupKey {
+    date: String,
+    tx_type: String,
+    quantity: Decimal,
+    price: Decimal,
+    fee: Decimal,
+}
+
+fn dup_key(date: &str, tx_type: TxType, quantity: &str, price: &str, fee: &str) -> Option<DupKey> {
+    let quantity = Decimal::from_str_exact(quantity).ok()?;
+    let price = Decimal::from_str_exact(price).ok()?;
+    let fee = if tx_type == TxType::Split {
+        Decimal::ZERO
+    } else {
+        Decimal::from_str_exact(fee).ok()?
+    };
+    Some(DupKey {
+        date: date.to_string(),
+        tx_type: tx_type.as_str().to_string(),
+        quantity,
+        price,
+        fee,
+    })
+}
+
+/// Write an approved batch, once.
+///
+/// Three properties this has to hold at the same time, and the ordering below is the whole
+/// argument:
+///
+/// 1. **Only an approved, unexpired handle writes.** Checked against the row, not against
+///    anything the caller claims.
+/// 2. **Exactly once.** The flip `approved -> applied` is a conditional `UPDATE` *inside*
+///    the same transaction as the writes, so a second concurrent apply either waits on the
+///    row lock and then sees `applied`, or matches zero rows and is refused.
+/// 3. **All or nothing.** One Postgres transaction covers the portfolio, every asset and
+///    every row. A batch that fails halfway leaves nothing behind.
+///
+/// Property 3 has a consequence worth stating because it looks like a bug and is not: if a
+/// write fails, the flip rolls back with it, so the batch is still `approved` and can be
+/// retried. A batch consumed by a failed apply would be a batch nobody can recover — the
+/// human approved it, nothing was written, and the only way forward is to start over. The
+/// flip is a claim on the batch, not a burn of it.
+///
+/// Re-validation happens after the flip and before the writes, inside the transaction: the
+/// target portfolio may have been deleted between stage and apply, and a symbol may have
+/// been taken by hand in the meantime.
+pub async fn apply(pool: &PgPool, user_id: i64, handle: &str) -> Result<Applied, ApplyError> {
+    // The caller-supplied portfolio id goes through `access.rs` like every other id in
+    // this application, before the transaction opens. It is checked a second time inside
+    // the transaction (see `resolve_portfolio`), which is not duplication for its own sake:
+    // the gate script and every other route read `access.rs` as the single answer, and the
+    // in-transaction read is the one that cannot race the write. Both are needed, and the
+    // comment in `resolve_portfolio` says which one is authoritative.
+    if let Target::Existing { portfolio_id } = target_of(pool, user_id, handle).await? {
+        require_portfolio(pool, user_id, portfolio_id, Access::Owner)
+            .await
+            .map_err(|_| ApplyError::PortfolioNotFound)?;
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        eprintln!("ERROR: staged apply: could not open a transaction: {e}");
+        ApplyError::Database
+    })?;
+
+    // Lock the row for the rest of this transaction. Without it, two concurrent applies
+    // both read `approved`, both flip (the second matching zero rows, which is caught), and
+    // the second one still goes on to *validate* against a state it has no claim on. The
+    // lock makes the second one wait and then read the truth.
+    let row: Option<(i64, String, Value, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, status, payload, expires_at FROM agent_staged_batch
+         WHERE handle = $1 AND user_id = $2
+         FOR UPDATE",
+    )
+    .bind(handle)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
+    let (_, status, payload, expires_at) = row.ok_or(ApplyError::NotFound)?;
+
+    match status.as_str() {
+        "staged" => return Err(ApplyError::NotApproved),
+        "approved" => {}
+        "applied" => return Err(ApplyError::AlreadyApplied),
+        // `discarded`, and anything a future migration adds. Refusing on the unknown case
+        // is the only safe default: a status this function does not recognise is a status
+        // whose rules it cannot enforce.
+        _ => return Err(ApplyError::NotApproved),
+    }
+
+    if expires_at <= Utc::now() {
+        return Err(ApplyError::Expired);
+    }
+
+    // The claim. Repeating the status and expiry predicates here rather than trusting the
+    // read above is what makes the single-use rule hold without the lock, and the lock is an
+    // optimisation over this rather than the other way round.
+    let flipped = sqlx::query(
+        "UPDATE agent_staged_batch
+            SET status = 'applied', applied_at = now()
+          WHERE handle = $1 AND user_id = $2
+            AND status = 'approved' AND expires_at > now()",
+    )
+    .bind(handle)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
+    if flipped.rows_affected() == 0 {
+        return Err(ApplyError::AlreadyApplied);
+    }
+
+    let proposal: Proposal = serde_json::from_value(payload).map_err(|e| {
+        eprintln!("ERROR: staged apply: stored payload does not deserialize: {e}");
+        ApplyError::Database
+    })?;
+    validate(&proposal).map_err(ApplyError::Rejected)?;
+
+    let portfolio_id = resolve_portfolio(&mut tx, user_id, &proposal.target).await?;
+
+    let mut asset_ids = Vec::new();
+    let mut written: i64 = 0;
+    let mut skipped: i64 = 0;
+
+    for pa in &proposal.assets {
+        let asset_id = resolve_asset(&mut tx, portfolio_id, pa).await?;
+        asset_ids.push(asset_id);
+
+        // Seeded from the database, then extended with whatever this batch writes, so a row
+        // duplicated *within* the proposal is skipped by the same rule as one already
+        // stored. Both are "this row is already there" from the importer's point of view.
+        let mut seen = existing_keys(&mut tx, asset_id).await?;
+
+        for pt in &pa.transactions {
+            let key = dup_key(&pt.date, pt.r#type, &pt.quantity, &pt.price, &pt.fee).ok_or_else(|| {
+                eprintln!("ERROR: staged apply: a staged money string will not parse");
+                ApplyError::Database
+            })?;
+            if seen.contains(&key) {
+                skipped += 1;
+                continue;
+            }
+
+            let create = TransactionCreate {
+                r#type: pt.r#type,
+                quantity: Decimal::from_str_exact(&pt.quantity).map_err(|_| ApplyError::Database)?,
+                price: Decimal::from_str_exact(&pt.price).map_err(|_| ApplyError::Database)?,
+                fee: Decimal::from_str_exact(&pt.fee).map_err(|_| ApplyError::Database)?,
+                date: chrono::DateTime::parse_from_rfc3339(&format!("{}T00:00:00Z", pt.date))
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?,
+            };
+            tx_service::insert(&mut tx, asset_id, &create)
+                .await
+                .map_err(|e| {
+                    // Roll the claim back with the failure: see the doc comment. sqlx
+                    // rolls the whole transaction back on drop without a commit, so this
+                    // only has to stop, not undo.
+                    ApplyError::Refused(e)
+                })?;
+            seen.insert(key);
+            written += 1;
+        }
+    }
+
+    tx.commit().await.map_err(|_| ApplyError::Database)?;
+
+    Ok(Applied {
+        portfolio_id,
+        asset_ids,
+        transaction_count: written,
+        skipped_duplicates: skipped,
+    })
+}
+
+/// The target named by the stored proposal, read before the transaction opens so the
+/// `access.rs` check can happen there. `NotFound` if the handle is not this user's.
+async fn target_of(pool: &PgPool, user_id: i64, handle: &str) -> Result<Target, ApplyError> {
+    let payload: Option<Value> = sqlx::query_scalar(
+        "SELECT payload FROM agent_staged_batch WHERE handle = $1 AND user_id = $2",
+    )
+    .bind(handle)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+    let payload = payload.ok_or(ApplyError::NotFound)?;
+    // The payload is the whole proposal; the target is a field of it. Reading the payload
+    // as a `Target` directly — which is what this did first — fails with serde's
+    // "missing field `kind`", and because every failure here collapses to one code, the
+    // message that named the real cause was the only thing left to follow.
+    let proposal: Proposal = serde_json::from_value(payload).map_err(|e| {
+        eprintln!("ERROR: staged apply: could not read the payload: {e}");
+        ApplyError::Database
+    })?;
+    Ok(proposal.target)
+}
+
+/// The portfolio to write into, creating it when the proposal asked for a new one.
+///
+/// The `existing` branch goes through `access.rs` like every other caller-supplied id. That
+/// is not ceremony: without it, a token could name any portfolio in the database by counting
+/// integers, and the batch would write into it after a human approved a preview that named a
+/// different one.
+async fn resolve_portfolio(
+    tx: &mut sqlx::PgConnection,
+    user_id: i64,
+    target: &Target,
+) -> Result<i64, ApplyError> {
+    match target {
+        Target::New {
+            name,
+            base_currency,
+        } => {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO portfolios (name, description, currency, base_currency, owner_id)
+                 VALUES ($1, $2, $3, $3, $4) RETURNING id",
+            )
+            .bind(name)
+            .bind("Created by an agent import")
+            .bind(base_currency)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+            Ok(id)
+        }
+        Target::Existing { portfolio_id } => {
+            // `require` answers on a pool, and this is a connection. The ownership answer
+            // cannot be taken outside the transaction that writes, or the portfolio could
+            // change owner between the check and the write, so the same predicate is
+            // restated here against the open transaction.
+            let owner: Option<i64> =
+                sqlx::query_scalar("SELECT owner_id FROM portfolios WHERE id = $1")
+                    .bind(portfolio_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+            match owner {
+                Some(uid) if uid == user_id => Ok(*portfolio_id),
+                _ => Err(ApplyError::PortfolioNotFound),
+            }
+        }
+    }
+}
+
+/// Find the asset by symbol, or create it.
+///
+/// Merge is by uppercased symbol within the target portfolio, which is the same identity
+/// the unique index uses. An agent re-staging the same statement must land on the same
+/// asset rather than failing with a symbol collision.
+async fn resolve_asset(
+    tx: &mut sqlx::PgConnection,
+    portfolio_id: i64,
+    pa: &crate::agent::protocol::ProposalAsset,
+) -> Result<i64, ApplyError> {
+    let symbol = pa.symbol.to_uppercase();
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM assets WHERE portfolio_id = $1 AND symbol = $2")
+            .bind(portfolio_id)
+            .bind(&symbol)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
+    if let Some(id) = found {
+        return Ok(id);
+    }
+
+    let create = AssetCreate {
+        symbol: pa.symbol.clone(),
+        name: pa.name.clone().unwrap_or_else(|| pa.symbol.clone()),
+        asset_type: pa.asset_type.clone(),
+        sector: None,
+        currency: pa.currency.clone().unwrap_or_else(|| "USD".to_string()),
+        isin: pa.isin.clone().unwrap_or_default(),
+    };
+    let asset = asset_service::insert(tx, portfolio_id, &create)
+        .await
+        .map_err(ApplyError::Refused)?;
+    Ok(asset.id)
+}
+
+/// The rows already stored for one asset, as duplicate keys.
+async fn existing_keys(tx: &mut sqlx::PgConnection, asset_id: i64) -> Result<std::collections::HashSet<DupKey>, ApplyError> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT date::text, upper(btrim(type)), quantity, price, fee
+           FROM transactions WHERE asset_id = $1",
+    )
+    .bind(asset_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
+    let mut out = std::collections::HashSet::new();
+    for (date, ty, quantity, price, fee) in rows {
+        // A stored row this code cannot parse is skipped rather than fatal: it predates the
+        // closure, and refusing to import anything into an asset that holds one legacy row
+        // would be a worse outcome than possibly re-importing a row nobody can read.
+        let qty = Decimal::from_str_exact(&quantity).ok();
+        let prc = Decimal::from_str_exact(&price).ok();
+        let fee = Decimal::from_str_exact(&fee).ok();
+        if let (Some(q), Some(p), Some(f)) = (qty, prc, fee) {
+            out.insert(DupKey {
+                date: date.chars().take(10).collect(),
+                tx_type: ty,
+                quantity: q,
+                price: p,
+                fee: f,
+            });
+        }
+    }
+    Ok(out)
 }
