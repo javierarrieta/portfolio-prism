@@ -183,6 +183,22 @@ async fn yahoo_lookup(isin: &str) -> Option<AssetLookupResult> {
     })
 }
 
+/// Shape **and** the ISO 6166 check digit.
+///
+/// The digit is not decoration. An ISIN whose check digit is wrong cannot resolve at any
+/// provider — OpenFIGI and Yahoo both answer "no such instrument" — so accepting one moves
+/// the failure from a free local rejection to a paid network round trip that ends in a
+/// vaguer error. Worse, `services::assets::insert` uses the ISIN as a cross-portfolio
+/// uniqueness key, so garbage ISINs are garbage that participates in a uniqueness
+/// constraint and can collide with each other.
+///
+/// The algorithm: expand letters to two digits each (`A`=10 … `Z`=35), then Luhn over the
+/// expanded string, with the twelfth character as the check digit.
+///
+/// This is a tightening. Input that is twelve shape-valid characters but a wrong digit was
+/// accepted before and is a 400 now. Real ISINs are unaffected — the vectors in the tests
+/// below are live instruments, and the algorithm reproduces each of their digits from the
+/// first eleven characters.
 pub fn is_valid_isin(isin: &str) -> bool {
     let isin = isin.to_uppercase();
     if isin.len() != 12 {
@@ -194,12 +210,89 @@ pub fn is_valid_isin(isin: &str) -> bool {
     if !country_code.is_ascii_alphabetic() || !second.is_ascii_alphabetic() {
         return false;
     }
-    chars.all(|c| c.is_ascii_alphanumeric())
+    if !chars.all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    let (body, check) = isin.split_at(11);
+    let expected: u8 = match check.parse::<u8>() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    isin_check_digit(body) == Some(expected)
+}
+
+/// The ISO 6166 check digit for the first eleven characters, or `None` if they are not a
+/// valid body.
+fn isin_check_digit(body: &str) -> Option<u8> {
+    // Letters become two decimal digits each, so the expanded form is longer than the input.
+    let mut digits: Vec<u8> = Vec::with_capacity(body.len() + 4);
+    for ch in body.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch as u8 - b'0');
+        } else if ch.is_ascii_alphabetic() {
+            let value = (ch as u8 - b'A') + 10;
+            digits.push(value / 10);
+            digits.push(value % 10);
+        } else {
+            return None;
+        }
+    }
+
+    // Luhn, read from the right of the body: the digit immediately left of the check digit
+    // is doubled, then every second one after that.
+    let mut sum: u32 = 0;
+    for (i, d) in digits.iter().rev().enumerate() {
+        let mut d = u32::from(*d);
+        if i % 2 == 0 {
+            d *= 2;
+            if d > 9 {
+                d -= 9;
+            }
+        }
+        sum += d;
+    }
+    Some(((10 - (sum % 10)) % 10) as u8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live instruments, each verified against its own check digit. These are the proof that
+    /// the tightening does not reject real ISINs: every one of these digits is reproduced
+    /// from the first eleven characters, including the two whose bodies carry letters.
+    #[test]
+    fn accepts_real_instruments() {
+        for isin in [
+            "US0378331005", // Apple
+            "US5949181045", // Microsoft
+            "US88160R1014", // Tesla — body contains a letter
+            "DE000BAY0017", // Puma SE — body contains letters
+            "DE0007164600", // Deutsche Telekom
+            "FR0000131906", // Renault
+            "GB0002634946", // Shell
+            "IE00B3RBWM25", // Vanguard FTSE All-World — body contains letters
+            "CH0038863350", // Novartis
+            "JP3756600007", // Sony Group
+        ] {
+            assert!(is_valid_isin(isin), "{isin} is a real ISIN and must be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_a_wrong_check_digit() {
+        // The shape is perfect; only the digit is wrong. This is the whole point: before the
+        // digit was computed, every one of these passed.
+        for bad in [
+            "US0378331004", // Apple, digit decremented
+            "US0378331006", // Apple, digit incremented
+            "IE00B3RBWM24", // Vanguard, digit decremented
+            "BTC123456789", // shape-valid, never issued
+        ] {
+            assert!(!is_valid_isin(bad), "{bad} must be rejected on its check digit");
+        }
+    }
 
     #[test]
     fn test_valid_isin() {
