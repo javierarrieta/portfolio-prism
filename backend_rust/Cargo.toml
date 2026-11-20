@@ -23,4 +23,12 @@ openidconnect = "4.1"
 # it only declares the use. Used for the CSPRNG and SHA-256 behind personal access
 # tokens (`auth/pat.rs`); the alternative was `rand` + `sha2`, two crates for what one
 # already-present crate does.
+# The MCP server. Measured in the spike: this adds exactly 8 crates to the tree, and
+# deliberately NOT axum, hyper or tower-http — `rmcp::handle` takes any `http_body::Body`
+# and returns `Response<BoxBody<Bytes, Infallible>>`, which is what lets a Rocket route
+# serve it. `legacy_session_mode` and `json_response` are set in `agent::mount`.
+rmcp = { version = "3.11.0", features = ["server-side-http", "transport-streamable-http-server", "transport-streamable-http-server-session", "tower", "macros"] }
+http = "1"
+http-body-util = "0.1.5"
+bytes = "1.12.2"
 ring = "0.17"

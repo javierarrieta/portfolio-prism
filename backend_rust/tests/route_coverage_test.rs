@@ -205,6 +205,22 @@ async fn no_mounted_route_escapes_the_prefix_rule() {
     // the assertion is inverted: every mounted route must be in a namespace that is
     // public by decision, and anything else is an escape.
     const PUBLIC_NAMESPACES: &[&str] = &["/api/", "/auth", "/_auth", "/api-docs"];
+
+    // Routes that sit outside `/api/` and therefore outside `AuthFairing`, but that
+    // authenticate themselves instead of being public.
+    //
+    // This is a separate list rather than an entry in `PUBLIC_NAMESPACES` because the two
+    // claims are opposites. "Public by decision" and "not covered by the fairing, so it
+    // must do its own checking" are different promises, and folding them together would let
+    // the next `/api`-external route be waved through by pointing at the MCP door.
+    //
+    // `/mcp` is here on one condition: `tests/mcp_mount_test.rs::mcp_refuses_a_session_cookie`
+    // and `mcp_refuses_a_request_with_no_credential` must keep passing. They are the only
+    // thing between that route and being an unauthenticated door onto every tool, and the
+    // route's own comment records that it landed inside the `/api` mount the first time and
+    // answered 404 — which is how the mistake announces itself. Removing those two tests
+    // should make this entry a lie.
+    const SELF_AUTHENTICATED: &[&str] = &["/mcp"];
     for (method, uri) in mounted("no_mounted_route_escapes_the_prefix_rule").await {
         let path = uri.split('?').next().unwrap();
         if path == "/api" {
@@ -219,7 +235,8 @@ async fn no_mounted_route_escapes_the_prefix_rule() {
             || PUBLIC_NAMESPACES.iter().any(|p| path.starts_with(p))
             // rocket_cors mounts its own responder under /cors/ and rewrites a
             // rejected request there; it is public by construction, not by us.
-            || path.starts_with("/cors/");
+            || path.starts_with("/cors/")
+            || SELF_AUTHENTICATED.contains(&path);
         assert!(
             allowed,
             "{method} {uri} (root {root}) is mounted outside every public namespace, \

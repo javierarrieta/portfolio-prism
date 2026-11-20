@@ -344,6 +344,17 @@ pub fn build_rocket(
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same
         // handler serves both mounts; the duplicate `/openapi.json` mount is gone.
+        // The MCP door, mounted at the root so its path is exactly `/mcp`.
+        //
+        // It must NOT go in the `/api` list above: the route's own attribute is
+        // `#[post("/mcp")]`, so mounting it under `/api` would silently serve it at
+        // `/api/mcp` — inside `AuthFairing`'s prefix, where a session cookie would
+        // authenticate it and the whole scope model would be decorative. That is the exact
+        // failure `agent::mount`'s module comment names, and it happened here first: the
+        // route was added to the `/api` list, every MCP test answered 404, and the reason
+        // was the prefix. `tests/mcp_mount_test.rs::mcp_refuses_a_session_cookie` is the
+        // assertion that keeps it out.
+        .mount("/", routes![agent::mount::mcp])
         .mount("/api-docs", routes![openapi_json])
         // Every `401` answers with the same body, whichever path produced it. Rocket
         // prefers a registered catcher over a guard's error responder, so without
