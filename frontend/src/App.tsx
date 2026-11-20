@@ -15,6 +15,7 @@ import {
   FolderSync,
   PanelLeftClose,
   PanelLeftOpen,
+  KeyRound,
   Wallet,
   type LucideIcon,
 } from 'lucide-react';
@@ -24,6 +25,7 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
+import AccessTokensPanel from './components/AccessTokensPanel';
 import BackupPanel from './components/BackupPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
 import type { ReportWindow } from './utils/reportWindow';
@@ -58,6 +60,9 @@ const NAV_ITEMS: { id: string; label: string; Icon: LucideIcon }[] = [
   { id: 'statement', label: 'Printable Statement', Icon: Printer },
   { id: 'report', label: 'Tax Report', Icon: Receipt },
   { id: 'backup', label: 'Backup', Icon: FolderSync },
+  // Account-level, like Backup: neither is about the selected portfolio, which is why
+  // both sit outside the `currentPortfolio` branch below rather than inside it.
+  { id: 'access', label: 'Access tokens', Icon: KeyRound },
 ];
 
 /**
@@ -790,6 +795,8 @@ export default function App() {
         */}
         {activeTab === 'backup' ? (
           <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : activeTab === 'access' ? (
+          <AccessTokensPanel />
         ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (

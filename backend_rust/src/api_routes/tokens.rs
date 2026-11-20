@@ -62,6 +62,9 @@ pub struct TokenOut {
     /// Idle for 90 days or more (or minted then and never used). The UI renders this
     /// as a nudge; the threshold itself lives in the list query, not here.
     pub stale: bool,
+    /// Past its expiry by the server's clock, so the list cannot show a token as live
+    /// that `lookup` would refuse.
+    pub expired: bool,
 }
 
 impl From<PatError> for Status {
@@ -161,6 +164,7 @@ pub async fn list_tokens(
                 last_used_at: t.last_used_at,
                 revoked_at: t.revoked_at,
                 stale: t.stale,
+                expired: t.expired,
             })
             .collect(),
     ))

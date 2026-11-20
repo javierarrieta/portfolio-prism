@@ -112,6 +112,14 @@ pub struct TokenInfo {
     /// Idle for so long that the owner has almost certainly forgotten it exists.
     /// Computed in SQL, not here, so the threshold is one number in one place.
     pub stale: bool,
+    /// Past `expires_at` as the database clock reads it.
+    ///
+    /// Same reason as `stale`, and stronger: the thing that refuses an expired token
+    /// is `lookup`, which compares against `now()` in the database. A client asked to
+    /// render "expired" from its own clock would disagree with the server any time the
+    /// two disagree — and would then show a token as live that cannot be used, or
+    /// vice versa. One clock, one answer.
+    pub expired: bool,
 }
 
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -221,7 +229,8 @@ pub async fn list(pool: &DbPool, user_id: i64) -> Result<Vec<TokenInfo>, PatErro
                 -- from a null: a credential minted and never used for a quarter is
                 -- exactly the one the nudge is for, and the literal
                 -- `last_used_at < now() - interval '90 days'` would skip it.
-                COALESCE(last_used_at, created_at) < now() - interval '90 days' AS \"stale!\"
+                COALESCE(last_used_at, created_at) < now() - interval '90 days' AS \"stale!\",
+                expires_at IS NOT NULL AND expires_at <= now() AS \"expired!\"
          FROM api_token
          WHERE user_id = $1
          ORDER BY created_at DESC",
@@ -355,6 +364,7 @@ struct TokenListRow {
     revoked_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     stale: bool,
+    expired: bool,
 }
 
 impl TokenListRow {
@@ -372,6 +382,7 @@ impl TokenListRow {
             last_used_at: self.last_used_at,
             revoked_at: self.revoked_at,
             stale: self.stale,
+            expired: self.expired,
         })
     }
 }

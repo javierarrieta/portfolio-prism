@@ -62,6 +62,13 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::ErrorBody,
         schemas::MissingRate,
         AssetLookupResult,
+        // Registered as a set: `list_tokens` answers `[TokenOut]`, `create_token`
+        // answers `TokenMinted`, and both take `TokenCreate`. Mounting the routes
+        // without these leaves the document with `$ref`s to schemas that do not
+        // exist, which is what it did until this line.
+        crate::api_routes::tokens::TokenCreate,
+        crate::api_routes::tokens::TokenMinted,
+        crate::api_routes::tokens::TokenOut,
     ))
 )]
 pub struct ApiDoc;
