@@ -8,7 +8,7 @@ import {
   TransactionType, 
   AssetType
 } from '../types';
-import { isValidIsin } from '../utils/isinValidator';
+import { isinProblem } from '../utils/isinValidator';
 import { apiFetch } from '../utils/apiFetch';
 import CsvImportModal from './CsvImportModal';
 
@@ -130,8 +130,18 @@ export default function PortfolioDetail({
 
   const handleIsinLookup = async (isin: string) => {
     const upper = isin.toUpperCase();
-    if (!isValidIsin(upper)) {
+    const problem = isinProblem(upper);
+    if (problem === 'shape') {
       setLookupError('ISIN must be 12 alphanumeric characters');
+      return;
+    }
+    if (problem === 'checkDigit') {
+      // Named separately because the API refuses this too — `is_valid_isin` answers a
+      // wrong digit with a bare 400, which without this branch surfaces as
+      // "ISIN not found" after a round trip to providers that cannot resolve it
+      // either. The digit is computed locally, so the user learns which character is
+      // wrong without leaving the form.
+      setLookupError('ISIN check digit is invalid — one character is mistyped');
       return;
     }
     if (lastLookedUpIsin.current === upper) return;
