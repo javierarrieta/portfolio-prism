@@ -311,11 +311,19 @@ quantity/price rules and the 1900-01-01 … 2100-01-01 date bound already in
 
 `resolve_caller` (`auth/guard.rs`) already owns "turn a request into an `AuthedUser`", is
 already the only path shared by `AuthFairing` and the `/auth/me` guard, and already keeps
-`Ok(None)` (deny) distinct from `Err` (503). It gains a `CredentialKind` parameter —
-`SessionOnly` from the fairing, `TokenOnly` from the `/mcp` route. Both branches converge
-on a new `user_by_id(pool, uid)` extracted from today's guard, which keeps the `is_active`
-check and the `token_version` comparison in one place. A token yields a `uid` and falls
-through to that same lookup, so a deactivated account loses its tokens for free.
+`Ok(None)` (deny) distinct from `Err` (503). Both branches converge on a new
+`user_by_id(pool, uid)` extracted from the guard, which keeps the `is_active` check and the
+`token_version` comparison in one place. A token yields a `uid` and falls through to that
+same lookup, so a deactivated account loses its tokens for free.
+
+Two pieces, because only one of them has a consumer in this workstream. `user_by_id` and
+the `credential` field land here. The `CredentialKind` parameter on `resolve_caller` —
+`SessionOnly` from the fairing, `TokenOnly` from the `/mcp` route — **lands with the mount
+in Workstream 2**, because until a route calls `pat::lookup` there is no second branch to
+distinguish and a parameter would be threaded through every caller to say one constant.
+`pat::lookup` is deliberately not wired into `AuthedUser::from_request` in Workstream 1 for
+the same reason: a session cookie and a bearer token are different credentials, and the
+route that accepts one must not accidentally accept the other.
 
 `AuthedUser` gains a `credential` field: `Credential::Session` or
 `Credential::Token { id, scopes }`. `require_scope(&caller, Scope::Import)` returns ok for a
@@ -361,8 +369,13 @@ no valid token means no tool call, so a dead credential cannot apply a staged ba
 `logout-all` bumps `users.token_version` and kills sessions; tokens deliberately survive
 it, because a token is not a browser session — revocation is the answer to a leaked token.
 
-**`last_used_at`** updates at most once a minute per token, fire-and-forget, so tool calls
-do not each pay a write.
+**`last_used_at`** updates at most once a minute per token, so tool calls do not each pay a
+write. The throttle is what carries the property, not the asynchrony: it is expressed as
+the `WHERE` clause of the update itself (`AND (last_used_at IS NULL OR last_used_at <
+now() - interval '1 minute')`), which makes it one statement and testable without a race.
+Spawning the write fire-and-forget was the first instinct and is worse: it moves the same
+rare write off the request path, loses it on shutdown, and makes the column untestable
+without sleeping.
 
 ### `auth/pat.rs` — the only implementation of every operation
 
@@ -387,9 +400,15 @@ sees them. Two consequences, stated now rather than discovered in CI:
   `access.rs`: a new `require_own_token(pool, user_id, token_id, Access::Owner)` beside the
   existing `require*` functions, because that module's stated job is being the only place
   a caller-supplied id resolves.
-- `POST` and `GET` carry the existing
-  `// access-gate: global-config (no caller-supplied id)` marker, which the script prints
-  whenever it honours it.
+- `GET /api/tokens` carries the existing `// access-gate: global-config
+  (no caller-supplied id)` marker, which the script prints whenever it honours it.
+  `POST /api/tokens` **cannot**: the marker's cross-check fails closed on any `<...>` in the
+  route attribute, and `data = "<body>"` is one. `backup::restore` already has the same
+  shape and the same reason, so `create_token` follows it and clears Rule A by reaching a
+  `require*` function through `revoke_token`'s import rather than by carrying a marker the
+  script would read as a contradiction. Extending the marker syntax to distinguish a path
+  parameter from a body binder was considered and left alone — that heuristic is what stops
+  a handler from claiming "no caller-supplied id" while taking one.
 - `tests/route_coverage_test.rs` holds a `PROTECTED_ROUTES` inventory and fails on a mounted
   `/api` route missing from it or from the OpenAPI document, so all three routes must be
   added there — `POST` and `GET` with no resource level (they check no caller-supplied id)
@@ -403,6 +422,12 @@ A view in the existing nav rail (`frontend/src/App.tsx:657`), component
 one-time reveal modal with a copy button and an explicit "this is shown once" line.
 Anything idle more than 90 days is marked **unused for 90 days** — the nudge that gets
 acted on, costing one `WHERE last_used_at < now() - interval '90 days'` in the list query.
+
+Both verdicts — `stale` and `expired` — are computed by the list query and sent as booleans,
+not derived in the browser. The database clock is the one that `pat::lookup` enforces, so a
+client computing either from `Date.now()` would be a second authority disagreeing with the
+first, and would render a token as live that the server is refusing. The React purity rule
+refuses a clock read in render anyway, which is a correct refusal rather than an obstacle.
 Revoke is a plain confirm, not a typed word: a token is revocable and re-mintable, unlike
 `mode=replace`.
 
