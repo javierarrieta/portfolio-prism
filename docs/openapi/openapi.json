@@ -2102,7 +2102,7 @@
             "type": "string"
           },
           "type": {
-            "type": "string"
+            "$ref": "#/components/schemas/TxType"
           }
         }
       },
@@ -2143,6 +2143,15 @@
             "type": "string"
           }
         }
+      },
+      "TxType": {
+        "type": "string",
+        "description": "The closed set of transaction types the engines understand.\n\nThis enum exists because of a specific failure that was live: `transactions.type`\nis `TEXT` with no `CHECK`, and the write path did `to_uppercase()` and stored\nwhatever came back. So `\"DIVIDEND\"` was accepted, stored, and then **silently\nignored** — `tax_engine.rs:665-771` and `stats_engine.rs:250-256` are both\n`if BUY / else if SELL / else if SPLIT` with no terminal `else`. Invisible tax\ndata is worse than a wrong lot, because nothing looks wrong.\n\n`rename_all = \"UPPERCASE\"` makes serde match the style names exactly, so the\naccepted wire values are precisely `BUY`, `SELL`, `SPLIT` and anything else is a\nserde error the route turns into a 422. There is no `to_uppercase()` left to\nforget, because a lowercase spelling is a compile error at the call site rather\nthan a string that survives to the database.\n\n**The read side stays `String`.** [`Transaction`] and `schemas::TransactionOut`\nare `FromRow` decode targets for rows this migration still accepts in any case —\nthe `CHECK` is `upper(btrim(type)) IN (...)` precisely so legacy `buy` rows do not\nhave to be rewritten. Decoding those into this enum would fail to read every one of\nthem, which turns a validation improvement into an unreadable database.",
+        "enum": [
+          "BUY",
+          "SELL",
+          "SPLIT"
+        ]
       }
     },
     "securitySchemes": {

@@ -132,6 +132,11 @@ want_migration_ledger() {
     v=$((10#$v))
     d=${base#*_}
     d=${d%.sql}
+    # sqlx stores the description with underscores turned into spaces, so a migration
+    # whose name has more than one word in it never matched until a multi-word filename
+    # came along. Comparing the file name verbatim reports an applied migration as
+    # missing. (0001_init.sql has one word, so this sat unnoticed for two migrations.)
+    d=${d//_/ }
     sum=$(sha384sum "$f" | cut -d' ' -f1)
     stored=$(q "select encode(checksum, 'hex') from _sqlx_migrations
                   where version = $v and description = '$d' and success") \
@@ -151,6 +156,32 @@ want_migration_ledger() {
 # column types would have passed that schema, which makes it complicit in the bug it
 # exists to prevent, so the index itself is asserted: present, unique, partial on SPLIT,
 # and keyed on the UTC calendar day.
+# The transaction-type CHECK, pinned to its exact definition.
+#
+# Three places name this vocabulary and nothing imports it between them: the `TxType` enum
+# the API accepts, `backup::KNOWN_TRANSACTION_TYPES` the bundle schema enumerates, and this
+# constraint. `tests/tx_type_test.rs` connects the first two and greps the SQL text for the
+# third; this connects the third to the *live database*, which is where a migration that
+# never ran would otherwise go unnoticed — the same blind spot `check_migrations.sh` exists
+# for everywhere else.
+#
+# The definition is `upper(btrim(type)) = ANY (...)` rather than `type IN (...)` on purpose:
+# legacy rows hold `buy` and the constraint must accept them without a rewrite. A future
+# edit that "simplifies" it to `type IN ('BUY','SELL','SPLIT')` would make every legacy
+# lowercase row refuse a later ALTER, so the whole expression is asserted, not just the
+# value list.
+want_type_check() {
+  local d
+  d=$(q "select coalesce(pg_get_constraintdef(oid), '') from pg_constraint
+          where conrelid = 'public.transactions'::regclass and conname = 'transactions_type_check'") \
+    || { echo "FAIL could not read transactions_type_check from $DATABASE_URL"; exit 1; }
+  [ -n "$d" ] \
+    || { echo "FAIL transactions has no transactions_type_check in $DATABASE_URL: migration 0002 has not been applied here, and a gate that passed anyway would be certifying an unconstrained column"; exit 1; }
+  [ "$d" = "CHECK ((upper(btrim(type)) = ANY (ARRAY['BUY'::text, 'SELL'::text, 'SPLIT'::text])))" ] \
+    || { echo "FAIL transactions_type_check is '$d', expected the case-insensitive upper(btrim(type)) form over BUY, SELL, SPLIT"; exit 1; }
+  echo "ok   transactions.transactions_type_check = upper(btrim(type)) IN BUY|SELL|SPLIT"
+}
+
 want_split_dedupe_index() {
   local row uniq partial pred def
   row=$(q "select concat_ws('|', i.indisunique, (i.indpred is not null),
@@ -284,6 +315,7 @@ want_pk historical_prices "PRIMARY KEY (symbol, date)"
 want_unique users uq_users_issuer_subj "(issuer, subj)"
 
 want_split_dedupe_index
+want_type_check
 want_migration_ledger
 
 echo "schema shape ok"

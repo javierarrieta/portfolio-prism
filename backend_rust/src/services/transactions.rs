@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
-use crate::models::Transaction;
+use crate::models::{Transaction, TxType};
 use crate::schemas::TransactionCreate;
 use crate::services::error::WriteError;
 
@@ -22,22 +22,26 @@ use crate::services::error::WriteError;
 /// connection out of the pool and passes that, which is the same autocommit
 /// single-statement behaviour it had before this function existed.
 ///
-/// Note what is *not* validated here: the transaction type is uppercased and
-/// inserted as-is, so an unknown type such as `BUY ` or `purchase` still reaches
-/// the database. Tightening that is a breaking change to the live API and is a
-/// separate change with its own migration and audit, not a detail to fold in here.
+/// The type arrives as [`TxType`], so it is already one of the three the engines
+/// handle — there is no `to_uppercase()` here and nothing to forget. That is the
+/// caller's problem to have solved, and it is solved at deserialisation for the HTTP
+/// route; a future caller that builds a `TransactionCreate` in Rust gets the same
+/// guarantee from the type system. The database enforces it a third time with the
+/// `CHECK` in `0002_transaction_type_check.sql`.
 pub async fn insert(
     conn: &mut PgConnection,
     asset_id: i64,
     create: &TransactionCreate,
 ) -> Result<Transaction, WriteError> {
-    let tx_type = create.r#type.to_uppercase();
-    if tx_type == "SPLIT" && (create.quantity <= Decimal::ZERO || create.price <= Decimal::ZERO) {
+    let tx_type = create.r#type;
+    if tx_type == TxType::Split
+        && (create.quantity <= Decimal::ZERO || create.price <= Decimal::ZERO)
+    {
         return Err(WriteError::InvalidSplit);
     }
     // A split is a ratio, not a trade: whatever fee the caller sent is discarded
     // rather than stored, exactly as before the extraction.
-    let tx_fee = if tx_type == "SPLIT" {
+    let tx_fee = if tx_type == TxType::Split {
         Decimal::ZERO
     } else {
         create.fee
@@ -57,7 +61,7 @@ pub async fn insert(
         "INSERT INTO transactions (asset_id, type, quantity, price, fee, date)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
         asset_id,
-        &tx_type,
+        tx_type.as_str(),
         create.quantity.to_string(),
         create.price.to_string(),
         tx_fee.to_string(),

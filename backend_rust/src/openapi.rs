@@ -43,6 +43,11 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::PortfolioUpdate,
         schemas::AssetCreate,
         schemas::AssetOut,
+        // The write side of the transaction type. Referenced by `TransactionCreate`, so
+        // without this the document carries a `$ref` to a schema that does not exist —
+        // the same shape of mistake the token schemas made, and the reason the enum is
+        // registered next to the DTO that points at it rather than in a block elsewhere.
+        models::TxType,
         schemas::TransactionCreate,
         schemas::TransactionOut,
         schemas::TaxLot,

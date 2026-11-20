@@ -11,7 +11,7 @@
 //! function instead of the connection it was handed would break the batch guarantee
 //! while leaving every endpoint test green. These tests fail if that happens.
 //!
-//! The normalization checks (uppercase, the `SPLIT` zero rule, the date range) moved
+//! The normalization checks (the uppercase symbol, the `SPLIT` zero rule, the date range) moved
 //! into the services from the handlers; the last two tests pin them at their new home
 //! so the move cannot silently drop one.
 
@@ -21,6 +21,7 @@ use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 use sqlx::Acquire;
 
+use backend_rust::models::TxType;
 use backend_rust::schemas::{AssetCreate, TransactionCreate};
 use backend_rust::services::assets;
 use backend_rust::services::error::WriteError;
@@ -39,9 +40,9 @@ fn asset_create(symbol: &str) -> AssetCreate {
     }
 }
 
-fn txn_create(kind: &str, quantity: &str, price: &str) -> TransactionCreate {
+fn txn_create(kind: TxType, quantity: &str, price: &str) -> TransactionCreate {
     TransactionCreate {
-        r#type: kind.to_string(),
+        r#type: kind,
         quantity: quantity.parse::<Decimal>().unwrap(),
         price: price.parse::<Decimal>().unwrap(),
         fee: Decimal::ZERO,
@@ -77,7 +78,7 @@ async fn a_rolled_back_transaction_leaves_neither_asset_nor_transaction() {
     let asset = assets::insert(&mut tx, pid, &asset_create("ACME"))
         .await
         .expect("asset insert");
-    transactions::insert(&mut tx, asset.id, &txn_create("buy", "10", "100.50"))
+    transactions::insert(&mut tx, asset.id, &txn_create(TxType::Buy, "10", "100.50"))
         .await
         .expect("transaction insert");
 
@@ -105,7 +106,7 @@ async fn a_committed_transaction_writes_both_rows_linked() {
     let asset = assets::insert(&mut tx, pid, &asset_create("ACME"))
         .await
         .expect("asset insert");
-    let written = transactions::insert(&mut tx, asset.id, &txn_create("buy", "10", "100.50"))
+    let written = transactions::insert(&mut tx, asset.id, &txn_create(TxType::Buy, "10", "100.50"))
         .await
         .expect("transaction insert");
 
@@ -137,7 +138,7 @@ async fn a_split_with_a_zero_price_is_refused_and_writes_nothing() {
         .await
         .expect("asset insert");
 
-    let err = transactions::insert(&mut conn, asset.id, &txn_create("split", "2", "0"))
+    let err = transactions::insert(&mut conn, asset.id, &txn_create(TxType::Split, "2", "0"))
         .await
         .expect_err("a zero-price split must be refused");
     assert_eq!(err, WriteError::InvalidSplit);
@@ -169,10 +170,17 @@ async fn a_duplicate_symbol_is_reported_as_a_collision_not_a_database_error() {
     assert_eq!(err, WriteError::SymbolExists);
 }
 
-/// Symbol and type are normalized inside the service now, so no caller can skip it by
-/// calling the service instead of the endpoint.
+/// The stored spelling is canonical for both columns, by two different routes.
+///
+/// The symbol is normalized at run time inside the service, so no caller can skip it by
+/// calling the service instead of the endpoint. The type is no longer normalized at all:
+/// it arrives as `TxType`, whose `as_str()` is the only spelling it can produce, so there
+/// is nothing left to forget. Both assertions stay because they are asserting different
+/// things — one is a runtime guarantee, the other is a type-system guarantee, and a future
+/// edit that reintroduces a stringly-typed type would fail the second one at compile time
+/// rather than here.
 #[tokio::test]
-async fn the_service_stores_the_canonical_uppercase_form() {
+async fn the_service_stores_the_canonical_form() {
     let (pool, user) = db_with_user("uppercase_normalization").await;
     let pid = seed_portfolio(&pool, user, "Seam", "USD").await;
 
@@ -180,7 +188,7 @@ async fn the_service_stores_the_canonical_uppercase_form() {
     let asset = assets::insert(&mut conn, pid, &asset_create("acme"))
         .await
         .expect("asset insert");
-    transactions::insert(&mut conn, asset.id, &txn_create("buy", "10", "100.50"))
+    transactions::insert(&mut conn, asset.id, &txn_create(TxType::Buy, "10", "100.50"))
         .await
         .expect("transaction insert");
     drop(conn);
@@ -194,5 +202,8 @@ async fn the_service_stores_the_canonical_uppercase_form() {
         .await
         .unwrap();
     assert_eq!(symbol, "ACME", "the symbol must be stored uppercased");
-    assert_eq!(kind, "BUY", "the transaction type must be stored uppercased");
+    assert_eq!(
+        kind, "BUY",
+        "the stored type is the enum's spelling, not whatever the caller spelled"
+    );
 }

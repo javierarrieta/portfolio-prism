@@ -40,6 +40,57 @@ pub struct Asset {
     pub isin: Option<String>,
 }
 
+/// The closed set of transaction types the engines understand.
+///
+/// This enum exists because of a specific failure that was live: `transactions.type`
+/// is `TEXT` with no `CHECK`, and the write path did `to_uppercase()` and stored
+/// whatever came back. So `"DIVIDEND"` was accepted, stored, and then **silently
+/// ignored** — `tax_engine.rs:665-771` and `stats_engine.rs:250-256` are both
+/// `if BUY / else if SELL / else if SPLIT` with no terminal `else`. Invisible tax
+/// data is worse than a wrong lot, because nothing looks wrong.
+///
+/// `rename_all = "UPPERCASE"` makes serde match the style names exactly, so the
+/// accepted wire values are precisely `BUY`, `SELL`, `SPLIT` and anything else is a
+/// serde error the route turns into a 422. There is no `to_uppercase()` left to
+/// forget, because a lowercase spelling is a compile error at the call site rather
+/// than a string that survives to the database.
+///
+/// **The read side stays `String`.** [`Transaction`] and `schemas::TransactionOut`
+/// are `FromRow` decode targets for rows this migration still accepts in any case —
+/// the `CHECK` is `upper(btrim(type)) IN (...)` precisely so legacy `buy` rows do not
+/// have to be rewritten. Decoding those into this enum would fail to read every one of
+/// them, which turns a validation improvement into an unreadable database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TxType {
+    Buy,
+    Sell,
+    Split,
+}
+
+impl TxType {
+    /// The spelling stored in the database and compared by the engines.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TxType::Buy => "BUY",
+            TxType::Sell => "SELL",
+            TxType::Split => "SPLIT",
+        }
+    }
+
+    /// The set, in the order the engines handle it. Mirrors
+    /// `backup::KNOWN_TRANSACTION_TYPES`; `tests/tx_type_test.rs` asserts the two
+    /// agree, because a fourth variant added here and not there would make a bundle
+    /// that the app can write and restore refuses to read.
+    pub const ALL: [TxType; 3] = [TxType::Buy, TxType::Sell, TxType::Split];
+}
+
+impl std::fmt::Display for TxType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Transaction {
     pub id: i64,
