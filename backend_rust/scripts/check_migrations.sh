@@ -2,7 +2,7 @@
 # The migration is the schema. This checks a Postgres database against it, and it pins
 # four things, because each one has a different way of going wrong silently:
 #
-#   1. every column's type and NOT NULL-ness (all 36 columns of the six tables, 28 of
+#   1. every column's type and NOT NULL-ness (all 47 columns of the seven tables, 36 of
 #      them NOT NULL, not a sample — sqlx-postgres type-checks at run time, so a wrong
 #      column type is a request failing in production rather than a compile error, and a
 #      column made nullable is a `None` the Rust structs have no field for),
@@ -182,6 +182,26 @@ want_type_check() {
   echo "ok   transactions.transactions_type_check = upper(btrim(type)) IN BUY|SELL|SPLIT"
 }
 
+# The status CHECK, pinned to its exact definition.
+#
+# `staged -> approved -> applied` plus `discarded` is the whole approval gate, and the
+# transition rules live in `agent::staging` as conditional UPDATEs. This constraint is the
+# only thing that stops a fourth status being written by hand — and a status nothing
+# recognises would make a batch permanently unapproachable rather than visibly wrong.
+want_status_check() {
+  local d
+  d=$(q "select coalesce(pg_get_constraintdef(oid), '') from pg_constraint
+          where conrelid = 'public.agent_staged_batch'::regclass and conname = 'agent_staged_batch_status_check'") \
+    || { echo "FAIL could not read agent_staged_batch_status_check from $DATABASE_URL"; exit 1; }
+  [ -n "$d" ] \
+    || { echo "FAIL agent_staged_batch has no status CHECK in $DATABASE_URL: migration 0004 has not been applied here"; exit 1; }
+  case "$d" in
+    *"'staged'"*"'approved'"*"'applied'"*"'discarded'"*) ;;
+    *) echo "FAIL agent_staged_batch status CHECK is '$d', expected the four states staged/approved/applied/discarded"; exit 1 ;;
+  esac
+  echo "ok   agent_staged_batch.status CHECK = staged|approved|applied|discarded"
+}
+
 want_split_dedupe_index() {
   local row uniq partial pred def
   row=$(q "select concat_ws('|', i.indisunique, (i.indpred is not null),
@@ -298,7 +318,36 @@ want split_sync covered_from   date
 want_notnull split_sync asset_id
 want_notnull split_sync last_synced_at
 
+# --- agent_staged_batch -----------------------------------------------------------
+# The row that makes the approval gate persistent. The nullable columns are the state
+# machine, so they are pinned as deliberately as any type: `approved_at` NULL means no
+# human has acted yet, `applied_at` NULL means nothing was written, and `approved_by` is
+# the only column here that is an audit field rather than a relationship.
+#
+# `payload` and `preview` are jsonb and NOT NULL together: a batch that stored one but not
+# the other would let the human approve something the apply step then writes differently.
+want agent_staged_batch id           bigint
+want agent_staged_batch handle       text
+want agent_staged_batch user_id      bigint
+want agent_staged_batch payload      jsonb
+want agent_staged_batch preview      jsonb
+want agent_staged_batch status       text
+want agent_staged_batch created_at   "timestamp with time zone"
+want agent_staged_batch expires_at   "timestamp with time zone"
+want agent_staged_batch approved_at  "timestamp with time zone"
+want agent_staged_batch approved_by  bigint
+want agent_staged_batch applied_at   "timestamp with time zone"
+want_notnull agent_staged_batch id
+want_notnull agent_staged_batch handle
+want_notnull agent_staged_batch user_id
+want_notnull agent_staged_batch payload
+want_notnull agent_staged_batch preview
+want_notnull agent_staged_batch status
+want_notnull agent_staged_batch created_at
+want_notnull agent_staged_batch expires_at
+
 # --- keys, identity, and the ledger -------------------------------------------------
+want_identity agent_staged_batch id
 want_identity users        id
 want_identity portfolios   id
 want_identity assets       id
@@ -313,9 +362,14 @@ want_pk historical_prices "PRIMARY KEY (symbol, date)"
 # `ON CONFLICT (issuer, subj) DO NOTHING` (auth/oidc.rs:304), so without this index every
 # first login fails when the plan is built rather than writing a duplicate identity.
 want_unique users uq_users_issuer_subj "(issuer, subj)"
+# The handle is the only name a batch has outside the database, and every route resolves
+# it. Without uniqueness two rows could answer the same handle and approval would land on
+# whichever the planner reached first.
+want_unique agent_staged_batch agent_staged_batch_handle_key "(handle)"
 
 want_split_dedupe_index
 want_type_check
+want_status_check
 want_migration_ledger
 
 echo "schema shape ok"

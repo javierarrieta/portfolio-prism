@@ -6,6 +6,7 @@
 // every build that includes the file, which is the only reason it is here.
 extern crate self as backend_rust;
 
+pub mod agent;
 pub mod db;
 pub mod db_types;
 pub mod models;

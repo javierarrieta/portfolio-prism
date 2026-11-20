@@ -167,6 +167,7 @@ dependencies = [
  "chrono",
  "openidconnect",
  "reqwest",
+ "ring",
  "rocket",
  "rocket_cors",
  "rust_decimal",
