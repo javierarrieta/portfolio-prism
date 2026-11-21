@@ -215,6 +215,9 @@ export interface components {
       symbol: string;
       unrealized_at_end: string;
     };
+    AssetUpdate: {
+      currency: string;
+    };
     /**
      * @description One row of the list. No payload and no preview: the list is a menu, and the detail route
      * is where the bytes are.

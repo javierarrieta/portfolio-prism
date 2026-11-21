@@ -1555,6 +1555,17 @@
           }
         }
       },
+      "AssetUpdate": {
+        "type": "object",
+        "required": [
+          "currency"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string"
+          }
+        }
+      },
       "BatchOut": {
         "type": "object",
         "description": "One row of the list. No payload and no preview: the list is a menu, and the detail route\nis where the bytes are.",

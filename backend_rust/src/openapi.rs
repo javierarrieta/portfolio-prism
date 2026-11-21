@@ -48,6 +48,7 @@ use utoipa::openapi::{Components, RefOr, Response};
         schemas::SyncSplitFailure,
         schemas::PortfolioUpdate,
         schemas::AssetCreate,
+        schemas::AssetUpdate,
         schemas::AssetOut,
         // The write side of the transaction type. Referenced by `TransactionCreate`, so
         // without this the document carries a `$ref` to a schema that does not exist —

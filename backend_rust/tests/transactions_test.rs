@@ -389,7 +389,12 @@ async fn test_create_asset_null_sector() {
         "asset_type": "CRYPTO",
         "sector": null,
         "currency": "USD",
-        "isin": "BTC123456789"
+        // A synthetic placeholder, but a shape- and check-digit-valid one: this test
+        // round-trips the ISIN, so it has to survive validation. `is_valid_isin` now
+        // computes the ISO 6166 digit, and the value this test used before (`BTC123456789`)
+        // was twelve shape-valid characters with a wrong digit — exactly what the tightening
+        // is there to refuse. `BTC123456783` is the same body with its correct digit.
+        "isin": "BTC123456783"
     }));
 
     let resp = client.post(format!("/api/portfolios/{}/assets", port_id))
@@ -403,7 +408,7 @@ async fn test_create_asset_null_sector() {
     let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(parsed["symbol"], "BTC-USD");
     assert_eq!(parsed["sector"], serde_json::Value::Null);
-    assert_eq!(parsed["isin"], "BTC123456789");
+    assert_eq!(parsed["isin"], "BTC123456783");
     assert!(parsed["id"].is_number());
 }
 

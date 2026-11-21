@@ -5,6 +5,68 @@ import { parseDecimal, validateCsvRow, validateCsvFile } from './csvValidator';
 
 const columnMapping = detectColumns(['date', 'symbol', 'type', 'qty', 'price', 'fee']);
 
+describe('separator handling', () => {
+  // Expectations are strings, not numbers: `quantity` travels as a decimal string
+  // end to end, so a float assertion here would be asserting the very conversion
+  // the string transport exists to remove.
+  const row = (qty: string, price = '150.00') =>
+    validateCsvRow({ date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty, price, fee: '5.00' }, columnMapping, 1);
+
+  test('a decimal comma is a decimal comma, not a stripped thousands separator', () => {
+    // The bug this pins: commas were deleted, so each of these was multiplied by a
+    // power of ten and imported silently wrong.
+    expect(row('1,5').quantity).toBe('1.5');
+    expect(row('1,50').quantity).toBe('1.5');
+    expect(row('0,25').quantity).toBe('0.25');
+    expect(row('1,5000').quantity).toBe('1.5');
+    expect(row('1.234,56').quantity).toBe('1234.56');
+    // A leading `+` carries no information and parseFloat always accepted it.
+    expect(row('+1,5').quantity).toBe('1.5');
+  });
+
+  test('a three-digit group after a comma is still a thousands separator', () => {
+    // Status quo, deliberately unchanged.
+    expect(row('1,500').quantity).toBe('1500');
+    expect(row('1,234,567').quantity).toBe('1234567');
+    expect(row('1,500.25').quantity).toBe('1500.25');
+  });
+
+  test('an ungrouped head is plain digits, of any length', () => {
+    // The head rule this pins. A head with no separator has no grouping to be
+    // wrong about, and this is the shape a European export actually has when the
+    // broker emits no thousands separator at all: DEGIRO, Scalable Capital and
+    // Trade Republic all write amounts like this. A leading group of one to three
+    // digits was required here, which refused every one of them.
+    expect(row('1234,56').quantity).toBe('1234.56');
+    expect(row('12345,6').quantity).toBe('12345.6');
+    expect(row('123456,78').quantity).toBe('123456.78');
+    expect(row('1', '1234,56').price).toBe('1234.56');
+    // Same rule, with the dot as the thousands separator: the canonical European
+    // spelling, and untested before.
+    expect(row('1.500,25').quantity).toBe('1500.25');
+  });
+
+  test('one separator never does both jobs', () => {
+    // `1,500,25` reads the comma as a thousands separator and as the decimal
+    // separator at the same time. It folded to 1500.25 while `1234,56` was being
+    // refused, which is the strictness pointed the wrong way.
+    for (const bad of ['1,500,25', '1,234,56', '1234.567,89']) {
+      const result = row(bad);
+      expect(result.errors.map((e) => e.field), bad).toContain('quantity');
+    }
+  });
+
+  test('illegal grouping is reported as an invalid cell, not guessed', () => {
+    // `1234,567` is the ambiguous one and stays refused on purpose: a three-digit
+    // tail takes the thousands reading (as in `1,500`), and `1234` is not a legal
+    // leading group. See `resolveSeparators` before changing it.
+    for (const bad of ['12,34,567', '1,5.25', '1234,567', ',5', '1,5000.25', '12,34,567.5']) {
+      const result = row(bad);
+      expect(result.errors.map((e) => e.field), bad).toContain('quantity');
+    }
+  });
+});
+
 describe('validateCsvRow', () => {
   test('valid row passes with no errors', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '150.00', fee: '5.00' };
