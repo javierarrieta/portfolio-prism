@@ -148,12 +148,17 @@ export default function StagedBatchesPanel() {
       if (res.ok) {
         setNotice('Approved. An agent can now apply this batch.');
       } else if (res.status === 409) {
-        // The server says which state it found, because "someone already approved this" and
-        // "that batch is gone" are different things to a user and different things to fix.
+        // Prefer the server's own sentence. It knows the reason and the panel does not: an
+        // expired batch is still `staged`, and "someone else acted on it first" would be a
+        // fabrication about a batch that nobody touched — the clock ran out. The composed
+        // fallback is only for a server old enough not to send `detail`.
+        const detail = typeof body.detail === 'string' ? body.detail : null;
         setNotice(
-          `Not approved — the batch is '${
-            typeof body.current_status === 'string' ? body.current_status : 'unknown'
-          }'. Someone else acted on it first.`,
+          detail
+            ? `Not approved — ${detail}`
+            : `Not approved — the batch is '${
+                typeof body.current_status === 'string' ? body.current_status : 'unknown'
+              }'. Someone else acted on it first.`,
         );
       } else {
         setNotice(`Not approved (HTTP ${res.status}).`);

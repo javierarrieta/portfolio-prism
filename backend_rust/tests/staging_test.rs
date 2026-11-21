@@ -393,3 +393,111 @@ async fn a_ttl_of_zero_expires_immediately_rather_than_never() {
     let s = staging::stage(&pool, user, &one_ok(), 60).await.unwrap();
     assert!(s.expires_at > Utc::now() + Duration::minutes(59));
 }
+
+// --- the target and the identity fields -------------------------------------------
+
+#[tokio::test]
+async fn a_target_that_cannot_become_a_portfolio_is_refused_at_staging() {
+    // `Target::New` becomes a `portfolios` row verbatim, so an empty name or an empty base
+    // currency is not cosmetic: a base currency of "" is a portfolio whose every pricing
+    // lookup fails, and the failure arrives after a human approved the batch.
+    for (name, base, what) in [
+        ("", "EUR", "target.name"),
+        ("   ", "EUR", "target.name"),
+        ("Depot", "", "target.base_currency"),
+    ] {
+        let p = Proposal {
+            target: Target::New {
+                name: name.into(),
+                base_currency: base.into(),
+            },
+            assets: vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1", "1", "0")])],
+        };
+        let err = staging::validate(&p).unwrap_err();
+        assert_eq!(err.code(), "empty_asset", "{what} blank: {err:?}");
+        assert_eq!(err.field(), Some(what), "the agent must be told which field");
+    }
+}
+
+#[tokio::test]
+async fn an_identifier_over_its_cap_is_refused_and_names_the_limit() {
+    // The limit travels as data on the error rather than being baked into a sentence, so the
+    // constant is stated once.
+    let long = "x".repeat(41);
+    let p = proposal(vec![asset(&long, vec![tx("BUY", "2024-03-01", "1", "1", "0")])]);
+    let err = staging::validate(&p).unwrap_err();
+    assert_eq!(err.code(), "out_of_range");
+    assert_eq!(err.field(), Some("assets[0].symbol"));
+    assert!(format!("{err:?}").contains("max: 40"), "the cap is in the answer: {err:?}");
+
+    // Trailing whitespace does not buy extra length: the trim happens before the count.
+    let at_cap = format!("{}   ", "x".repeat(MAX_IDENTIFIER_LEN_FOR_TEST));
+    staging::validate(&proposal(vec![asset(
+        &at_cap,
+        vec![tx("BUY", "2024-03-01", "1", "1", "0")],
+    )]))
+    .expect("40 characters plus padding is at the cap, not over it");
+}
+
+/// Mirrors `staging`'s private `MAX_IDENTIFIER_LEN`; the over-cap case above is the one that
+/// would fail loudly if the two ever disagree.
+const MAX_IDENTIFIER_LEN_FOR_TEST: usize = 40;
+
+#[tokio::test]
+async fn a_blank_symbol_or_asset_type_is_refused_before_any_asset_row_exists() {
+    // `services::assets::insert` does not refuse a blank symbol, so an asset nothing can list
+    // or merge into would be created at apply — after the approval.
+    for (symbol, asset_type, field) in [
+        ("", "ETF", "assets[0].symbol"),
+        ("IWDA", "  ", "assets[0].asset_type"),
+    ] {
+        let p = Proposal {
+            target: Target::New {
+                name: "Depot".into(),
+                base_currency: "EUR".into(),
+            },
+            assets: vec![ProposalAsset {
+                symbol: symbol.into(),
+                isin: None,
+                name: None,
+                asset_type: asset_type.into(),
+                currency: None,
+                transactions: vec![tx("BUY", "2024-03-01", "1", "1", "0")],
+            }],
+        };
+        let err = staging::validate(&p).unwrap_err();
+        assert_eq!(err.code(), "empty_asset");
+        assert_eq!(err.field(), Some(field));
+    }
+}
+
+// --- approval and expiry -----------------------------------------------------------
+
+#[tokio::test]
+async fn an_expired_batch_cannot_be_approved() {
+    // `apply` refuses an expired batch, so approving one is a promise that cannot be kept:
+    // the human is told "approved, an agent may now apply this batch", the agent is told
+    // `expired`, and nothing reconciles the two except a timestamp in a table. The expiry
+    // belongs in the same conditional UPDATE as the status.
+    let (pool, user) = db_with_user("approve_expired").await;
+    let s = staging::stage(&pool, user, &one_ok(), 60).await.unwrap();
+    sqlx::query("UPDATE agent_staged_batch SET expires_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        !staging::approve(&pool, user, &s.handle).await.unwrap(),
+        "an approval nobody can spend is not an approval"
+    );
+
+    let (status, approved_at): (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status, approved_at FROM agent_staged_batch WHERE handle = $1",
+    )
+    .bind(&s.handle)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "staged", "and the row is left for the sweep, not marked");
+    assert!(approved_at.is_none(), "no human act is recorded for a refused approval");
+}

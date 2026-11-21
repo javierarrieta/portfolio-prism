@@ -455,3 +455,100 @@ async fn a_target_portfolio_deleted_after_approval_is_refused_not_guessed_at() {
     assert_eq!(err.code(), "portfolio_not_found");
     assert_eq!(counts(&pool).await, (0, 0, 0));
 }
+
+// --- the currency an asset is created with ----------------------------------------
+
+/// The currency stored for the first asset an apply creates.
+async fn asset_currency(pool: &sqlx::PgPool, asset_id: i64) -> String {
+    sqlx::query_scalar("SELECT currency FROM assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_asset_without_a_currency_takes_the_portfolios_base_currency() {
+    // `render_preview` warns, in as many words, that "one or more assets carry no currency
+    // and will take the portfolio's base currency", and a human approves on the strength of
+    // that sentence. Defaulting to a literal "USD" — which this path did — makes the preview
+    // a lie for every non-USD portfolio, and the engines then price a EUR holding in dollars.
+    // The existing EUR fixtures here never looked at the created asset's currency, which is
+    // how the contradiction survived a green suite.
+    let (pool, user) = db_with_user("apply_currency_new").await;
+    let handle = stage_and_approve(
+        &pool,
+        user,
+        &new_portfolio(vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1.5", "82.34", "0")])]),
+    )
+    .await;
+    let out = staging::apply(&pool, user, &handle).await.unwrap();
+    assert_eq!(
+        asset_currency(&pool, out.asset_ids[0]).await,
+        "EUR",
+        "the new portfolio's base currency, not a literal"
+    );
+}
+
+#[tokio::test]
+async fn merging_into_an_existing_portfolio_defaults_to_its_base_currency_not_usd() {
+    // The stronger case: the proposal says nothing about currency and the portfolio it merges
+    // into is EUR for a reason. `Target::New` could have guessed from the proposal; this can
+    // only be answered by reading the row.
+    let (pool, user) = db_with_user("apply_currency_existing").await;
+    let (portfolio,): (i64,) = sqlx::query_as(
+        "INSERT INTO portfolios (name, currency, base_currency, owner_id)
+         VALUES ('Depot EUR', 'EUR', 'EUR', $1) RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let out = staging::apply(
+        &pool,
+        user,
+        &stage_and_approve(
+            &pool,
+            user,
+            &Proposal {
+                target: Target::Existing { portfolio_id: portfolio },
+                assets: vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1.5", "82.34", "0")])],
+            },
+        )
+        .await,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(asset_currency(&pool, out.asset_ids[0]).await, "EUR");
+}
+
+#[tokio::test]
+async fn an_explicit_currency_survives_a_portfolio_with_a_different_base() {
+    // The default is a fallback, not an override: a USD line in a EUR portfolio is a USD line.
+    let (pool, user) = db_with_user("apply_currency_explicit").await;
+    let mut apple = asset("AAPL", vec![tx("BUY", "2024-03-01", "1", "100", "0")]);
+    apple.currency = Some("USD".into());
+
+    let out = staging::apply(
+        &pool,
+        user,
+        &stage_and_approve(
+            &pool,
+            user,
+            &Proposal {
+                target: Target::New {
+                    name: "Depot".into(),
+                    base_currency: "EUR".into(),
+                },
+                assets: vec![apple],
+            },
+        )
+        .await,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(asset_currency(&pool, out.asset_ids[0]).await, "USD");
+}

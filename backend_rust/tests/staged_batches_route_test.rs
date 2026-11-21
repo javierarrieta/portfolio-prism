@@ -179,3 +179,40 @@ async fn an_expired_batch_is_reported_expired_rather_than_approvable() {
     let resp = req(&as_alice, Method::Get, "/api/staged-batches").await;
     assert_eq!(resp.into_json::<Value>().await.unwrap()[0]["expired"], json!(true));
 }
+
+#[tokio::test]
+async fn approving_an_expired_batch_is_a_conflict_that_says_so() {
+    // The panel renders `expired` from the row, but a human can still click. The answer must
+    // not be "only a batch at status 'staged' can be approved" — the batch *is* staged, and
+    // that sentence reads as though trying again would work. It would not.
+    let (pool, alice, _, as_alice, _) = two_users("approve_expired_route").await;
+    let handle = stage(&pool, alice).await;
+    sqlx::query("UPDATE agent_staged_batch SET expires_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let path = format!("/api/staged-batches/{handle}/approve");
+    let resp = req(&as_alice, Method::Post, &path).await;
+    assert_eq!(resp.status(), Status::Conflict);
+    let body: Value = resp.into_json().await.unwrap();
+    assert_eq!(body["error"], json!("not_approvable"));
+    assert_eq!(body["expired"], json!(true), "the real reason, not the status");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expired"),
+        "the sentence must name expiry: {body}"
+    );
+
+    assert_eq!(
+        staging::preview_of(&pool, alice, &handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        "staged",
+        "and nothing was recorded as a human act"
+    );
+}

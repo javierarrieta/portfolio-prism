@@ -186,7 +186,17 @@ pub(crate) async fn mcp(
         .uri(parts.uri)
         .header("host", parts.host);
     for (name, value) in parts.headers {
-        if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("host") {
+        // `authorization` is consumed at the door and `host` was already set from the
+        // request URI. `content-length` and `transfer-encoding` are dropped because Rocket
+        // has already decoded the body: what is handed to rmcp is the decoded bytes, so the
+        // client's framing headers describe a body that is no longer the one being sent. A
+        // `Transfer-Encoding: chunked` forwarded verbatim tells hyper to expect framing it
+        // will never receive, and a stale `Content-Length` contradicts the payload.
+        if name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -216,9 +226,4 @@ pub(crate) async fn mcp(
         headers,
         body: out.to_vec(),
     })
-}
-
-#[allow(dead_code)]
-pub(crate) fn routes() -> Vec<rocket::Route> {
-    rocket::routes![mcp]
 }

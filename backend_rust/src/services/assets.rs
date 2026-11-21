@@ -20,8 +20,18 @@ use crate::services::error::WriteError;
 /// that skips it would insert a dangling row, and no constraint would stop it.
 ///
 /// Symbol and ISIN are uppercased here rather than in the handler so that every
-/// caller stores the same canonical form. The uniqueness checks are per-portfolio,
-/// matching the existing partial unique index.
+/// caller stores the same canonical form. The uniqueness checks are per-portfolio.
+///
+/// **Uniqueness is enforced here and nowhere else.** There is no unique index on
+/// `assets (portfolio_id, symbol)` — `0001_init.sql` creates only `assets_portfolio_idx`, a
+/// plain non-unique index on `portfolio_id` — so the `SELECT`-then-`INSERT` below is the
+/// whole rule. Two callers running concurrently can both find nothing and both insert, and
+/// Postgres will not stop them. That is pre-existing, and a comment does not fix it; it is
+/// stated because the alternative is a later reader assuming an index exists and reasoning
+/// from it. The real fix is `CREATE UNIQUE INDEX ON assets (portfolio_id, upper(symbol))`,
+/// and it needs a migration that first audits and refuses existing duplicates in the shape of
+/// `0005_split_index_case_insensitive.sql` — it cannot simply be added, or the migration dies
+/// on whatever duplicate a live database already holds.
 pub async fn insert(
     conn: &mut PgConnection,
     portfolio_id: i64,

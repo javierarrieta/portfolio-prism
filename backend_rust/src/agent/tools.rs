@@ -13,11 +13,12 @@
 //! domain refusals come back as `CallToolResult::error` carrying a JSON body with a `code`
 //! field, and only genuinely broken arguments become `McpError`.
 //!
-//! **The scope is checked here, at the only door.** `require_scope` is the same function the
-//! `/api` token routes use, so a token that lacks `import` gets the same answer from both
-//! surfaces. `Credential::Session` passes every scope — which is why the mount refuses
-//! sessions before a tool is ever reached, and why that refusal is a required test rather
-//! than an assumption.
+//! **The scope is checked here, at the only door.** `require_scope` is the one function that
+//! decides it, and today `/mcp` is the only surface that calls it: `AuthedUser::from_request`
+//! never consults an `Authorization` header, so a token cannot reach `/api` at all. That is
+//! what makes the tokens routes safe to mount under `/api` — a token cannot mint a token
+//! because a token cannot reach the route that mints. If a bearer credential is ever accepted
+//! on `/api`, every `require_scope` call site there has to be added to this sentence.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
@@ -40,14 +41,14 @@ use crate::engines::tax_engine::TaxLotEngine;
 use crate::services::currency_service::CurrencyService;
 use std::sync::Arc;
 
+/// One row of `list_transactions`, in the order the SELECT lists its columns.
+type TxRow = (i64, i64, String, i64, String, String, String, String, String);
+
 /// Page size for every listing tool, per *Limits*: 100 default, 500 max.
 ///
 /// The ceiling is not politeness. A read response that exceeds a client's truncation limit
 /// is a response the model silently sees half of, and half a transaction list looks exactly
 /// like a complete one.
-/// One row of `list_transactions`, in the order the SELECT lists its columns.
-type TxRow = (i64, i64, String, i64, String, String, String, String, String);
-
 const DEFAULT_PAGE_SIZE: i64 = 100;
 const MAX_PAGE_SIZE: i64 = 500;
 
@@ -304,16 +305,28 @@ impl AgentServer {
         }
         let done = staging::discard(&self.pool, self.user.id, &args.handle)
             .await
-            .map_err(|e| McpError::internal_error(e.code().to_string(), None))?;
-        if done {
-            Ok(ok(json!({ "status": "discarded" })))
-        } else {
-            Ok(refused("stale_handle", "no staged batch with that handle"))
+            .map_err(|e| refused(e.code(), "the batch could not be discarded"));
+        match done {
+            Ok(true) => Ok(ok(json!({ "status": "discarded" }))),
+            Ok(false) => Ok(refused("stale_handle", "no staged batch with that handle")),
+            // A database refusal is still an answer the agent reads, not a protocol error.
+            // `Err(McpError)` is the one shape that invites an identical retry, and every
+            // other refusal in this module is a tool result for that reason.
+            Err(r) => Ok(r),
         }
     }
 
+    /// Re-render the stored preview.
+    ///
+    /// Gated on `Import`, not `Read`, even though it writes nothing — and the test
+    /// `get_staged_reports_what_a_human_actually_approved` calls it with an import-only token,
+    /// which is the case that decides it. `read_only_hint` answers does this call change state,
+    /// and the answer is no; the scope answers which job this token was issued for, and polling
+    /// your own batch for approval is part of the import job. Gating on `Read` would strand an
+    /// import-only agent after `stage_import`: it could create a batch, could never see whether
+    /// a human had approved it, and would have to retry `apply_staged` blind.
     #[tool(
-        description = "Re-render the stored preview for a handle, so you can report what a human actually approved rather than what you staged.",
+        description = "Re-render the stored preview for a handle, so you can report what a human actually approved rather than what you staged. Needs the import scope: it is the importer's own receipt, not a portfolio read.",
         annotations(read_only_hint = true)
     )]
     async fn get_staged(
@@ -378,7 +391,7 @@ impl AgentServer {
               WHERE p.owner_id = $1
                 AND ($2::bigint IS NULL OR a.portfolio_id = $2)
                 AND ($3::bigint IS NULL OR t.asset_id = $3)
-                AND ($4::text IS NULL OR upper(t.type) = upper($4))
+                AND ($4::text IS NULL OR upper(btrim(t.type)) = upper($4))
                 AND ($5::date IS NULL OR (t.date AT TIME ZONE 'UTC')::date >= $5)
                 AND ($6::date IS NULL OR (t.date AT TIME ZONE 'UTC')::date <= $6)
               ORDER BY t.date DESC, t.id DESC
@@ -404,7 +417,7 @@ impl AgentServer {
               WHERE p.owner_id = $1
                 AND ($2::bigint IS NULL OR a.portfolio_id = $2)
                 AND ($3::bigint IS NULL OR t.asset_id = $3)
-                AND ($4::text IS NULL OR upper(t.type) = upper($4))
+                AND ($4::text IS NULL OR upper(btrim(t.type)) = upper($4))
                 AND ($5::date IS NULL OR (t.date AT TIME ZONE 'UTC')::date >= $5)
                 AND ($6::date IS NULL OR (t.date AT TIME ZONE 'UTC')::date <= $6)",
         )

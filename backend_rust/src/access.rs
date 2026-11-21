@@ -245,14 +245,20 @@ pub async fn require_own_staged_batch(
                 Status::InternalServerError
             })?;
 
+    // One message for both "no such handle" and "not yours", so the two cannot be told apart
+    // from this side of the network either — including in the logs an operator reads.
+    let deny = || {
+        eprintln!("DENY: staged batch not available to user {user_id}");
+        Status::NotFound
+    };
+
     match owner {
-        Some(uid) if uid == user_id => Ok(min),
-        // One message for both cases, so the two cannot be told apart from this side of the
-        // network either — including in the logs an operator reads.
-        _ => {
-            eprintln!("DENY: staged batch not available to user {user_id}");
-            Err(Status::NotFound)
-        }
+        // Graded rather than handed back: ownership is the only level this module can grant,
+        // so `min` has to be *checked* against it, not echoed back to the caller that asked
+        // for it. `grade` cannot actually fail here — `Owner` is the top level — but going
+        // through it is what keeps this function the same shape as its neighbours.
+        Some(uid) if uid == user_id => grade(Access::Owner, min).map_err(|_| deny()),
+        _ => Err(deny()),
     }
 }
 
@@ -288,7 +294,9 @@ pub async fn require_own_token(
         return Err(deny("api_token", token_id, user_id));
     }
 
-    Ok(min)
+    // Graded, for the reason `require_own_staged_batch` states: `min` is a question to answer,
+    // not a value to return.
+    grade(Access::Owner, min).map_err(|_| deny("api_token", token_id, user_id))
 }
 
 /// Check that a bearer-token caller holds `scope`. A session passes unconditionally.

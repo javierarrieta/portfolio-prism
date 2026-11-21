@@ -199,19 +199,30 @@ pub async fn approve_batch(
     // The update refused, so say why with the state the row is actually in. Reading it back
     // is not a check-then-act: the decision has already been made by the conditional update,
     // and this only describes the outcome.
+    //
+    // `expired` is part of the answer because `status` alone would lie. An expired batch is
+    // still `staged`, and "only a batch at status 'staged' can be approved" read to a human
+    // as though clicking again would work. It would not: expiry is in the same predicate now.
     let current = staging::preview_of(pool.inner(), user.id, handle)
         .await
         .ok()
-        .flatten()
-        .map(|(s, _, _)| s)
-        .unwrap_or_else(|| "gone".to_string());
+        .flatten();
+    let (current_status, expired) = match current {
+        Some((status, _, expires_at)) => (status, expires_at <= chrono::Utc::now()),
+        None => ("gone".to_string(), false),
+    };
 
     Err((
         Status::Conflict,
         Json(json!({
             "error": "not_approvable",
-            "current_status": current,
-            "detail": "only a batch at status 'staged' can be approved",
+            "current_status": current_status,
+            "expired": expired,
+            "detail": if expired {
+                "this batch has expired; it can no longer be approved or applied"
+            } else {
+                "only a batch at status 'staged' can be approved"
+            },
         })),
     ))
 }

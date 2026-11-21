@@ -55,6 +55,10 @@ pub enum StageError {
     NonCanonicalDecimal { field: String, given: String },
     BadDate { field: String, given: String },
     OutOfRange { field: String, rule: &'static str, given: String },
+    /// A text field longer than its stated cap. Shares the `out_of_range` code with
+    /// [`StageError::OutOfRange`] because it is the same answer — a value outside a rule —
+    /// and carries the limit as data rather than repeating it in a sentence.
+    TooLong { field: String, given: String, max: usize },
     Database,
 }
 
@@ -68,6 +72,7 @@ impl StageError {
             StageError::NonCanonicalDecimal { .. } => "non_canonical_decimal",
             StageError::BadDate { .. } => "bad_date",
             StageError::OutOfRange { .. } => "out_of_range",
+            StageError::TooLong { .. } => "out_of_range",
             StageError::Database => "database",
         }
     }
@@ -77,7 +82,8 @@ impl StageError {
             StageError::EmptyAsset { field }
             | StageError::NonCanonicalDecimal { field, .. }
             | StageError::BadDate { field, .. }
-            | StageError::OutOfRange { field, .. } => Some(field),
+            | StageError::OutOfRange { field, .. }
+            | StageError::TooLong { field, .. } => Some(field),
             _ => None,
         }
     }
@@ -104,13 +110,62 @@ fn is_calendar_date(s: &str) -> bool {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
+/// Longest accepted portfolio name. A display label, not a document; the cap exists so a
+/// 1 MB body cannot hide a portfolio behind a wall of text in the UI's portfolio picker.
+const MAX_NAME_LEN: usize = 120;
+/// Longest accepted `symbol` and `asset_type`. Both are short identifiers that appear in
+/// every listing; neither is a place for prose.
+const MAX_IDENTIFIER_LEN: usize = 40;
+/// Longest accepted currency code. ISO 4217 is three letters and the app stores nothing
+/// longer, but the cap is a bound rather than a validator: a wrong code is refused by the
+/// pricing provider at read time, and a 200-character one is refused here.
+const MAX_CURRENCY_LEN: usize = 8;
+
+/// A required free-text field: present after trimming, and not absurdly long.
+///
+/// Both failures reuse an existing wire code rather than minting a new one. A blank is the
+/// same shape as an empty asset list (`empty_asset`); a length is a value outside a stated
+/// rule (`out_of_range`). The spec's code list is the contract and adding to it unilaterally
+/// is how the agent-facing vocabulary stops matching the documentation. The limit itself
+/// travels as data on the variant, so the number is stated once, as the constant.
+fn text_field(value: &str, field: String, max: usize) -> Result<(), StageError> {
+    if value.trim().is_empty() {
+        return Err(StageError::EmptyAsset { field });
+    }
+    if value.trim().chars().count() > max {
+        return Err(StageError::TooLong {
+            field,
+            given: value.chars().take(max + 1).collect(),
+            max,
+        });
+    }
+    Ok(())
+}
+
 /// Check a proposal completely, before anything is written.
 ///
 /// Deterministic and total: it reports the first problem it finds in document order, with a
 /// path. It does not consult the database — that is `stage`'s job — so the same payload
 /// always gets the same answer, which is what makes an agent's retry loop converge instead
 /// of oscillating.
+///
+/// The `target` is checked too, not only the rows. `Target::New` becomes a `portfolios` row
+/// verbatim, so an empty name or an empty base currency is not a cosmetic defect: a base
+/// currency of `""` is a portfolio whose every pricing lookup fails, and it is discovered
+/// after a human approved the batch.
 pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
+    match &proposal.target {
+        Target::New {
+            name,
+            base_currency,
+        } => {
+            text_field(name, "target.name".to_string(), MAX_NAME_LEN)?;
+            text_field(base_currency, "target.base_currency".to_string(), MAX_CURRENCY_LEN)?;
+        }
+        // An existing portfolio is validated by `access.rs` at apply, not here.
+        Target::Existing { .. } => {}
+    }
+
     if proposal.assets.is_empty() {
         return Err(StageError::EmptyAsset {
             field: "assets".to_string(),
@@ -138,6 +193,23 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
                 given: total_tx,
                 max: MAX_TRANSACTIONS_PER_BATCH,
             });
+        }
+
+        // Identity fields, checked before the rows: an asset with a blank symbol is an asset
+        // nothing can list, merge into, or delete by name, and `asset_service::insert` does
+        // not refuse one.
+        text_field(
+            &asset.symbol,
+            format!("assets[{ai}].symbol"),
+            MAX_IDENTIFIER_LEN,
+        )?;
+        text_field(
+            &asset.asset_type,
+            format!("assets[{ai}].asset_type"),
+            MAX_IDENTIFIER_LEN,
+        )?;
+        if let Some(currency) = &asset.currency {
+            text_field(currency, format!("assets[{ai}].currency"), MAX_CURRENCY_LEN)?;
         }
 
         for (ti, tx) in asset.transactions.iter().enumerate() {
@@ -361,6 +433,17 @@ pub async fn stage(
 
     let mut tx = pool.begin().await.map_err(|_| StageError::Database)?;
 
+    // Serialise this user's stages against each other. The cap below is a count-then-insert,
+    // and two concurrent `stage_import` calls both reading four pending would both insert and
+    // leave six. A row lock cannot help — the rows being counted are not the rows being
+    // written — so the lock is on the user, and `xact` so it is released by the commit below
+    // rather than by anything that has to remember to unlock.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StageError::Database)?;
+
     // Sweep first, then count. In the other order five expired batches would refuse a new
     // one: the cap would be measuring rows that are already dead, and a user whose batches
     // had all timed out could never stage again without discarding by hand. The spec puts
@@ -424,6 +507,12 @@ pub async fn stage(
 /// approving the same batch cannot both succeed, and the second sees `already_applied`
 /// rather than a second `approved_at`.
 ///
+/// Expiry is part of the same predicate, not a later discovery. `apply` refuses an expired
+/// batch, so approving one is a promise that cannot be kept: the human is told "approved, an
+/// agent may now apply this batch", the agent is told `expired`, and nothing explains the
+/// contradiction except a timestamp in a table. Refusing here is the honest answer, and it
+/// is the same answer the panel already gives by rendering `expired`.
+///
 /// Returns `Err(false)` meaning "not in a state that can be approved" — the caller turns
 /// that into `not_approved` or `already_applied` by reading the row, because the distinction
 /// is for the human's benefit and the update deliberately does not encode it.
@@ -435,7 +524,7 @@ pub async fn approve(
     let updated: Option<(i64,)> = sqlx::query_as(
         "UPDATE agent_staged_batch
             SET status = 'approved', approved_at = now(), approved_by = $3
-          WHERE handle = $1 AND user_id = $2 AND status = 'staged'
+          WHERE handle = $1 AND user_id = $2 AND status = 'staged' AND expires_at > now()
           RETURNING id",
     )
     .bind(handle)
@@ -770,14 +859,15 @@ pub async fn apply(pool: &PgPool, user_id: i64, handle: &str) -> Result<Applied,
     })?;
     validate(&proposal).map_err(ApplyError::Rejected)?;
 
-    let portfolio_id = resolve_portfolio(&mut tx, user_id, &proposal.target).await?;
+    let (portfolio_id, base_currency) =
+        resolve_portfolio(&mut tx, user_id, &proposal.target).await?;
 
     let mut asset_ids = Vec::new();
     let mut written: i64 = 0;
     let mut skipped: i64 = 0;
 
     for pa in &proposal.assets {
-        let asset_id = resolve_asset(&mut tx, portfolio_id, pa).await?;
+        let asset_id = resolve_asset(&mut tx, portfolio_id, &base_currency, pa).await?;
         asset_ids.push(asset_id);
 
         // Seeded from the database, then extended with whatever this batch writes, so a row
@@ -850,7 +940,13 @@ async fn target_of(pool: &PgPool, user_id: i64, handle: &str) -> Result<Target, 
     Ok(proposal.target)
 }
 
-/// The portfolio to write into, creating it when the proposal asked for a new one.
+/// The portfolio to write into, creating it when the proposal asked for a new one, and its
+/// base currency.
+///
+/// The base currency comes back with the id because `resolve_asset` needs it: an asset
+/// staged without a currency takes the portfolio's, which is what the preview promises the
+/// human, and reading it from the row rather than assuming it is the only way the two can
+/// agree for a `Target::Existing` whose base currency has nothing to do with the proposal.
 ///
 /// The `existing` branch goes through `access.rs` like every other caller-supplied id. That
 /// is not ceremony: without it, a token could name any portfolio in the database by counting
@@ -860,15 +956,15 @@ async fn resolve_portfolio(
     tx: &mut sqlx::PgConnection,
     user_id: i64,
     target: &Target,
-) -> Result<i64, ApplyError> {
+) -> Result<(i64, String), ApplyError> {
     match target {
         Target::New {
             name,
             base_currency,
         } => {
-            let (id,): (i64,) = sqlx::query_as(
+            let (id, stored): (i64, String) = sqlx::query_as(
                 "INSERT INTO portfolios (name, description, currency, base_currency, owner_id)
-                 VALUES ($1, $2, $3, $3, $4) RETURNING id",
+                 VALUES ($1, $2, $3, $3, $4) RETURNING id, base_currency",
             )
             .bind(name)
             .bind("Created by an agent import")
@@ -877,21 +973,25 @@ async fn resolve_portfolio(
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
-            Ok(id)
+            Ok((id, stored))
         }
         Target::Existing { portfolio_id } => {
             // `require` answers on a pool, and this is a connection. The ownership answer
             // cannot be taken outside the transaction that writes, or the portfolio could
             // change owner between the check and the write, so the same predicate is
-            // restated here against the open transaction.
-            let owner: Option<i64> =
-                sqlx::query_scalar("SELECT owner_id FROM portfolios WHERE id = $1")
-                    .bind(portfolio_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
-            match owner {
-                Some(uid) if uid == user_id => Ok(*portfolio_id),
+            // restated here against the open transaction. The base currency is read in the
+            // same statement, so it is the value the row had when ownership was proven.
+            let row: Option<(i64, String)> = sqlx::query_as(
+                "SELECT owner_id, base_currency FROM portfolios WHERE id = $1",
+            )
+            .bind(portfolio_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+            match row {
+                Some((uid, base_currency)) if uid == user_id => {
+                    Ok((*portfolio_id, base_currency))
+                }
                 _ => Err(ApplyError::PortfolioNotFound),
             }
         }
@@ -900,12 +1000,20 @@ async fn resolve_portfolio(
 
 /// Find the asset by symbol, or create it.
 ///
-/// Merge is by uppercased symbol within the target portfolio, which is the same identity
-/// the unique index uses. An agent re-staging the same statement must land on the same
-/// asset rather than failing with a symbol collision.
+/// Merge is by uppercased symbol within the target portfolio — the same identity
+/// `services::assets::insert` enforces in software. There is **no unique index** on
+/// `assets (portfolio_id, symbol)` (`0001_init.sql` has only `assets_portfolio_idx`), so
+/// this lookup and that insert are the whole dedupe and nothing underneath them is a
+/// backstop; see the note on that function for the concurrency consequence.
+///
+/// `base_currency` is the fallback for an asset that arrived without one, and it is the
+/// portfolio's, never a literal. Defaulting to `"USD"` here would contradict the preview the
+/// human approved — which says, in as many words, that the asset takes the portfolio's base
+/// currency — and would silently price a EUR holding in dollars.
 async fn resolve_asset(
     tx: &mut sqlx::PgConnection,
     portfolio_id: i64,
+    base_currency: &str,
     pa: &crate::agent::protocol::ProposalAsset,
 ) -> Result<i64, ApplyError> {
     let symbol = pa.symbol.to_uppercase();
@@ -926,7 +1034,10 @@ async fn resolve_asset(
         name: pa.name.clone().unwrap_or_else(|| pa.symbol.clone()),
         asset_type: pa.asset_type.clone(),
         sector: None,
-        currency: pa.currency.clone().unwrap_or_else(|| "USD".to_string()),
+        currency: pa
+            .currency
+            .clone()
+            .unwrap_or_else(|| base_currency.to_string()),
         isin: pa.isin.clone().unwrap_or_default(),
     };
     let asset = asset_service::insert(tx, portfolio_id, &create)

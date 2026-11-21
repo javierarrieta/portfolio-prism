@@ -142,6 +142,17 @@ From root:
   `CHECK` in `0002` only after the same question was answered — and which still refuses to
   rewrite anything it does not recognise. Do not treat that migration as a template to copy
   without doing the inventory.
+- **There is no unique index on `assets (portfolio_id, symbol)`.** `0001_init.sql` creates
+  only `assets_portfolio_idx`, a plain non-unique index on `portfolio_id`, so asset identity
+  inside a portfolio is enforced in software and nowhere else: `services::assets::insert`
+  `SELECT`s the uppercased symbol and `INSERT`s if absent, and `agent::staging::resolve_asset`
+  does the same inside its transaction. Two concurrent writers can both find nothing and both
+  insert, and Postgres will not stop them — which also means the staged-import dedupe in
+  `apply` has no backstop underneath it. Adding the index is the fix, and it cannot simply be
+  added: a live database may already hold two same-symbol assets, so the migration has to
+  audit and refuse first in the shape of `0005_split_index_case_insensitive.sql`. Note the
+  predicate question too — the software compares uppercased, so the index must be on
+  `upper(symbol)` or it will not match the rule it is enforcing.
 - **Postgres cutover, the deferred half**: the application side is merged (engine, tests,
   gates, runbook). The cluster side is
   `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — a CNPG `Database`,

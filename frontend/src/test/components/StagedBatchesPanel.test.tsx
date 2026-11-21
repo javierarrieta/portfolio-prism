@@ -133,4 +133,28 @@ describe('StagedBatchesPanel', () => {
     render(<StagedBatchesPanel />)
     expect(await screen.findByTestId('staged-empty')).toBeTruthy()
   })
+
+  it('repeats the server\'s reason when a 409 gives one', async () => {
+    // An expired batch is still `staged`, so the panel's own sentence — "someone else acted on
+    // it first" — would invent a second party. The server knows it was the clock, and its
+    // `detail` wins wherever it sends one.
+    approveStatus = 409
+    approveBody = {
+      error: 'not_approvable',
+      current_status: 'staged',
+      expired: true,
+      detail: 'this batch has expired; it can no longer be approved or applied',
+    }
+    vi.stubGlobal('confirm', () => true)
+
+    render(<StagedBatchesPanel />)
+    const row = await screen.findByTestId(`staged-row-${HANDLE}`)
+    fireEvent.click(row.querySelector('button')!)
+    await waitFor(() => expect(screen.getByTestId('staged-detail')).toBeTruthy())
+
+    fireEvent.click(screen.getByTestId('staged-approve'))
+    const notice = await screen.findByTestId('staged-notice')
+    expect(notice.textContent).toContain('expired')
+    expect(notice.textContent).not.toContain('Someone else acted on it first')
+  })
 })
