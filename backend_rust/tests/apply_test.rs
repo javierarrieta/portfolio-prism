@@ -552,3 +552,50 @@ async fn an_explicit_currency_survives_a_portfolio_with_a_different_base() {
 
     assert_eq!(asset_currency(&pool, out.asset_ids[0]).await, "USD");
 }
+
+#[tokio::test]
+async fn apply_refuses_to_create_a_portfolio_past_the_cap_and_writes_nothing() {
+    // `stage` refuses early, but the count can move between staging and apply — a portfolio
+    // created by hand, or by another batch that applied first. The check inside the
+    // transaction is the one that decides, and a refusal must leave the batch untouched.
+    let (pool, user) = db_with_user("apply_portfolio_cap").await;
+    let handle = stage_and_approve(
+        &pool,
+        user,
+        &new_portfolio(vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1.5", "82.34", "0")])]),
+    )
+    .await;
+
+    for i in 0..staging::MAX_PORTFOLIOS_PER_USER {
+        sqlx::query(
+            "INSERT INTO portfolios (name, currency, base_currency, owner_id)
+             VALUES ($1, 'EUR', 'EUR', $2)",
+        )
+        .bind(format!("P{i}"))
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let err = staging::apply(&pool, user, &handle).await.unwrap_err();
+    assert_eq!(err.code(), "too_many_portfolios");
+    assert!(
+        err.message().contains("merge into an existing portfolio"),
+        "the agent is told what to do instead: {}",
+        err.message()
+    );
+    assert_eq!(
+        counts(&pool).await,
+        (staging::MAX_PORTFOLIOS_PER_USER as i64, 0, 0),
+        "and the refusal wrote nothing"
+    );
+
+    // The batch is still approved and still spendable — the claim rolled back with the
+    // failure, exactly as it does for any other failed write. Discarding it would be the
+    // wrong advice; the user has one slot to free up.
+    assert_eq!(
+        staging::preview_of(&pool, user, &handle).await.unwrap().unwrap().0,
+        "approved"
+    );
+}

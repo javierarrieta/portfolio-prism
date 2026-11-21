@@ -11,7 +11,8 @@
 //!   exist, from every angle: list, preview, approve.
 
 use backend_rust::agent::protocol::{Proposal, ProposalAsset, ProposalTx, Target};
-use backend_rust::agent::staging::{self, StageError, MAX_ASSETS_PER_BATCH, MAX_PREVIEW_BYTES,
+use backend_rust::agent::staging::{self, ApplyError, StageError, ValidationError, MAX_ASSETS_PER_BATCH,
+                                   MAX_PORTFOLIOS_PER_USER, MAX_PREVIEW_BYTES,
                                    MAX_TRANSACTIONS_PER_BATCH};
 use chrono::{Duration, Utc};
 
@@ -72,7 +73,7 @@ fn a_clean_proposal_passes_and_the_caps_are_exactly_the_stated_numbers() {
     );
     assert!(matches!(
         staging::validate(&over),
-        Err(StageError::BatchTooLarge { what: "assets", .. })
+        Err(ValidationError::BatchTooLarge { what: "assets", .. })
     ));
 }
 
@@ -101,7 +102,7 @@ fn the_transaction_cap_counts_across_assets_not_per_asset() {
     over.assets[0].transactions.push(tx("BUY", "2024-01-02", "1", "1", "0"));
     assert!(matches!(
         staging::validate(&over),
-        Err(StageError::BatchTooLarge { what: "transactions", .. })
+        Err(ValidationError::BatchTooLarge { what: "transactions", .. })
     ));
 }
 
@@ -500,4 +501,99 @@ async fn an_expired_batch_cannot_be_approved() {
     .unwrap();
     assert_eq!(status, "staged", "and the row is left for the sweep, not marked");
     assert!(approved_at.is_none(), "no human act is recorded for a refused approval");
+}
+
+// --- the portfolio backstop --------------------------------------------------------
+
+/// Give `user` exactly `n` portfolios, so a limit test can start one row below the line.
+async fn seed_portfolios(pool: &sqlx::PgPool, user: i64, n: i64) {
+    for i in 0..n {
+        sqlx::query(
+            "INSERT INTO portfolios (name, currency, base_currency, owner_id)
+             VALUES ($1, 'EUR', 'EUR', $2)",
+        )
+        .bind(format!("P{i}"))
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_new_portfolio_is_refused_once_the_user_is_at_the_cap() {
+    // Without this an `import` token could mint one portfolio per apply, forever, and every
+    // one of them is a row in every portfolio listing from then on. The number itself is
+    // arbitrary — see `MAX_PORTFOLIOS_PER_USER` — but the shape of the refusal is not: it
+    // arrives at staging, before a human is asked to approve a batch that cannot land.
+    let (pool, user) = db_with_user("portfolio_cap").await;
+    seed_portfolios(&pool, user, MAX_PORTFOLIOS_PER_USER - 1).await;
+
+    // One room left: the ninth stages, and so does the tenth after it is applied.
+    staging::stage(&pool, user, &one_ok(), 60)
+        .await
+        .expect("one slot left means one batch stages");
+
+    seed_portfolios(&pool, user, 1).await;
+    let err = staging::stage(&pool, user, &one_ok(), 60).await.unwrap_err();
+    assert_eq!(err.code(), "too_many_portfolios");
+    assert!(
+        format!("{err:?}").contains(&format!("max: {MAX_PORTFOLIOS_PER_USER}")),
+        "the limit is in the answer: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_portfolio_cap_leaves_merging_into_an_existing_portfolio_alone() {
+    // The cap is on creating, not on importing. A user at the limit can still import into a
+    // portfolio they already own — that is the whole point of `Target::Existing`.
+    let (pool, user) = db_with_user("portfolio_cap_merge").await;
+    seed_portfolios(&pool, user, MAX_PORTFOLIOS_PER_USER).await;
+    let (target,): (i64,) = sqlx::query_as(
+        "SELECT id FROM portfolios WHERE owner_id = $1 LIMIT 1",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let merge = Proposal {
+        target: Target::Existing { portfolio_id: target },
+        assets: vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1", "1", "0")])],
+    };
+    staging::stage(&pool, user, &merge, 60)
+        .await
+        .expect("an existing portfolio is not a new one");
+}
+
+#[test]
+fn revalidation_can_only_ever_report_a_document_error() {
+    // The guarantee that made `ApplyError::Rejected(StageError)` an impossible state, now
+    // asserted rather than trusted. `Rejected` takes `ValidationError`, so the codes it can
+    // surface are exactly the ones a document can cause. It used to take the whole
+    // `StageError` and therefore claimed it could answer `too_many_pending`,
+    // `too_many_portfolios` or `database` from re-reading a payload — arms that could never
+    // run, because those are facts about the moment of staging. Widen `Rejected` back and
+    // this fails.
+    let cases = [
+        ValidationError::BatchTooLarge { what: "assets", given: 1, max: 0 },
+        ValidationError::EmptyAsset { field: "f".into() },
+        ValidationError::NonCanonicalDecimal { field: "f".into(), given: "1e3".into() },
+        ValidationError::BadDate { field: "f".into(), given: "2024-3-1".into() },
+        ValidationError::OutOfRange { field: "f".into(), rule: "r", given: "1".into() },
+        ValidationError::TooLong { field: "f".into(), given: "x".into(), max: 0 },
+    ];
+    let staging_only = ["too_many_pending", "too_many_portfolios", "database"];
+    for case in cases {
+        let code = ApplyError::Rejected(case.clone()).code();
+        assert!(
+            !staging_only.contains(&code),
+            "{case:?} must not make apply answer a staging-only code, got {code}"
+        );
+        // And every one of them still has to be a code an agent can act on.
+        assert!(
+            StageError::Rejected(case.clone()).code() == code,
+            "stage and apply must agree on the code for {case:?}"
+        );
+    }
 }

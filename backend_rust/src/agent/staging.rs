@@ -32,6 +32,17 @@ pub const MAX_TRANSACTIONS_PER_BATCH: usize = 500;
 pub const MAX_ASSETS_PER_BATCH: usize = 50;
 /// Pending batches per user, so abandoned imports cannot accumulate rows.
 pub const MAX_PENDING_BATCHES_PER_USER: i64 = 5;
+/// Portfolios a user may own, which is what bounds a `Target::New` batch: without it an
+/// `import` token could create one portfolio per apply, unbounded, and every one of them is
+/// a row in every portfolio listing forever after.
+///
+/// **Ten is an arbitrary number.** It is not derived from a measurement, a spec limit, or a
+/// resource ceiling — nothing in the app degrades at eleven. It is a backstop set above any
+/// plausible personal portfolio count (the largest real one seen while writing this was two
+/// or three) so that a runaway agent is stopped rather than merely slowed, and the honest
+/// statement about it is that any number in the same order of magnitude would do. Anyone
+/// who legitimately wants more changes the constant; nothing else needs to change with it.
+pub const MAX_PORTFOLIOS_PER_USER: i64 = 10;
 /// Default lifetime of a staged batch. A human approves in the same sitting or the batch
 /// is stale.
 pub const DEFAULT_TTL_MINUTES: i64 = 60;
@@ -42,23 +53,71 @@ pub const MAX_PREVIEW_BYTES: usize = 16 * 1024;
 /// maximum-size batch still renders; the cap is what makes the byte budget satisfiable.
 const PREVIEW_ASSETS_SHOWN: usize = 25;
 
-/// Why a proposal was refused, with the code the agent sees.
+/// Every way a proposal's own text can be wrong.
+///
+/// This is a separate enum from [`StageError`] for one reason, and it is a type-level
+/// reason rather than a tidiness one: `apply` re-validates the stored payload, and its
+/// error used to carry the whole `StageError` — including `TooManyPending` and `Database`,
+/// which are facts about the moment of staging and can never be produced by re-reading a
+/// document. That arm existed only to be unreachable. Narrowing the type is what removes
+/// it; a comment saying "unreachable" would have gone stale the day someone added a check
+/// to `validate` that can actually fail.
 ///
 /// The codes are the ones the design spec lists as authoritative. Each carries a `field`
 /// path rather than an id, because the sender needs to know *which* value to fix in the
 /// document it still holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StageError {
+pub enum ValidationError {
     BatchTooLarge { what: &'static str, given: usize, max: usize },
-    TooManyPending { given: i64, max: i64 },
     EmptyAsset { field: String },
     NonCanonicalDecimal { field: String, given: String },
     BadDate { field: String, given: String },
     OutOfRange { field: String, rule: &'static str, given: String },
     /// A text field longer than its stated cap. Shares the `out_of_range` code with
-    /// [`StageError::OutOfRange`] because it is the same answer — a value outside a rule —
-    /// and carries the limit as data rather than repeating it in a sentence.
+    /// [`ValidationError::OutOfRange`] because it is the same answer — a value outside a
+    /// rule — and carries the limit as data rather than repeating it in a sentence.
     TooLong { field: String, given: String, max: usize },
+}
+
+impl ValidationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ValidationError::BatchTooLarge { .. } => "batch_too_large",
+            ValidationError::EmptyAsset { .. } => "empty_asset",
+            ValidationError::NonCanonicalDecimal { .. } => "non_canonical_decimal",
+            ValidationError::BadDate { .. } => "bad_date",
+            ValidationError::OutOfRange { .. } | ValidationError::TooLong { .. } => {
+                "out_of_range"
+            }
+        }
+    }
+
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            ValidationError::EmptyAsset { field }
+            | ValidationError::NonCanonicalDecimal { field, .. }
+            | ValidationError::BadDate { field, .. }
+            | ValidationError::OutOfRange { field, .. }
+            | ValidationError::TooLong { field, .. } => Some(field),
+            ValidationError::BatchTooLarge { .. } => None,
+        }
+    }
+}
+
+/// Why staging a proposal was refused, with the code the agent sees.
+///
+/// Two layers, and the split is the point: [`ValidationError`] is what the document got
+/// wrong, and everything else here is what the world was already full of. `apply` can only
+/// ever see the first layer, so [`ApplyError::Rejected`] takes `ValidationError` and cannot
+/// name a limit it does not enforce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageError {
+    /// The document itself was refused. `what: "preview"` arrives here from `stage` rather
+    /// than from `validate` — the preview is derived from the document, so it is still a
+    /// fact about the document and not about the world.
+    Rejected(ValidationError),
+    TooManyPending { given: i64, max: i64 },
+    TooManyPortfolios { given: i64, max: i64 },
     Database,
 }
 
@@ -66,24 +125,16 @@ impl StageError {
     /// The wire code, and the message an agent is told.
     pub fn code(&self) -> &'static str {
         match self {
-            StageError::BatchTooLarge { .. } => "batch_too_large",
+            StageError::Rejected(e) => e.code(),
             StageError::TooManyPending { .. } => "too_many_pending",
-            StageError::EmptyAsset { .. } => "empty_asset",
-            StageError::NonCanonicalDecimal { .. } => "non_canonical_decimal",
-            StageError::BadDate { .. } => "bad_date",
-            StageError::OutOfRange { .. } => "out_of_range",
-            StageError::TooLong { .. } => "out_of_range",
+            StageError::TooManyPortfolios { .. } => "too_many_portfolios",
             StageError::Database => "database",
         }
     }
 
     pub fn field(&self) -> Option<&str> {
         match self {
-            StageError::EmptyAsset { field }
-            | StageError::NonCanonicalDecimal { field, .. }
-            | StageError::BadDate { field, .. }
-            | StageError::OutOfRange { field, .. }
-            | StageError::TooLong { field, .. } => Some(field),
+            StageError::Rejected(e) => e.field(),
             _ => None,
         }
     }
@@ -128,12 +179,12 @@ const MAX_CURRENCY_LEN: usize = 8;
 /// rule (`out_of_range`). The spec's code list is the contract and adding to it unilaterally
 /// is how the agent-facing vocabulary stops matching the documentation. The limit itself
 /// travels as data on the variant, so the number is stated once, as the constant.
-fn text_field(value: &str, field: String, max: usize) -> Result<(), StageError> {
+fn text_field(value: &str, field: String, max: usize) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
-        return Err(StageError::EmptyAsset { field });
+        return Err(ValidationError::EmptyAsset { field });
     }
     if value.trim().chars().count() > max {
-        return Err(StageError::TooLong {
+        return Err(ValidationError::TooLong {
             field,
             given: value.chars().take(max + 1).collect(),
             max,
@@ -153,7 +204,7 @@ fn text_field(value: &str, field: String, max: usize) -> Result<(), StageError> 
 /// verbatim, so an empty name or an empty base currency is not a cosmetic defect: a base
 /// currency of `""` is a portfolio whose every pricing lookup fails, and it is discovered
 /// after a human approved the batch.
-pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
+pub fn validate(proposal: &Proposal) -> Result<(), ValidationError> {
     match &proposal.target {
         Target::New {
             name,
@@ -167,12 +218,12 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
     }
 
     if proposal.assets.is_empty() {
-        return Err(StageError::EmptyAsset {
+        return Err(ValidationError::EmptyAsset {
             field: "assets".to_string(),
         });
     }
     if proposal.assets.len() > MAX_ASSETS_PER_BATCH {
-        return Err(StageError::BatchTooLarge {
+        return Err(ValidationError::BatchTooLarge {
             what: "assets",
             given: proposal.assets.len(),
             max: MAX_ASSETS_PER_BATCH,
@@ -182,13 +233,13 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
     let mut total_tx = 0usize;
     for (ai, asset) in proposal.assets.iter().enumerate() {
         if asset.transactions.is_empty() {
-            return Err(StageError::EmptyAsset {
+            return Err(ValidationError::EmptyAsset {
                 field: format!("assets[{ai}].transactions"),
             });
         }
         total_tx += asset.transactions.len();
         if total_tx > MAX_TRANSACTIONS_PER_BATCH {
-            return Err(StageError::BatchTooLarge {
+            return Err(ValidationError::BatchTooLarge {
                 what: "transactions",
                 given: total_tx,
                 max: MAX_TRANSACTIONS_PER_BATCH,
@@ -219,7 +270,7 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
             // inventing an instant for it is the kind of silent interpretation this module
             // exists to avoid.
             if !is_calendar_date(&tx.date) {
-                return Err(StageError::BadDate {
+                return Err(ValidationError::BadDate {
                     field: format!("{base}.date"),
                     given: tx.date.clone(),
                 });
@@ -235,7 +286,7 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
                 let min = NaiveDate::from_ymd_opt(1900, 1, 1).expect("1900-01-01 exists");
                 let max = NaiveDate::from_ymd_opt(2100, 1, 1).expect("2100-01-01 exists");
                 if day < min || day > max {
-                    return Err(StageError::OutOfRange {
+                    return Err(ValidationError::OutOfRange {
                         field: format!("{base}.date"),
                         rule: "between 1900-01-01 and 2100-01-01",
                         given: tx.date.clone(),
@@ -249,7 +300,7 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
                 ("fee", &tx.fee),
             ] {
                 if !is_canonical_decimal(value) {
-                    return Err(StageError::NonCanonicalDecimal {
+                    return Err(ValidationError::NonCanonicalDecimal {
                         field: format!("{base}.{key}"),
                         given: value.clone(),
                     });
@@ -268,21 +319,21 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
                 .expect("is_canonical_decimal already accepted this");
 
             if qty <= rust_decimal::Decimal::ZERO {
-                return Err(StageError::OutOfRange {
+                return Err(ValidationError::OutOfRange {
                     field: format!("{base}.quantity"),
                     rule: "quantity must be greater than zero",
                     given: tx.quantity.clone(),
                 });
             }
             if price < rust_decimal::Decimal::ZERO {
-                return Err(StageError::OutOfRange {
+                return Err(ValidationError::OutOfRange {
                     field: format!("{base}.price"),
                     rule: "price must be zero or greater",
                     given: tx.price.clone(),
                 });
             }
             if fee < rust_decimal::Decimal::ZERO {
-                return Err(StageError::OutOfRange {
+                return Err(ValidationError::OutOfRange {
                     field: format!("{base}.fee"),
                     rule: "fee must be zero or greater",
                     given: tx.fee.clone(),
@@ -293,7 +344,7 @@ pub fn validate(proposal: &Proposal) -> Result<(), StageError> {
             // than after a human has approved it — approving a batch that cannot apply is
             // worse than refusing it now.
             if tx.r#type == TxType::Split && price <= rust_decimal::Decimal::ZERO {
-                return Err(StageError::OutOfRange {
+                return Err(ValidationError::OutOfRange {
                     field: format!("{base}.price"),
                     rule: "a SPLIT needs a price greater than zero",
                     given: tx.price.clone(),
@@ -403,19 +454,39 @@ fn new_handle() -> Result<String, StageError> {
 
 /// Persist a proposal as a batch awaiting approval.
 ///
-/// One transaction, doing three things: refuse if the user already has too many pending,
-/// sweep the ones that have expired, and insert. The sweep is in the same transaction as
-/// the insert on purpose — there is no scheduled job in this design, so "when does an
-/// abandoned batch go away" has to be answered by something, and the honest answer is "the
-/// next time this user stages". A user who never stages again keeps their rows; that is
-/// stated in the spec rather than papered over.
+/// One transaction, doing four things: refuse if the document is wrong, refuse if the user
+/// already has too many pending batches or too many portfolios, sweep the ones that have
+/// expired, and insert. The sweep is in the same transaction as the insert on purpose —
+/// there is no scheduled job in this design, so "when does an abandoned batch go away" has
+/// to be answered by something, and the honest answer is "the next time this user stages".
+/// A user who never stages again keeps their rows; that is stated in the spec rather than
+/// papered over.
 pub async fn stage(
     pool: &PgPool,
     user_id: i64,
     proposal: &Proposal,
     ttl_minutes: i64,
 ) -> Result<Staged, StageError> {
-    validate(proposal)?;
+    validate(proposal).map_err(StageError::Rejected)?;
+
+    // Checked here as well as at apply, for the same reason the date window is: a batch that
+    // cannot apply should be refused before a human is asked to approve it, not after.
+    // `apply` re-checks inside its transaction, because the count can move in between.
+    if matches!(proposal.target, Target::New { .. }) {
+        let (portfolios,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM portfolios WHERE owner_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| StageError::Database)?;
+        if portfolios >= MAX_PORTFOLIOS_PER_USER {
+            return Err(StageError::TooManyPortfolios {
+                given: portfolios,
+                max: MAX_PORTFOLIOS_PER_USER,
+            });
+        }
+    }
 
     let payload = serde_json::to_value(proposal).map_err(|_| StageError::Database)?;
     let preview = render_preview(proposal);
@@ -424,11 +495,11 @@ pub async fn stage(
         // Unreachable for a payload that passed `validate`, because the preview is bounded
         // by construction. Kept as a refusal rather than an assertion because the budget is
         // a client property and a future preview field could break it silently.
-        return Err(StageError::BatchTooLarge {
+        return Err(StageError::Rejected(ValidationError::BatchTooLarge {
             what: "preview",
             given: preview_bytes.len(),
             max: MAX_PREVIEW_BYTES,
-        });
+        }));
     }
 
     let mut tx = pool.begin().await.map_err(|_| StageError::Database)?;
@@ -670,10 +741,18 @@ pub enum ApplyError {
     /// `target.existing` named a portfolio that is gone, or is not this user's. Re-checked
     /// at apply because the portfolio could have been deleted between stage and apply.
     PortfolioNotFound,
+    /// `target.new` would be one portfolio too many. Checked at staging and again here, in
+    /// the transaction that creates it.
+    TooManyPortfolios { given: i64, max: i64 },
     /// The stored proposal no longer validates. It did at staging, so this means the world
     /// moved — a symbol now collides, a date fell out of range — and not that the agent
     /// sent something bad.
-    Rejected(StageError),
+    ///
+    /// Carries [`ValidationError`] and not [`StageError`], which is what removes the arm that
+    /// used to sit here believing `apply` could answer `too_many_pending` or `database`
+    /// because a re-validation could. It could not: those are facts about the moment of
+    /// staging, and `apply` re-reads a document, not the world.
+    Rejected(ValidationError),
     /// A row write was refused by the same seam the HTTP routes use.
     Refused(WriteError),
     Database,
@@ -687,6 +766,7 @@ impl ApplyError {
             ApplyError::Expired => "expired",
             ApplyError::AlreadyApplied => "already_applied",
             ApplyError::PortfolioNotFound => "portfolio_not_found",
+            ApplyError::TooManyPortfolios { .. } => "too_many_portfolios",
             ApplyError::Rejected(e) => e.code(),
             ApplyError::Refused(_) => "write_refused",
             ApplyError::Database => "database",
@@ -704,6 +784,9 @@ impl ApplyError {
             ApplyError::Expired => "the approval has expired".into(),
             ApplyError::AlreadyApplied => "this batch has already been applied".into(),
             ApplyError::PortfolioNotFound => "the target portfolio no longer exists".into(),
+            ApplyError::TooManyPortfolios { given, max } => format!(
+                "this user owns {given} portfolios and the limit is {max}; merge into an existing portfolio instead of creating another"
+            ),
             ApplyError::Rejected(e) => format!("the stored proposal no longer validates: {}", e.code()),
             ApplyError::Refused(w) => format!("a row was refused: {:?}", w),
             ApplyError::Database => "the database refused the write".into(),
@@ -962,6 +1045,26 @@ async fn resolve_portfolio(
             name,
             base_currency,
         } => {
+            // The authoritative copy of the check. `stage` refuses early so a human is never
+            // asked to approve a batch that cannot land, but the count can move between
+            // staging and apply, and this is the statement that creates the row — so this is
+            // the one that decides. It runs on the open transaction, after the batch has been
+            // claimed by the flip, so two concurrent applies cannot both count nine and both
+            // create a tenth.
+            let (portfolios,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM portfolios WHERE owner_id = $1",
+            )
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+            if portfolios >= MAX_PORTFOLIOS_PER_USER {
+                return Err(ApplyError::TooManyPortfolios {
+                    given: portfolios,
+                    max: MAX_PORTFOLIOS_PER_USER,
+                });
+            }
+
             let (id, stored): (i64, String) = sqlx::query_as(
                 "INSERT INTO portfolios (name, description, currency, base_currency, owner_id)
                  VALUES ($1, $2, $3, $3, $4) RETURNING id, base_currency",
