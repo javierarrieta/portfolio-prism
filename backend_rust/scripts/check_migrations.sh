@@ -174,7 +174,7 @@ want_migration_ledger() {
 # a split adjustment and corrupting cost basis. A gate that checked only tables and
 # column types would have passed that schema, which makes it complicit in the bug it
 # exists to prevent, so the index itself is asserted: present, unique, partial on SPLIT,
-# and keyed on the UTC calendar day.
+# and keyed on the UTC calendar day, on the same case-insensitive expression the CHECK uses.
 # The transaction-type CHECK, pinned to its exact definition.
 #
 # Three places name this vocabulary and nothing imports it between them: the `TxType` enum
@@ -239,9 +239,17 @@ want_split_dedupe_index() {
   [ "$uniq" = "t" ] || { echo "FAIL uq_split_asset_date must be UNIQUE, it is not"; exit 1; }
   [ "$partial" = "t" ] \
     || { echo "FAIL uq_split_asset_date must be partial (WHERE type = 'SPLIT'); a full index would constrain every transaction type"; exit 1; }
+  # Pinned to the case-insensitive form, and pinned tightly. `0001` created this predicate as
+  # `type = 'SPLIT'` and `0002`'s CHECK accepts a lowercase `split`, so a schema that regressed
+  # to the old predicate would still be a valid-looking unique index while being blind to every
+  # variant spelling — the exact asymmetry `0005` exists to close. Matching a substring that
+  # both forms satisfy would make this assertion vacuous, so it names the expression.
   case "$pred" in
-    *"type = 'SPLIT'"*) ;;
-    *) echo "FAIL uq_split_asset_date predicate is '$pred', expected type = 'SPLIT'"; exit 1 ;;
+    *"upper(btrim(type)) = 'SPLIT'"*) ;;
+    *"type = 'SPLIT'"*)
+      echo "FAIL uq_split_asset_date predicate is '$pred': case-sensitive, so a row typed 'split' passes transactions_type_check and escapes the dedupe. Migration 0005 rebuilds it on upper(btrim(type))."
+      exit 1 ;;
+    *) echo "FAIL uq_split_asset_date predicate is '$pred', expected upper(btrim(type)) = 'SPLIT'"; exit 1 ;;
   esac
   case "$def" in
     *"AT TIME ZONE 'UTC'"*::date*) ;;
