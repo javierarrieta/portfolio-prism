@@ -66,6 +66,126 @@ pub mod decimal_json {
     }
 }
 
+/// The largest number of decimal places a write may carry.
+///
+/// A validation rule, stated here, not inferred from a column: `transactions.quantity`,
+/// `price` and `fee` are `TEXT` (`0001_init.sql`) and will hold anything, so the storage
+/// type cannot be the thing that bounds scale. `rust_decimal` carries 28 digits of
+/// precision, so 12 places leaves room for a price like `0.000000000001` while making a
+/// value with 200 places — which is what a float round-trip leaves behind — a refusal
+/// rather than a stored artefact.
+pub const MAX_DECIMAL_SCALE: usize = 12;
+
+/// The largest integer part that survives the round trip intact. `rust_decimal` is 28
+/// significant digits; with the scale cap at 12, 16 integer digits is the point past
+/// which the two rules would disagree about what fits.
+pub const MAX_DECIMAL_PRECISION: usize = 28;
+
+/// True for a plain decimal string: optional `-`, at least one integer digit, and an
+/// optional fractional part of at most [`MAX_DECIMAL_SCALE`] digits.
+///
+/// Written by hand rather than with a regex crate, and deliberately narrower than
+/// `Decimal::from_str`, which is the *storage* parser and accepts exponent notation,
+/// leading `+`, and whitespace. Accepting those on the wire would mean a value can enter
+/// the system in a form nothing else writes, and the dedup key built from the stored
+/// string would treat `1e3` and `1000` as different transactions.
+///
+/// Rejects: `1e3`, `1E3`, `+10`, `" 10"`, `10.`, `.5`, `1,50`, `1.2345678901234` (13 dp),
+/// `NaN`, `inf`, and the empty string.
+pub fn is_canonical_decimal(s: &str) -> bool {
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (s, None),
+    };
+    let int_digits = int_part.strip_prefix('-').unwrap_or(int_part);
+    // A lone `-`, an empty integer part, and a non-digit anywhere (which is what catches
+    // `1e3`, `1_000`, ` 10` and `NaN` without a separate rule each) are all refused here.
+    if int_digits.is_empty() || !int_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(f) = frac_part {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if f.len() > MAX_DECIMAL_SCALE {
+            return false;
+        }
+    }
+    if int_digits.len() + frac_part.map_or(0, str::len) > MAX_DECIMAL_PRECISION {
+        return false;
+    }
+    true
+}
+
+/// The **write-side** decimal codec: a JSON *string* or nothing.
+///
+/// This is not `decimal_json` and `decimal_json` must not become this. That module is the
+/// response serializer at roughly 55 sites in `schemas.rs`, and its `visit_f64` arm is
+/// load-bearing for `TaxLot` and `AssetTaxSummary` round-trips — tightening it would turn
+/// every tax figure the app has ever answered into a deserialization failure. This module
+/// is the opposite direction: what a client may send.
+///
+/// Why it exists: `transactions.quantity`, `price` and `fee` are stored as
+/// `Decimal::to_string()`, which is exact — but a value that arrived as a JSON *number*
+/// has already passed through `f64` before it became a `Decimal`. `0.1 + 0.2` is not
+/// `0.3`, and a cost basis that drifted by a rounding unit per row is wrong on tax
+/// figures. The only way to stop that at a boundary is to refuse the boundary, so a number
+/// is a 422 naming the fix rather than a silent float.
+///
+/// `deserialize_str` rather than `deserialize_any` is the mechanism: with it, serde answers
+/// a JSON number with `invalid type: integer `10`, expected a decimal string ...` on its
+/// own, so there is no `visit_f64` here to forget to remove.
+///
+/// **Deploy order.** The browser's CSV importer posted JSON numbers until
+/// `refactor/frontend-decimal-strings`. That must ship and deploy first; this change is
+/// what makes it a breaking one.
+pub mod strict_decimal_json {
+    use rust_decimal::Decimal;
+    use serde::{Deserializer, Serializer};
+
+    use super::{is_canonical_decimal, MAX_DECIMAL_SCALE};
+
+    pub fn serialize<S>(d: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Same spelling as the response codec, so a client that reads what it sent sees
+        // the same text. Writes are strings in and strings out; only the *accepting* side
+        // is stricter.
+        serializer.serialize_str(&d.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StrictDecimal;
+
+        impl<'de> serde::de::Visitor<'de> for StrictDecimal {
+            type Value = Decimal;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a decimal string such as '10' or '10.50' (JSON numbers are refused because they pass through a float; no exponent; at most {MAX_DECIMAL_SCALE} decimal places)"
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Decimal, E> {
+                if !is_canonical_decimal(v) {
+                    return Err(E::custom(format!(
+                        "{v:?} is not an accepted decimal string: send a plain decimal in quotes, not a JSON number, with no exponent, no thousands separator, and at most {MAX_DECIMAL_SCALE} decimal places"
+                    )));
+                }
+                super::parse_decimal(v)
+                    .map_err(|e| E::custom(format!("{v:?} could not be parsed as a decimal: {e}")))
+            }
+        }
+
+        deserializer.deserialize_str(StrictDecimal)
+    }
+}
+
 /// `decimal_json` lifted to `Option<Decimal>`: `None` serializes as JSON null,
 /// `Some(d)` as the exact `d.to_string()` — no `normalize()`, no fixed scale.
 /// The `Some` arm delegates to `decimal_json::deserialize`, so there is one

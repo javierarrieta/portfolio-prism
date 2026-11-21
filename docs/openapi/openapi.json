@@ -1002,6 +1002,199 @@
         }
       }
     },
+    "/api/staged-batches": {
+      "get": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "List the caller's staged batches, newest first.",
+        "description": "No caller-supplied id: the caller *is* the selector, so there is nothing for\n`access.rs` to resolve.",
+        "operationId": "list_batches",
+        "responses": {
+          "200": {
+            "description": "This user's staged batches, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BatchOut"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/staged-batches/<handle>": {
+      "get": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "The stored preview, rendered verbatim.",
+        "description": "The UI renders this JSON and does not recompute it. That is not a rendering preference:\nif the preview were derived at render time, what a human read and what the agent was\nshown could differ, and the approval would be an approval of something else.",
+        "operationId": "get_batch",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored preview, byte for byte",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such batch for this user"
+          }
+        }
+      }
+    },
+    "/api/staged-batches/<handle>/approve": {
+      "post": {
+        "tags": [
+          "crate::api_routes::staged_batches"
+        ],
+        "summary": "`staged -> approved`. The human act, and the only write this UI performs.",
+        "description": "A conditional update inside `staging::approve`, so two tabs cannot both succeed; the\nloser gets 409 naming the current status rather than a silent second success.",
+        "operationId": "approve_batch",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Approved",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such batch for this user"
+          },
+          "409": {
+            "description": "Not in a state that can be approved"
+          }
+        }
+      }
+    },
+    "/api/tokens": {
+      "get": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "list_tokens",
+        "responses": {
+          "200": {
+            "description": "This user's tokens, newest first, without secrets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TokenOut"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Token created; the secret is shown here for the first and last time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenMinted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank label, no scopes, an unknown scope name, or an out-of-range expiry"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/api/tokens/<id>": {
+      "delete": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token revoked"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "404": {
+            "description": "No such token, or not yours"
+          }
+        }
+      }
+    },
     "/api/transactions/<id>": {
       "delete": {
         "tags": [
@@ -1370,6 +1563,57 @@
         "properties": {
           "currency": {
             "type": "string"
+          }
+        }
+      },
+      "BatchOut": {
+        "type": "object",
+        "description": "One row of the list. No payload and no preview: the list is a menu, and the detail route\nis where the bytes are.",
+        "required": [
+          "handle",
+          "status",
+          "created_at",
+          "expires_at",
+          "asset_count",
+          "transaction_count",
+          "expired"
+        ],
+        "properties": {
+          "applied_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "approved_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "asset_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Computed here rather than stored, because \"is this still approvable\" is a fact about\nthe clock and not about the row: an `approved` batch past `expires_at` can never be\napplied, and showing it as approvable invites a human to approve something that will\nthen be refused."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "transaction_count": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -2051,6 +2295,126 @@
           }
         }
       },
+      "TokenCreate": {
+        "type": "object",
+        "description": "What the owner sends to create a token.",
+        "required": [
+          "label",
+          "scopes"
+        ],
+        "properties": {
+          "expires_in_days": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Omitted or `null` means no expiry — the default, and the honest one.",
+            "nullable": true
+          },
+          "label": {
+            "type": "string",
+            "description": "Free text, shown in the list. The only thing that makes a token\ndistinguishable once it is out in the world, so it is required."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Scope names as the client spells them; `pat::mint` is what decides whether\nthey exist."
+          }
+        }
+      },
+      "TokenMinted": {
+        "type": "object",
+        "description": "A minted token. `secret` appears in this response and nowhere else, ever.",
+        "required": [
+          "id",
+          "secret",
+          "label",
+          "scopes",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "secret": {
+            "type": "string",
+            "description": "Shown once. There is no endpoint that can show it again, which is why the UI\nhas to say so out loud rather than offer a reveal button later."
+          }
+        }
+      },
+      "TokenOut": {
+        "type": "object",
+        "description": "A token as listed. No secret, no hash — the query does not select either.",
+        "required": [
+          "id",
+          "label",
+          "scopes",
+          "created_at",
+          "stale",
+          "expired"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Past its expiry by the server's clock, so the list cannot show a token as live\nthat `lookup` would refuse."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Idle for 90 days or more (or minted then and never used). The UI renders this\nas a nudge; the threshold itself lives in the list query, not here."
+          }
+        }
+      },
       "Transaction": {
         "type": "object",
         "required": [
@@ -2113,7 +2477,7 @@
             "type": "string"
           },
           "type": {
-            "type": "string"
+            "$ref": "#/components/schemas/TxType"
           }
         }
       },
@@ -2154,6 +2518,15 @@
             "type": "string"
           }
         }
+      },
+      "TxType": {
+        "type": "string",
+        "description": "The closed set of transaction types the engines understand.\n\nThis enum exists because of a specific failure that was live: `transactions.type`\nis `TEXT` with no `CHECK`, and the write path did `to_uppercase()` and stored\nwhatever came back. So `\"DIVIDEND\"` was accepted, stored, and then **silently\nignored** — `tax_engine.rs:665-771` and `stats_engine.rs:250-256` are both\n`if BUY / else if SELL / else if SPLIT` with no terminal `else`. Invisible tax\ndata is worse than a wrong lot, because nothing looks wrong.\n\n`rename_all = \"UPPERCASE\"` makes serde match the style names exactly, so the\naccepted wire values are precisely `BUY`, `SELL`, `SPLIT` and anything else is a\nserde error the route turns into a 422. There is no `to_uppercase()` left to\nforget, because a lowercase spelling is a compile error at the call site rather\nthan a string that survives to the database.\n\n**The read side stays `String`.** [`Transaction`] and `schemas::TransactionOut`\nare `FromRow` decode targets for rows this migration still accepts in any case —\nthe `CHECK` is `upper(btrim(type)) IN (...)` precisely so legacy `buy` rows do not\nhave to be rewritten. Decoding those into this enum would fail to read every one of\nthem, which turns a validation improvement into an unreadable database.",
+        "enum": [
+          "BUY",
+          "SELL",
+          "SPLIT"
+        ]
       }
     },
     "securitySchemes": {

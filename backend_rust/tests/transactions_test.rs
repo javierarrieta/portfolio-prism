@@ -76,11 +76,15 @@ async fn test_create_transaction() {
     let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
+    // Money is a quoted string here, not a number. The write codec refuses JSON numbers
+    // because they have already been through an `f64` by the time they become a `Decimal`,
+    // and these columns are cost basis — see `tests/strict_decimal_test.rs` for the rule
+    // and `db_types::strict_decimal_json` for why the response side stays lenient.
     let body = Json(serde_json::json!({
         "type": "BUY",
-        "quantity": 10.0,
-        "price": 150.0,
-        "fee": 5.0,
+        "quantity": "10",
+        "price": "150",
+        "fee": "5",
         "date": "2024-06-15T00:00:00Z"
     }));
 
@@ -112,9 +116,9 @@ async fn test_create_split_transaction_forces_fee_to_zero() {
 
     let body = Json(serde_json::json!({
         "type": "SPLIT",
-        "quantity": 2.0,
-        "price": 1.0,
-        "fee": 5.0,
+        "quantity": "2",
+        "price": "1",
+        "fee": "5",
         "date": "2024-06-15T00:00:00Z"
     }));
 
@@ -143,9 +147,9 @@ async fn test_create_split_transaction_rejects_non_positive_ratio() {
 
     let body = Json(serde_json::json!({
         "type": "SPLIT",
-        "quantity": 0.0,
-        "price": 1.0,
-        "fee": 0.0,
+        "quantity": "0",
+        "price": "1",
+        "fee": "0",
         "date": "2024-06-15T00:00:00Z"
     }));
 
@@ -165,11 +169,15 @@ async fn test_create_transaction_nonexistent_asset_returns_404() {
     let rocket = build_rocket(pool, user);
     let client = Client::tracked(rocket).await.unwrap();
 
+    // Money is a quoted string here, not a number. The write codec refuses JSON numbers
+    // because they have already been through an `f64` by the time they become a `Decimal`,
+    // and these columns are cost basis — see `tests/strict_decimal_test.rs` for the rule
+    // and `db_types::strict_decimal_json` for why the response side stays lenient.
     let body = Json(serde_json::json!({
         "type": "BUY",
-        "quantity": 10.0,
-        "price": 150.0,
-        "fee": 5.0,
+        "quantity": "10",
+        "price": "150",
+        "fee": "5",
         "date": "2024-06-15T00:00:00Z"
     }));
 
@@ -296,11 +304,15 @@ async fn test_create_transaction_invalid_date_returns_400() {
     let client = Client::tracked(rocket).await.unwrap();
 
     // Test date from year 11 AD
+    // Money is a quoted string here, not a number. The write codec refuses JSON numbers
+    // because they have already been through an `f64` by the time they become a `Decimal`,
+    // and these columns are cost basis — see `tests/strict_decimal_test.rs` for the rule
+    // and `db_types::strict_decimal_json` for why the response side stays lenient.
     let body = Json(serde_json::json!({
         "type": "BUY",
-        "quantity": 10.0,
-        "price": 150.0,
-        "fee": 5.0,
+        "quantity": "10",
+        "price": "150",
+        "fee": "5",
         "date": "0011-11-21T11:37:21Z"
     }));
 
@@ -410,11 +422,15 @@ async fn test_cross_portfolio_transaction_rejected() {
     let client = Client::tracked(rocket).await.unwrap();
 
     // Try to add transaction via portfolio B's URL but asset belongs to A
+    // Money is a quoted string here, not a number. The write codec refuses JSON numbers
+    // because they have already been through an `f64` by the time they become a `Decimal`,
+    // and these columns are cost basis — see `tests/strict_decimal_test.rs` for the rule
+    // and `db_types::strict_decimal_json` for why the response side stays lenient.
     let body = Json(serde_json::json!({
         "type": "BUY",
-        "quantity": 10.0,
-        "price": 150.0,
-        "fee": 5.0,
+        "quantity": "10",
+        "price": "150",
+        "fee": "5",
         "date": "2024-06-15T00:00:00Z"
     }));
 

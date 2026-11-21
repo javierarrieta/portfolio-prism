@@ -84,8 +84,15 @@ fn the_real_tree_passes_the_gate() {
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     assert!(
-        text.contains("handlers inspected: 21"),
-        "the gate should account for all 21 handlers, said:\n{text}"
+        // 21 handlers on main, 24 with the token routes, 24 with the staged-batch
+        // routes, and 27 with both — which is what this tree is. Git resolved the
+        // assertion to 24 on its own because both branches wrote the same edit from the
+        // same base; the merged truth is the sum, and neither branch could have known it.
+        // The count is pinned rather than range-checked on purpose — a handler the script
+        // failed to see would show up here as a smaller number, which is the only way an
+        // invisible handler is ever noticed.
+        text.contains("handlers inspected: 27"),
+        "the gate should account for all 27 handlers, said:\n{text}"
     );
 }
 

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT handle, status, created_at, expires_at, approved_at, applied_at,\n                jsonb_array_length(payload -> 'assets')::bigint AS \"asset_count!\",\n                COALESCE((\n                    SELECT sum(jsonb_array_length(a -> 'transactions'))\n                      FROM jsonb_array_elements(payload -> 'assets') AS a\n                ), 0)::bigint AS \"transaction_count!\"\n           FROM agent_staged_batch\n          WHERE user_id = $1\n          ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "handle",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "approved_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "applied_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "asset_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "transaction_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "ed9f067b92080a99f4cfb6c0aa0d0065fd61617a01c4424f73d7c16cdd7f989d"
+}

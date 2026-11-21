@@ -92,6 +92,38 @@ export interface paths {
   "/api/portfolios/<portfolio_id>/transactions": {
     get: operations["list_portfolio_transactions"];
   };
+  "/api/staged-batches": {
+    /**
+     * List the caller's staged batches, newest first.
+     * @description No caller-supplied id: the caller *is* the selector, so there is nothing for
+     * `access.rs` to resolve.
+     */
+    get: operations["list_batches"];
+  };
+  "/api/staged-batches/<handle>": {
+    /**
+     * The stored preview, rendered verbatim.
+     * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
+     * if the preview were derived at render time, what a human read and what the agent was
+     * shown could differ, and the approval would be an approval of something else.
+     */
+    get: operations["get_batch"];
+  };
+  "/api/staged-batches/<handle>/approve": {
+    /**
+     * `staged -> approved`. The human act, and the only write this UI performs.
+     * @description A conditional update inside `staging::approve`, so two tabs cannot both succeed; the
+     * loser gets 409 naming the current status rather than a silent second success.
+     */
+    post: operations["approve_batch"];
+  };
+  "/api/tokens": {
+    get: operations["list_tokens"];
+    post: operations["create_token"];
+  };
+  "/api/tokens/<id>": {
+    delete: operations["revoke_token"];
+  };
   "/api/transactions/<id>": {
     delete: operations["delete_transaction"];
   };
@@ -185,6 +217,33 @@ export interface components {
     };
     AssetUpdate: {
       currency: string;
+    };
+    /**
+     * @description One row of the list. No payload and no preview: the list is a menu, and the detail route
+     * is where the bytes are.
+     */
+    BatchOut: {
+      /** Format: date-time */
+      applied_at?: string | null;
+      /** Format: date-time */
+      approved_at?: string | null;
+      /** Format: int64 */
+      asset_count: number;
+      /** Format: date-time */
+      created_at: string;
+      /**
+       * @description Computed here rather than stored, because "is this still approvable" is a fact about
+       * the clock and not about the row: an `approved` batch past `expires_at` can never be
+       * applied, and showing it as approvable invites a human to approve something that will
+       * then be refused.
+       */
+      expired: boolean;
+      /** Format: date-time */
+      expires_at: string;
+      handle: string;
+      status: string;
+      /** Format: int64 */
+      transaction_count: number;
     };
     /**
      * @description The one body every failure returns. Validation failures carry an empty pair of lists
@@ -472,6 +531,65 @@ export interface components {
       original_qty: string;
       remaining_qty: string;
     };
+    /** @description What the owner sends to create a token. */
+    TokenCreate: {
+      /**
+       * Format: int64
+       * @description Omitted or `null` means no expiry — the default, and the honest one.
+       */
+      expires_in_days?: number | null;
+      /**
+       * @description Free text, shown in the list. The only thing that makes a token
+       * distinguishable once it is out in the world, so it is required.
+       */
+      label: string;
+      /**
+       * @description Scope names as the client spells them; `pat::mint` is what decides whether
+       * they exist.
+       */
+      scopes: string[];
+    };
+    /** @description A minted token. `secret` appears in this response and nowhere else, ever. */
+    TokenMinted: {
+      /** Format: date-time */
+      created_at: string;
+      /** Format: date-time */
+      expires_at?: string | null;
+      /** Format: int64 */
+      id: number;
+      label: string;
+      scopes: string[];
+      /**
+       * @description Shown once. There is no endpoint that can show it again, which is why the UI
+       * has to say so out loud rather than offer a reveal button later.
+       */
+      secret: string;
+    };
+    /** @description A token as listed. No secret, no hash — the query does not select either. */
+    TokenOut: {
+      /** Format: date-time */
+      created_at: string;
+      /**
+       * @description Past its expiry by the server's clock, so the list cannot show a token as live
+       * that `lookup` would refuse.
+       */
+      expired: boolean;
+      /** Format: date-time */
+      expires_at?: string | null;
+      /** Format: int64 */
+      id: number;
+      label: string;
+      /** Format: date-time */
+      last_used_at?: string | null;
+      /** Format: date-time */
+      revoked_at?: string | null;
+      scopes: string[];
+      /**
+       * @description Idle for 90 days or more (or minted then and never used). The UI renders this
+       * as a nudge; the threshold itself lives in the list query, not here.
+       */
+      stale: boolean;
+    };
     Transaction: {
       /** Format: int64 */
       asset_id: number;
@@ -490,7 +608,7 @@ export interface components {
       fee: string;
       price: string;
       quantity: string;
-      type: string;
+      type: components["schemas"]["TxType"];
     };
     TransactionOut: {
       /** Format: int64 */
@@ -504,6 +622,30 @@ export interface components {
       quantity: string;
       type: string;
     };
+    /**
+     * @description The closed set of transaction types the engines understand.
+     *
+     * This enum exists because of a specific failure that was live: `transactions.type`
+     * is `TEXT` with no `CHECK`, and the write path did `to_uppercase()` and stored
+     * whatever came back. So `"DIVIDEND"` was accepted, stored, and then **silently
+     * ignored** — `tax_engine.rs:665-771` and `stats_engine.rs:250-256` are both
+     * `if BUY / else if SELL / else if SPLIT` with no terminal `else`. Invisible tax
+     * data is worse than a wrong lot, because nothing looks wrong.
+     *
+     * `rename_all = "UPPERCASE"` makes serde match the style names exactly, so the
+     * accepted wire values are precisely `BUY`, `SELL`, `SPLIT` and anything else is a
+     * serde error the route turns into a 422. There is no `to_uppercase()` left to
+     * forget, because a lowercase spelling is a compile error at the call site rather
+     * than a string that survives to the database.
+     *
+     * **The read side stays `String`.** [`Transaction`] and `schemas::TransactionOut`
+     * are `FromRow` decode targets for rows this migration still accepts in any case —
+     * the `CHECK` is `upper(btrim(type)) IN (...)` precisely so legacy `buy` rows do not
+     * have to be rewritten. Decoding those into this enum would fail to read every one of
+     * them, which turns a validation improvement into an unreadable database.
+     * @enum {string}
+     */
+    TxType: "BUY" | "SELL" | "SPLIT";
   };
   responses: never;
   parameters: never;
@@ -1121,6 +1263,144 @@ export interface operations {
         content: never;
       };
       /** @description Portfolio not found */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * List the caller's staged batches, newest first.
+   * @description No caller-supplied id: the caller *is* the selector, so there is nothing for
+   * `access.rs` to resolve.
+   */
+  list_batches: {
+    responses: {
+      /** @description This user's staged batches, newest first */
+      200: {
+        content: {
+          "application/json": components["schemas"]["BatchOut"][];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * The stored preview, rendered verbatim.
+   * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
+   * if the preview were derived at render time, what a human read and what the agent was
+   * shown could differ, and the approval would be an approval of something else.
+   */
+  get_batch: {
+    parameters: {
+      path: {
+        handle: string;
+      };
+    };
+    responses: {
+      /** @description The stored preview, byte for byte */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such batch for this user */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * `staged -> approved`. The human act, and the only write this UI performs.
+   * @description A conditional update inside `staging::approve`, so two tabs cannot both succeed; the
+   * loser gets 409 naming the current status rather than a silent second success.
+   */
+  approve_batch: {
+    parameters: {
+      path: {
+        handle: string;
+      };
+    };
+    responses: {
+      /** @description Approved */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such batch for this user */
+      404: {
+        content: never;
+      };
+      /** @description Not in a state that can be approved */
+      409: {
+        content: never;
+      };
+    };
+  };
+  list_tokens: {
+    responses: {
+      /** @description This user's tokens, newest first, without secrets */
+      200: {
+        content: {
+          "application/json": components["schemas"]["TokenOut"][];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  create_token: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["TokenCreate"];
+      };
+    };
+    responses: {
+      /** @description Token created; the secret is shown here for the first and last time */
+      201: {
+        content: {
+          "application/json": components["schemas"]["TokenMinted"];
+        };
+      };
+      /** @description Blank label, no scopes, an unknown scope name, or an out-of-range expiry */
+      400: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+    };
+  };
+  revoke_token: {
+    parameters: {
+      path: {
+        id: number;
+      };
+    };
+    responses: {
+      /** @description Token revoked */
+      204: {
+        content: never;
+      };
+      /** @description Not authenticated */
+      401: {
+        content: never;
+      };
+      /** @description No such token, or not yours */
       404: {
         content: never;
       };

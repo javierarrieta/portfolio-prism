@@ -6,6 +6,7 @@
 // every build that includes the file, which is the only reason it is here.
 extern crate self as backend_rust;
 
+pub mod agent;
 pub mod db;
 pub mod db_types;
 pub mod models;
@@ -23,6 +24,8 @@ pub mod api_routes {
     pub mod analytics;
     pub mod lookup;
     pub mod backup;
+    pub mod staged_batches;
+    pub mod tokens;
 }
 
 /// Test-only stand-in for the pricing provider, compiled into the library's own
@@ -277,7 +280,16 @@ pub fn build_rocket(
         .attach(cors)
         .attach(AuthFairing)
         .manage(pool)
-        .manage(currency_service)
+        // Arc, not the value. Rocket resolves managed state by exact type, so anything
+        // that needs to hand a `&CurrencyService` to code outside a request — the agent
+        // mount builds its tool server inside a `'static` closure, where a borrowed `&T`
+        // cannot go — needs a shared handle rather than a borrow of the managed value.
+        //
+        // One instance, one cache, one rate limiter: the pricing provider is rate-limited
+        // and the limiter exists to keep the process under that ceiling. Two instances
+        // would double the request rate against it, which is why this is an Arc and not a
+        // second `CurrencyService::new`.
+        .manage(std::sync::Arc::new(currency_service))
         .manage(auth)
         .manage(backup_cfg)
         .mount("/", routes![index])
@@ -331,10 +343,27 @@ pub fn build_rocket(
             api_routes::backup::preview,
             api_routes::backup::restore,
             api_routes::backup::owned,
+            api_routes::staged_batches::list_batches,
+            api_routes::staged_batches::get_batch,
+            api_routes::staged_batches::approve_batch,
+            api_routes::tokens::create_token,
+            api_routes::tokens::list_tokens,
+            api_routes::tokens::revoke_token,
         ])
         // `openapi_json` is mounted here only. The `#[get("/openapi.json")]` attribute
         // stays on the handler because the attribute *is* the route path and the same
         // handler serves both mounts; the duplicate `/openapi.json` mount is gone.
+        // The MCP door, mounted at the root so its path is exactly `/mcp`.
+        //
+        // It must NOT go in the `/api` list above: the route's own attribute is
+        // `#[post("/mcp")]`, so mounting it under `/api` would silently serve it at
+        // `/api/mcp` — inside `AuthFairing`'s prefix, where a session cookie would
+        // authenticate it and the whole scope model would be decorative. That is the exact
+        // failure `agent::mount`'s module comment names, and it happened here first: the
+        // route was added to the `/api` list, every MCP test answered 404, and the reason
+        // was the prefix. `tests/mcp_mount_test.rs::mcp_refuses_a_session_cookie` is the
+        // assertion that keeps it out.
+        .mount("/", routes![agent::mount::mcp])
         .mount("/api-docs", routes![openapi_json])
         // Every `401` answers with the same body, whichever path produced it. Rocket
         // prefers a registered catcher over a guard's error responder, so without

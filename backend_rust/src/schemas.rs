@@ -2,8 +2,8 @@ use serde::{Serialize, Deserialize};
 use chrono::{DateTime, NaiveDate, Utc};
 use utoipa::ToSchema;
 use rust_decimal::Decimal;
-use crate::db_types::{decimal_json, decimal_opt_json};
-use crate::models::{Asset, Transaction};
+use crate::db_types::{decimal_json, decimal_opt_json, strict_decimal_json};
+use crate::models::{Asset, Transaction, TxType};
 
 // Every id in this file is `i64` because every id in the schema is `BIGINT GENERATED
 // ALWAYS AS IDENTITY` (`migrations/0001_init.sql`). These structs used to be `i32`
@@ -16,12 +16,22 @@ use crate::models::{Asset, Transaction};
 // --- Transaction ---
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TransactionCreate {
-    pub r#type: String,
-    #[serde(with = "decimal_json")]
+    // Enum, not `String`: see [`TxType`] for why the write side is closed and the read
+    // side is not. Spelled bare rather than `crate::models::TxType` on purpose — utoipa
+    // names a `$ref` from the path as written, so the fully-qualified form here produced
+    // a reference to `crate.models.TxType` while the registered schema is `TxType`, and
+    // the document shipped a dangling reference. `Asset` and `Transaction` are bare for
+    // the same reason.
+    pub r#type: TxType,
+    // `strict_decimal_json`, not `decimal_json`: a JSON number has already been through
+    // `f64` by the time it becomes a `Decimal`, and these three columns are cost basis.
+    // The response side keeps the lenient codec — see that module's comment for why
+    // tightening it there would break every tax figure the app answers with.
+    #[serde(with = "strict_decimal_json")]
     pub quantity: Decimal,
-    #[serde(with = "decimal_json")]
+    #[serde(with = "strict_decimal_json")]
     pub price: Decimal,
-    #[serde(with = "decimal_json")]
+    #[serde(with = "strict_decimal_json")]
     pub fee: Decimal,
     pub date: DateTime<Utc>,
 }
@@ -686,7 +696,7 @@ mod tests {
     #[test]
     fn test_transaction_create_roundtrip() {
         let tx = TransactionCreate {
-            r#type: "BUY".to_string(),
+            r#type: TxType::Buy,
             quantity: Decimal::from_str("100.0").unwrap(),
             price: Decimal::from_str("150.5").unwrap(),
             fee: Decimal::from_str("9.99").unwrap(),
@@ -694,7 +704,7 @@ mod tests {
         };
         let json = serde_json::to_string(&tx).unwrap();
         let deserialized: TransactionCreate = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.r#type, "BUY");
+        assert_eq!(deserialized.r#type, TxType::Buy);
         assert_eq!(deserialized.quantity, Decimal::from_str("100.0").unwrap());
         assert_eq!(deserialized.price, Decimal::from_str("150.5").unwrap());
         assert_eq!(deserialized.fee, Decimal::from_str("9.99").unwrap());
@@ -705,6 +715,9 @@ mod tests {
         let tx = TransactionOut {
             id: 42,
             asset_id: 7,
+            // `String`, not `TxType`, and this test is the proof that the two sides are
+            // genuinely different types: `TransactionOut` decodes rows the `CHECK` accepts
+            // in any case, so a legacy `buy` has to have somewhere to land.
             r#type: "SELL".to_string(),
             quantity: Decimal::from_str("25.0").unwrap(),
             price: Decimal::from_str("200.0").unwrap(),

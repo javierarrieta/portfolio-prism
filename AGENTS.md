@@ -131,6 +131,17 @@ From root:
   (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
 
 ## Roadmap / Current Focus
+- **`asset_type` is unconstrained at the database.** `assets.asset_type` is `TEXT` with no
+  `CHECK`, and nothing in the engines reads it — which is the only reason that is tolerable.
+  It is constrained at the bundle boundary (`backup/mod.rs:431-434` and
+  `docs/backup-schema/v1.json:6-15`), so a restore cannot introduce junk even today.
+  Constraining it needs an inventory of live values first: `SELECT DISTINCT asset_type FROM
+  assets` across real databases, because a `CHECK` written from the enum in the bundle schema
+  rather than from what is actually stored would refuse rows on migration and take the app
+  down at boot (`sqlx::migrate!` runs at startup). Contrast `transactions.type`, which got a
+  `CHECK` in `0002` only after the same question was answered — and which still refuses to
+  rewrite anything it does not recognise. Do not treat that migration as a template to copy
+  without doing the inventory.
 - **Postgres cutover, the deferred half**: the application side is merged (engine, tests,
   gates, runbook). The cluster side is
   `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — a CNPG `Database`,

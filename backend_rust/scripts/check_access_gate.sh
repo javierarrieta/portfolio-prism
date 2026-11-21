@@ -166,7 +166,7 @@ for file in "${FILES[@]}"; do
     fi
   done <<< "$handlers"
 
-  if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(' "$file"; then
+  if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction|_own_token|_own_staged_batch)?\(' "$file"; then
     echo "  ok       $name"
   elif [ "$total" -gt 0 ] && [ "$unmarked" -eq 0 ] && [ "$contradicted" -eq 0 ]; then
     echo "  ok       $name (every handler carries the global-config marker: none resolves a caller-supplied id)"
@@ -220,7 +220,7 @@ for file in "${FILES[@]}"; do
         sig = sig " " $0
         if ($0 ~ /->/) sigdone = 1
       }
-      if ($0 ~ /(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(/ && reqline == 0) { req = 1; reqline = FNR }
+      if ($0 ~ /(^|[^A-Za-z_])require(_asset(_in)?|_transaction|_own_token|_own_staged_batch)?\(/ && reqline == 0) { req = 1; reqline = FNR }
       if ($0 ~ /(FROM|UPDATE|DELETE FROM)[ \t]+(portfolios|assets|transactions)[ \t].*WHERE[ \t]+id/ && idline == 0) { idq = 1; idline = FNR }
       if (sig ~ /AuthedUser/) authed = 1
       if ($0 ~ /^\}/) {
