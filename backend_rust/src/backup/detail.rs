@@ -201,10 +201,16 @@ fn portfolio_detail(p: &BundlePortfolio, today: NaiveDate) -> PlanPortfolio {
     }
     // A portfolio fact, not an asset fact: it lands in `flags`, not `asset_flags`. It
     // records *that* a symbol is duplicated, once per duplicated symbol — three copies
-    // of one symbol set the flag once, which is what the SQL side reports too. Nothing
-    // here counts how many symbols are duplicated, and the flag is not a count. Two
-    // producers disagreeing about what one code means is exactly the drift the
-    // round-trip test in Task 5 is there to catch.
+    // of one symbol set the flag once. Nothing here counts how many symbols are
+    // duplicated, and the flag is not a count.
+    //
+    // This is now the only producer. The database side used to compute the same flag from a
+    // `GROUP BY symbol` over `assets`; migration `0006_asset_symbol_unique.sql` made that
+    // unreachable and it was deleted — see the note in `owned_detail`. What is left is the
+    // case that stays reachable for as long as bundles are caller-supplied: a preview is
+    // built from JSON before anything is inserted, and the index only gets a vote when the
+    // insert runs. So the flag is what tells a human, in the preview, why their bundle is
+    // about to be refused by `validate`.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut dupes: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for a in &p.assets {
@@ -327,10 +333,7 @@ pub async fn owned_detail(
                   COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM transactions t
                                                   WHERE t.asset_id = a.id
                                                     AND (t.date AT TIME ZONE 'UTC')::date > $2)) AS "future_dated!",
-                  COUNT(*) FILTER (WHERE a.currency <> p.currency) AS "currency_mismatch!",
-                  (SELECT COUNT(*) FROM (SELECT a2.symbol FROM assets a2
-                                          WHERE a2.portfolio_id = p.id
-                                          GROUP BY a2.symbol HAVING COUNT(*) > 1) d) AS "duplicates!"
+                  COUNT(*) FILTER (WHERE a.currency <> p.currency) AS "currency_mismatch!"
             FROM portfolios p JOIN assets a ON a.portfolio_id = p.id
            WHERE p.owner_id = $1 GROUP BY p.id"#,
         user_id,
@@ -408,8 +411,22 @@ pub async fn owned_detail(
         let mut asset_flags: BTreeMap<String, usize> = BTreeMap::new();
         // Push order is contractual, not incidental: `flags` is a `Vec<String>` and the
         // round-trip test compares vectors, not sets, so this side pushes in the same
-        // order as `portfolio_detail` on the bundle side (`no_assets`, then
-        // `duplicate_symbol`).
+        // order as `portfolio_detail` on the bundle side.
+        //
+        // `duplicate_symbol` used to be pushed here, from a `GROUP BY symbol HAVING COUNT(*)
+        // > 1` subquery over `assets`. Migration `0006_asset_symbol_unique.sql` makes that
+        // subquery unreachable, and "unreachable" is the provable claim rather than a hunch:
+        // the migration refuses to apply to a database that already holds a duplicated
+        // symbol, and the unique index it creates on `(portfolio_id, upper(symbol))` prevents
+        // any new one. There is no sequence of writes that leaves the database in a state the
+        // detector could see. It is deleted rather than left dormant because a detector that
+        // cannot fire is not a safety net — it is a reader's false premise, and the round-trip
+        // test would keep comparing a flag one producer can emit and the other never can.
+        //
+        // The flag itself stays, and stays live, on the bundle side (`detail_from_bundle`):
+        // a bundle is caller-supplied JSON, it is validated after the preview is built, and
+        // nothing about the index constrains it until the insert runs. That is where the
+        // duplicate case is now tested.
         let mut flags_vec = Vec::new();
         if p.assets == 0 {
             flags_vec.push(flag::NO_ASSETS.to_string());
@@ -425,11 +442,6 @@ pub async fn owned_detail(
                 if n > 0 {
                     asset_flags.insert(code.to_string(), n as usize);
                 }
-            }
-            // Portfolio-level, and meaning the same thing it means on the bundle side:
-            // how many symbols are duplicated, expressed as present or absent.
-            if f.duplicates > 0 {
-                flags_vec.push(flag::DUPLICATE_SYMBOL.to_string());
             }
         }
 
@@ -738,7 +750,10 @@ mod tests {
         let p = &side.shown[0];
         // Exactly one flag entry for three copies of one symbol — `contains` could not
         // tell that apart from the flag being pushed once per duplicate, which is the
-        // thing this test's name claims and the thing the SQL side must agree about.
+        // thing this test's name claims. This is now the flag's only producer: the
+        // `owned_detail` side computed it from a `GROUP BY symbol` over `assets` until
+        // migration `0006_asset_symbol_unique.sql` made that unreachable. See the note in
+        // `owned_detail` before assuming a second producer exists to agree with.
         assert_eq!(p.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
         assert!(!p.asset_flags.contains_key(flag::DUPLICATE_SYMBOL));
     }

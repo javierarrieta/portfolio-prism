@@ -22,16 +22,24 @@ use crate::services::error::WriteError;
 /// Symbol and ISIN are uppercased here rather than in the handler so that every
 /// caller stores the same canonical form. The uniqueness checks are per-portfolio.
 ///
-/// **Uniqueness is enforced here and nowhere else.** There is no unique index on
-/// `assets (portfolio_id, symbol)` — `0001_init.sql` creates only `assets_portfolio_idx`, a
-/// plain non-unique index on `portfolio_id` — so the `SELECT`-then-`INSERT` below is the
-/// whole rule. Two callers running concurrently can both find nothing and both insert, and
-/// Postgres will not stop them. That is pre-existing, and a comment does not fix it; it is
-/// stated because the alternative is a later reader assuming an index exists and reasoning
-/// from it. The real fix is `CREATE UNIQUE INDEX ON assets (portfolio_id, upper(symbol))`,
-/// and it needs a migration that first audits and refuses existing duplicates in the shape of
-/// `0005_split_index_case_insensitive.sql` — it cannot simply be added, or the migration dies
-/// on whatever duplicate a live database already holds.
+/// **Symbol uniqueness is constrained; ISIN uniqueness is not.**
+///
+/// Migration `0006_asset_symbol_unique.sql` added `uq_assets_portfolio_symbol`, unique on
+/// `(portfolio_id, upper(symbol))`, so the `SELECT`-then-`INSERT` below is now a friendly
+/// answer in front of a real constraint rather than the whole rule. Two callers racing here
+/// still both pass the `SELECT`, but exactly one `INSERT` lands and the other gets a database
+/// error — which is the correct outcome and the reason the index exists.
+///
+/// `isin` has the same shape and no index: the check below is a `SELECT`-then-`INSERT` with a
+/// window, and two concurrent writers can each store a row for one ISIN in one portfolio.
+/// It is left that way on purpose rather than by omission — closing it needs the same
+/// audit-first migration, and the audit script reports existing ISIN collisions so the
+/// decision is made with the data in view. Do not read the symbol index as covering it.
+///
+/// A note for whoever adds the ISIN one: do not normalize symbols in a migration to make the
+/// data match a constraint. `historical_prices` is keyed by the symbol string, not by
+/// `asset_id`, so rewriting an asset's symbol silently detaches its price history. Step (2)
+/// of `0006` says all this at length; the fix there was to change the lookup, not the rows.
 pub async fn insert(
     conn: &mut PgConnection,
     portfolio_id: i64,
@@ -41,7 +49,14 @@ pub async fn insert(
 
     let existing = sqlx::query_as!(
         Asset,
-        "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2",
+        // `upper(symbol)`, not `symbol`. Migration 0006 puts the uniqueness constraint on
+        // `(portfolio_id, upper(symbol))`, and this check has to agree with the constraint it
+        // is standing in front of: comparing the bare column would miss a row stored as `aapl`
+        // — by restore, by hand, or by an older build — let the insert through, and the insert
+        // would then fail on the index as a raw database error instead of returning
+        // `SymbolExists`. The bind is already upper-cased above, and the index leads with
+        // `portfolio_id`, so this is the shape the index serves.
+        "SELECT * FROM assets WHERE portfolio_id = $1 AND upper(symbol) = $2",
         portfolio_id,
         &symbol
     )

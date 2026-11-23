@@ -1120,8 +1120,14 @@ async fn resolve_asset(
     pa: &crate::agent::protocol::ProposalAsset,
 ) -> Result<i64, ApplyError> {
     let symbol = pa.symbol.to_uppercase();
+    // `upper(symbol)` to match the constraint migration 0006 puts on
+    // `(portfolio_id, upper(symbol))`, for the same reason `services::assets::insert` does:
+    // an asset row stored as `aapl` must be found here and reused, not missed and then
+    // re-inserted against the index. Reusing is also the correct answer for a staged import
+    // specifically — the whole point of the lookup is that re-staging the same statement
+    // lands on the same asset rather than writing a second one.
     let found: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM assets WHERE portfolio_id = $1 AND symbol = $2")
+        sqlx::query_scalar("SELECT id FROM assets WHERE portfolio_id = $1 AND upper(symbol) = $2")
             .bind(portfolio_id)
             .bind(&symbol)
             .fetch_optional(&mut *tx)

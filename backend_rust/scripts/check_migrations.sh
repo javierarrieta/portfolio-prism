@@ -262,6 +262,41 @@ want_split_dedupe_index() {
   echo "ok   transactions.uq_split_asset_date = unique, partial on SPLIT, keyed on (asset_id, UTC day)"
 }
 
+# The asset-identity index, pinned to its exact definition.
+#
+# Asset identity inside a portfolio is the rule the whole import path is written against,
+# and until `0006` it lived only in software: a `SELECT`-then-`INSERT` with a window in the
+# middle. This asserts the constraint exists and keys on the expression the code compares,
+# because an index on the bare `symbol` would look identical in a `\d` listing while enforcing
+# a different rule — it would still admit `aapl` beside `AAPL`, which is the exact duplicate
+# the lookup is blind to.
+want_asset_symbol_index() {
+  local row uniq def cols
+  row=$(q "select concat_ws('|', i.indisunique, pg_get_indexdef(i.indexrelid))
+            from pg_class t
+            join pg_namespace n on n.oid = t.relnamespace
+            join pg_index i on i.indrelid = t.oid
+            join pg_class x on x.oid = i.indexrelid
+            where n.nspname = 'public' and t.relname = 'assets'
+              and x.relname = 'uq_assets_portfolio_symbol'") \
+    || { echo "FAIL could not read uq_assets_portfolio_symbol from $DATABASE_URL"; exit 1; }
+  [ -n "$row" ] \
+    || { echo "FAIL assets.uq_assets_portfolio_symbol is missing; asset identity is a SELECT-then-INSERT with no constraint behind it (migration 0006)"; exit 1; }
+  IFS='|' read -r uniq def <<<"$row"
+  [ "$uniq" = "t" ] || { echo "FAIL uq_assets_portfolio_symbol must be UNIQUE, it is not"; exit 1; }
+  case "$def" in
+    *"(portfolio_id, upper(symbol))"*) ;;
+    *) echo "FAIL uq_assets_portfolio_symbol must key on (portfolio_id, upper(symbol)); the code compares the upper-cased symbol, so an index on the bare column enforces a different rule. Definition is: $def"; exit 1 ;;
+  esac
+  # Leading column order, asserted separately so a definition that swaps the two — legal SQL,
+  # useless for the per-portfolio lookup — is named rather than waved through.
+  case "$def" in
+    *"(portfolio_id,"*) ;;
+    *) echo "FAIL uq_assets_portfolio_symbol must lead with portfolio_id; definition is: $def"; exit 1 ;;
+  esac
+  echo "ok   assets.uq_assets_portfolio_symbol = unique on (portfolio_id, upper(symbol))"
+}
+
 # --- users --------------------------------------------------------------------------
 # token_version is BIGINT because auth/guard.rs decodes it into an i64 and sqlx-postgres
 # will not decode INT4 into i64; INTEGER would fail every authenticated request.
@@ -426,6 +461,7 @@ want_unique agent_staged_batch agent_staged_batch_handle_key "(handle)"
 want_unique api_token api_token_secret_hash_key "(secret_hash)"
 
 want_split_dedupe_index
+want_asset_symbol_index
 want_type_check
 want_status_check
 want_migration_ledger

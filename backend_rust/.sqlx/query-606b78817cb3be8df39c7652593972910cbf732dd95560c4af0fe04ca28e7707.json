@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2",
+  "query": "SELECT * FROM assets WHERE portfolio_id = $1 AND upper(symbol) = $2",
   "describe": {
     "columns": [
       {
@@ -61,5 +61,5 @@
       true
     ]
   },
-  "hash": "d14e04790e1e77dbc38586a62d6513bc1439b8eb08b0a3c57e1e969416e9a521"
+  "hash": "606b78817cb3be8df39c7652593972910cbf732dd95560c4af0fe04ca28e7707"
 }

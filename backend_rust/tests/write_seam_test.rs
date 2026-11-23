@@ -207,3 +207,115 @@ async fn the_service_stores_the_canonical_form() {
         "the stored type is the enum's spelling, not whatever the caller spelled"
     );
 }
+
+/// The constraint behind the check, asserted rather than assumed.
+///
+/// `a_duplicate_symbol_is_reported_as_a_collision_not_a_database_error` proves the service is
+/// careful. It cannot prove anything is underneath it, and for the whole life of this schema
+/// nothing was: the check was a `SELECT`-then-`INSERT` with a window, so two concurrent
+/// writers each stored a row for one symbol and split its cost basis. This bypasses the
+/// service entirely and asks Postgres, which is the only way to tell a real constraint from a
+/// careful-looking convention.
+///
+/// The lowercase spelling is the point of the second insert. The index is on
+/// `upper(symbol)`, so `acme` beside `ACME` is a violation; an index on the bare column would
+/// have allowed it and looked exactly as reassuring in a `\d` listing.
+#[tokio::test]
+async fn the_schema_rejects_a_second_asset_for_one_symbol_in_one_portfolio() {
+    let (pool, user) = db_with_user("asset_symbol_unique").await;
+    let pid = seed_portfolio(&pool, user, "Seam", "USD").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    assets::insert(&mut conn, pid, &asset_create("ACME"))
+        .await
+        .expect("first insert");
+    drop(conn);
+
+    for spelling in ["ACME", "acme", "Acme"] {
+        let dup = sqlx::query(
+            "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency)
+             VALUES ($1, $2, $3, 'EQUITY', 'USD')",
+        )
+        .bind(pid)
+        .bind(spelling)
+        .bind("ACME Corp")
+        .execute(&pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "`{spelling}` beside the stored `ACME` must be rejected by the index, not appended"
+        );
+        // Vacuous-pass guard: without this, a typo in the INSERT (a NOT NULL column left out,
+        // most likely) makes every iteration "fail" for a reason that has nothing to do with
+        // uniqueness, and the test reports success while proving nothing.
+        let e = dup.err().unwrap().to_string();
+        assert!(
+            e.contains("duplicate key value") && e.contains("uq_assets_portfolio_symbol"),
+            "`{spelling}` was refused, but not by the index: {e}"
+        );
+    }
+
+    // And the rejected writes left nothing behind.
+    let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM assets WHERE portfolio_id = $1")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "one symbol, one row");
+}
+
+/// The same symbol in a different portfolio is a different asset, and must stay insertable.
+///
+/// The index leads with `portfolio_id` for exactly this reason. A unique index on `symbol`
+/// alone would be a plausible-looking mistake — it would pass every test in this file except
+/// this one, and it would make it impossible to hold the same security in two portfolios,
+/// which is the ordinary case for anyone who tracks a tax-free wrapper separately.
+#[tokio::test]
+async fn the_same_symbol_in_two_portfolios_is_two_assets() {
+    let (pool, user) = db_with_user("asset_symbol_scoped_per_portfolio").await;
+    let one = seed_portfolio(&pool, user, "Taxable", "USD").await;
+    let two = seed_portfolio(&pool, user, "Wrapper", "USD").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    assets::insert(&mut conn, one, &asset_create("ACME"))
+        .await
+        .expect("first portfolio");
+    assets::insert(&mut conn, two, &asset_create("ACME"))
+        .await
+        .expect("the same symbol in a second portfolio is not a collision");
+}
+
+/// A symbol stored in a spelling the write path never produces is still found by the check.
+///
+/// This is the regression test for changing the lookup to `upper(symbol) = $2`. Such a row is
+/// reachable — a hand-authored restore bundle inserts `&a.symbol` untouched, and so does any
+/// psql session — and while the bare-column comparison missed it, re-importing that symbol
+/// sailed past the check and hit the index as a raw database error: right answer, wrong layer,
+/// and a 500 where the API has a 400 with a name.
+///
+/// It is also why `0006` does not normalize the column. Normalizing would have made this row
+/// unreachable by detaching its price history instead.
+#[tokio::test]
+async fn a_lowercase_row_is_found_by_the_check_rather_than_slipping_past_it() {
+    let (pool, user) = db_with_user("asset_symbol_legacy_case").await;
+    let pid = seed_portfolio(&pool, user, "Seam", "USD").await;
+
+    sqlx::query(
+        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, currency)
+         VALUES ($1, 'acme', 'ACME Corp', 'EQUITY', 'USD')",
+    )
+    .bind(pid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let err = assets::insert(&mut conn, pid, &asset_create("ACME"))
+        .await
+        .expect_err("the legacy lowercase row is the same asset and must be reported as one");
+    assert_eq!(
+        err,
+        WriteError::SymbolExists,
+        "a collision the service can name, not a database error from the index"
+    );
+}
