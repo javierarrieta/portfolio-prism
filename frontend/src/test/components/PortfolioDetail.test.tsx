@@ -376,6 +376,67 @@ describe('PortfolioDetail', () => {
     }))
   })
 
+  it('canonicalizes money to the decimal string the API accepts, and refuses what it cannot take', async () => {
+    // The API refuses a JSON number for these fields (`strict_decimal_json`) and it also
+    // refuses exponent form, a decimal comma and more than twelve fractional digits. This
+    // form posts the contents of a text box, so without `parseDecimal` a `1e3` typed into a
+    // `type="number"` input arrived as a 422 carrying serde's sentence. Same rule as the CSV
+    // importer, now one function.
+    const user = userEvent.setup()
+    const onAddTransaction = vi.fn().mockResolvedValue(undefined)
+
+    const renderPanel = () =>
+      render(
+        <PortfolioDetail
+          onFetchPortfolioData={noop}
+          portfolio={mockPortfolio}
+          taxSummary={mockTaxSummary}
+          onAddAsset={noop}
+          onDeleteAsset={noop}
+          onDeletePortfolio={noop}
+          onAddTransaction={onAddTransaction}
+          strategy="FIFO"
+          setStrategy={() => {}}
+          thresholdDays={30}
+          setThresholdDays={() => {}}
+        />
+      )
+
+    const openForm = async () => {
+      await user.click(screen.getAllByText('Log Transaction')[0])
+      const aaplOption = screen.getByText('AAPL (Apple Inc.)')
+      await user.selectOptions(aaplOption.closest('select') as HTMLSelectElement, '1')
+      const form = document.querySelector('form')!
+      const spinbuttons = screen.getAllByRole('spinbutton') as HTMLInputElement[]
+      return { submit: form.querySelector('button[type="submit"]')!, quantity: spinbuttons[0], price: spinbuttons[1] }
+    }
+
+    const setValue = (input: HTMLInputElement, value: string) => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set?.call(input, value)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+
+    // Trailing zeros are dropped: what goes out is the canonical spelling, not the keystrokes.
+    renderPanel()
+    let { submit, quantity, price } = await openForm()
+    setValue(price, '180')
+    setValue(quantity, '10.50')
+    await user.click(submit)
+    expect(onAddTransaction).toHaveBeenCalledWith(1, expect.objectContaining({ quantity: '10.5' }))
+
+    // `1e3` is a number to the input and is not a decimal string to the API. It is refused
+    // here, in the form, rather than by a 422 the user has to decode.
+    onAddTransaction.mockClear()
+    renderPanel()
+    ;({ submit, quantity, price } = await openForm())
+    setValue(price, '180')
+    setValue(quantity, '1e3')
+    await user.click(submit)
+    expect(onAddTransaction).not.toHaveBeenCalled()
+    expect(screen.getByText(/must be a plain decimal/i)).toBeInTheDocument()
+  })
+
   it('calls onAddTransaction with fee "0" when a valid SPLIT is submitted', async () => {
     const user = userEvent.setup()
     const onAddTransaction = vi.fn().mockResolvedValue(undefined)

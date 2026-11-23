@@ -234,8 +234,9 @@ const DECIMAL_ONLY = /^-?\d+(\.\d+)?$/;
  * The two steps compose rather than overlap: `resolveSeparators` guarantees its
  * output is `[-]digits[.digits]` or nothing at all, so `DECIMAL_ONLY` is left to
  * reject only what it exists to reject — exponent form, stray characters, a bare
- * sign. `+1.5` and `.5` reach here unchanged and are refused here, as they always
- * were.
+ * sign. `.5` reaches here unchanged and is refused here, as it always was. A leading
+ * `+` does not: `resolveSeparators` strips it (it carries no information, and it has
+ * always been accepted), so `+1.5` arrives as `1.5` and passes.
  */
 export function parseDecimal(val: string): string | null {
   const cleaned = (val ?? '').replace(/[$€£¥₹\s]/g, '');

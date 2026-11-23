@@ -351,5 +351,16 @@ describe('decimal transport', () => {
     expect(parseDecimal('')).toBeNull();
     expect(parseDecimal('.5')).toBeNull();
     expect(parseDecimal('1.2.3')).toBeNull();
+    // A leading `+` is dropped by `resolveSeparators` before the shape check ever sees it
+    // — it carries no information, and that function's own comment says refusing it would
+    // be a new rejection rather than a fixed one. Pinned here because the prose in
+    // `parseDecimal` once claimed the opposite.
+    expect(parseDecimal('+1.5')).toBe('1.5');
+    // A decimal comma is a locale, not an error: this is the whole reason the comma is left
+    // in for `resolveSeparators` instead of being stripped.
+    expect(parseDecimal('1,5')).toBe('1.5');
+    expect(parseDecimal('1.234,56')).toBe('1234.56');
+    // Exponent form is a number to `parseFloat` and is not a decimal string to the API.
+    expect(parseDecimal('1e3')).toBeNull();
   });
 });

@@ -102,10 +102,15 @@ export interface paths {
   };
   "/api/staged-batches/<handle>": {
     /**
-     * The stored preview, rendered verbatim.
+     * The stored preview, rendered verbatim — plus three envelope fields.
      * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
      * if the preview were derived at render time, what a human read and what the agent was
      * shown could differ, and the approval would be an approval of something else.
+     *
+     * "Verbatim" is about the preview object, not about the response body: `status`,
+     * `expires_at` and `expired` are added to it below, because the panel needs the state to
+     * decide whether to offer the approve button and the preview itself is stateless. The
+     * preview's own keys are untouched and none of the three collides with one.
      */
     get: operations["get_batch"];
   };
@@ -540,7 +545,8 @@ export interface components {
       expires_in_days?: number | null;
       /**
        * @description Free text, shown in the list. The only thing that makes a token
-       * distinguishable once it is out in the world, so it is required.
+       * distinguishable once it is out in the world, so it is required. Bounded by
+       * `pat::MAX_LABEL_LEN`: it is a table cell, not a document.
        */
       label: string;
       /**
@@ -1288,10 +1294,15 @@ export interface operations {
     };
   };
   /**
-   * The stored preview, rendered verbatim.
+   * The stored preview, rendered verbatim — plus three envelope fields.
    * @description The UI renders this JSON and does not recompute it. That is not a rendering preference:
    * if the preview were derived at render time, what a human read and what the agent was
    * shown could differ, and the approval would be an approval of something else.
+   *
+   * "Verbatim" is about the preview object, not about the response body: `status`,
+   * `expires_at` and `expired` are added to it below, because the panel needs the state to
+   * decide whether to offer the approve button and the preview itself is stateless. The
+   * preview's own keys are untouched and none of the three collides with one.
    */
   get_batch: {
     parameters: {
@@ -1300,7 +1311,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description The stored preview, byte for byte */
+      /** @description The stored preview verbatim, plus `status`, `expires_at` and `expired` */
       200: {
         content: {
           "application/json": unknown;
@@ -1375,7 +1386,7 @@ export interface operations {
           "application/json": components["schemas"]["TokenMinted"];
         };
       };
-      /** @description Blank label, no scopes, an unknown scope name, or an out-of-range expiry */
+      /** @description Blank label, an over-long label, no scopes, an unknown scope name, or an out-of-range expiry */
       400: {
         content: never;
       };

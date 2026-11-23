@@ -9,6 +9,7 @@ import {
   AssetType
 } from '../types';
 import { isinProblem } from '../utils/isinValidator';
+import { parseDecimal } from '../utils/csvValidator';
 import { apiFetch } from '../utils/apiFetch';
 import CsvImportModal from './CsvImportModal';
 
@@ -169,10 +170,30 @@ export default function PortfolioDetail({
     const isSplit = txForm.type === 'SPLIT';
     if (!txForm.asset_id) { setTxError('Select an asset'); return; }
     if (!txForm.quantity || !txForm.price) { setTxError('Quantity and price are required'); return; }
+
+    // Money is canonicalized before it is sent, with the same function the CSV importer
+    // uses. The API refuses a JSON number for these three fields (`strict_decimal_json`),
+    // and it also refuses a decimal comma, an exponent, a leading `+` and more than twelve
+    // fractional digits — so this form, which used to post the raw input of a text box,
+    // turned a German-locale `1,5` or a pasted `1e3` into a 422 carrying serde's sentence.
+    // Two write paths, one rule: `parseDecimal` is that rule.
+    const canonical = (raw: string, what: string): string | null => {
+      const value = parseDecimal(raw);
+      if (value === null) {
+        setTxError(`${what} must be a plain decimal such as 10 or 10.50 — got "${raw}"`);
+      }
+      return value;
+    };
+    const quantity = canonical(txForm.quantity, 'Quantity');
+    if (quantity === null) return;
+    const price = canonical(txForm.price, 'Price');
+    if (price === null) return;
+    const fee = canonical(isSplit ? '0' : txForm.fee || '0', 'Fee');
+    if (fee === null) return;
+
     if (isSplit) {
-      const qty = parseFloat(txForm.quantity);
-      const price = parseFloat(txForm.price);
-      if (!(qty > 0) || !(price > 0)) {
+      // `Number()` for the sign test only; the strings above are what get sent.
+      if (!(Number(quantity) > 0) || !(Number(price) > 0)) {
         setTxError('Split ratio must be positive (shares after : shares before)');
         return;
       }
@@ -180,9 +201,9 @@ export default function PortfolioDetail({
     setTxError(null);
     const payload: CreateTxPayload = {
       type: txForm.type,
-      quantity: txForm.quantity,
-      price: txForm.price,
-      fee: isSplit ? '0' : txForm.fee,
+      quantity,
+      price,
+      fee,
       date: new Date(txForm.date).toISOString()
     };
     await onAddTransaction(Number(txForm.asset_id), payload);
