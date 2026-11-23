@@ -603,3 +603,60 @@ async fn lookup_asset_refuses_a_malformed_isin_without_reaching_the_network() {
         assert_eq!(payload(&resp)["error"], json!("bad_isin"), "{bad:?} should be refused");
     }
 }
+
+// --- the transport itself -----------------------------------------------------------
+
+#[tokio::test]
+async fn a_batch_bigger_than_rockets_default_body_limit_still_reaches_the_tools() {
+    // Rocket's default `bytes` limit is 8 KiB (`Limits::BYTES`) and this application
+    // deliberately configures no `Limits` at all (`lib.rs`: the bundle upload is capped per
+    // route). A `Vec<u8>` body guard on this route therefore read 8 KiB and answered `400`
+    // before the handler ran — silently capping `stage_import` at roughly ninety rows while
+    // `staging::MAX_TRANSACTIONS_PER_BATCH` promised five hundred, and leaving
+    // `config.max_request_body_bytes` as dead configuration. The route opens its own body
+    // under `MAX_BODY_BYTES` instead.
+    //
+    // This is the mutation-proof: put `body: Vec<u8>` back and this test answers 400 with
+    // the payload never reaching a tool.
+    let (pool, user, client) = client("mcp_big_body").await;
+    let (portfolio_id, _) = seed_rows(&pool, user).await;
+    let secret = token(&pool, user, &["import"]).await;
+    let (status, _) = rpc(&client, initialize(1), Some(&secret)).await;
+    assert_eq!(status, Status::Ok);
+
+    // 200 rows of a realistic shape — the size is the point, so it is asserted, not assumed.
+    let rows: Vec<Value> = (0..200)
+        .map(|i| {
+            json!({
+                "type": "BUY",
+                "date": format!("2024-01-{:02}", (i % 28) + 1),
+                "quantity": "10.50",
+                "price": "175.99",
+                "fee": "4.99"
+            })
+        })
+        .collect();
+    let body = call(
+        2,
+        "stage_import",
+        json!({"payload": {
+            "target": {"kind": "existing", "portfolio_id": portfolio_id},
+            "assets": [{"symbol": "BIGBATCH", "asset_type": "ETF", "transactions": rows}]
+        }}),
+    );
+    let size = body.to_string().len();
+    assert!(
+        size > 8 * 1024,
+        "the payload must clear Rocket's default 8 KiB body limit, got {size} bytes"
+    );
+
+    let (status, resp) = rpc(&client, body, Some(&secret)).await;
+    assert_eq!(status, Status::Ok, "{size}-byte body refused: {resp}");
+    let out = payload(&resp);
+    assert_eq!(out["status"], json!("staged"), "{out}");
+    assert_eq!(
+        out["preview"]["totals"]["transactions"],
+        json!(200),
+        "every row arrived: {out}"
+    );
+}

@@ -166,13 +166,28 @@ fn hash_secret(secret: &str) -> String {
         .collect()
 }
 
+/// Longest accepted label. It is a display string shown in a table cell, and `mint` is
+/// reachable with nothing but a session and a JSON body — Rocket's default `json` limit is
+/// 1 MiB, so an unbounded label is a 1 MiB row rendered in a table cell. The same reasoning
+/// as `MAX_PORTFOLIOS_PER_USER`: a backstop, not a measurement.
+const MAX_LABEL_LEN: usize = 120;
+
 fn to_scopes(raw: &[String]) -> Result<Vec<Scope>, PatError> {
     if raw.is_empty() {
         return Err(PatError::InvalidInput);
     }
-    raw.iter()
-        .map(|s| Scope::parse(s).ok_or(PatError::InvalidInput))
-        .collect()
+    // Deduplicated, order preserved. `["read","read"]` is one grant, not two, and storing
+    // the duplicate would make `TokenInfo::scopes` a list whose length means nothing — the
+    // panel renders it as chips and would render `read` twice. `Scope` has two variants, so
+    // this bounds the stored array without a second arbitrary constant.
+    let mut seen: Vec<Scope> = Vec::with_capacity(raw.len());
+    for s in raw {
+        let scope = Scope::parse(s).ok_or(PatError::InvalidInput)?;
+        if !seen.contains(&scope) {
+            seen.push(scope);
+        }
+    }
+    Ok(seen)
 }
 
 /// Create a token. Returns the plaintext secret exactly once, in the returned
@@ -186,6 +201,9 @@ pub async fn mint(
 ) -> Result<Minted, PatError> {
     let label = label.trim();
     if label.is_empty() {
+        return Err(PatError::InvalidInput);
+    }
+    if label.chars().count() > MAX_LABEL_LEN {
         return Err(PatError::InvalidInput);
     }
     let scopes = to_scopes(scopes)?;

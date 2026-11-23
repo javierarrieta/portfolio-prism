@@ -15,8 +15,11 @@
 # finding out whether the live database already has any, while the answer is still "fix these
 # rows" rather than "the site is down".
 #
-# It also reports the symbols that step (2) of the migration will rewrite, because that step
-# changes displayed text and whoever deploys should know the count in advance.
+# It also reports two things it does NOT fix, so the operator is not surprised after the
+# fact: symbols stored in a spelling the write path never produces (0006 deliberately does
+# not rewrite them — upper-casing an asset symbol would silently detach its price history,
+# see step (2) of the migration), and ISINs held twice in one portfolio, which 0006 does not
+# constrain at all.
 #
 # Exit codes, in the order a caller should read them:
 #   0  clean — 0006 will apply

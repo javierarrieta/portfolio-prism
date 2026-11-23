@@ -99,16 +99,21 @@ pub async fn list_batches(
     Ok(Json(rows.into_iter().map(BatchOut::from).collect()))
 }
 
-/// The stored preview, rendered verbatim.
+/// The stored preview, rendered verbatim — plus three envelope fields.
 ///
 /// The UI renders this JSON and does not recompute it. That is not a rendering preference:
 /// if the preview were derived at render time, what a human read and what the agent was
 /// shown could differ, and the approval would be an approval of something else.
+///
+/// "Verbatim" is about the preview object, not about the response body: `status`,
+/// `expires_at` and `expired` are added to it below, because the panel needs the state to
+/// decide whether to offer the approve button and the preview itself is stateless. The
+/// preview's own keys are untouched and none of the three collides with one.
 #[utoipa::path(
     get,
     path = "/api/staged-batches/<handle>",
     responses(
-        (status = 200, description = "The stored preview, byte for byte", body = Value),
+        (status = 200, description = "The stored preview verbatim, plus `status`, `expires_at` and `expired`", body = Value),
         (status = 401, description = "Not authenticated"),
         (status = 404, description = "No such batch for this user")
     )

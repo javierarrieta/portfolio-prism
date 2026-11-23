@@ -26,7 +26,8 @@ use crate::db::DbPool;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TokenCreate {
     /// Free text, shown in the list. The only thing that makes a token
-    /// distinguishable once it is out in the world, so it is required.
+    /// distinguishable once it is out in the world, so it is required. Bounded by
+    /// `pat::MAX_LABEL_LEN`: it is a table cell, not a document.
     pub label: String,
     /// Scope names as the client spells them; `pat::mint` is what decides whether
     /// they exist.
@@ -88,7 +89,7 @@ const MAX_EXPIRY_DAYS: i64 = 3650;
     request_body = TokenCreate,
     responses(
         (status = 201, description = "Token created; the secret is shown here for the first and last time", body = TokenMinted),
-        (status = 400, description = "Blank label, no scopes, an unknown scope name, or an out-of-range expiry")
+        (status = 400, description = "Blank label, an over-long label, no scopes, an unknown scope name, or an out-of-range expiry")
     )
 )]
 // No marker here, and it cannot have one: the marker's cross-check fails closed on

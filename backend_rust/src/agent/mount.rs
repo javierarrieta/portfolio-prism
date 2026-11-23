@@ -46,6 +46,7 @@ use http_body_util::{BodyExt, Full};
 use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use rocket::data::{Data, ToByteUnit};
 use rocket::http::{Header, Status};
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::Responder;
@@ -57,8 +58,20 @@ use crate::agent::tools::AgentServer;
 use crate::auth::pat;
 use crate::services::currency_service::CurrencyService;
 
-/// Matches the body cap in *Limits*. rmcp enforces it itself; naming it here keeps the two
-/// documents from drifting apart silently.
+/// The body cap for `/mcp`, enforced **by this route** and not by a `Limits` entry.
+///
+/// There is no global `Limits` in this application (`lib.rs` says so out loud: the bundle
+/// upload is capped per route rather than by raising a global limit for one endpoint), and
+/// Rocket's default for the `bytes` limit — the one a `Vec<u8>` data guard reads — is
+/// **8 KiB** (`rocket::data::Limits::BYTES`). A `Vec<u8>` argument here would therefore
+/// have refused every `stage_import` over ~90 rows with a `400` from Rocket, before this
+/// handler ran, while `config.max_request_body_bytes` below sat at 1 MiB never being
+/// reached. So the handler takes `Data` and opens it under this constant itself, the same
+/// shape as `api_routes::backup::preview`.
+///
+/// The number has to be at least what `staging::MAX_TRANSACTIONS_PER_BATCH` can produce:
+/// 500 rows of `{"type":…, "date":…, "quantity":…}` is roughly 50 KB, and a batch that the
+/// validator accepts must survive the transport that carries it.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// The parts of the Rocket request the bridge needs, captured before the body is consumed.
@@ -153,6 +166,9 @@ fn service(
     // The default is TRUE. Left alone, a client negotiating a pre-2026-07-28 protocol
     // version is routed onto the session path and `NeverSessionManager` answers 500.
     config.legacy_session_mode = false;
+    // Redundant by design. The route has already refused anything larger than this before
+    // rmcp sees a byte (see `MAX_BODY_BYTES`), so this arm never fires — it stays set to the
+    // same number so the two caps cannot drift if the route's is ever raised.
     config.max_request_body_bytes = MAX_BODY_BYTES;
     StreamableHttpService::new(
         move || Ok(AgentServer::new(pool.clone(), user.clone(), pricing.clone())),
@@ -165,7 +181,7 @@ fn service(
 #[rocket::post("/mcp", data = "<body>")]
 pub(crate) async fn mcp(
     parts: RawParts,
-    body: Vec<u8>,
+    body: Data<'_>,
     pool: &rocket::State<PgPool>,
     pricing: &rocket::State<std::sync::Arc<CurrencyService>>,
 ) -> Result<McpResponse, Status> {
@@ -178,6 +194,21 @@ pub(crate) async fn mcp(
         // response carries no hint about which. That is the point: the difference tells an
         // attacker that a token id was real.
         .ok_or(Status::Unauthorized)?;
+
+    // Read the body under the route's own cap. `Data` rather than `Vec<u8>` because the
+    // `Vec<u8>` guard reads the `bytes` limit (8 KiB by default, and no `Limits` is
+    // configured here) and answers `400` on truncation — see `MAX_BODY_BYTES`. A body over
+    // the cap is refused with `413` rather than handed to rmcp short, which would come back
+    // as a JSON parse error and send an agent off to fix a payload that was fine.
+    let uploaded = body
+        .open(MAX_BODY_BYTES.bytes())
+        .into_bytes()
+        .await
+        .map_err(|_| Status::BadRequest)?;
+    if !uploaded.is_complete() {
+        return Err(Status::PayloadTooLarge);
+    }
+    let body: Vec<u8> = uploaded.value;
 
     // The bearer is consumed and never reaches rmcp: the tool server holds the resolved
     // user, so a tool cannot accidentally forward a credential it has no business seeing.
@@ -192,7 +223,17 @@ pub(crate) async fn mcp(
         // client's framing headers describe a body that is no longer the one being sent. A
         // `Transfer-Encoding: chunked` forwarded verbatim tells hyper to expect framing it
         // will never receive, and a stale `Content-Length` contradicts the payload.
+        //
+        // `cookie` goes for the same reason `authorization` does, and it is the more
+        // dangerous of the two: a browser pointed at `/mcp` sends the `pp_session` cookie
+        // unprompted, and `Credential::Session` passes every scope. The route does not
+        // *authenticate* on it — `pat::lookup` on the bearer is the only credential this
+        // route honours, and `mcp_refuses_a_session_cookie` pins that — but leaving a
+        // full-authority session credential sitting in the request object the tool server
+        // receives is how a future header log, or an error that echoes its request, leaks
+        // one. Nothing in rmcp needs a cookie; nothing here should hand it one.
         if name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("cookie")
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("transfer-encoding")

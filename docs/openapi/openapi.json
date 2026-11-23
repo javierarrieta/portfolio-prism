@@ -1035,8 +1035,8 @@
         "tags": [
           "crate::api_routes::staged_batches"
         ],
-        "summary": "The stored preview, rendered verbatim.",
-        "description": "The UI renders this JSON and does not recompute it. That is not a rendering preference:\nif the preview were derived at render time, what a human read and what the agent was\nshown could differ, and the approval would be an approval of something else.",
+        "summary": "The stored preview, rendered verbatim — plus three envelope fields.",
+        "description": "The UI renders this JSON and does not recompute it. That is not a rendering preference:\nif the preview were derived at render time, what a human read and what the agent was\nshown could differ, and the approval would be an approval of something else.\n\n\"Verbatim\" is about the preview object, not about the response body: `status`,\n`expires_at` and `expired` are added to it below, because the panel needs the state to\ndecide whether to offer the approve button and the preview itself is stateless. The\npreview's own keys are untouched and none of the three collides with one.",
         "operationId": "get_batch",
         "parameters": [
           {
@@ -1050,7 +1050,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The stored preview, byte for byte",
+            "description": "The stored preview verbatim, plus `status`, `expires_at` and `expired`",
             "content": {
               "application/json": {
                 "schema": {}
@@ -1157,7 +1157,7 @@
             }
           },
           "400": {
-            "description": "Blank label, no scopes, an unknown scope name, or an out-of-range expiry"
+            "description": "Blank label, an over-long label, no scopes, an unknown scope name, or an out-of-range expiry"
           },
           "401": {
             "description": "Not authenticated"
@@ -2311,7 +2311,7 @@
           },
           "label": {
             "type": "string",
-            "description": "Free text, shown in the list. The only thing that makes a token\ndistinguishable once it is out in the world, so it is required."
+            "description": "Free text, shown in the list. The only thing that makes a token\ndistinguishable once it is out in the world, so it is required. Bounded by\n`pat::MAX_LABEL_LEN`: it is a table cell, not a document."
           },
           "scopes": {
             "type": "array",

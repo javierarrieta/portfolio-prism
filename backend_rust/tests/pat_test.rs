@@ -243,6 +243,38 @@ async fn mint_refuses_input_it_cannot_honour() {
     assert!(pat::mint(&pool, user, "ok", &[" Read ".into()], None)
         .await
         .is_ok());
+    // A label is a table cell, not a document. `mint` is reachable with nothing but a
+    // session and a body, and Rocket's default `json` limit is 1 MiB, so an unbounded label
+    // is a 1 MiB row rendered in a list.
+    assert!(matches!(
+        pat::mint(&pool, user, &"x".repeat(121), &["read".into()], None).await,
+        Err(PatError::InvalidInput)
+    ));
+    assert!(pat::mint(&pool, user, &"x".repeat(120), &["read".into()], None)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn a_scope_listed_twice_is_one_grant_not_two() {
+    // `["read","read"]` used to store two entries, which made the length of
+    // `TokenInfo::scopes` mean nothing and rendered the same chip twice in the Access
+    // panel. Deduplicating keeps the stored array a set, which is what a scope is.
+    let (pool, user) = db_with_user("mint_dedupe").await;
+    let minted = pat::mint(&pool, user, "dup", &["read".into(), "read".into()], None)
+        .await
+        .unwrap();
+    assert_eq!(minted.scopes, vec![Scope::Read]);
+
+    let listed = pat::list(&pool, user).await.unwrap();
+    let row = listed.iter().find(|t| t.id == minted.id).unwrap();
+    assert_eq!(row.scopes, vec![Scope::Read], "the list shows one grant");
+
+    // Order survives, so `["import","read"]` still reads as it was written.
+    let both = pat::mint(&pool, user, "both", &["import".into(), "read".into(), "import".into()], None)
+        .await
+        .unwrap();
+    assert_eq!(both.scopes, vec![Scope::Import, Scope::Read]);
 }
 
 /// `last_used_at` is what the 90-day nudge reads, so it has to move — but not on

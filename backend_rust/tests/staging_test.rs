@@ -232,6 +232,118 @@ fn a_real_calendar_date_outside_the_write_window_is_refused_at_staging() {
     }
 }
 
+#[test]
+fn an_isin_that_will_not_validate_is_refused_at_staging_and_not_at_apply() {
+    // The same shape as the date-window test below it, and the same trap: `resolve_asset`
+    // hands the string to `services::assets::insert`, which answers `IsinInvalid`. That is
+    // a `write_refused` *after* a human approved the batch; the transaction rolls back, the
+    // batch stays `approved`, and every retry fails identically until it expires. The
+    // preview shows the ISIN and says nothing about it being wrong, so the approver had no
+    // way to see it coming.
+    let with_isin = |isin: &str| -> Proposal {
+        serde_json::from_value(serde_json::json!({
+            "target": {"kind": "new", "name": "Depot", "base_currency": "EUR"},
+            "assets": [{
+                "symbol": "A", "asset_type": "ETF", "isin": isin,
+                "transactions": [tx("BUY", "2024-01-01", "1", "1", "0")]
+            }]
+        }))
+        .unwrap()
+    };
+
+    // Real instruments, from the vectors in `api_routes::lookup`'s own tests.
+    for good in ["IE00B3RBWM25", "CH0038863350", "de0007164600"] {
+        staging::validate(&with_isin(good))
+            .unwrap_or_else(|e| panic!("{good} is a real ISIN and must pass: {e:?}"));
+    }
+
+    // Absent and blank both mean "no ISIN", which is what `insert` treats them as too.
+    staging::validate(&with_isin("")).unwrap_or_else(|e| panic!("an empty isin is no ISIN: {e:?}"));
+
+    for bad in [
+        "IE00B3RBWM24",   // right shape, check digit decremented
+        "X",              // nonsense
+        "IE00B3RBWM25X",  // thirteen characters
+        "1E00B3RBWM25",   // a digit where the country code's letters belong
+        " IE00B3RBWM25",  // padded: `insert` upper-cases but does NOT trim, so neither may this
+    ] {
+        let err = staging::validate(&with_isin(bad)).unwrap_err();
+        assert_eq!(err.code(), "out_of_range", "{bad} must be refused at staging");
+        assert_eq!(err.field(), Some("assets[0].isin"), "{bad} must name its path");
+    }
+}
+
+#[test]
+fn an_asset_name_over_the_cap_is_refused_the_way_a_portfolio_name_is() {
+    // `MAX_NAME_LEN` bounds `target.name` and nothing else, while `assets[i].name` goes
+    // into the preview verbatim and into the row. Same limit, same wire code, same promise.
+    let with_name = |name: &str| -> Proposal {
+        serde_json::from_value(serde_json::json!({
+            "target": {"kind": "new", "name": "Depot", "base_currency": "EUR"},
+            "assets": [{
+                "symbol": "A", "asset_type": "ETF", "name": name,
+                "transactions": [tx("BUY", "2024-01-01", "1", "1", "0")]
+            }]
+        }))
+        .unwrap()
+    };
+
+    staging::validate(&with_name(&"x".repeat(120))).expect("exactly at the cap must pass");
+    let err = staging::validate(&with_name(&"x".repeat(121))).unwrap_err();
+    assert_eq!(err.code(), "out_of_range");
+    assert_eq!(err.field(), Some("assets[0].name"));
+}
+
+#[test]
+fn the_preview_never_promises_a_view_that_does_not_exist() {
+    // With more than `PREVIEW_ASSETS_SHOWN` assets the preview lists some and counts the
+    // rest — and there is no other view: `get_batch` and `get_staged` both serve this stored
+    // preview and nothing else. The warning used to send the reader to a "full view" for the
+    // remainder, which is a promise the approval cannot keep.
+    let many = proposal(
+        (0..30)
+            .map(|i| asset(&format!("A{i}"), vec![tx("BUY", "2024-01-01", "1", "1", "0")]))
+            .collect(),
+    );
+    let preview = staging::render_preview(&many);
+    let warnings = preview["warnings"].as_array().expect("warnings");
+    let text = warnings
+        .iter()
+        .map(|w| w.as_str().unwrap_or_default().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("not shown"), "{warnings:?}");
+    for forbidden in ["full view", "listed by symbol only"] {
+        assert!(!text.contains(forbidden), "the preview promises {forbidden:?}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_batch_that_could_never_apply_is_refused_before_a_human_sees_it() {
+    // End to end on the staging side of the same rule: `stage` must not hand out a handle
+    // for a proposal that `apply` could never write, because the handle is what invites the
+    // approval.
+    let (pool, user) = db_with_user("stage_bad_isin").await;
+    let mut p = one_ok();
+    p.assets[0].isin = Some("IE00B3RBWM24".into());
+
+    let err = staging::stage(&pool, user, &p, 60).await.unwrap_err();
+    assert_eq!(err.code(), "out_of_range");
+    assert_eq!(err.field(), Some("assets[0].isin"));
+    // And the message says something an agent can act on, not a Debug dump.
+    assert!(
+        err.message().contains("assets[0].isin"),
+        "the message must name the field: {}",
+        err.message()
+    );
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_staged_batch")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a refused proposal leaves no row behind");
+}
+
 #[tokio::test]
 async fn staging_persists_the_payload_and_the_preview_and_hands_out_a_handle() {
     let (pool, user) = db_with_user("stage_ok").await;

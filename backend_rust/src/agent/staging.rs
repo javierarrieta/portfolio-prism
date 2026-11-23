@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use crate::agent::protocol::{Proposal, Target};
-use crate::db_types::is_canonical_decimal;
+use crate::api_routes::lookup::is_valid_isin;
+use crate::db_types::{is_canonical_decimal, MAX_DECIMAL_SCALE};
 use crate::models::TxType;
 
 /// Rows per staged batch. A real batch is 20-40 rows; 500 is a full history for a large
@@ -136,6 +137,46 @@ impl StageError {
         match self {
             StageError::Rejected(e) => e.field(),
             _ => None,
+        }
+    }
+
+    /// The human- and agent-readable half, alongside [`code`](Self::code).
+    ///
+    /// This existed only on [`ApplyError`], which left `stage_import` answering with
+    /// `format!("{e:?}")` — Rust's Debug shape (`Rejected(NonCanonicalDecimal { field: … })`)
+    /// pasted into a JSON string. An agent parsing a wire contract should not have to read a
+    /// Rust enum's debug output, and the two halves of this module's error convention should
+    /// not be two different shapes. Same rule as `code`: the wording is the message, the
+    /// `code` is the contract.
+    pub fn message(&self) -> String {
+        match self {
+            StageError::Rejected(e) => match e {
+                ValidationError::BatchTooLarge { what, given, max } => format!(
+                    "the batch is too large: {given} {what} where the limit is {max}"
+                ),
+                ValidationError::EmptyAsset { field } => {
+                    format!("{field} is missing or blank")
+                }
+                ValidationError::NonCanonicalDecimal { field, given } => format!(
+                    "{field} is {given:?}: money must be a plain decimal string, no JSON number, no exponent, at most {MAX_DECIMAL_SCALE} decimal places"
+                ),
+                ValidationError::BadDate { field, given } => {
+                    format!("{field} is {given:?}: dates are YYYY-MM-DD")
+                }
+                ValidationError::OutOfRange { field, rule, given } => {
+                    format!("{field} is {given:?}: {rule}")
+                }
+                ValidationError::TooLong { field, given, max } => format!(
+                    "{field} is too long ({given:?}…): the limit is {max} characters"
+                ),
+            },
+            StageError::TooManyPending { given, max } => format!(
+                "this user has {given} batches awaiting approval and the limit is {max}; discard one or wait for one to expire"
+            ),
+            StageError::TooManyPortfolios { given, max } => format!(
+                "this user owns {given} portfolios and the limit is {max}; target an existing portfolio instead of creating another"
+            ),
+            StageError::Database => "the database refused the write".into(),
         }
     }
 }
@@ -261,6 +302,43 @@ pub fn validate(proposal: &Proposal) -> Result<(), ValidationError> {
         )?;
         if let Some(currency) = &asset.currency {
             text_field(currency, format!("assets[{ai}].currency"), MAX_CURRENCY_LEN)?;
+        }
+        // Length only, not `text_field`: a blank name is not refused here because `apply`
+        // falls back to the symbol for `None`, and turning `Some("")` into a refusal would
+        // reject payloads that apply correctly today. An over-long one is the gap: the
+        // preview carries it verbatim, and `MAX_NAME_LEN` already bounds a portfolio's name
+        // for the same reason — a display label is not a place for prose.
+        if let Some(name) = &asset.name
+            && name.trim().chars().count() > MAX_NAME_LEN
+        {
+            return Err(ValidationError::TooLong {
+                field: format!("assets[{ai}].name"),
+                given: name.chars().take(MAX_NAME_LEN + 1).collect(),
+                max: MAX_NAME_LEN,
+            });
+        }
+        // An ISIN that will not validate is refused **here**, not at apply, and this is the
+        // finding that makes the difference between a refusal and a trap. `resolve_asset`
+        // hands the string to `asset_service::insert`, which answers `IsinInvalid`; that is
+        // a `write_refused` *after* a human approved the batch, the transaction rolls back,
+        // the batch stays `approved`, and every retry fails the same way until it expires.
+        // The preview shows the ISIN (`render_preview`) and says nothing about it being
+        // malformed, so the human had no way to see it coming. Staging's rule is that
+        // nothing a human approves may be unappliable — the same rule that put the date
+        // window and the portfolio cap here.
+        //
+        // Checked exactly as `insert` will check it: no trim, no pre-uppercase. A rule here
+        // that is looser than the one at apply is the same bug wearing a different hat —
+        // `insert` upper-cases but does not trim, so a padded ISIN must be refused now too.
+        if let Some(isin) = &asset.isin
+            && !isin.is_empty()
+            && !is_valid_isin(isin)
+        {
+            return Err(ValidationError::OutOfRange {
+                field: format!("assets[{ai}].isin"),
+                rule: "an ISIN is 12 characters: two letters, then ten alphanumerics, with a valid check digit",
+                given: isin.clone(),
+            });
         }
 
         for (ti, tx) in asset.transactions.iter().enumerate() {
@@ -395,10 +473,17 @@ pub fn render_preview(proposal: &Proposal) -> Value {
         );
     }
     if proposal.assets.len() > PREVIEW_ASSETS_SHOWN {
+        // Truthful, and nothing more. This used to promise that "the remainder are listed by
+        // symbol only in the full view" — and there is no full view. `get_batch` and
+        // `get_staged` both serve this stored preview and nothing else, so the sentence
+        // pointed a human at a screen that does not exist while the assets past the cap went
+        // unlisted. An approval has to be an approval of what was shown, so what is shown
+        // says exactly what is missing rather than implying it is one click away.
         warnings.push(format!(
-            "showing {} of {} assets; the remainder are listed by symbol only in the full view",
+            "showing {} of {} assets: the other {} are NOT shown here and will still be written, so approve this batch only if the totals and the counts above are acceptable without reading every asset",
             PREVIEW_ASSETS_SHOWN,
-            proposal.assets.len()
+            proposal.assets.len(),
+            proposal.assets.len() - PREVIEW_ASSETS_SHOWN
         ));
     }
 
@@ -933,7 +1018,28 @@ pub async fn apply(pool: &PgPool, user_id: i64, handle: &str) -> Result<Applied,
     .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
 
     if flipped.rows_affected() == 0 {
-        return Err(ApplyError::AlreadyApplied);
+        // The flip refused although the read above said `approved` and unexpired. There are
+        // two ways that happens and they are not the same answer: the database clock is
+        // ahead of the application's — the flip compares `expires_at` against the
+        // *database's* `now()` while the check above used `Utc::now()` — or the row moved
+        // between the read and the lock. Answering `already_applied` to a batch that was
+        // never written tells an agent its rows are in the database when they are not, which
+        // is the one thing this module promises not to do. The row is locked by this
+        // transaction, so this read describes the state the flip saw rather than racing it.
+        let state: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT status, expires_at FROM agent_staged_batch WHERE handle = $1 AND user_id = $2",
+        )
+        .bind(handle)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
+        return Err(match state {
+            Some((status, _)) if status == "applied" => ApplyError::AlreadyApplied,
+            Some(_) => ApplyError::Expired,
+            None => ApplyError::NotFound,
+        });
     }
 
     let proposal: Proposal = serde_json::from_value(payload).map_err(|e| {
@@ -1103,11 +1209,18 @@ async fn resolve_portfolio(
 
 /// Find the asset by symbol, or create it.
 ///
-/// Merge is by uppercased symbol within the target portfolio — the same identity
-/// `services::assets::insert` enforces in software. There is **no unique index** on
-/// `assets (portfolio_id, symbol)` (`0001_init.sql` has only `assets_portfolio_idx`), so
-/// this lookup and that insert are the whole dedupe and nothing underneath them is a
-/// backstop; see the note on that function for the concurrency consequence.
+/// Merge is by uppercased symbol within the target portfolio. Migration
+/// `0006_asset_symbol_unique.sql` put a real constraint under that identity —
+/// `uq_assets_portfolio_symbol`, unique on `(portfolio_id, upper(symbol))` — so this lookup
+/// is a friendly answer in front of a rule the database enforces, not the whole rule. Two
+/// callers racing here still both pass the `SELECT`, and exactly one `INSERT` lands; the
+/// other gets a database error, which is the correct outcome and the reason the index
+/// exists. `services::assets::insert` says the same thing at its own site, and the two
+/// comments are meant to be read as one statement.
+///
+/// The lookup compares `upper(symbol)` rather than the bare column because the constraint
+/// expression is `upper(symbol)`: a legacy row stored as `aapl` has to be found here and
+/// reused, not missed and then re-inserted against the index as a raw violation.
 ///
 /// `base_currency` is the fallback for an asset that arrived without one, and it is the
 /// portfolio's, never a literal. Defaulting to `"USD"` here would contradict the preview the

@@ -5,6 +5,20 @@
 //! `access` or the engines, because a rule that lives in a tool is a rule an `/api` caller
 //! does not have to follow.
 //!
+//! **How far that reaches today, stated exactly.** The tools that would drift loudest do
+//! share: `get_tax_summary` calls the same `analytics` helpers in the same order as
+//! `GET /api/portfolios/<id>/tax-summary`, `get_transaction_pnl` calls `TaxLotEngine` the
+//! way its route does, `lookup_asset` calls `lookup::resolve_isin`, and the staging tools
+//! call `agent::staging` — which is also what the session routes call. Three read tools do
+//! **not**: `list_portfolios`, `get_portfolio` and `list_transactions` inline their own
+//! `SELECT`, because the `/api` equivalents have no function to call — their queries are
+//! written in the handler body and take a `&State<DbPool>`, not a pool an agent tool can
+//! hand them. Those three are the gap this module has not closed, and a change to
+//! `api_routes::transactions::list_portfolio_transactions` will not reach `list_transactions`
+//! until someone extracts the query into a shared function. The authorization half of the
+//! rule is not in that gap: every one of the three goes through `access::require*` first,
+//! which is the chokepoint and is where the rule actually lives.
+//!
 //! Two shapes worth naming:
 //!
 //! **A refused tool call is a tool result, not a protocol error.** `not_approved`,
@@ -261,7 +275,7 @@ impl AgentServer {
                 "preview": s.preview,
                 "next": "a human must approve this handle at status 'staged' before apply_staged will write anything",
             }))),
-            Err(e) => Ok(refused_from(e.code(), &format!("{e:?}"), e.field())),
+            Err(e) => Ok(refused_from(e.code(), &e.message(), e.field())),
         }
     }
 
