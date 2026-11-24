@@ -271,22 +271,29 @@ fn two_distinct_duplicated_symbols_in_a_bundle_still_report_the_flag_once() {
     assert_eq!(p.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
 }
 
-/// `aapl` beside `AAPL`: the index refuses it, the bundle flag does not notice it.
+/// `aapl` beside `AAPL`: the index refuses it, and so does the flag.
 ///
-/// The bundle-side detector compares the symbol as written; `uq_assets_portfolio_symbol` is
-/// keyed on `upper(symbol)`. Left asymmetric on purpose — the flag is a human-facing "you
-/// listed this twice" hint about the spelling in front of them, and `validate` is what refuses
-/// the bundle, upper-cased to match the index. Asserting the disagreement is the point: a
-/// future reader comparing the two would otherwise "fix" the flag and silently change what a
-/// preview means without anything failing to tell them.
+/// This test used to assert the opposite, and its comment argued the asymmetry was
+/// deliberate: "the flag is a human-facing 'you listed this twice' hint about the spelling
+/// in front of them." That rationale depended on a premise that turns out to be false. The
+/// preview route runs `parse_and_validate` **before** it builds a plan, and `validate`
+/// refuses a case-insensitive duplicate — so no client ever sees this flag through HTTP,
+/// and there is no human looking at a spelling. What is left is a tripwire for a caller
+/// that plans without validating, and a tripwire that misses the exact case the rule it
+/// guards catches (`to_uppercase()`, matching `upper(symbol)`) is worse than none: it would
+/// stay silent in the one situation that would prove the ordering guarantee had broken.
+///
+/// So the flag now compares the way `validate` compares. If the operator decides the old
+/// reading was right — a preview that shows the spelling as written, duplicates and all —
+/// then the flag has to be made reachable first, or this test is pinning dead behaviour.
 #[test]
-fn a_case_variant_does_not_set_the_bundle_flag_although_the_index_would_refuse_it() {
+fn a_case_variant_sets_the_bundle_flag_because_the_index_and_validate_both_refuse_it() {
     let parsed: Bundle = serde_json::from_str(&bundle_with_symbols(&["aapl", "AAPL"])).unwrap();
     let side = detail_from_bundle(&parsed, today());
     assert_eq!(
         side.shown[0].flags,
-        Vec::<String>::new(),
-        "the flag compares the spelling as written"
+        vec![flag::DUPLICATE_SYMBOL.to_string()],
+        "the flag must compare the way validate does: case-insensitively, matching upper(symbol)"
     );
 }
 

@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import type { ColumnMapping } from '../types/csv';
 import { detectColumns } from './csvParser';
-import { parseDecimal, validateCsvRow, validateCsvFile } from './csvValidator';
+import { parseDecimal, validateCsvRow, validateCsvFile, MAX_DECIMAL_SCALE, MAX_DECIMAL_DIGITS } from './csvValidator';
 
 const columnMapping = detectColumns(['date', 'symbol', 'type', 'qty', 'price', 'fee']);
 
@@ -343,6 +343,24 @@ describe('decimal transport', () => {
     // number. The API takes a decimal string and will not take `1e3`; catching it
     // here is one fewer failed row in the import results.
     expect(money('1e3', '150', '0').errors.some((e) => e.field === 'quantity')).toBe(true);
+  });
+
+  test('parseDecimal refuses what the backend money rule refuses', () => {
+    // The whole claim of this function is "if it parses here it is accepted there". The
+    // backend's `is_canonical_decimal` caps the fractional part at MAX_DECIMAL_SCALE and
+    // the **total** digit count at MAX_DECIMAL_PRECISION; before these caps a 16-decimal
+    // cell cleared the browser and died at the API — the failed import row the doc comment
+    // promises not to produce.
+    const atScale = '1.' + '0'.repeat(MAX_DECIMAL_SCALE);
+    const pastScale = '1.' + '0'.repeat(MAX_DECIMAL_SCALE + 1);
+    expect(parseDecimal(atScale)).not.toBeNull();
+    expect(parseDecimal(pastScale)).toBeNull();
+
+    // Total, not integer-part: 20 integer digits plus 9 fractional is 29, over the cap,
+    // even though neither half alone looks alarming.
+    const pastTotal = '9'.repeat(MAX_DECIMAL_DIGITS) + '.9';
+    expect(parseDecimal(pastTotal)).toBeNull();
+    expect(parseDecimal('9'.repeat(MAX_DECIMAL_DIGITS))).not.toBeNull();
   });
 
   test('parseDecimal returns the string form or null', () => {

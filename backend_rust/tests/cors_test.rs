@@ -1,3 +1,4 @@
+use backend_rust::agent::AgentConfig;
 use backend_rust::backup::BackupConfig;
 use backend_rust::build_rocket;
 use backend_rust::get_cors_options;
@@ -20,7 +21,7 @@ async fn test_cors_allowed_origin() {
     let allowed_origin: &'static str =
         Box::leak("http://localhost:5173".to_string().into_boxed_str());
     let cors = get_cors_options(vec![allowed_origin.to_string()]);
-    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default());
+    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default(), AgentConfig::default());
     let client = Client::tracked(rocket).await.expect("valid rocket");
 
     let response = client
@@ -90,7 +91,7 @@ async fn test_cors_disallowed_origin() {
     let allowed_origin: &'static str =
         Box::leak("http://localhost:5173".to_string().into_boxed_str());
     let cors = get_cors_options(vec![allowed_origin.to_string()]);
-    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default());
+    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default(), AgentConfig::default());
     let client = Client::tracked(rocket).await.expect("valid rocket");
 
     let disallowed_origin: &'static str =
@@ -123,7 +124,7 @@ async fn test_cors_multiple_origins() {
         .collect();
 
     let cors = get_cors_options(allowed_origins_raw.clone());
-    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default());
+    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default(), AgentConfig::default());
     let client = Client::tracked(rocket).await.expect("valid rocket");
 
     // Test first origin
@@ -161,7 +162,7 @@ async fn test_cors_trailing_comma_origin_is_allowed() {
     let currency_service = offline_pricing_service();
 
     let cors = get_cors_options(parse_allowed_origins(Some("http://localhost:5173,")));
-    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default());
+    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default(), AgentConfig::default());
     let client = Client::tracked(rocket).await.expect("valid rocket");
 
     let response = client
@@ -187,7 +188,7 @@ async fn test_cors_blank_env_falls_back_to_dev_defaults() {
     let currency_service = offline_pricing_service();
 
     let cors = get_cors_options(parse_allowed_origins(Some("")));
-    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default());
+    let rocket = build_rocket(pool, currency_service, cors, auth, BackupConfig::default(), AgentConfig::default());
     let client = Client::tracked(rocket).await.expect("valid rocket");
 
     let response = client

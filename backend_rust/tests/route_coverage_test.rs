@@ -110,6 +110,10 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // the same as `POST /api/portfolios/`.
     ("POST", "/api/tokens", None),
     ("GET", "/api/tokens", None),
+    // The incident-response lever: revokes every live token the caller owns. Session-only
+    // like the rest of this file — a token cannot revoke anything, which is the same
+    // property that stops it minting one.
+    ("POST", "/api/tokens/revoke-all", None),
     // The one that does resolve a caller-supplied id, and the reason it is listed:
     // without `require_own_token` on this path, any signed-in user revokes anyone's
     // token by counting integers. `Owner` because a token is the caller's own
@@ -190,9 +194,10 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    // 21 on main, +3 token routes, +3 staged-batch routes. Both branches wrote 24
-    // from the same base; git took the identical edit and the sum is only visible now.
-    assert_eq!(checked, 27, "the mounted /api surface is 27 operations");
+    // 21 on main, +3 token routes, +3 staged-batch routes, +1 for `revoke-all`. Both
+    // branches wrote 24 from the same base; git took the identical edit and the sum is only
+    // visible now.
+    assert_eq!(checked, 28, "the mounted /api surface is 28 operations");
 }
 
 #[tokio::test]
@@ -331,7 +336,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 27);
+    assert_eq!(PROTECTED_ROUTES.len(), 28);
 }
 
 #[test]

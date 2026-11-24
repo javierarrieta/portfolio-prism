@@ -129,6 +129,9 @@ export interface paths {
   "/api/tokens/<id>": {
     delete: operations["revoke_token"];
   };
+  "/api/tokens/revoke-all": {
+    post: operations["revoke_all_tokens"];
+  };
   "/api/transactions/<id>": {
     delete: operations["delete_transaction"];
   };
@@ -457,6 +460,14 @@ export interface components {
       realized_cumulative: string;
       realized_in_window: string;
       unrealized_at_end: string;
+    };
+    RevokedCount: {
+      /**
+       * Format: int64
+       * @description How many tokens this call moved from live to revoked. A retry reports `0`, which is
+       * the truth rather than a failure.
+       */
+      revoked: number;
     };
     /**
      * @description Which selection a row is. Exhaustive on purpose: both renderers switch on it, and the
@@ -1413,6 +1424,20 @@ export interface operations {
       };
       /** @description No such token, or not yours */
       404: {
+        content: never;
+      };
+    };
+  };
+  revoke_all_tokens: {
+    responses: {
+      /** @description Every live token the caller owns is revoked */
+      200: {
+        content: {
+          "application/json": components["schemas"]["RevokedCount"];
+        };
+      };
+      /** @description Not authenticated */
+      401: {
         content: never;
       };
     };

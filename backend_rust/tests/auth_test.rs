@@ -286,10 +286,10 @@ async fn every_api_route_is_unauthenticated_without_a_session() {
     }
     assert_eq!(
         // 21 on main, 24 with the token routes, 24 with the staged-batch routes, 27
-        // with both. The sweep enumerates the mounted surface, so this number moving is
-        // the only signal that a route was added without anyone deciding how it
-        // authenticates.
-        checked, 27,
+        // with both, 28 since `POST /api/tokens/revoke-all`. The sweep enumerates the
+        // mounted surface, so this number moving is the only signal that a route was
+        // added without anyone deciding how it authenticates.
+        checked, 28,
         "the sweep must cover the whole mounted surface"
     );
 }
@@ -344,7 +344,8 @@ async fn every_api_route_reaches_a_handler_with_a_session() {
         checked += 1;
     }
     assert_eq!(
-        checked, 26,
+        // 28 mounted routes less the one network route the sweep must not reach.
+        checked, 27,
         "the sweep covers the mounted surface bar the network route"
     );
 }

@@ -171,6 +171,36 @@ pub async fn list_tokens(
     ))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RevokedCount {
+    /// How many tokens this call moved from live to revoked. A retry reports `0`, which is
+    /// the truth rather than a failure.
+    pub revoked: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/tokens/revoke-all",
+    responses(
+        (status = 200, description = "Every live token the caller owns is revoked", body = RevokedCount)
+    )
+)]
+// access-gate: global-config (no caller-supplied id)
+#[post("/tokens/revoke-all")]
+pub async fn revoke_all_tokens(
+    user: AuthedUser,
+    pool: &State<DbPool>,
+) -> Result<Json<RevokedCount>, Status> {
+    // The incident-response lever. `logout-all` kills sessions and, by design, spares
+    // tokens; before this there was no way to stop a leaked token except one DELETE at a
+    // time from a UI that cannot see the secrets. Scoped to `user.id` by the statement
+    // itself, so there is no id to authorise and nothing to check first.
+    let revoked = pat::revoke_all(pool.inner(), user.id)
+        .await
+        .map_err(Status::from)?;
+    Ok(Json(RevokedCount { revoked }))
+}
+
 #[utoipa::path(
     delete,
     path = "/api/tokens/<id>",

@@ -18,7 +18,9 @@ use rocket::local::asynchronous::Client;
 use serde_json::{json, Value};
 
 mod common;
-use common::{build_rocket, db_with_user};
+use common::{
+    build_rocket, build_rocket_oidc, build_rocket_with_agent_config, db_with_user,
+};
 
 async fn client(caller: &str) -> (sqlx::PgPool, i64, Client) {
     let (pool, user) = db_with_user(caller).await;
@@ -116,16 +118,94 @@ async fn mcp_refuses_a_request_with_no_credential() {
 
 #[tokio::test]
 async fn mcp_refuses_a_session_cookie() {
-    // THE test for this module. A session cookie is a human's whole authority and passes
-    // every scope, so if `/mcp` ever honoured one, the scope model would be decorative.
-    // `build_rocket` runs in `AuthMode::Disabled`, which is exactly a session-shaped
-    // credential with no bearer token attached.
-    let (_pool, _user, client) = client("mcp_cookie").await;
+    // THE test for this module, and it only counts if it runs in the mode where a session
+    // cookie is a credential at all.
+    //
+    // `build_rocket` runs in `AuthMode::Disabled`, and `resolve_caller` reads the cookie in
+    // the `AuthMode::Oidc` arm only (`auth/guard.rs`) — so a request built there cannot
+    // carry a session-shaped credential, and a regression that made `/mcp` honour
+    // `pp_session` in production would leave a disabled-mode test green. This one ignites
+    // the OIDC builder, attaches a **real, decryptable** `pp_session` for a user that
+    // exists, and sends no bearer. If the route ever fell back to the session, this is the
+    // assertion that fires.
+    let (pool, user) = db_with_user("mcp_cookie").await;
+    let client = Client::tracked(build_rocket_oidc(pool))
+        .await
+        .expect("valid rocket");
+
+    let res = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .header(Header::new("Accept", "application/json, text/event-stream"))
+        .private_cookie(common::session_cookie(user, 0))
+        .body(initialize(1).to_string())
+        .dispatch()
+        .await;
+
+    assert_eq!(
+        res.status(),
+        Status::Unauthorized,
+        "a live session cookie must not authenticate /mcp; the scope model depends on it"
+    );
+}
+
+#[tokio::test]
+async fn mcp_refuses_a_request_with_no_credential_in_disabled_mode() {
+    // Kept separate from the OIDC case rather than merged into it: in `AuthMode::Disabled`
+    // every `/api` route answers as the named user with no credential at all, so this
+    // proves `/mcp` does not inherit that shortcut. It is a weaker claim than the one above
+    // and it used to stand in for it.
+    let (_pool, _user, client) = client("mcp_no_cred_disabled").await;
     let (status, _) = rpc(&client, initialize(1), None).await;
     assert_eq!(
         status,
         Status::Unauthorized,
         "a session must not authenticate /mcp; the route is outside AuthFairing's prefix"
+    );
+}
+
+#[tokio::test]
+async fn agent_mcp_mount_off_removes_the_route_entirely() {
+    // `AGENT_MCP_MOUNT` is the operator's kill switch, and a documented lever that is not
+    // wired is worse than none: an operator who sets it and still sees `/mcp` answering has
+    // no way to learn that nothing happened. So the assertion is 404, not 403 — the surface
+    // is gone, not disabled.
+    let (pool, _user) = db_with_user("mcp_unmounted").await;
+    let cfg = backend_rust::agent::AgentConfig {
+        mcp_mount: false,
+        ..Default::default()
+    };
+    let client = Client::tracked(build_rocket_with_agent_config(pool.clone(), 1, cfg))
+        .await
+        .expect("valid rocket");
+
+    let res = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .body(initialize(1).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        res.status(),
+        Status::NotFound,
+        "AGENT_MCP_MOUNT off must unmount, not merely refuse"
+    );
+
+    // And on, the default, it is there. Without this half the test above could be passed by
+    // a route that never mounts at all.
+    let on = Client::tracked(build_rocket(pool.clone(), 1))
+        .await
+        .expect("valid rocket");
+    let res = on
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .body(initialize(1).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        res.status(),
+        Status::NotFound,
+        "the default must mount /mcp, or the surface is dark unless an operator knows to opt in"
     );
 }
 
@@ -581,9 +661,17 @@ async fn read_tools_answer_not_found_for_someone_elses_rows() {
     ] {
         let (_, resp) = rpc(&client, call(2, tool, args), Some(&secret)).await;
         let code = payload(&resp)["error"].clone();
-        assert!(
-            matches!(code, Value::String(_)),
-            "{tool} must refuse a stranger's id, got {resp}"
+        // The exact code, not "some string". `matches!(code, Value::String(_))` passed for
+        // any refusal at all, so deleting `require_transaction` from `get_transaction_pnl`
+        // — which would make the tool answer `pricing` or `database` about a stranger's id
+        // — left this test green. The code IS the claim.
+        let expected = match tool {
+            "get_transaction_pnl" => "transaction_not_found",
+            _ => "portfolio_not_found",
+        };
+        assert_eq!(
+            code, json!(expected),
+            "{tool} must answer {expected} for a stranger's id, got {resp}"
         );
     }
 

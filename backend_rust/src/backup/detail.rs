@@ -193,8 +193,9 @@ fn portfolio_detail(p: &BundlePortfolio, today: NaiveDate) -> PlanPortfolio {
     }
 
     // Push order is contractual, not incidental: `flags` is a `Vec<String>` and the
-    // round-trip test compares vectors, not sets, so `owned_detail` pushes in this same
-    // order (`no_assets` first, then `duplicate_symbol`).
+    // round-trip test compares vectors, not sets, so both sides push `no_assets` first.
+    // (This used to read "`no_assets` first, then `duplicate_symbol`"; the second half is
+    // gone from the database side — see the note in `owned_detail`.)
     let mut flags = Vec::new();
     if p.assets.is_empty() {
         flags.push(flag::NO_ASSETS.to_string());
@@ -204,17 +205,31 @@ fn portfolio_detail(p: &BundlePortfolio, today: NaiveDate) -> PlanPortfolio {
     // of one symbol set the flag once. Nothing here counts how many symbols are
     // duplicated, and the flag is not a count.
     //
-    // This is now the only producer. The database side used to compute the same flag from a
-    // `GROUP BY symbol` over `assets`; migration `0006_asset_symbol_unique.sql` made that
-    // unreachable and it was deleted — see the note in `owned_detail`. What is left is the
-    // case that stays reachable for as long as bundles are caller-supplied: a preview is
-    // built from JSON before anything is inserted, and the index only gets a vote when the
-    // insert runs. So the flag is what tells a human, in the preview, why their bundle is
-    // about to be refused by `validate`.
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Read this before trusting it, because the honest version is narrower than the useful
+    // one. The database side of this flag was deleted when migration `0006` made it
+    // unreachable. What is left is **not reachable through the preview route either**:
+    // `api_routes::backup::preview` runs `parse_and_validate` before it builds a plan, and
+    // `validate` refuses a case-insensitive duplicate symbol per portfolio — so a bundle
+    // that would set this flag is refused with a 422 before any plan exists, and no client
+    // ever sees it. It is reachable only for a caller that plans without validating, which
+    // today means the unit tests.
+    //
+    // So this is a tripwire, not a message to a human: if it ever fires in a real request,
+    // the ordering in `preview` changed and the guarantee that nothing unvalidatable is
+    // planned has gone. It is kept rather than deleted because the code is published in the
+    // preview flag vocabulary and rendered by `BackupPlanDetail.tsx`, so removing it is a
+    // schema decision, not a cleanup — and because the comparison below is now the same
+    // rule `validate` enforces (upper-cased, matching the `upper(symbol)` index), which
+    // makes it a correct tripwire even though it was not one before.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dupes: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for a in &p.assets {
-        if !seen.insert(a.symbol.as_str()) {
+        // Upper-cased on purpose, and it used to be a bug that it was not: `validate`'s rule
+        // is `to_uppercase()` because the index is `upper(symbol)`, so a bundle carrying
+        // `MSFT` beside `msft` was refused by the validator and would not have been flagged
+        // here. A tripwire that misses the case the rule it pre-announces catches is worse
+        // than no tripwire.
+        if !seen.insert(a.symbol.to_uppercase()) {
             dupes.insert(a.symbol.as_str());
         }
     }
@@ -423,10 +438,12 @@ pub async fn owned_detail(
         // cannot fire is not a safety net — it is a reader's false premise, and the round-trip
         // test would keep comparing a flag one producer can emit and the other never can.
         //
-        // The flag itself stays, and stays live, on the bundle side (`detail_from_bundle`):
-        // a bundle is caller-supplied JSON, it is validated after the preview is built, and
-        // nothing about the index constrains it until the insert runs. That is where the
-        // duplicate case is now tested.
+        // The flag itself still exists on the bundle side (`detail_from_bundle`), but do
+        // not read that as a live path: the preview route validates before it plans, and
+        // `validate` refuses a duplicated symbol, so the bundle side is a tripwire too —
+        // see the note there. Neither producer can set this code through an HTTP preview
+        // today, which is the fact the round-trip test below now pins by asserting absence
+        // on both sides.
         let mut flags_vec = Vec::new();
         if p.assets == 0 {
             flags_vec.push(flag::NO_ASSETS.to_string());

@@ -90,6 +90,115 @@ identity reappears on first login. That is the entire data path this cutover nee
 does not make them unnecessary for a deployment that has data. Those steps are still unrehearsed
 against a populated file.
 
+## Migrations: what is actually true about them
+
+Written 2026-11-24 during the review of PR #77, because three claims about these migrations
+were wrong in three different directions and two of them were in migration files that cannot
+now be edited.
+
+### Every migration here is atomic — including `0005`
+
+`0005_split_index_case_insensitive.sql` carries a comment saying its `DROP INDEX` / `CREATE
+INDEX` pair "is not atomic" and that this is tolerable only while the deployment is one
+replica with `Recreate`. **That is false, and the correction lives here rather than in the
+migration because the migration is checksum-locked** (see below).
+
+sqlx wraps each migration in a transaction unless the file's first line is `-- no-transaction`
+(`sqlx-core::migrate::source::MigrationSource::resolve_blocking`), and `sqlx::migrate!` uses
+that same resolver. No migration in `migrations/` carries the marker. Measured on a scratch
+database: with `uq_assets_portfolio_symbol` dropped inside an open transaction that then
+slept, a concurrent `INSERT` of the colliding symbol was still blocked after 4005 ms and
+proceeded only when the drop committed. `DROP INDEX` takes `ACCESS EXCLUSIVE` on the table,
+so there is no window at one replica or at ten.
+
+What is true instead: the rebuild holds that lock for the duration of the `CREATE UNIQUE
+INDEX`, so on a large table it blocks writes for that long. That is the constraint worth
+knowing, and it is a sizing question, not a correctness one.
+
+### Do not edit an applied migration
+
+sqlx stores a checksum per applied migration in `_sqlx_migrations` and refuses to start when
+a file no longer matches. The live database applied `0001`–`0006` on 2026-11-15, so **every
+file in `migrations/` is frozen** — fixing a comment in `0005` is not a docs change, it is an
+outage at boot. Corrections go in this runbook. That also rules out the tidy-up the review
+suggested (folding `0005`'s steps into `0002` to make the rebuild one statement): correct in
+theory, impossible in place.
+
+### Pre-flight audits, and where to run them
+
+`0002`–`0006` all have shapes that refuse to apply to data that violates them, and
+`sqlx::migrate!` runs at startup — so a migration that cannot apply is a pod that does not
+boot, discovered after the rollout. Two scripts exist to catch that before the apply:
+
+| Script | Guards | Exit codes |
+| --- | --- | --- |
+| `backend_rust/scripts/audit_transaction_types.sh` | `0002`'s `CHECK` on `transactions.type` | `0` clean, `1` rows would be refused, `2` cannot tell |
+| `backend_rust/scripts/audit_asset_symbols.sh` | `0006`'s `uq_assets_portfolio_symbol` | `0` clean, `1` duplicates found, `2` cannot tell |
+
+**Neither can run inside the backend pod.** The runtime image is `debian:bookworm-slim` with
+`ca-certificates` and nothing else — there is no `psql` in it. Run them from a host that can
+reach the database, with the DSN taken from the Secret the deployment already uses:
+
+```sh
+# The URL the application itself is using, not one you assemble by hand.
+kubectl -n <ns> get secret backend-secrets -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+export DATABASE_URL="<that>"
+
+# psql is not installed here either; nix-shell provides it transiently.
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/audit_asset_symbols.sh'
+nix-shell -p postgresql_18 --run 'bash backend_rust/scripts/audit_transaction_types.sh'
+```
+
+If the database is only reachable from inside the cluster, port-forward first
+(`kubectl port-forward svc/<cnpg-service> 5432:5432`) and point `DATABASE_URL` at the
+forwarded port. Both scripts exit `2` when they cannot answer — treat that as "unknown", not
+as "clean".
+
+### Rolling back past `0006` is not a clean operation
+
+`0006_asset_symbol_unique.sql` deliberately does **not** rewrite `assets.symbol`, because
+`historical_prices` is keyed by the symbol string and a rewrite would silently detach price
+history. The write path changed to match: `main` looked an asset up case-sensitively
+(`api_routes/transactions.rs`, `AND symbol = $2`) and the branch looks it up with
+`upper(symbol) = $2` (`services/assets.rs`).
+
+So after `0006` has been applied, rolling the **image** back to a pre-`0006` build while
+keeping the database is unsafe: a row stored as `auditdup` is invisible to the old binary's
+case-sensitive lookup, so the old code tries to insert a duplicate and dies on the raw index
+violation (a 500) where it used to write a silent duplicate. `audit_asset_symbols.sh`'s
+"rows in a spelling the write path never produces" count is exactly the set at risk.
+
+Rolling back means one of:
+
+1. **Roll the image and the database together** — restore the pre-`0006` dump. This is the
+   only fully clean option, and it loses writes since the dump.
+2. **Roll the image only, and accept the constraint violations** — safe only if the audit
+   script reports zero mixed-case collisions, because then there is no row the old lookup
+   cannot see.
+
+There is no in-place downgrade migration, and writing one would mean rewriting `symbol`, which
+is the thing `0006` refused to do on purpose.
+
+### The frontend-before-backend order, and how to actually get it
+
+The staged-batches work needs the frontend image to roll before the backend image (the new
+panels call routes an old backend does not have; the reverse order only degrades two panels
+into an error message). The committed procedure did not achieve that: images publish only
+from `release.yml` on a `v*` tag, one release run pushes `:latest` for **both** at the same
+moment, and `k8s/app-deployment.yaml` pins the frontend to `:latest` while pinning the
+backend to a digest.
+
+The order is therefore something an operator does, not something the pipeline does:
+
+1. Tag and release, which publishes both images.
+2. Update the deployment's **frontend** tag first and apply. The backend is digest-pinned, so
+   it does not move.
+3. Confirm the new panels load against the old backend and degrade cleanly.
+4. Update the backend digest and apply.
+
+If you would rather the pipeline do it, the change is to pin the frontend to a digest too —
+at which point nothing rolls by itself and step 2 above is the whole procedure either way.
+
 ## What you need
 
 - **The SQLite file the running app uses.** In production that is the file mounted at

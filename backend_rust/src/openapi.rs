@@ -37,6 +37,7 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::tokens::create_token,
         crate::api_routes::tokens::list_tokens,
         crate::api_routes::tokens::revoke_token,
+        crate::api_routes::tokens::revoke_all_tokens,
     ),
     components(schemas(
         models::Portfolio,
@@ -82,6 +83,7 @@ use utoipa::openapi::{Components, RefOr, Response};
         crate::api_routes::tokens::TokenCreate,
         crate::api_routes::tokens::TokenMinted,
         crate::api_routes::tokens::TokenOut,
+        crate::api_routes::tokens::RevokedCount,
     ))
 )]
 pub struct ApiDoc;

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, user_id, label, scopes, expires_at, last_used_at, revoked_at, created_at\n         FROM api_token\n         WHERE secret_hash = $1",
+  "query": "SELECT id, user_id, label, scopes, expires_at, last_used_at, revoked_at, created_at\n         FROM api_token\n         WHERE secret_hash = $1\n           AND (expires_at IS NULL OR expires_at > now())",
   "describe": {
     "columns": [
       {
@@ -60,5 +60,5 @@
       false
     ]
   },
-  "hash": "e8d607f82e1cdb47f2ccbf1c2557909a7a6107e488900e8ceb6e0a96672e0728"
+  "hash": "3589f50891555e8c544c19bca0e1dccfb5529cf6732915f96db249993f4fac49"
 }

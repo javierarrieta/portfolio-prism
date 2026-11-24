@@ -19,7 +19,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use crate::agent::protocol::{Proposal, Target};
+use crate::agent::protocol::{Proposal, ProposalAsset, Target};
 use crate::api_routes::lookup::is_valid_isin;
 use crate::db_types::{is_canonical_decimal, MAX_DECIMAL_SCALE};
 use crate::models::TxType;
@@ -440,6 +440,48 @@ pub fn validate(proposal: &Proposal) -> Result<(), ValidationError> {
 /// [`PREVIEW_ASSETS_SHOWN`] assets are listed and the rest are counted, because a 500-row
 /// batch rendered in full would blow the 16 KB budget the client enforces by deleting the
 /// middle of the payload — which is the part a human would have needed to read.
+/// The smallest and largest of a set of already-validated decimal strings, as strings.
+///
+/// `render_preview` used to show a count and nothing else, which meant a human approving a
+/// batch was approving "IWDA: 500 transactions" without ever seeing a number with money in
+/// it. Ranges rather than a sum: a sum invites the eye to accept an outlier, and the thing
+/// worth seeing in a statement you did not write is the extremes — the 9,999,999 share
+/// quantity and the 0.0001 price stand out in a range and vanish in a total.
+///
+/// Returns `None` when there is nothing to compare or nothing parses. Unparseable is skipped
+/// rather than panicked on: `validate` has already refused those rows, and a preview helper
+/// must not be the place that decides what happens if that ever stops being true.
+fn decimal_range<'a>(values: impl Iterator<Item = &'a str>) -> Option<(String, String)> {
+    let mut min: Option<rust_decimal::Decimal> = None;
+    let mut max: Option<rust_decimal::Decimal> = None;
+    for v in values {
+        let Ok(d) = rust_decimal::Decimal::from_str_exact(v) else {
+            continue;
+        };
+        min = Some(min.map_or(d, |m| m.min(d)));
+        max = Some(max.map_or(d, |m| m.max(d)));
+    }
+    Some((min?.to_string(), max?.to_string()))
+}
+
+/// The money shape of one asset's rows, for the preview.
+fn asset_money_range(asset: &ProposalAsset) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if let Some((min, max)) = decimal_range(asset.transactions.iter().map(|t| t.quantity.as_str()))
+    {
+        out.insert("quantity_min".into(), json!(min));
+        out.insert("quantity_max".into(), json!(max));
+    }
+    if let Some((min, max)) = decimal_range(asset.transactions.iter().map(|t| t.price.as_str())) {
+        out.insert("price_min".into(), json!(min));
+        out.insert("price_max".into(), json!(max));
+    }
+    if let Some((_, max)) = decimal_range(asset.transactions.iter().map(|t| t.fee.as_str())) {
+        out.insert("fee_max".into(), json!(max));
+    }
+    out
+}
+
 pub fn render_preview(proposal: &Proposal) -> Value {
     let total_tx: usize = proposal.assets.iter().map(|a| a.transactions.len()).sum();
 
@@ -459,6 +501,12 @@ pub fn render_preview(proposal: &Proposal) -> Value {
                 // and that is wrong for a EUR statement.
                 "currency_assumed": a.currency.is_none(),
                 "transactions": a.transactions.len(),
+                // The money, as ranges. A count is not an approval: without these four
+                // fields the human sees how many rows land and never sees a price.
+                // Deliberately not a plausibility check — `validate` documents that a zero
+                // price is legitimate (a free allotment, a transfer at nil cost), so the
+                // preview's job is to show the extremes and let the reader judge them.
+                "money": Value::Object(asset_money_range(a)),
                 "first_date": a.transactions.first().map(|t| t.date.clone()),
                 "last_date": a.transactions.last().map(|t| t.date.clone()),
             })
@@ -495,10 +543,27 @@ pub fn render_preview(proposal: &Proposal) -> Value {
         Target::Existing { portfolio_id } => json!({"kind": "existing", "portfolio_id": portfolio_id}),
     };
 
+    // Across **every** asset, not the shown ones. Past the 25-asset cap the per-asset detail
+    // is genuinely missing — the warning above says so — but the extremes are not, so the
+    // worst row in a 60-asset batch is still in front of the person approving it.
+    let all = proposal.assets.iter().flat_map(|a| a.transactions.iter());
+    let mut money = serde_json::Map::new();
+    if let Some((min, max)) = decimal_range(all.clone().map(|t| t.quantity.as_str())) {
+        money.insert("quantity_min".into(), json!(min));
+        money.insert("quantity_max".into(), json!(max));
+    }
+    if let Some((min, max)) = decimal_range(all.clone().map(|t| t.price.as_str())) {
+        money.insert("price_min".into(), json!(min));
+        money.insert("price_max".into(), json!(max));
+    }
+    if let Some((_, max)) = decimal_range(all.map(|t| t.fee.as_str())) {
+        money.insert("fee_max".into(), json!(max));
+    }
+
     json!({
         "target": target,
         "assets": shown,
-        "totals": {"assets": proposal.assets.len(), "transactions": total_tx},
+        "totals": {"assets": proposal.assets.len(), "transactions": total_tx, "money": Value::Object(money)},
         "warnings": warnings,
     })
 }
@@ -998,6 +1063,24 @@ pub async fn apply(pool: &PgPool, user_id: i64, handle: &str) -> Result<Applied,
         _ => return Err(ApplyError::NotApproved),
     }
 
+    // Serialise applies **for this user**, not just for this batch.
+    //
+    // The `FOR UPDATE` above locks one row of `agent_staged_batch`, and two batches are two
+    // rows: it stops the same batch being applied twice and it stops nothing else. The
+    // portfolio cap below counts `portfolios WHERE owner_id = $1`, and a plain count takes
+    // no lock, so two approved `Target::New` batches — up to five may be pending — both
+    // counted nine and both created a tenth. The comment here used to claim the flip made
+    // that impossible; it did not, and the claim was the reason nobody checked.
+    //
+    // Same lock `stage` takes, same key, and it is an xact lock, so it is released by the
+    // commit or the rollback with no cleanup path to get wrong. Order is advisory-then-row
+    // here and advisory-only in `stage`, so there is no cycle to deadlock on.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| { eprintln!("ERROR: staged apply: {e}"); ApplyError::Database })?;
+
     if expires_at <= Utc::now() {
         return Err(ApplyError::Expired);
     }
@@ -1154,9 +1237,9 @@ async fn resolve_portfolio(
             // The authoritative copy of the check. `stage` refuses early so a human is never
             // asked to approve a batch that cannot land, but the count can move between
             // staging and apply, and this is the statement that creates the row — so this is
-            // the one that decides. It runs on the open transaction, after the batch has been
-            // claimed by the flip, so two concurrent applies cannot both count nine and both
-            // create a tenth.
+            // the one that decides. It runs on the open transaction, inside the user-level
+            // advisory lock taken above, so two concurrent applies cannot both count nine
+            // and both create a tenth.
             let (portfolios,): (i64,) = sqlx::query_as(
                 "SELECT count(*) FROM portfolios WHERE owner_id = $1",
             )

@@ -202,6 +202,13 @@ function resolveSeparators(value: string): string | null {
     }
   }
 
+  // The caps are checked on the normalised form, after separators are gone, so
+  // `1.234.567,89` (a European thousands grouping) is measured as 7 digits and not as 9.
+  // Without this line a 16-decimal-place cell passes the browser, is refused by
+  // `strict_decimal_json`, and costs the user a failed import row for a number that looked
+  // fine in the preview — the exact failure this function's doc comment names.
+  if (!withinDecimalCaps(out)) return null;
+
   return negative ? `-${out}` : out;
 }
 
@@ -215,6 +222,35 @@ function resolveSeparators(value: string): string | null {
  * decimal string.
  */
 const DECIMAL_ONLY = /^-?\d+(\.\d+)?$/;
+
+/**
+ * Fractional digits the API accepts. Mirrors `MAX_DECIMAL_SCALE` in
+ * `backend_rust/src/db_types.rs`; the two are pinned to the same number by
+ * `csvValidator.test.ts` because a cell that clears this file and is refused by the
+ * backend is exactly the round trip this function exists to prevent.
+ */
+export const MAX_DECIMAL_SCALE = 12;
+
+/**
+ * Total digits — integer plus fraction together — the API accepts. Mirrors
+ * `MAX_DECIMAL_PRECISION`, which the backend applies as a **total**, not as an integer-part
+ * bound. `rust_decimal` holds 28 significant digits and no more is representable, so a
+ * longer value is not merely refused, it cannot round-trip.
+ */
+export const MAX_DECIMAL_DIGITS = 28;
+
+/**
+ * True when `value` (already normalised, no sign, no separators) is inside both caps.
+ * Same rule as `is_canonical_decimal`, same order of checks.
+ */
+export function withinDecimalCaps(value: string): boolean {
+  const dot = value.indexOf('.');
+  const intDigits = dot === -1 ? value : value.slice(0, dot);
+  const fracDigits = dot === -1 ? '' : value.slice(dot + 1);
+  if (fracDigits.length > MAX_DECIMAL_SCALE) return false;
+  if (intDigits.length + fracDigits.length > MAX_DECIMAL_DIGITS) return false;
+  return true;
+}
 
 /**
  * Parse one CSV cell into the exact decimal string that will be sent to the API,

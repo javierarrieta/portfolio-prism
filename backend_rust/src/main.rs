@@ -106,7 +106,12 @@ async fn main() -> Result<(), rocket::Error> {
         eprintln!("WARN: BACKUP_ALLOW_PRICE_RESTORE={raw:?} is not recognised; price restore stays off (1/true/yes to enable, 0/false/no to disable)");
     }
 
-    build_rocket(pool, currency_service, cors, auth, backup_cfg)
+    let agent_cfg = backend_rust::agent::AgentConfig::from_env();
+    if !agent_cfg.mcp_mount {
+        eprintln!("WARN: AGENT_MCP_MOUNT is off; the /mcp agent surface will not be mounted");
+    }
+
+    build_rocket(pool, currency_service, cors, auth, backup_cfg, agent_cfg)
         .launch()
         .await?;
     Ok(())
