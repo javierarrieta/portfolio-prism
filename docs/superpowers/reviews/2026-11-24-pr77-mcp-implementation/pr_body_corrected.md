@@ -7,9 +7,9 @@ wrong — and the review treats a false claim as a finding. Each is corrected be
 section where it appears. The corrections are marked `CORRECTED:` so the diff against the
 old body is auditable; delete the markers when pasting.
 
-Counts are for head `34482ba` on `fix/pr77-review-findings` (the review-fix commit on top of
-`df258e4`). If the fix commit is not merged into this branch, subtract one commit and use
-23 / 81 / +11225 / −318.
+Counts are for head `0fa2a4d` on `feat/staged-batches` — i.e. `df258e4` plus the squashed
+review-fix commit (`fix/pr77-review-findings`, merged as PR #78). Verified against the API:
+24 commits, 90 files, +12481 / −335.
 
 ---
 
@@ -22,8 +22,8 @@ exposing eleven tools.
 **Read it in the order below; that is the order the code depends on.**
 
 The last four commits are a review round on the agent surface, one schema change it
-uncovered, a second review round on that, and `fix(agent): close the PR #77 review findings
-that were code`. They are
+uncovered, a second review round on that, and the squashed review-fix commit (`fix(agent):
+close the PR #77 review findings that were code`). They are
 [their own section](#review-round--the-findings-on-top-of-the-reviewed-head).
 
 > **CORRECTED (was: "21 commits, 79 files, +10718/−312").** The body described a tree two
@@ -280,7 +280,7 @@ flag now.
 Body cap wired, an approval that could never apply, and the manual transaction form
 canonicalizing money the way the importer does.
 
-### `34482ba` — the findings from the adversarial review that were code
+### `34482ba` (squashed into this branch as `0fa2a4d`) — the findings from the adversarial review that were code
 
 `/mcp` reachability and its gate rule, `AGENT_MCP_MOUNT` / `AGENT_BATCH_TTL_MINUTES` becoming
 real configuration, the user-level advisory lock in `apply`, money ranges in the preview,
