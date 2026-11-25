@@ -349,7 +349,7 @@ async fn the_routes_mint_list_and_revoke() {
     let resp = client.delete(format!("/api/tokens/{id}")).dispatch().await;
     assert_eq!(resp.status(), Status::NoContent);
     // And the token really is dead, not merely listed as revoked.
-    assert!(pat::lookup(&client.rocket().state::<DbPool>().unwrap(), &secret)
+    assert!(pat::lookup(client.rocket().state::<DbPool>().unwrap(), &secret)
         .await
         .unwrap()
         .is_none());
@@ -382,3 +382,29 @@ async fn the_mint_route_refuses_what_it_cannot_honour() {
 // `tests/route_coverage_test.rs`, which fails on any mounted `/api` route missing from
 // its inventory — and a `/mcp` mount is deliberately outside `/api` and outside that
 // inventory, which is why its own tests live with it in Workstream 2.
+
+#[tokio::test]
+async fn revoke_all_kills_every_live_token_and_only_the_callers() {
+    // The incident-response claim, stated as the thing an operator actually needs: a token
+    // is out there, and one call must stop it. `logout-all` does not do this — it bumps
+    // `token_version`, which kills sessions and deliberately spares tokens — so before
+    // `revoke_all` the only lever was one DELETE per token, from a UI that cannot see the
+    // secrets, against tokens that by default never expire.
+    let (pool, user) = db_with_user("revoke_all").await;
+    let other = seed_user(&pool, "other-subject").await;
+
+    let mine_a = mint_read(&pool, user, "laptop").await;
+    let mine_b = mint_read(&pool, user, "desktop").await;
+    let theirs = mint_read(&pool, other, "theirs").await;
+
+    let n = pat::revoke_all(&pool, user).await.expect("revoke_all");
+    assert_eq!(n, 2, "two live tokens were the caller's, got {n}");
+
+    assert!(pat::lookup(&pool, &mine_a).await.unwrap().is_none(), "a revoked token must stop working on the next call");
+    assert!(pat::lookup(&pool, &mine_b).await.unwrap().is_none());
+    assert!(pat::lookup(&pool, &theirs).await.unwrap().is_some(), "revoke_all must not reach another user's tokens");
+
+    // Idempotent, and honest about it: a second call revokes nothing and says so, rather
+    // than repeating the first call's number and looking like it had worked again.
+    assert_eq!(pat::revoke_all(&pool, user).await.unwrap(), 0);
+}

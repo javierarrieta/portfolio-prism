@@ -276,6 +276,30 @@ pub async fn revoke(pool: &DbPool, user_id: i64, token_id: i64) -> Result<bool, 
     Ok(row.is_some())
 }
 
+/// Revoke every live token the caller owns. Returns how many were revoked.
+///
+/// This is the incident-response lever the module did not have. `logout-all` bumps
+/// `users.token_version`, which kills sessions and — deliberately, and documented above —
+/// leaves every token standing. That is the right default for an idle device, and the wrong
+/// one for a leak: the only action the app offered for "a token is out there" was to revoke
+/// them one at a time, from a UI that cannot show the secret, against tokens that by default
+/// never expire. Revoking one's own tokens cannot be a privilege escalation and needs no
+/// caller-supplied id, so the absence of this endpoint bought nothing.
+pub async fn revoke_all(pool: &DbPool, user_id: i64) -> Result<u64, PatError> {
+    let updated = sqlx::query!(
+        "UPDATE api_token SET revoked_at = now()
+         WHERE user_id = $1 AND revoked_at IS NULL",
+        user_id
+    )
+    .execute(pool)
+    .await?;
+
+    // `rows_affected` is the honest count: the predicate is `revoked_at IS NULL`, so a token
+    // already revoked is not counted twice and a retried call reports zero rather than
+    // repeating the first call's number.
+    Ok(updated.rows_affected())
+}
+
 /// Turn a presented secret into a caller, or `None`.
 ///
 /// Every failure is the same `None` — unknown secret, revoked, expired, user gone —
@@ -297,7 +321,8 @@ pub async fn lookup(pool: &DbPool, secret: &str) -> Result<Option<AuthedUser>, P
         TokenRow,
         "SELECT id, user_id, label, scopes, expires_at, last_used_at, revoked_at, created_at
          FROM api_token
-         WHERE secret_hash = $1",
+         WHERE secret_hash = $1
+           AND (expires_at IS NULL OR expires_at > now())",
         hash
     )
     .fetch_optional(pool)
@@ -310,10 +335,14 @@ pub async fn lookup(pool: &DbPool, secret: &str) -> Result<Option<AuthedUser>, P
     if row.revoked_at.is_some() {
         return Ok(None);
     }
-    // One comparison, the same shape as the session `exp` check in `guard.rs`.
-    if let Some(exp) = row.expires_at && exp <= Utc::now() {
-        return Ok(None);
-    }
+    // Expiry is decided by the database, in the SELECT above, not here.
+    //
+    // This used to be `if exp <= Utc::now()`, which compared a stored instant against the
+    // **application** clock while the list query that renders `Token::expired` compares it
+    // against the database's `now()`. Two clocks answering one question is how a UI shows a
+    // token as live that the server refuses, or the reverse, and the skew is invisible: it
+    // only shows up on whichever host drifted. The doc on `Token::expired` promises "one
+    // clock, one answer"; the predicate above is the line that makes it true.
 
     let scopes = to_scopes(&row.scopes)?;
 

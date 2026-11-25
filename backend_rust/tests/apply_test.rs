@@ -587,7 +587,7 @@ async fn apply_refuses_to_create_a_portfolio_past_the_cap_and_writes_nothing() {
     );
     assert_eq!(
         counts(&pool).await,
-        (staging::MAX_PORTFOLIOS_PER_USER as i64, 0, 0),
+        (staging::MAX_PORTFOLIOS_PER_USER, 0, 0),
         "and the refusal wrote nothing"
     );
 
@@ -598,4 +598,119 @@ async fn apply_refuses_to_create_a_portfolio_past_the_cap_and_writes_nothing() {
         staging::preview_of(&pool, user, &handle).await.unwrap().unwrap().0,
         "approved"
     );
+}
+
+// --- the locking, proven by contention ---------------------------------------------
+//
+// The module's two load-bearing claims are about concurrency: that a batch applies once,
+// and that the portfolio cap cannot be walked past. Both were asserted only by sequential
+// tests, which pass whether or not the locking exists.
+//
+// A `tokio::join!` race was tried first and rejected: on a current-thread runtime the two
+// futures interleave only where they choose to, and the cap race passed with the advisory
+// lock deleted — a test that cannot fail is not a test. These force the contention from
+// the outside instead, by holding the very lock the code is supposed to take. Blocking on
+// an advisory lock or a row lock is not a timing window; it is guaranteed. So each test
+// fails the moment the lock it names is removed.
+
+/// Hold `pg_advisory_lock(user_id)` on a session of our own, run `f`, and report whether it
+/// finished while the lock was held. The connection is returned so the caller can release
+/// it by dropping.
+async fn held_user_lock<R, F: std::future::Future<Output = R>>(
+    pool: &sqlx::PgPool,
+    user: i64,
+    f: F,
+) -> (Result<R, ()>, sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(user)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(400), f)
+        .await
+        .map_err(|_| ());
+    (outcome, conn)
+}
+
+#[tokio::test]
+async fn apply_takes_the_user_lock_so_the_portfolio_cap_cannot_be_walked_past() {
+    // The claim: `apply` serialises against anything else holding the user's advisory lock,
+    // which is what makes the in-transaction portfolio count mean something. Two approved
+    // `Target::New` batches are two rows, so the batch row's `FOR UPDATE` cannot do this
+    // job — and the comment in `apply` used to claim it did.
+    let (pool, user) = db_with_user("apply_user_lock").await;
+    let handle = stage_and_approve(
+        &pool,
+        user,
+        &new_portfolio(vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1.5", "82.34", "0")])]),
+    )
+    .await;
+
+    let (outcome, conn) = held_user_lock(&pool, user, staging::apply(&pool, user, &handle)).await;
+    assert!(
+        outcome.is_err(),
+        "apply ran while another session held the user's advisory lock, so the portfolio \
+         cap it checks inside that lock is not serialised with anything"
+    );
+
+    // Release, and the same apply goes through — so the wait above was the lock and not
+    // some other refusal.
+    drop(conn);
+    staging::apply(&pool, user, &handle)
+        .await
+        .expect("apply proceeds once the user lock is free");
+    assert_eq!(counts(&pool).await.0, 1);
+}
+
+#[tokio::test]
+async fn apply_serialises_on_the_batch_row_for_its_whole_transaction() {
+    // The other half: two callers cannot both read `approved`. Forcing it from outside —
+    // lock the batch row ourselves and show `apply` waits.
+    //
+    // What this pins, precisely: that `apply` cannot proceed at all while another session
+    // holds the batch row. It does **not** distinguish the `FOR UPDATE` at the top from the
+    // flip's `UPDATE` further down — both take the row lock, so removing either still
+    // blocks here, and a test that claimed otherwise would be overclaiming. The property
+    // that matters is the one asserted: no second writer interleaves with an apply.
+    let (pool, user) = db_with_user("apply_row_lock").await;
+    let handle = stage_and_approve(
+        &pool,
+        user,
+        &new_portfolio(vec![asset("IWDA", vec![tx("BUY", "2024-03-01", "1.5", "82.34", "0")])]),
+    )
+    .await;
+    let (id,): (i64,) =
+        sqlx::query_as("SELECT id FROM agent_staged_batch WHERE handle = $1")
+            .bind(&handle)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    // `FOR UPDATE` outside a transaction is a statement that commits itself and releases
+    // the lock immediately, so the transaction has to be opened by hand here.
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT id FROM agent_staged_batch WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        staging::apply(&pool, user, &handle),
+    )
+    .await
+    .map_err(|_| ());
+    assert!(
+        outcome.is_err(),
+        "apply did not wait for the batch row, so two callers can interleave with an apply"
+    );
+
+    drop(conn);
+    staging::apply(&pool, user, &handle)
+        .await
+        .expect("apply proceeds once the row is released");
+    assert_eq!(counts(&pool).await, (1, 1, 1));
 }

@@ -78,6 +78,10 @@ pub struct AgentServer {
     /// Shared with every request, because the pricing cache and the rate limiter live in
     /// it. A second instance would double the request rate against a rate-limited provider.
     pricing: Arc<CurrencyService>,
+    /// How long a batch this call stages stays approvable. Operator-set via
+    /// `AGENT_BATCH_TTL_MINUTES` (`agent::AgentConfig`), not a constant, so the window a
+    /// human has to approve can be matched to how long a human takes.
+    ttl_minutes: i64,
 }
 
 /// A domain refusal, rendered the way every refusal in this module is rendered.
@@ -131,8 +135,18 @@ fn refused_from(code: &str, detail: &str, field: Option<&str>) -> CallToolResult
 
 #[tool_router]
 impl AgentServer {
-    pub fn new(pool: PgPool, user: AuthedUser, pricing: Arc<CurrencyService>) -> Self {
-        Self { pool, user, pricing }
+    pub fn new(
+        pool: PgPool,
+        user: AuthedUser,
+        pricing: Arc<CurrencyService>,
+        ttl_minutes: i64,
+    ) -> Self {
+        Self {
+            pool,
+            user,
+            pricing,
+            ttl_minutes,
+        }
     }
 
     /// The scope gate, expressed once. A tool that forgets to call it is a tool that
@@ -265,7 +279,7 @@ impl AgentServer {
             }
         };
 
-        match staging::stage(&self.pool, self.user.id, &proposal, staging::DEFAULT_TTL_MINUTES)
+        match staging::stage(&self.pool, self.user.id, &proposal, self.ttl_minutes)
             .await
         {
             Ok(s) => Ok(ok(json!({

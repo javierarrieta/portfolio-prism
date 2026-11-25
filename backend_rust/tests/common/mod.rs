@@ -14,6 +14,7 @@
 //! database, so moving them would relocate a single copy, not collapse two.
 #![allow(dead_code)]
 
+use backend_rust::agent::AgentConfig;
 use backend_rust::auth::{AuthMode, OidcConfig, StartupConfig};
 use backend_rust::backup::BackupConfig;
 use backend_rust::db::DbPool;
@@ -113,7 +114,7 @@ fn rocket_with_service(
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
     let mode = AuthMode::Disabled { as_user };
-    lib_build_rocket(pool, currency_service, cors, mode, BackupConfig::default())
+    lib_build_rocket(pool, currency_service, cors, mode, BackupConfig::default(), AgentConfig::default())
 }
 
 /// `build_rocket` with a specific `BackupConfig`. There is no other way to set the
@@ -130,7 +131,29 @@ pub fn build_rocket_with_backup_config(
     let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
     #[cfg(debug_assertions)]
     let mode = AuthMode::Disabled { as_user };
-    lib_build_rocket(pool, offline_pricing_service(), cors, mode, backup_cfg)
+    lib_build_rocket(pool, offline_pricing_service(), cors, mode, backup_cfg, AgentConfig::default())
+}
+
+/// `build_rocket` with a specific `AgentConfig`. Same reason as
+/// `build_rocket_with_backup_config`: the environment is not a test seam, so whether
+/// `/mcp` is mounted has to be settable through the builder.
+#[allow(dead_code)]
+pub fn build_rocket_with_agent_config(
+    pool: DbPool,
+    as_user: i64,
+    agent_cfg: AgentConfig,
+) -> Rocket<Build> {
+    let cors = get_cors_options(vec!["http://localhost:5173".to_string()]);
+    #[cfg(debug_assertions)]
+    let mode = AuthMode::Disabled { as_user };
+    lib_build_rocket(
+        pool,
+        offline_pricing_service(),
+        cors,
+        mode,
+        BackupConfig::default(),
+        agent_cfg,
+    )
 }
 
 /// Build the app in OIDC mode — the mode production runs in, and the only one in
@@ -144,6 +167,7 @@ pub fn build_rocket_oidc(pool: DbPool) -> Rocket<Build> {
         cors,
         AuthMode::Oidc(oidc_cfg()),
         BackupConfig::default(),
+        AgentConfig::default(),
     )
 }
 
@@ -159,6 +183,7 @@ pub fn build_rocket_oidc_with_cors(pool: DbPool, origins: Vec<String>) -> Rocket
         cors,
         AuthMode::Oidc(oidc_cfg()),
         BackupConfig::default(),
+        AgentConfig::default(),
     )
 }
 

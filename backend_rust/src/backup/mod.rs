@@ -492,8 +492,28 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
                         format!("{:?} is not one of {:?}", t.r#type, KNOWN_TRANSACTION_TYPES));
                 }
                 for (field, value) in [("quantity", &t.quantity), ("price", &t.price), ("fee", &t.fee)] {
-                    if rust_decimal::Decimal::from_str_exact(value).is_err() {
-                        push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                    // `from_str_exact` alone was not enough: it accepts any scale, so a
+                    // bundle could carry a 20-digit fraction that `strict_decimal_json`
+                    // refuses on `POST /api/transactions`. Two money write paths with two
+                    // rules is how a value enters the database that the ordinary API can
+                    // never write or rewrite. The grammar stays as it was — `+0` is a price
+                    // a bundle may really carry, and `restore.rs` writes the string verbatim
+                    // — and the **scale** now matches the API's.
+                    let parsed = match rust_decimal::Decimal::from_str_exact(value) {
+                        Err(_) => {
+                            push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                            continue;
+                        }
+                        Ok(d) => d,
+                    };
+                    if parsed.scale() > crate::db_types::MAX_DECIMAL_SCALE as u32 {
+                        push(
+                            format!("{tp}.{field}"),
+                            format!(
+                                "{value:?} carries more than {} fractional digits, which the API's own money rule refuses",
+                                crate::db_types::MAX_DECIMAL_SCALE
+                            ),
+                        );
                     }
                 }
                 // A SPLIT is a ratio, not a trade, and the ordinary write path refuses

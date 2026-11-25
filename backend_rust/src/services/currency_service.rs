@@ -107,9 +107,11 @@ fn f64_to_decimal(v: f64) -> Decimal {
 /// `numerator : denominator` (shares after : shares before). Splits dated before
 /// `earliest_tx_date` are skipped (they would be no-ops since no lots existed).
 /// A split already recorded for the asset on the same calendar day is not
-/// duplicated — enforced by `uq_split_asset_date`, so a concurrent writer cannot
-/// slip a second row in between a check and this insert. Returns the number of
-/// transactions actually inserted, which is zero when every event was already there.
+/// duplicated — enforced by the unique index `uq_split_asset_date`, which is the **only**
+/// dedupe here: there is no read before the insert, deliberately. A `SELECT COUNT(*)`
+/// guard let two concurrent callers both see zero and both write, doubling the adjustment;
+/// migration `0005` documents the hole that closed. Returns the number of transactions
+/// actually inserted, which is zero when every event was already there.
 pub async fn apply_split_events(
     asset_id: i64,
     earliest_tx_date: Option<NaiveDate>,

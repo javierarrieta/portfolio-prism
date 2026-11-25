@@ -1195,6 +1195,29 @@
         }
       }
     },
+    "/api/tokens/revoke-all": {
+      "post": {
+        "tags": [
+          "crate::api_routes::tokens"
+        ],
+        "operationId": "revoke_all_tokens",
+        "responses": {
+          "200": {
+            "description": "Every live token the caller owns is revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedCount"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        }
+      }
+    },
     "/api/transactions/<id>": {
       "delete": {
         "tags": [
@@ -2097,6 +2120,20 @@
           },
           "unrealized_at_end": {
             "type": "string"
+          }
+        }
+      },
+      "RevokedCount": {
+        "type": "object",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many tokens this call moved from live to revoked. A retry reports `0`, which is\nthe truth rather than a failure.",
+            "minimum": 0
           }
         }
       },

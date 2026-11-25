@@ -10,9 +10,18 @@
 //!
 //! `AuthFairing` protects by the `/api/` prefix (`auth/fairing.rs:40`). `/mcp` is outside
 //! that prefix, so it is **unauthenticated by default** — not structurally excluded the way
-//! a second listener would have been, but excluded by one route string in one fairing. If
-//! someone later "tidies" that prefix, or mounts `/mcp` under `/api`, the failure is silent
-//! and total: every tool would run as whoever holds a session cookie.
+//! a second listener would have been, but excluded by one route string in one fairing.
+//!
+//! What that actually costs, stated precisely, because the loose version of this sentence
+//! teaches the wrong lesson: moving `/mcp` under `/api` would **not** hand every tool to a
+//! session cookie. This handler requires a bearer unconditionally — `parts.bearer
+//! .ok_or(Status::Unauthorized)?` is its first statement, and `pat::lookup` on that string is
+//! the only credential it resolves — so an `/api/mcp` mount would answer 401 and every MCP
+//! test
+//! would answer 404, which is how the mistake announced itself when it happened here. The
+//! boundary is the route's own bearer check, not the prefix; the prefix decides who else
+//! gets to *see* the route, and `AuthFairing` running on top of a route that already
+//! authenticates itself is a second, different authentication on the same request.
 //!
 //! So two assertions live here and both are tested:
 //!
@@ -23,7 +32,9 @@
 //! `Credential::Session` passes every scope — so if `/mcp` ever accepted one, the entire
 //! scope model would be decorative. The check is written as "a bearer token is required and
 //! nothing else is examined", not as "reject cookies", so adding a new cookie path elsewhere
-//! cannot quietly become an MCP credential.
+//! cannot quietly become an MCP credential. Note where the second test runs: in
+//! `AuthMode::Oidc`, because `resolve_caller` reads a cookie in that mode only. A cookie
+//! test written against `AuthMode::Disabled` cannot fail for the reason it claims to prove.
 //!
 //! ## Not in the OpenAPI document
 //!
@@ -53,6 +64,8 @@ use rocket::response::Responder;
 use sqlx::PgPool;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use crate::agent::tools::AgentServer;
 use crate::auth::pat;
@@ -73,6 +86,38 @@ use crate::services::currency_service::CurrencyService;
 /// 500 rows of `{"type":…, "date":…, "quantity":…}` is roughly 50 KB, and a batch that the
 /// validator accepts must survive the transport that carries it.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// How many `/mcp` requests may be in flight in this process at once.
+///
+/// There was no bound at all, and the surface shares a process, a runtime and a database
+/// pool with the interactive app. `db.rs` caps the pool at **5** connections; every `/api`
+/// request takes one to resolve its own caller (`guard.rs` documents that it makes two
+/// reads), and `staging::apply` holds one for the whole of a multi-hundred-statement
+/// transaction. Five unbounded agent calls could therefore take the entire pool and turn
+/// the next human click into a 503 from `/_auth/unavailable` — an agent, holding a scoped
+/// token, denying the human who issued it.
+///
+/// Three leaves two connections for `/api`, which is enough for interactive traffic
+/// because those reads are short and sequential. Exhaustion answers 503 rather than
+/// queueing: an agent that is told to back off knows to back off, and an agent whose
+/// request sits in an invisible queue is one whose user is watching a spinner.
+const MAX_CONCURRENT_MCP: usize = 3;
+
+/// The wall-clock bound on one `/mcp` request, tool execution included.
+///
+/// Nothing bounded a request before: `statement_timeout = '30s'` in `db.rs` is **per
+/// statement**, so a transaction of six hundred of them is unbounded by construction, and
+/// a client that stalls mid-body held its task open indefinitely. This is the outer bound.
+///
+/// It is deliberately larger than the per-statement timeout, not smaller: `apply_staged`
+/// legitimately runs hundreds of statements, so a 30 s request deadline would kill valid
+/// work and turn a slow apply into a mystery. A request that needs more than this is not
+/// slow, it is stuck.
+const MAX_REQUEST_SECONDS: u64 = 120;
+
+/// The bound behind [`MAX_CONCURRENT_MCP`]. `const_new` so there is no lazy-init branch and
+/// nothing to poison: a semaphore cannot be poisoned.
+static MCP_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_MCP);
 
 /// The parts of the Rocket request the bridge needs, captured before the body is consumed.
 pub(crate) struct RawParts {
@@ -160,6 +205,7 @@ fn service(
     pool: PgPool,
     user: crate::auth::guard::AuthedUser,
     pricing: Arc<CurrencyService>,
+    ttl_minutes: i64,
 ) -> StreamableHttpService<AgentServer, NeverSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
@@ -171,7 +217,14 @@ fn service(
     // same number so the two caps cannot drift if the route's is ever raised.
     config.max_request_body_bytes = MAX_BODY_BYTES;
     StreamableHttpService::new(
-        move || Ok(AgentServer::new(pool.clone(), user.clone(), pricing.clone())),
+        move || {
+            Ok(AgentServer::new(
+                pool.clone(),
+                user.clone(),
+                pricing.clone(),
+                ttl_minutes,
+            ))
+        },
         Arc::new(NeverSessionManager::default()),
         config,
     )
@@ -184,7 +237,14 @@ pub(crate) async fn mcp(
     body: Data<'_>,
     pool: &rocket::State<PgPool>,
     pricing: &rocket::State<std::sync::Arc<CurrencyService>>,
+    cfg: &rocket::State<crate::agent::AgentConfig>,
 ) -> Result<McpResponse, Status> {
+    // Taken before authentication on purpose: the bound exists to protect the process, and
+    // an unauthenticated flood is exactly the load that needs bounding. The permit is held
+    // for the whole request, including the response body collection below.
+    let _slot = MCP_SLOTS
+        .try_acquire()
+        .map_err(|_| Status::ServiceUnavailable)?;
     let secret = parts.bearer.ok_or(Status::Unauthorized)?;
 
     let user = pat::lookup(pool.inner(), &secret)
@@ -246,9 +306,23 @@ pub(crate) async fn mcp(
         .body(Full::new(Bytes::from(body)))
         .map_err(|_| Status::InternalServerError)?;
 
-    let response = service(pool.inner().clone(), user, pricing.inner().clone())
-        .handle(http_req)
-        .await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(MAX_REQUEST_SECONDS),
+        service(
+            pool.inner().clone(),
+            user,
+            pricing.inner().clone(),
+            cfg.batch_ttl_minutes,
+        )
+        .handle(http_req),
+    )
+    .await
+    .map_err(|_| {
+        // Logged rather than surfaced in detail: the client sees a 504, the operator sees
+        // which bound fired. A tool that hits this is stuck, not slow.
+        eprintln!("WARN: /mcp request exceeded {MAX_REQUEST_SECONDS}s and was abandoned");
+        Status::GatewayTimeout
+    })?;
     let (parts_out, resp_body) = response.into_parts();
     let out = resp_body
         .collect()

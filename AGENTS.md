@@ -132,8 +132,11 @@ From root:
 
 ## Roadmap / Current Focus
 - **`asset_type` is unconstrained at the database.** `assets.asset_type` is `TEXT` with no
-  `CHECK`, and nothing in the engines reads it — which is the only reason that is tolerable.
-  It is constrained at the bundle boundary (`backup/mod.rs:431-434` and
+  `CHECK`. No engine *branches* on it, which is most of why that is tolerable — but not all
+  of it: `tax_engine::calculate_lots` takes it and echoes it into every tax-summary
+  response (`tax_engine.rs:797`, `:873`), so a junk value stored in the column is shown to
+  the user even though nothing computes with it. It is constrained at the bundle boundary
+  (`backup/mod.rs:452-455` and
   `docs/backup-schema/v1.json:6-15`), so a restore cannot introduce junk even today.
   Constraining it needs an inventory of live values first: `SELECT DISTINCT asset_type FROM
   assets` across real databases, because a `CHECK` written from the enum in the bundle schema
