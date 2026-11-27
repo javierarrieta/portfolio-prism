@@ -274,7 +274,7 @@ export default function AccessTokensPanel() {
                     <td style={{ padding: '8px' }}>{t.expires_at ? fmt(t.expires_at) : 'never'}</td>
                     <td style={{ padding: '8px', textAlign: 'right' }}>
                       {!revoked && (
-                        <button type="button" className="btn" onClick={() => void revoke(t)} title="Revoke">
+                        <button type="button" className="btn btn-secondary" onClick={() => void revoke(t)} title="Revoke">
                           <Trash2 size={15} />
                         </button>
                       )}
@@ -317,7 +317,7 @@ export default function AccessTokensPanel() {
               <button type="button" className="btn btn-primary" onClick={() => void copySecret()}>
                 {copied ? <Check size={16} /> : <Copy size={16} />} {copied ? 'Copied' : 'Copy'}
               </button>
-              <button type="button" className="btn" onClick={() => setRevealed(null)}>
+              <button type="button" className="btn btn-secondary" onClick={() => setRevealed(null)}>
                 Done
               </button>
             </div>

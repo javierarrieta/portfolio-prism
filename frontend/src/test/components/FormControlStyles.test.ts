@@ -111,3 +111,52 @@ describe('text-entry controls are styled', () => {
     expect(body).toMatch(/padding/);
   });
 });
+
+describe('buttons carry a variant that paints them', () => {
+  /**
+   * `.btn` sets shape only — padding, radius, cursor. It sets **no background and no
+   * colour**, so a button whose class list is `btn` and nothing else gets the user-agent's
+   * light `buttonface` behind the same inherited near-white text that made the inputs
+   * unreadable. The Access Tokens panel hit this twice — the modal's "Done" and every row's
+   * delete — while the "Copy" beside them was fine, because `btn-primary` does paint.
+   *
+   * So the rule is per class **list**, not per token: `btn` is the base class and is always
+   * present, so flagging its presence would flag every correct button in the app. What has
+   * to be true is that the same list carries a `btn-*` variant, and that the variant names a
+   * rule that exists. Checked against the stylesheet rather than a hardcoded list, so a
+   * typo'd `btn-primery` fails here instead of rendering as an invisible button.
+   */
+  const css = readFileSync(resolve(SRC, 'index.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const defined = new Set([...css.matchAll(/\.([a-z][\w-]*)/g)].map((m) => m[1]));
+
+  const lists = tsxFiles(SRC).flatMap((f) => {
+    const src = readFileSync(f, 'utf8');
+    const out: { where: string; cls: string }[] = [];
+    for (const m of src.matchAll(/className=(?:"([^"]*)"|\{[^}]*?"([^"]+)"[^}]*?\})/g)) {
+      const cls = m[1] ?? m[2] ?? '';
+      if (!/(?:^|\s)btn(?:\s|$)/.test(cls)) continue;
+      out.push({ where: `${f.replace(SRC + '/', '')}:${src.slice(0, m.index).split('\n').length}`, cls });
+    }
+    return out;
+  });
+
+  it('finds the buttons it claims to find', () => {
+    // A scan matching nothing passes for the wrong reason.
+    expect(lists.length).toBeGreaterThan(10);
+  });
+
+  it('every button class list carries a variant that is defined', () => {
+    const bad = lists
+      .filter((l) => {
+        const tokens = l.cls.split(/\s+/);
+        const variant = tokens.find((t) => t.startsWith('btn-'));
+        return !variant || !defined.has(variant);
+      })
+      .map((l) => `${l.where}  className="${l.cls}"`);
+    expect(
+      bad,
+      `A list of just \`btn\` has no background, and an undefined variant has no rule at all —\n` +
+        `either way the inherited near-white text sits on the browser's own light button face.\n\n${bad.join('\n')}`,
+    ).toEqual([]);
+  });
+});
