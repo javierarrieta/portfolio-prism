@@ -64,6 +64,20 @@ data:
   # slash. The dev defaults are `http://localhost:5173,http://127.0.0.1:5173`.
   ALLOWED_ORIGINS: "https://portfolio.example.com"
 
+  # Which `Host` values `/mcp` answers, as that header arrives at the backend. The shipped
+  # nginx forwards the public name (`proxy_set_header Host $host`), and the library default
+  # is loopback only, so leaving this unset makes every MCP call answer
+  # `403 Forbidden: Host header is not allowed` — and it answers that *after* the bearer
+  # token has been accepted, so it reads as a broken token rather than as missing
+  # configuration. There is no way to fix that from the proxy side.
+  #
+  # A bare authority, NOT a URL. This is not `ALLOWED_ORIGINS` directly above it, and
+  # copying that format across is the likeliest mistake (a scheme is stripped with a
+  # warning, but do not write it that way). Comma-separated; a portless entry matches any
+  # port; `*` turns the DNS-rebinding guard off and prints a `WARN` on every start.
+  # Set it to the exact host your ingress serves.
+  MCP_ALLOWED_HOSTS: "portfolio.example.com"
+
   # Deliberately absent:
   #   ROCKET_PROFILE — the release image resolves to the `release` profile on its
   #     own, and Rocket's own secret-key check is what proves ROCKET_SECRET_KEY is

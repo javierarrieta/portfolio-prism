@@ -45,17 +45,63 @@ pub struct AgentConfig {
     /// who is away from the keyboard, and one that lasts longer than a day is not a
     /// pending approval, it is a standing write permission.
     pub batch_ttl_minutes: i64,
+    /// The `Host` authorities `/mcp` will answer, as that header arrives **at this
+    /// process**. Behind the shipped nginx that is the public hostname, not loopback:
+    /// `frontend/nginx.conf` proxies `/mcp` with `proxy_set_header Host $host`, so the
+    /// value to put here is the name the browser types, without a scheme.
+    ///
+    /// **Default: loopback only** — `localhost`, `127.0.0.1`, `::1`. That is rmcp's own
+    /// default and it is a local-development default, and leaving it in place on a real
+    /// deployment is not a silent failure but a misleading one: the guard runs *after* the
+    /// bearer check, so every call answers `403 Forbidden: Host header is not allowed`
+    /// against a token that is perfectly valid. It reads as a broken token, and nothing in
+    /// the response says otherwise. Any deployment reached by a name other than the one
+    /// making the request has to name itself here.
+    ///
+    /// An entry with no port matches any port, so the bare hostname is the right shape for
+    /// a proxy-fronted deployment; an entry with a port matches that port and nothing else.
+    /// Matching is case-insensitive and IPv6 brackets are ignored, both done by rmcp.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// The TTL floor and ceiling, so a typo in a Secret cannot make approvals impossible or
 /// permanent.
 const TTL_RANGE: (i64, i64) = (1, 1440);
 
+/// rmcp's loopback-only default, read from the library rather than restated here, so the
+/// fallback cannot drift from the guard it is falling back to.
+fn default_mcp_allowed_hosts() -> Vec<String> {
+    rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default().allowed_hosts
+}
+
+/// Reduce one `MCP_ALLOWED_HOSTS` entry to a bare authority.
+///
+/// The shape this exists for is the mistake an operator actually makes: `ALLOWED_ORIGINS`
+/// lives beside this variable in the same ConfigMap and is a **URL**
+/// (`https://portfolio.example.com`), while this one wants an **authority**
+/// (`portfolio.example.com`). Copying the format across is a 403 on every MCP call with no
+/// hint that a configuration value is at fault, so the scheme and any path are taken off
+/// here and the correction is printed rather than swallowed.
+fn normalize_host_entry(raw: &str) -> Option<String> {
+    let mut entry = raw.trim();
+    if let Some((_, rest)) = entry.split_once("://") {
+        entry = rest;
+    }
+    // Split on `/` only. Splitting on `:` would take the tail off an IPv6 literal.
+    entry = entry.split('/').next().unwrap_or(entry).trim();
+    if entry.is_empty() {
+        None
+    } else {
+        Some(entry.to_string())
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             mcp_mount: true,
             batch_ttl_minutes: staging::DEFAULT_TTL_MINUTES,
+            mcp_allowed_hosts: default_mcp_allowed_hosts(),
         }
     }
 }
@@ -102,9 +148,49 @@ impl AgentConfig {
                 }
             },
         };
+        let mcp_allowed_hosts = match env("MCP_ALLOWED_HOSTS") {
+            None => defaults.mcp_allowed_hosts.clone(),
+            Some(v) if v.trim() == "*" => {
+                // The only way to say "any Host" is rmcp's empty list, and an empty list
+                // means exactly that: the DNS-rebinding guard is off. Loud, because it is
+                // the one value here that removes a protection rather than configuring it.
+                eprintln!(
+                    "WARN: MCP_ALLOWED_HOSTS=* accepts any Host header; the DNS-rebinding guard on /mcp is disabled"
+                );
+                Vec::new()
+            }
+            Some(v) => {
+                let mut hosts: Vec<String> = Vec::new();
+                for raw in v.split(',') {
+                    let raw = raw.trim();
+                    let Some(host) = normalize_host_entry(raw) else {
+                        continue;
+                    };
+                    if host != raw {
+                        eprintln!(
+                            "WARN: MCP_ALLOWED_HOSTS entry {raw:?} is not a bare authority; matching on {host:?}"
+                        );
+                    }
+                    hosts.push(host);
+                }
+                if hosts.is_empty() {
+                    // Not the same thing as `*`. An empty list in rmcp means *allow every
+                    // host*, so a value that parses to nothing — `""`, `" , , "` — must
+                    // never reach it. That is how a half-filled Secret would open the guard
+                    // instead of leaving it alone.
+                    eprintln!(
+                        "WARN: MCP_ALLOWED_HOSTS={v:?} names no host; using the default (loopback only)"
+                    );
+                    defaults.mcp_allowed_hosts.clone()
+                } else {
+                    hosts
+                }
+            }
+        };
         Self {
             mcp_mount,
             batch_ttl_minutes,
+            mcp_allowed_hosts,
         }
     }
 }
@@ -143,6 +229,75 @@ mod tests {
             let cfg = AgentConfig::from_env_with(&env_with(&[("AGENT_MCP_MOUNT", v)]));
             assert!(!cfg.mcp_mount, "{v:?} must unmount");
         }
+    }
+
+    #[test]
+    fn an_unset_host_allowlist_is_the_library_loopback_default_not_every_host() {
+        // The defect this variable exists for: the default is right for a laptop and wrong
+        // for a deployment, and the failure it produces is a 403 that names the token's
+        // host rather than the missing configuration. So the default is pinned, not left
+        // to whatever the dependency happens to ship.
+        let cfg = AgentConfig::from_env_with(&env_with(&[]));
+        assert_eq!(
+            cfg.mcp_allowed_hosts,
+            default_mcp_allowed_hosts(),
+            "unset must fall back to rmcp's own loopback list"
+        );
+        assert!(
+            !cfg.mcp_allowed_hosts.is_empty(),
+            "an empty allowlist means allow-any-host, and unset must never mean that"
+        );
+    }
+
+    #[test]
+    fn the_host_allowlist_is_a_list_and_empty_entries_are_not_a_wildcard() {
+        let cfg = AgentConfig::from_env_with(&env_with(&[(
+            "MCP_ALLOWED_HOSTS",
+            " portfolio.example.com , , 10.0.0.5:8000 ,",
+        )]));
+        assert_eq!(
+            cfg.mcp_allowed_hosts,
+            vec!["portfolio.example.com".to_string(), "10.0.0.5:8000".to_string()]
+        );
+        // Empty and comma-only are the half-filled-Secret shape. Both must land on the
+        // default, because in rmcp an empty list is the opposite of a no-op.
+        for blank in ["", "   ", ",", " , , "] {
+            let cfg = AgentConfig::from_env_with(&env_with(&[("MCP_ALLOWED_HOSTS", blank)]));
+            assert_eq!(
+                cfg.mcp_allowed_hosts,
+                default_mcp_allowed_hosts(),
+                "{blank:?} must fall back rather than allow every host"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_shaped_host_entry_is_reduced_to_an_authority() {
+        // `ALLOWED_ORIGINS` is a URL and sits next to this in the ConfigMap; copying its
+        // format across is the likeliest misconfiguration and the one that fails silently.
+        for (raw, want) in [
+            ("https://portfolio.example.com", "portfolio.example.com"),
+            ("https://portfolio.example.com/", "portfolio.example.com"),
+            ("http://portfolio.example.com:8443/x", "portfolio.example.com:8443"),
+            ("portfolio.example.com", "portfolio.example.com"),
+        ] {
+            let cfg = AgentConfig::from_env_with(&env_with(&[("MCP_ALLOWED_HOSTS", raw)]));
+            assert_eq!(cfg.mcp_allowed_hosts, vec![want.to_string()], "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_lone_star_disables_the_guard() {
+        let cfg = AgentConfig::from_env_with(&env_with(&[("MCP_ALLOWED_HOSTS", " * ")]));
+        assert!(
+            cfg.mcp_allowed_hosts.is_empty(),
+            "`*` is the documented off switch and an empty list is how rmcp spells it"
+        );
+        // Anything else keeps the guard. A star inside a list is a typo for a hostname, not
+        // a request to open the endpoint, and must not become the empty list.
+        let cfg = AgentConfig::from_env_with(&env_with(&[("MCP_ALLOWED_HOSTS", "*,other")]))
+            ;
+        assert_eq!(cfg.mcp_allowed_hosts, vec!["*".to_string(), "other".to_string()]);
     }
 
     #[test]
