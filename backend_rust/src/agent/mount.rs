@@ -51,6 +51,20 @@
 //! defaults to **true**, and leaving it there routes any client negotiating a pre-
 //! `2026-07-28` protocol version onto the session path, where `NeverSessionManager` answers
 //! 500. The spike found that by being hit by it.
+//!
+//! ## The Host guard runs here too, and it runs after the token check
+//!
+//! `StreamableHttpService::handle` validates the `Host` header before it looks at the body,
+//! against [`StreamableHttpServerConfig::allowed_hosts`] — whose default is loopback only,
+//! because the library assumes a server on the machine that is calling it. This deployment
+//! is not that: nginx forwards the public hostname (`proxy_set_header Host $host`), so the
+//! untouched default answers **403 `Forbidden: Host header is not allowed`** to every call,
+//! and it does so *after* `pat::lookup` has already accepted the bearer. The operator sees a
+//! valid token refused, and the response names the Host rather than the missing setting.
+//!
+//! So the list is set from `AgentConfig::mcp_allowed_hosts` in [`service`] and nowhere else.
+//! It is configuration and not a constant for the same reason `AGENT_MCP_MOUNT` is: a lever
+//! that needs an image rebuild is a lever nobody pulls.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -161,9 +175,11 @@ impl<'r> FromRequest<'r> for RawParts {
             .map(|(_, v)| v.clone())
             // Rocket's `Request` carries the origin-form URI only, so there is no host to
             // read here; a local client sends no `Host` header at all. The fallback is a
-            // literal, and that is fine: rmcp requires *a* Host to build its `http::Request`
-            // and nothing in this application branches on its value. Anyone who later makes
-            // a routing decision on it must revisit this line.
+            // literal, and it is now load-bearing in a second way: rmcp matches this string
+            // against `allowed_hosts`, and `localhost` is on that list only because the
+            // default is loopback. A test that sets its own allowlist and sends no Host
+            // header is therefore testing the fallback, not the host it means to test —
+            // `tests/mcp_host_test.rs` sends the header explicitly for that reason.
             .unwrap_or_else(|| "localhost".to_string());
 
         Outcome::Success(RawParts {
@@ -206,6 +222,7 @@ fn service(
     user: crate::auth::guard::AuthedUser,
     pricing: Arc<CurrencyService>,
     ttl_minutes: i64,
+    allowed_hosts: Vec<String>,
 ) -> StreamableHttpService<AgentServer, NeverSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
@@ -216,6 +233,13 @@ fn service(
     // rmcp sees a byte (see `MAX_BODY_BYTES`), so this arm never fires — it stays set to the
     // same number so the two caps cannot drift if the route's is ever raised.
     config.max_request_body_bytes = MAX_BODY_BYTES;
+    // The library default is loopback only, which is a development default and refuses the
+    // real hostname on any deployment. See the module comment: this check runs after the
+    // bearer check, so leaving it defaulted looks like a broken token, not like missing
+    // configuration. The value is `AgentConfig::mcp_allowed_hosts`, whose own default is
+    // this same library list — so an unset variable changes nothing here, and the empty
+    // list that disables the guard can only arrive through the explicit `*`.
+    config.allowed_hosts = allowed_hosts;
     StreamableHttpService::new(
         move || {
             Ok(AgentServer::new(
@@ -313,6 +337,7 @@ pub(crate) async fn mcp(
             user,
             pricing.inner().clone(),
             cfg.batch_ttl_minutes,
+            cfg.mcp_allowed_hosts.clone(),
         )
         .handle(http_req),
     )
