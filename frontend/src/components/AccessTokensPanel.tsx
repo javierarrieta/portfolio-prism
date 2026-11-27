@@ -177,10 +177,11 @@ export default function AccessTokensPanel() {
           <label style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Name</span>
             <input
+              className="form-control"
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="e.g. laptop agent"
-              style={{ padding: '8px 10px', minWidth: '220px' }}
+              style={{ minWidth: '220px' }}
             />
           </label>
 
@@ -202,7 +203,11 @@ export default function AccessTokensPanel() {
 
           <label style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Expires</span>
-            <select value={expiryDays} onChange={(e) => setExpiryDays(Number(e.target.value))}>
+            <select
+              className="form-control"
+              value={expiryDays}
+              onChange={(e) => setExpiryDays(Number(e.target.value))}
+            >
               {EXPIRY_CHOICES.map((c) => (
                 <option key={c.days} value={c.days}>
                   {c.label}
