@@ -485,15 +485,30 @@ export default function App() {
       setLoading(true);
       setError(null);
 
-      // 1. Create portfolio
+      // Rocket answers a rejected request with an HTML error page, and `.json()` on that
+      // throws "Unexpected token '<'". That is what made a missing required field take a
+      // manual click to find: the real status was thrown away before anyone could read it.
+      const ensureOk = async (res: Response, what: string) => {
+        if (res.ok) return;
+        const detail = (await res.text()).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+        throw new Error(`could not ${what}: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`);
+      };
+
+      // 1. Create portfolio.
+      // `currency` is not optional on PortfolioCreate — the server answers 422 without it,
+      // and the test double defaulted it, so nothing ever complained here. The fund holds
+      // USD and EUR assets, but this field is the currency the portfolio's own totals are
+      // reported in, so USD.
       const pRes = await apiFetch(`${API_BASE}/portfolios/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           name: 'Global Retirement Fund', 
-          description: 'Diverse core tactical allocation comprising stocks, cryptos, and ETFs.' 
+          description: 'Diverse core tactical allocation comprising stocks, cryptos, and ETFs.',
+          currency: 'USD'
         })
       });
+      await ensureOk(pRes, 'create the demo portfolio');
        const p: Portfolio = await pRes.json();
 
       // 2. Add symbols: AAPL (Stock), BTC-USD (Crypto), SPY (ETF)
@@ -511,6 +526,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(s)
         });
+        await ensureOk(aRes, `add ${s.symbol}`);
          const a: Asset = await aRes.json();
         createdAssets[s.symbol] = a.id;
       }
@@ -540,7 +556,7 @@ export default function App() {
 
       for (const tx of txs) {
         const txDate = new Date(now.getTime() - tx.daysAgo * 24 * 60 * 60 * 1000);
-        await apiFetch(`${API_BASE}/portfolios/${p.id}/assets/${createdAssets[tx.symbol]}/transactions/`, {
+        const txRes = await apiFetch(`${API_BASE}/portfolios/${p.id}/assets/${createdAssets[tx.symbol]}/transactions/`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -551,6 +567,9 @@ export default function App() {
             date: txDate.toISOString()
           })
         });
+        // This one discarded the response entirely: eleven transactions could all have
+        // been refused and the button would still have reported success.
+        await ensureOk(txRes, `log ${tx.type} ${tx.symbol}`);
       }
 
       // Reload portfolios list and set active
