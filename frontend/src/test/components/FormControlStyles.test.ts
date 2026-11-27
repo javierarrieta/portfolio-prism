@@ -160,3 +160,65 @@ describe('buttons carry a variant that paints them', () => {
     ).toEqual([]);
   });
 });
+
+describe('classes used in JSX exist in a stylesheet', () => {
+  /**
+   * The general form of the three defects this file exists for. Each one — the inputs, the
+   * buttons, the staging panels' `card` — was a component asking for a style that had never
+   * been written, and rendering as the browser's own default instead. Nothing failed, no
+   * test caught it, and an operator found them by looking at the screen.
+   *
+   * So: every class named in JSX must resolve to a rule in some stylesheet. The allowlist is
+   * the debt, written down rather than discovered again, and a stale entry fails so the list
+   * can only shrink.
+   */
+  const css = ['index.css', 'App.css', 'print.css']
+    .map((f) => readFileSync(resolve(SRC, f), 'utf8'))
+    .join('\n')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  const defined = new Set([...css.matchAll(/\.([a-zA-Z][\w-]*)/g)].map((m) => m[1]));
+
+  const KNOWN_UNSTYLED: Record<string, string> = {
+    muted: 'secondary text renders at the inherited colour; de-emphasis is a design call',
+    'text-muted': 'same as `muted`, and the two spellings are themselves worth reconciling',
+    statement: 'print-statement hooks with no rule anywhere, including print.css',
+    'statement-header': 'as above',
+    'statement-notes': 'as above',
+    'statement-figure': 'figures render as stacked plain lines rather than a formatted row',
+    'analytics-container': 'a layout hook that was never given a layout; the div stacks naturally',
+    'portfolio-detail-container': 'as above',
+  };
+
+  const used = new Map<string, string>();
+  for (const f of tsxFiles(SRC)) {
+    const src = readFileSync(f, 'utf8');
+    for (const m of src.matchAll(/className=(?:"([^"]*)"|\{[^}]*?"([^"]+)"[^}]*?\})/g)) {
+      for (const token of (m[1] ?? m[2] ?? '').split(/\s+/).filter(Boolean)) {
+        if (!defined.has(token) && !used.has(token)) {
+          used.set(token, `${f.replace(SRC + '/', '')}:${src.slice(0, m.index).split('\n').length}`);
+        }
+      }
+    }
+  }
+
+  it('names no class that has no rule', () => {
+    const undeclared = [...used.entries()]
+      .filter(([cls]) => !(cls in KNOWN_UNSTYLED))
+      .map(([cls, where]) => `${cls}  (first used at ${where})`);
+    expect(
+      undeclared,
+      `These classes appear in JSX and in no stylesheet, so the element gets the browser's\n` +
+        `default instead. Either write the rule or add the class to KNOWN_UNSTYLED with a\n` +
+        `reason — that list is the debt, and it is meant to shrink.\n\n${undeclared.join('\n')}`,
+    ).toEqual([]);
+  });
+
+  it('keeps the debt list honest', () => {
+    // An allowlist that cannot fail is how an allowlist becomes a lie.
+    const stale = Object.keys(KNOWN_UNSTYLED).filter((cls) => !used.has(cls));
+    expect(
+      stale,
+      `These are allowed to be unstyled but are no longer used anywhere: ${stale.join(', ')}. Remove them.`,
+    ).toEqual([]);
+  });
+});

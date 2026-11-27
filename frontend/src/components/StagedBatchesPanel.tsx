@@ -170,7 +170,7 @@ export default function StagedBatchesPanel() {
   };
 
   return (
-    <section className="card" data-testid="staged-batches-panel">
+    <section className="glass-card" data-testid="staged-batches-panel" style={{ padding: '24px' }}>
       <h2>Agent staging area</h2>
       <p className="muted">
         An agent can propose rows, and proposing writes nothing. Nothing here becomes part of a
@@ -232,7 +232,7 @@ export default function StagedBatchesPanel() {
       )}
 
       {selected && (
-        <div className="card" data-testid="staged-detail">
+        <div className="glass-card" data-testid="staged-detail" style={{ padding: '24px' }}>
           <h3>Proposal</h3>
           {previewError && <p className="error">{previewError}</p>}
           {preview && (

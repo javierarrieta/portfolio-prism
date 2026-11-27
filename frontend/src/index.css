@@ -723,6 +723,14 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.12);
 }
 
+/* Error text. Four call sites already say `className="error"`; with no rule they rendered
+   at the inherited colour, which is how a failed load came to look like a sentence. The
+   other convention in this app is an inline `color: var(--color-danger)`, and that is left
+   alone — a class beats four more inline styles for something used this often. */
+.error {
+  color: var(--color-danger);
+}
+
 /* Badges */
 .badge {
   display: inline-flex;
