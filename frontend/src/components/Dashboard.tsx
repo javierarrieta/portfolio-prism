@@ -4,6 +4,7 @@ import { DollarSign, ArrowUpRight, ArrowDownRight, Briefcase, TrendingUp } from 
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import { toNumber } from '../utils/decimal';
 import { PortfolioPerformance, TaxSummary } from '../types';
+import { formatDate } from '../utils/dates';
 
 const COLORS = ['#6366f1', '#a855f7', '#f59e0b', '#10b981', '#ec4899'];
 
@@ -111,7 +112,7 @@ export default function Dashboard({
             <TrendingUp size={18} style={{ color: 'var(--color-primary)' }} /> Historical Performance (Time-Weighted)
           </h3>
           <p style={{ margin: '0 0 16px 26px', color: 'var(--text-muted)', fontSize: '12px' }}>
-            Data as of {new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+            Data as of {formatDate(new Date())}
           </p>
           <div className="chart-container-inner" style={{ height: '320px', minWidth: 0 }}>
             {mounted && (

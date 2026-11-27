@@ -67,6 +67,19 @@ From root:
   `stats_engine.rs:383` asserts the Sharpe is `"0.0"`. The correlation matrix is returned
   empty for the same reason. Do not write a test or a doc that treats those four as real
   measurements without changing the engine first.
+- **Dates are ISO 8601 (`YYYY-MM-DD`), everywhere, built from UTC parts.** Use `formatDate` /
+  `formatDateTime` from `frontend/src/utils/dates.ts`; `isoDate` in that module is the same
+  value the report window sends the server. `toLocaleDateString()`, `toDateString()` and
+  `new Date(x).toLocaleString()` are banned by a scan test
+  (`frontend/src/test/utils/DateFormat.test.ts`), for two reasons. Locale output makes a printed
+  tax statement read `11/09/2026` in one country and `09/11/2026` in another — and hardcoding
+  `'en-US'` does not fix that, it just picks the winner. And the backend serialises a `DATE`
+  column as `2026-10-01T00:00:00Z`, so formatting it in the browser's zone shows every user
+  west of UTC their own transaction on the day before it happened. The suite pins `TZ=UTC`
+  (`frontend/src/test/setup.ts`), which is why that shift is invisible to any test that does not
+  set a zone deliberately — the date tests flip `process.env.TZ` to `America/Los_Angeles` and
+  assert `getDate()` and `getUTCDate()` disagree. Timestamps print as `YYYY-MM-DD HH:MM` in
+  UTC; a panel that prints them says "(UTC)" once in its header rather than on every row.
 - **macOS Tip**: Use `127.0.0.1` instead of `localhost` for the API to avoid IPv6 resolution issues.
 
 ## Branching Workflow

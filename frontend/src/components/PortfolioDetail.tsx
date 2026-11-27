@@ -12,6 +12,7 @@ import { isinProblem } from '../utils/isinValidator';
 import { parseDecimal } from '../utils/csvValidator';
 import { apiFetch } from '../utils/apiFetch';
 import CsvImportModal from './CsvImportModal';
+import { formatDate } from '../utils/dates';
 
 export interface CreateTxPayload {
   type: TransactionType;
@@ -420,7 +421,7 @@ export default function PortfolioDetail({
                                 <tbody>
                                   {a.tax_lots.map((lot, index) => (
                                     <tr key={index}>
-                                      <td>{new Date(lot.buy_date).toLocaleDateString()}</td>
+                                      <td>{formatDate(lot.buy_date)}</td>
                                       <td>{formatCurrency(lot.buy_price, displayCurrency)}</td>
                                       <td>{lot.remaining_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
                                       <td>{lot.original_qty.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>

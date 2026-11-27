@@ -62,8 +62,8 @@ describe('PortfolioStatement, populated', () => {
     // The unrealized label has no test id of its own; the spec requires this copy
     // literally, so it is pinned by text.
     expect(screen.getByText('Unrealized P&L — as of today')).toBeDefined();
-    expect(screen.getByTestId('generated-at').textContent).toBe('Printed Nov 9, 2026');
-    expect(screen.getByTestId('data-at').textContent).toBe('Data fetched Nov 9, 2026, 10:30 AM');
+    expect(screen.getByTestId('generated-at').textContent).toBe('Printed 2026-11-09');
+    expect(screen.getByTestId('data-at').textContent).toBe('Data fetched 2026-11-09 10:30 (UTC)');
     expect(screen.getByTestId('rounding-note').textContent)
       .toBe('Figures are rounded for display from full-precision calculations.');
     expect(screen.getByTestId('splits-note').textContent)
@@ -150,7 +150,7 @@ describe('PortfolioStatement, empty portfolio', () => {
       />
     );
     expect(screen.getByTestId('empty-note').textContent)
-      .toBe('No holdings in this portfolio on Nov 9, 2026.');
+      .toBe('No holdings in this portfolio on 2026-11-09.');
     expect(screen.getByTestId('generated-at')).toBeDefined();
     for (const id of ['data-at', 'rounding-note', 'splits-note', 'run-context',
                       'figure-value', 'figure-realized', 'figure-unrealized']) {

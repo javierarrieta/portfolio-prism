@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { KeyRound, Copy, Check, Trash2 } from 'lucide-react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
+import { formatDate } from '../utils/dates';
 
 /**
  * Personal access tokens: what an agent holds instead of a session.
@@ -57,8 +58,7 @@ const EXPIRY_CHOICES = [
   { days: 365, label: '1 year' },
 ];
 
-const fmt = (iso: string | null): string =>
-  iso ? new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+const fmt = (iso: string | null): string => formatDate(iso);
 
 export default function AccessTokensPanel() {
   // null means "not loaded yet". A separate `loading` boolean would have to be set

@@ -6,6 +6,7 @@ import { sellPnlFilename, sellPnlToCsv } from '../utils/sellPnlCsv';
 import { downloadCsv } from '../utils/download';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
 import type { SellPnlBreakdown } from '../types';
+import { formatDate, formatDateTime } from '../utils/dates';
 
 interface Props {
   transactionId: number;
@@ -135,7 +136,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
             <div>
               <h3 style={{ marginBottom: '4px' }}>Sell P&L — {data.symbol}</h3>
               <div style={{ ...muted, fontSize: '13px' }}>
-                {new Date(data.sell_date).toLocaleString()} · {qty(data.sold_qty)} sold @ {formatCurrency(data.price, data.asset_currency)}
+                {formatDateTime(data.sell_date)} · {qty(data.sold_qty)} sold @ {formatCurrency(data.price, data.asset_currency)}
                 {data.fee !== 0 && ` · fee ${formatCurrency(data.fee, data.asset_currency)}`}
                 {` · proceeds ${formatCurrency(data.proceeds, data.currency)}`}
               </div>
@@ -251,7 +252,7 @@ export default function SellPnlModal({ transactionId, strategy, thresholdDays, o
                     {/* Rendered in payload order: that is the engine's consumption order. */}
                     {data.matches.map((m) => (
                       <tr key={`${m.buy_transaction_id}-${m.buy_date}`}>
-                        <td style={{ whiteSpace: 'nowrap' }}>{new Date(m.buy_date).toLocaleDateString('en-CA')}</td>
+                        <td style={{ whiteSpace: 'nowrap' }}>{formatDate(m.buy_date)}</td>
                         <td>{formatCurrency(m.buy_price, data.currency)}</td>
                         <td>{qty(m.matched_qty)}<span style={muted}> of {qty(m.lot_qty_before_match)}</span></td>
                         <td>{formatCurrency(m.cost_basis, data.currency)}</td>

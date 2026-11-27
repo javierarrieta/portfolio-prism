@@ -1,5 +1,6 @@
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import type { Portfolio, TaxSummary } from '../types';
+import { formatDate, formatDateTime } from '../utils/dates';
 
 interface PortfolioStatementProps {
   taxSummary: TaxSummary;
@@ -7,8 +8,6 @@ interface PortfolioStatementProps {
   fetchedAt: Date;
 }
 
-const DATE_OPTS: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' };
-const DATETIME_OPTS: Intl.DateTimeFormatOptions = { ...DATE_OPTS, hour: '2-digit', minute: '2-digit' };
 const QTY_OPTS: Intl.NumberFormatOptions = { maximumFractionDigits: 6 };
 
 /* The Type column prints a display label, not the stored enum: MUTUAL_FUND is an internal
@@ -26,7 +25,7 @@ export default function PortfolioStatement(
   { taxSummary, portfolio, fetchedAt }: PortfolioStatementProps,
 ) {
   const currency = taxSummary.currency;
-  const printDate = new Date().toLocaleDateString('en-US', DATE_OPTS);
+  const printDate = formatDate(new Date());
   const empty = taxSummary.assets.length === 0;
 
   // The empty-portfolio response carries no strategy, so run-context is absent rather
@@ -46,7 +45,7 @@ export default function PortfolioStatement(
         {runContext && <p data-testid="run-context">{runContext}</p>}
         <p data-testid="generated-at">Printed {printDate}</p>
         {!empty && (
-          <p data-testid="data-at">Data fetched {fetchedAt.toLocaleString('en-US', DATETIME_OPTS)}</p>
+          <p data-testid="data-at">Data fetched {formatDateTime(fetchedAt)} (UTC)</p>
         )}
       </header>
 

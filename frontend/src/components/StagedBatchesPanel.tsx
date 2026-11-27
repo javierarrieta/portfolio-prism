@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
 import { CheckCircle2, Inbox, ShieldCheck, XCircle } from 'lucide-react';
+import { formatDateTime } from '../utils/dates';
 
 /**
  * What an agent has staged and a human has to decide about.
@@ -55,7 +56,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 function fmtTime(iso: string): string {
-  return new Date(iso).toLocaleString();
+  return formatDateTime(iso);
 }
 
 export default function StagedBatchesPanel() {
