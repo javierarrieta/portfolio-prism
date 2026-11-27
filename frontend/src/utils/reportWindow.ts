@@ -9,20 +9,10 @@
 
 export interface ReportWindow { from: string; to: string }
 
-/**
- * The date the SERVER will call today, as `YYYY-MM-DD`.
- *
- * *** UTC parts, not local. *** The route's future-date check is `Utc::now().date_naive()`
- * (`backend_rust/src/api_routes/analytics.rs:71`), so a `to` after the UTC date is a hard 422
- * (`:669`). Built from local parts this made the tab fail on open for every user east of UTC: at
- * 01:30 in UTC+2 the local date is already tomorrow while the server still says today, and the
- * default window is built from this same value, so no preset could rescue it. UTC parts are
- * deliberate even though that can read as "yesterday" to a user after their local midnight --
- * the server owns the boundary, and the alternative is a request that is refused.
- * Exported so the date inputs' `max` cannot drift from the value the presets clamp to.
- */
-export const isoDate = (d: Date) =>
-  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+// `isoDate` lives in `./dates` now, next to the display helpers that share its UTC rule, and
+// is re-exported here because `ReportControls` and its test already import it from this module.
+import { isoDate } from './dates';
+export { isoDate };
 
 /**
  * The default window: the current year to date. Not January 1 to December 31 -- a December

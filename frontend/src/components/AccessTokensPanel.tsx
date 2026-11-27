@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { KeyRound, Copy, Check, Trash2 } from 'lucide-react';
 import { apiFetch, API_BASE } from '../utils/apiFetch';
+import { formatDate } from '../utils/dates';
 
 /**
  * Personal access tokens: what an agent holds instead of a session.
@@ -57,8 +58,7 @@ const EXPIRY_CHOICES = [
   { days: 365, label: '1 year' },
 ];
 
-const fmt = (iso: string | null): string =>
-  iso ? new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+const fmt = (iso: string | null): string => formatDate(iso);
 
 export default function AccessTokensPanel() {
   // null means "not loaded yet". A separate `loading` boolean would have to be set
@@ -177,10 +177,11 @@ export default function AccessTokensPanel() {
           <label style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Name</span>
             <input
+              className="form-control"
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="e.g. laptop agent"
-              style={{ padding: '8px 10px', minWidth: '220px' }}
+              style={{ minWidth: '220px' }}
             />
           </label>
 
@@ -202,7 +203,11 @@ export default function AccessTokensPanel() {
 
           <label style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Expires</span>
-            <select value={expiryDays} onChange={(e) => setExpiryDays(Number(e.target.value))}>
+            <select
+              className="form-control"
+              value={expiryDays}
+              onChange={(e) => setExpiryDays(Number(e.target.value))}
+            >
               {EXPIRY_CHOICES.map((c) => (
                 <option key={c.days} value={c.days}>
                   {c.label}
@@ -269,7 +274,7 @@ export default function AccessTokensPanel() {
                     <td style={{ padding: '8px' }}>{t.expires_at ? fmt(t.expires_at) : 'never'}</td>
                     <td style={{ padding: '8px', textAlign: 'right' }}>
                       {!revoked && (
-                        <button type="button" className="btn" onClick={() => void revoke(t)} title="Revoke">
+                        <button type="button" className="btn btn-secondary" onClick={() => void revoke(t)} title="Revoke">
                           <Trash2 size={15} />
                         </button>
                       )}
@@ -312,7 +317,7 @@ export default function AccessTokensPanel() {
               <button type="button" className="btn btn-primary" onClick={() => void copySecret()}>
                 {copied ? <Check size={16} /> : <Copy size={16} />} {copied ? 'Copied' : 'Copy'}
               </button>
-              <button type="button" className="btn" onClick={() => setRevealed(null)}>
+              <button type="button" className="btn btn-secondary" onClick={() => setRevealed(null)}>
                 Done
               </button>
             </div>

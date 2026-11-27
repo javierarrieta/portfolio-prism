@@ -1,6 +1,7 @@
 import { Trash2, TrendingUp } from 'lucide-react';
 import type { Asset, Transaction } from '../types';
 import { formatCurrency } from '../utils/formatters';
+import { formatDateTime } from '../utils/dates';
 
 interface Props {
   transactions: Transaction[];
@@ -47,7 +48,7 @@ export default function TransactionLedger({ transactions, assets, onDeleteTransa
                   onClick={isSell ? () => onSelectSell(tx.id) : undefined}
                   style={isSell ? { cursor: 'pointer' } : undefined}
                 >
-                  <td>{new Date(tx.date).toLocaleString()}</td>
+                  <td>{formatDateTime(tx.date)}</td>
                   <td style={{ fontWeight: 600 }}>{asset ? asset.symbol : 'Unknown'}</td>
                   <td>
                     <span style={{ color: isSplit ? 'var(--text-secondary)' : (tx.type === 'BUY' ? 'var(--color-success)' : 'var(--color-danger)'), fontWeight: 700 }}>

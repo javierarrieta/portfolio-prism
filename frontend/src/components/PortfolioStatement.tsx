@@ -1,5 +1,6 @@
 import { formatCurrency, formatPercent } from '../utils/formatters';
 import type { Portfolio, TaxSummary } from '../types';
+import { formatDate, formatDateTime } from '../utils/dates';
 
 interface PortfolioStatementProps {
   taxSummary: TaxSummary;
@@ -7,8 +8,6 @@ interface PortfolioStatementProps {
   fetchedAt: Date;
 }
 
-const DATE_OPTS: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' };
-const DATETIME_OPTS: Intl.DateTimeFormatOptions = { ...DATE_OPTS, hour: '2-digit', minute: '2-digit' };
 const QTY_OPTS: Intl.NumberFormatOptions = { maximumFractionDigits: 6 };
 
 /* The Type column prints a display label, not the stored enum: MUTUAL_FUND is an internal
@@ -26,7 +25,7 @@ export default function PortfolioStatement(
   { taxSummary, portfolio, fetchedAt }: PortfolioStatementProps,
 ) {
   const currency = taxSummary.currency;
-  const printDate = new Date().toLocaleDateString('en-US', DATE_OPTS);
+  const printDate = formatDate(new Date());
   const empty = taxSummary.assets.length === 0;
 
   // The empty-portfolio response carries no strategy, so run-context is absent rather
@@ -40,13 +39,13 @@ export default function PortfolioStatement(
   }
 
   return (
-    <section data-print="statement" className="statement">
-      <header className="statement-header">
+    <section data-print="statement">
+      <header>
         <h1>Portfolio Statement</h1>
         {runContext && <p data-testid="run-context">{runContext}</p>}
         <p data-testid="generated-at">Printed {printDate}</p>
         {!empty && (
-          <p data-testid="data-at">Data fetched {fetchedAt.toLocaleString('en-US', DATETIME_OPTS)}</p>
+          <p data-testid="data-at">Data fetched {formatDateTime(fetchedAt)} (UTC)</p>
         )}
       </header>
 
@@ -55,19 +54,19 @@ export default function PortfolioStatement(
       ) : (
         <>
           <div className="statement-headline">
-            <div className="statement-figure">
+            <div>
               <span>Portfolio value</span>
               <strong data-testid="figure-value">
                 {formatCurrency(taxSummary.total_portfolio_value, currency)}
               </strong>
             </div>
-            <div className="statement-figure">
+            <div>
               <span data-testid="label-realized">Realized P&L — cumulative since inception</span>
               <strong data-testid="figure-realized">
                 {formatCurrency(taxSummary.total_realized_pnl, currency)}
               </strong>
             </div>
-            <div className="statement-figure">
+            <div>
               <span>Unrealized P&L — as of today</span>
               <strong data-testid="figure-unrealized">
                 {formatCurrency(taxSummary.total_unrealized_pnl, currency)}
@@ -99,7 +98,7 @@ export default function PortfolioStatement(
             </tbody>
           </table>
 
-          <footer className="statement-notes">
+          <footer>
             <p data-testid="rounding-note">
               Figures are rounded for display from full-precision calculations.
             </p>
