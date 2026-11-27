@@ -54,9 +54,14 @@ From root:
   prints; `start.sh` exports it if the environment does not already set one. Schema comes
   from `backend_rust/migrations/` via `sqlx::migrate!` at startup, not from any
   create-if-not-exists code. There is no `backend/` directory. The cutover procedure is
-  `docs/postgres-cutover.md`. **`k8s/configmap.yaml` still ships a `sqlite:` DSN on
-  purpose** — a live deployment consumes that manifest, and changing it is an ordered
-  cutover step (database and Secret first, image last), not a commit; see the runbook and
+  `docs/postgres-cutover.md`. **`k8s/configmap.yaml` still ships a `sqlite:` DSN, and it is
+  inert** — nothing applies anything in `k8s/`. No cluster has a `backend-config` ConfigMap or
+  a `backend-secrets` Secret, and no cluster has the `investment-portfolio-manager` namespace
+  these manifests name (measured 2026-11-27; see `k8s/README.md`). The live deployment is
+  `apps/portfolio-prism` on **titan**, defined in the `k8s-titan` repo
+  (`apply/50-apps/portfolio-prism/`), and it takes `DATABASE_URL` from the
+  `portfolio-prism-secrets` Secret. The ordered cutover (database and Secret first, image
+  last) is a rule about **that** manifest, not about `k8s/`; see the runbook and
   `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md`. The image itself no
   longer ships one: `backend_rust/Dockerfile` has no `DATABASE_URL` and no SQLite runtime
   dependency, so a container without an injected URL exits and names the variable.

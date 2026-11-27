@@ -50,11 +50,17 @@ the whole app.
 in these documents.** `k8s/app-deployment.yaml` in this repository declares no
 `spec.strategy` at all, and the default is `RollingUpdate` — under which the old pod keeps
 serving and the shape of the outage below is softer. The manifests in this repo are known to
-be stale (see #61), so the live object is the only authority:
+be stale (see #61) — so stale that the command this section used to give,
+`kubectl -n investment-portfolio-manager get deploy app`, names a namespace that exists on no
+cluster. The live object is the only authority, and it is on titan:
 
 ```sh
-kubectl -n investment-portfolio-manager get deploy app -o jsonpath='{.spec.strategy.type}'
+kubectl --context titan -n apps get deploy portfolio-prism -o jsonpath='{.spec.strategy.type}'
 ```
+
+Measured 2026-11-15 and again 2026-11-27: it prints `Recreate`. The live manifest is
+`k8s-titan/apply/50-apps/portfolio-prism/portfolio-prism.yaml`, not anything in this repo; see
+`k8s/README.md`.
 
 If it answers `RollingUpdate`, the ordering rule below does **not** relax: a new pod that
 cannot start never becomes ready, so you get a half-deployed rollout and a stale pod instead
