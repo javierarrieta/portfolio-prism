@@ -608,12 +608,18 @@ editing one file at a time.
    at a file database is not a convenience in a Postgres-only build — it is a pod that
    starts, refuses, and looks like a database outage. The URL now arrives from the runtime
    (`docker run -e DATABASE_URL=…`, or the deployment's Secret) and nothing else.
-2. **`k8s/configmap.yaml` — the `sqlite:` key is deleted at cutover, not in this branch.**
-   It ships `DATABASE_URL: "sqlite:///app/data/portfolio.db?mode=rwc"` because a running
-   cluster consumes this file. Deleting the key now breaks the live SQLite deployment on the
-   next apply — no `DATABASE_URL` at all — and replacing it with a Postgres placeholder
-   breaks it differently, with a DSN the app refuses on sight. Either edit is an outage caused
-   by a commit rather than by the cutover, which is why the key stays where it is.
+2. **`k8s/configmap.yaml` — the `sqlite:` key is inert, and was.**
+   It ships `DATABASE_URL: "sqlite:///app/data/portfolio.db?mode=rwc"`. The reason given for
+   leaving it when the engine switched was that a running cluster consumes this file, and that
+   deleting it would break a live SQLite deployment on the next apply. **That reason is false**,
+   measured 2026-11-27 on both clusters: no ConfigMap named `backend-config`, no Secret named
+   `backend-secrets`, and no namespace named `investment-portfolio-manager` exists anywhere.
+   Nothing applies `k8s/`. The key reaches no pod, so deleting it or leaving it breaks nothing;
+   it is kept as a record, and `k8s/README.md` now says so plainly.
+
+   What the ordering rule below actually governs is the **live** manifest, which lives in the
+   `k8s-titan` repo as `apply/50-apps/portfolio-prism/portfolio-prism.yaml` — not in this
+   repository.
 
    **The atomic set.** The CNPG `Database`, the `DatabaseRole`, and the Secret carrying the
    real DSN must all exist and be Ready **before** the one apply that removes

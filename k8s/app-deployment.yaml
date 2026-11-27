@@ -1,3 +1,13 @@
+# REFERENCE ONLY — nothing applies this file. Read k8s/README.md before using it.
+#
+# The namespace (`investment-portfolio-manager`), the deployment name (`app`), the image
+# repository path, and both `envFrom` names (`backend-config`, `backend-secrets`) exist on no
+# cluster — measured 2026-11-27 on titan and casa. The live app is `apps/portfolio-prism` on
+# titan, defined in the `k8s-titan` repo. Rolling a release by editing this file rolls nothing
+# and creates a second, unstartable deployment beside the one serving traffic.
+#
+# What IS portable is the reasoning below: the deleted initContainer, the startupProbe, and the
+# digest-not-`:latest` pinning all apply to the live deployment.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
