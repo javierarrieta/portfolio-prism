@@ -435,7 +435,11 @@ async fn a_selection_over_the_row_ceiling_is_refused_by_the_route() {
     // restore will reject after the download.
     let (pool, user) = db_with_user("a_selection_over_the_row_ceiling_is_refused_by_the_route").await;
     let (one, _) = seed_two_portfolios(&pool, user).await;
-    let asset = seed_asset(&pool, one, "AAPL", "Apple").await;
+    // A distinct symbol, because `seed_two_portfolios` already put an `AAPL` in this
+    // portfolio and `assets` is unique on `(portfolio_id, upper(symbol))` as of migration
+    // 0006. Nothing here is about symbols — the test wants rows over the ceiling, and any
+    // asset supplies them — so this is a name, not a second assertion.
+    let asset = seed_asset(&pool, one, "OVER", "Over").await;
     seed_many_transactions(&pool, asset, MAX_BUNDLE_ROWS).await;
     let c = client(pool, user).await;
 

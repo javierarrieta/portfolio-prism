@@ -48,6 +48,11 @@ server {{
         proxy_pass http://127.0.0.1:8000;
 {directive}
     }}
+
+    location /mcp {{
+        proxy_pass http://127.0.0.1:8000;
+        client_max_body_size 2m;
+    }}
 }}
 "
     )
@@ -64,6 +69,12 @@ fn run_tree(label: &str, max_bundle: &str, nginx: &str, panel: &str) -> (i32, St
     fs::write(
         root.join("backend_rust/src/backup/mod.rs"),
         format!("pub const MAX_BUNDLE_BYTES: usize = {max_bundle};\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("backend_rust/src/agent")).unwrap();
+    fs::write(
+        root.join("backend_rust/src/agent/mount.rs"),
+        "const MAX_BODY_BYTES: usize = 1024 * 1024;\n",
     )
     .unwrap();
     fs::write(root.join("frontend/nginx.conf"), nginx).unwrap();
@@ -151,6 +162,9 @@ server {
     location /api {
         proxy_pass http://127.0.0.1:8000;
     }
+    location /mcp {
+        proxy_pass http://127.0.0.1:8000;
+    }
 }
 ";
     let (code, text) = ok("serverlevel", "8 * 1024 * 1024", nginx);
@@ -217,4 +231,55 @@ fn a_constant_that_stopped_being_arithmetic_is_refused() {
     let (code, text) = ok("weird", "MAX_UPLOAD", &nginx_with("        client_max_body_size 12m;"));
     assert_eq!(code, 1, "a non-arithmetic cap must not be silently skipped, said:\n{text}");
     assert!(text.contains("not arithmetic"), "said:\n{text}");
+}
+
+// --- Rule 3: the MCP door is reachable, and the proxy is not narrower --------------
+
+/// The shipped fixture with the `/mcp` block changed. An empty `directive` removes the
+/// block entirely — the shape that actually shipped, where Rocket serves `/mcp` and nothing
+/// in front of it mentions it.
+fn nginx_mcp_with(directive: &str) -> String {
+    let base = nginx_with("        client_max_body_size 12m;");
+    if directive.is_empty() {
+        let block = "\n    location /mcp {\n        proxy_pass http://127.0.0.1:8000;\n        client_max_body_size 2m;\n    }\n";
+        return base.replace(block, "\n");
+    }
+    base.replace("client_max_body_size 2m;", directive)
+}
+
+#[test]
+fn a_missing_mcp_location_fails_the_gate() {
+    // The failure this rule exists for: the route shipped, every Rust test passed, and the
+    // deployed topology could not reach it because the SPA fallback answered the POST.
+    let (code, text) = run_tree("mcp-missing", "8 * 1024 * 1024", &nginx_mcp_with(""), PANEL);
+    assert!(
+        text.contains("no `location /mcp` block"),
+        "an unreachable /mcp slipped through:\n{text}"
+    );
+    assert_eq!(code, 1, "a route no proxy forwards must fail the gate:\n{text}");
+}
+
+#[test]
+fn a_narrower_mcp_cap_fails_the_gate() {
+    // Equal is fine (nginx refuses *above* the cap, the route refuses above its own);
+    // smaller is the bug — the proxy answers HTML where the handler would answer 413.
+    let (code, text) = run_tree(
+        "mcp-narrow",
+        "8 * 1024 * 1024",
+        &nginx_mcp_with("client_max_body_size 512k;"),
+        PANEL,
+    );
+    assert!(
+        text.contains("the proxy allows 524288 bytes for /mcp"),
+        "a proxy narrower than the route's own cap passed:\n{text}"
+    );
+    assert_eq!(code, 1, "a narrower /mcp cap must fail the gate:\n{text}");
+}
+
+#[test]
+fn the_shipped_mcp_pair_passes() {
+    // The other half: 2m against the route's 1 MiB is headroom, and the gate must say so.
+    let (code, text) = run_tree("mcp-ok", "8 * 1024 * 1024", &nginx_with("        client_max_body_size 12m;"), PANEL);
+    let _ = &text;
+    assert_eq!(code, 0, "the shipped pairing must pass:\n{text}");
 }

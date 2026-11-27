@@ -131,6 +131,45 @@ From root:
   (see `.auth-test.env.example`). Not validated — the authoring workspace has no docker.
 
 ## Roadmap / Current Focus
+- **`asset_type` is unconstrained at the database.** `assets.asset_type` is `TEXT` with no
+  `CHECK`. No engine *branches* on it, which is most of why that is tolerable — but not all
+  of it: `tax_engine::calculate_lots` takes it and echoes it into every tax-summary
+  response (`tax_engine.rs:797`, `:873`), so a junk value stored in the column is shown to
+  the user even though nothing computes with it. It is constrained at the bundle boundary
+  (`backup/mod.rs:452-455` and
+  `docs/backup-schema/v1.json:6-15`), so a restore cannot introduce junk even today.
+  Constraining it needs an inventory of live values first: `SELECT DISTINCT asset_type FROM
+  assets` across real databases, because a `CHECK` written from the enum in the bundle schema
+  rather than from what is actually stored would refuse rows on migration and take the app
+  down at boot (`sqlx::migrate!` runs at startup). Contrast `transactions.type`, which got a
+  `CHECK` in `0002` only after the same question was answered — and which still refuses to
+  rewrite anything it does not recognise. Do not treat that migration as a template to copy
+  without doing the inventory.
+- **`assets (portfolio_id, upper(symbol))` is unique as of `0006`; `isin` is not.** Asset
+  identity inside a portfolio used to be software-only — `services::assets::insert` and
+  `agent::staging::resolve_asset` each `SELECT`ed the uppercased symbol and `INSERT`ed if
+  absent, with a window in the middle and no constraint underneath, so two concurrent writers
+  could both store a row for one symbol and split its cost basis. `0006_asset_symbol_unique.sql`
+  adds `uq_assets_portfolio_symbol` and refuses to apply if the live data already violates it,
+  so **run `backend_rust/scripts/audit_asset_symbols.sh` before the deploy that carries it** —
+  `sqlx::migrate!` runs at startup, so a migration that raises is a crashloop with the reason
+  in a container log. Two things to keep in mind here:
+  - **The index is on `upper(symbol)`, and the lookups were changed to match it**
+    (`upper(symbol) = $2`, not `symbol = $2`). An index on the bare column would enforce a
+    different rule than the code applies and would still admit `aapl` beside `AAPL`.
+    `check_migrations.sh` pins the exact expression for that reason.
+  - **Do not normalize `assets.symbol` in a migration.** `historical_prices` is keyed by the
+    symbol string, not by `asset_id` (`PRIMARY KEY (symbol, date)`, read back via the asset's
+    symbol in `stats_engine.rs:154`), so rewriting an asset's symbol silently detaches its
+    price history — no error, just an empty chart. `0006` step (2) explains this at length and
+    deliberately does nothing. The same reasoning applies to any future `isin` index, which is
+    still unconstrained and whose existing collisions the audit script reports without fixing.
+  - **Restore now refuses a bundle that puts one symbol in one portfolio twice**, naming the
+    asset path (`backup::validate`, "duplicate symbol"). Before the index such a bundle
+    restored and left a split cost basis; after the index alone it would have been a 500 from a
+    raw violation mid-transaction. Consequence worth knowing: `backup/detail.rs`'s
+    `duplicate_symbol` flag now has **one** producer, `detail_from_bundle`. The `owned_detail`
+    half was deleted because `0006` makes it unreachable, not because it was in the way.
 - **Postgres cutover, the deferred half**: the application side is merged (engine, tests,
   gates, runbook). The cluster side is
   `docs/superpowers/specs/2026-11-14-postgres-gitops-followup.md` — a CNPG `Database`,

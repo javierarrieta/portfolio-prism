@@ -13,8 +13,10 @@ import {
   Printer,
   Receipt,
   FolderSync,
+  Bot,
   PanelLeftClose,
   PanelLeftOpen,
+  KeyRound,
   Wallet,
   type LucideIcon,
 } from 'lucide-react';
@@ -24,7 +26,9 @@ import AnalyticsView from './components/AnalyticsView';
 import TransactionLedger from './components/TransactionLedger';
 import PortfolioStatement from './components/PortfolioStatement';
 import ReportControls, { TaxReportTable } from './components/ReportControls';
+import AccessTokensPanel from './components/AccessTokensPanel';
 import BackupPanel from './components/BackupPanel';
+import StagedBatchesPanel from './components/StagedBatchesPanel';
 import { currentYearToDate, buildReportQuery } from './utils/reportWindow';
 import type { ReportWindow } from './utils/reportWindow';
 import SellPnlModal from './components/SellPnlModal';
@@ -58,6 +62,13 @@ const NAV_ITEMS: { id: string; label: string; Icon: LucideIcon }[] = [
   { id: 'statement', label: 'Printable Statement', Icon: Printer },
   { id: 'report', label: 'Tax Report', Icon: Receipt },
   { id: 'backup', label: 'Backup', Icon: FolderSync },
+  // Outside the portfolio branch like Backup: a staged batch may create the portfolio it
+  // is going to fill, so there may be no portfolio to select yet when there is something
+  // to approve.
+  { id: 'staged', label: 'Agent staging', Icon: Bot },
+  // Account-level, like Backup: neither is about the selected portfolio, which is why
+  // both sit outside the `currentPortfolio` branch below rather than inside it.
+  { id: 'access', label: 'Access tokens', Icon: KeyRound },
 ];
 
 /**
@@ -506,25 +517,25 @@ export default function App() {
 
       // 3. Log transactions over the past months to build history
       const now = new Date();
-       const txs: Array<{ symbol: string; type: TransactionType; qty: number; price: number; fee: number; daysAgo: number }> = [
+       const txs: Array<{ symbol: string; type: TransactionType; qty: string; price: string; fee: string; daysAgo: number }> = [
         // AAPL Buys
-        { symbol: 'AAPL', type: 'BUY', qty: 20, price: 175.0, fee: 5.0, daysAgo: 60 },
-        { symbol: 'AAPL', type: 'BUY', qty: 15, price: 185.0, fee: 5.0, daysAgo: 30 },
-        { symbol: 'AAPL', type: 'BUY', qty: 10, price: 190.0, fee: 5.0, daysAgo: 10 },
-        { symbol: 'AAPL', type: 'SELL', qty: 8, price: 210.0, fee: 8.0, daysAgo: 2 }, // triggers tax matching
+        { symbol: 'AAPL', type: 'BUY', qty: '20', price: '175', fee: '5', daysAgo: 60 },
+        { symbol: 'AAPL', type: 'BUY', qty: '15', price: '185', fee: '5', daysAgo: 30 },
+        { symbol: 'AAPL', type: 'BUY', qty: '10', price: '190', fee: '5', daysAgo: 10 },
+        { symbol: 'AAPL', type: 'SELL', qty: '8', price: '210', fee: '8', daysAgo: 2 }, // triggers tax matching
         
         // BTC Buys
-        { symbol: 'BTC-USD', type: 'BUY', qty: 0.25, price: 60000.0, fee: 15.0, daysAgo: 45 },
-        { symbol: 'BTC-USD', type: 'BUY', qty: 0.15, price: 65000.0, fee: 10.0, daysAgo: 15 },
-        { symbol: 'BTC-USD', type: 'SELL', qty: 0.10, price: 69000.0, fee: 12.0, daysAgo: 1 },
+        { symbol: 'BTC-USD', type: 'BUY', qty: '0.25', price: '60000', fee: '15', daysAgo: 45 },
+        { symbol: 'BTC-USD', type: 'BUY', qty: '0.15', price: '65000', fee: '10', daysAgo: 15 },
+        { symbol: 'BTC-USD', type: 'SELL', qty: '0.1', price: '69000', fee: '12', daysAgo: 1 },
 
          // SPY Buys
-         { symbol: 'SPY', type: 'BUY', qty: 30, price: 500.0, fee: 0.0, daysAgo: 90 },
-         { symbol: 'SPY', type: 'BUY', qty: 10, price: 520.0, fee: 0.0, daysAgo: 25 },
+         { symbol: 'SPY', type: 'BUY', qty: '30', price: '500', fee: '0', daysAgo: 90 },
+         { symbol: 'SPY', type: 'BUY', qty: '10', price: '520', fee: '0', daysAgo: 25 },
 
          // SAP.DE Buys
-         { symbol: 'SAP.DE', type: 'BUY', qty: 5, price: 170.0, fee: 2.0, daysAgo: 40 },
-         { symbol: 'SAP.DE', type: 'BUY', qty: 5, price: 175.0, fee: 2.0, daysAgo: 10 }
+         { symbol: 'SAP.DE', type: 'BUY', qty: '5', price: '170', fee: '2', daysAgo: 40 },
+         { symbol: 'SAP.DE', type: 'BUY', qty: '5', price: '175', fee: '2', daysAgo: 10 }
        ];
 
       for (const tx of txs) {
@@ -790,6 +801,10 @@ export default function App() {
         */}
         {activeTab === 'backup' ? (
           <BackupPanel portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : activeTab === 'staged' ? (
+          <StagedBatchesPanel />
+        ) : activeTab === 'access' ? (
+          <AccessTokensPanel />
         ) : currentPortfolio ? (
           <>
             {activeTab === 'dashboard' && (

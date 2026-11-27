@@ -95,4 +95,51 @@ calls=$(grep -c 'oversizeReason' "$PANEL")
 echo "oversizeReason mentions in BackupPanel.tsx: $calls"
 [ "$calls" -ge 3 ] || fail "BackupPanel.tsx no longer refuses an oversized bundle before sending it ($calls mentions, expected at least 3: the definition and both write paths)."
 
+# --- Rule 3: the MCP door is reachable, and the proxy is not narrower -----------
+# Same failure class as Rule 1, found in review rather than in production: the `/mcp`
+# route shipped, every test passed, and nothing in the deployed topology could reach it,
+# because `location /mcp` did not exist and the SPA fallback answered the POST with
+# index.html. A route that no proxy forwards is a feature that does not exist, so this
+# rule fails when the block is missing — it is not allowed to skip.
+MOUNT="$ROOT/backend_rust/src/agent/mount.rs"
+[ -f "$MOUNT" ] || fail "backend_rust/src/agent/mount.rs is missing; the layout changed under this script"
+
+mcp_start=$(grep -n 'location /mcp' "$NGINX" | head -1 | cut -d: -f1)
+if [ -z "$mcp_start" ]; then
+  fail "no \`location /mcp\` block in frontend/nginx.conf."
+"Rocket serves /mcp (agent/mount.rs) but nginx has no block for it, so \`location /\`"
+"answers POST /mcp with index.html and the agent surface is unreachable in the deployed"
+"topology while every Rust test still passes."
+fi
+mcp_end=$(awk -v s="$mcp_start" 'NR>s && /^[[:space:]]*}[[:space:]]*$/ {print NR; exit}' "$NGINX")
+[ -n "$mcp_end" ] || fail "the \`location /mcp\` block in frontend/nginx.conf never closes"
+
+if ! grep -q 'proxy_pass' <(sed -n "${mcp_start},${mcp_end}p" "$NGINX"); then
+  fail "\`location /mcp\` exists but has no proxy_pass — it is not forwarded to the backend."
+fi
+
+mcp_expr=$(sed -n 's/^const MAX_BODY_BYTES: *usize *= *\(.*\);$/\1/p' "$MOUNT" | head -1)
+[ -n "$mcp_expr" ] || fail "no \`const MAX_BODY_BYTES: usize = ...\` in backend_rust/src/agent/mount.rs"
+case "$mcp_expr" in
+  *[!0-9\ *]*) fail "MAX_BODY_BYTES expression is not arithmetic: \`$mcp_expr\`" ;;
+esac
+mcp_bytes=$((mcp_expr))
+
+directive=$(sed -n "${mcp_start},${mcp_end}p" "$NGINX" \
+  | grep -o 'client_max_body_size[[:space:]]*[^;]*' | head -1 | sed 's/client_max_body_size[[:space:]]*//')
+if [ -z "$directive" ]; then
+  directive=$(printf '%s\n' "$server_level" | grep -o 'client_max_body_size[[:space:]]*[^;]*' | head -1 | sed 's/client_max_body_size[[:space:]]*//')
+  [ -n "$directive" ] || fail "\`location /mcp\` sets no client_max_body_size and neither does server level,"
+"so nginx applies its 1 MiB default: a batch at the backend's own ${mcp_bytes}-byte cap is"
+"refused by the proxy with an HTML page instead of a protocol-shaped 413."
+fi
+mcp_allowed=$(nginx_bytes "$directive")
+echo "MAX_BODY_BYTES (/mcp): $mcp_bytes bytes ($mcp_expr)"
+echo "client_max_body_size (/mcp): $directive = $mcp_allowed bytes"
+if [ "$mcp_allowed" != "0" ] && [ "$mcp_allowed" -lt "$mcp_bytes" ]; then
+  fail "the proxy allows $mcp_allowed bytes for /mcp but the route accepts $mcp_bytes."
+"A batch between those sizes is refused by nginx before the handler can answer in the"
+"protocol's own shape."
+fi
+
 echo "UPLOAD PATH GATE PASSED"

@@ -84,8 +84,16 @@ fn the_real_tree_passes_the_gate() {
     let (code, text) = run(&repo);
     assert_eq!(code, 0, "gate failed on the repository:\n{text}");
     assert!(
-        text.contains("handlers inspected: 21"),
-        "the gate should account for all 21 handlers, said:\n{text}"
+        // 21 handlers on main, 24 with the token routes, 24 with the staged-batch
+        // routes, and 27 with both — which is what this tree was. Git resolved the
+        // assertion to 24 on its own because both branches wrote the same edit from the
+        // same base; the merged truth is the sum, and neither branch could have known it.
+        // 28 since `POST /api/tokens/revoke-all` joined the token routes. The count is
+        // pinned rather than range-checked on purpose — a handler the script failed to see
+        // would show up here as a smaller number, which is the only way an invisible
+        // handler is ever noticed.
+        text.contains("handlers inspected: 28"),
+        "the gate should account for all 28 handlers, said:\n{text}"
     );
 }
 
@@ -297,4 +305,96 @@ fn a_marker_is_refused_on_a_wrapped_route_attribute() {
         "a parameter on a continuation line of the attribute was not seen:\n{text}"
     );
     assert_eq!(code, 1, "a wrapped attribute must not hide a contradiction:\n{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Rule D — the MCP tools are inside the gate, not beside it
+// ---------------------------------------------------------------------------
+
+/// A handler that satisfies Rules A–C: it takes `AuthedUser`, and it carries the
+/// whole-line marker that says it resolves no caller-supplied id, on a route with no path
+/// parameter to contradict that claim.
+const GOOD_HANDLER: &str = r#"use crate::auth::guard::AuthedUser;
+
+// access-gate: global-config (no caller-supplied id)
+#[get("/health")]
+pub async fn health(user: AuthedUser) -> Json<Value> {
+    Json(json!({}))
+}
+"#;
+
+/// A tool server with one tool that never calls the scope gate. `src/agent/tools.rs`
+/// resolves caller-supplied ids and issues raw SQL against the protected tables, and it
+/// is not a Rocket handler file, so Rules A–C never looked at it.
+const UNGATED_TOOL: &str = r#"
+use rmcp::tool;
+pub struct AgentServer { pool: sqlx::PgPool }
+impl AgentServer {
+    #[tool(description = "list")]
+    async fn list_portfolios(&self) -> String {
+        let _ = sqlx::query("SELECT * FROM portfolios WHERE owner_id = $1");
+        String::new()
+    }
+}
+"#;
+
+const GATED_TOOL: &str = r#"
+use rmcp::tool;
+pub struct AgentServer { pool: sqlx::PgPool }
+impl AgentServer {
+    #[tool(description = "list")]
+    async fn list_portfolios(&self) -> String {
+        if let Some(_) = self.gate(Scope::Read) { return String::new(); }
+        let _ = sqlx::query("SELECT * FROM portfolios WHERE owner_id = $1");
+        String::new()
+    }
+}
+"#;
+
+/// Run the real gate against a tree whose `src/agent/tools.rs` is `tools`.
+fn run_agent_tree(label: &str, tools: &str) -> (i32, String) {
+    let root = std::env::temp_dir().join(format!("access-gate-agent-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("src/api_routes")).unwrap();
+    fs::create_dir_all(root.join("src/agent")).unwrap();
+    fs::copy(SCRIPT, root.join("scripts/check_access_gate.sh")).unwrap();
+    fs::write(root.join("src/api_routes/backup.rs"), GOOD_HANDLER).unwrap();
+    fs::write(root.join("src/agent/tools.rs"), tools).unwrap();
+
+    let out = run(&root);
+    let _ = fs::remove_dir_all(&root);
+    out
+}
+
+#[test]
+fn an_ungated_mcp_tool_fails_the_gate() {
+    let (code, text) = run_agent_tree("ungated", UNGATED_TOOL);
+    assert!(
+        text.contains("UNGATED") && text.contains("list_portfolios"),
+        "a tool that never calls the scope gate slipped through:\n{text}"
+    );
+    assert_eq!(code, 1, "an ungated tool must fail the gate:\n{text}");
+}
+
+#[test]
+fn a_gated_mcp_tool_passes_the_gate() {
+    // The other half. Without it, the test above could be passed by a rule that fails on
+    // every tool, which is how a gate gets disabled rather than fixed.
+    let (code, text) = run_agent_tree("gated", GATED_TOOL);
+    assert_eq!(code, 0, "a gated tool must pass:\n{text}");
+    assert!(text.contains("agent tools inspected: 1"), "got:\n{text}");
+}
+
+#[test]
+fn the_real_tree_gates_every_mcp_tool() {
+    // Pinned count, same reason the handler count is: a tool the rule failed to see shows
+    // up here as a smaller number and nowhere else.
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, text) = run(&repo);
+    assert_eq!(code, 0, "gate failed on the repository:\n{text}");
+    assert!(
+        text.contains("agent tools inspected: 11, ungated: 0"),
+        "expected all 11 MCP tools inspected and gated, said:\n{text}"
+    );
 }

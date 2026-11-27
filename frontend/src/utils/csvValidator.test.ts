@@ -1,31 +1,34 @@
 import { describe, test, expect } from 'vitest';
 import type { ColumnMapping } from '../types/csv';
 import { detectColumns } from './csvParser';
-import { validateCsvRow, validateCsvFile } from './csvValidator';
+import { parseDecimal, validateCsvRow, validateCsvFile, MAX_DECIMAL_SCALE, MAX_DECIMAL_DIGITS } from './csvValidator';
 
 const columnMapping = detectColumns(['date', 'symbol', 'type', 'qty', 'price', 'fee']);
 
 describe('separator handling', () => {
+  // Expectations are strings, not numbers: `quantity` travels as a decimal string
+  // end to end, so a float assertion here would be asserting the very conversion
+  // the string transport exists to remove.
   const row = (qty: string, price = '150.00') =>
     validateCsvRow({ date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty, price, fee: '5.00' }, columnMapping, 1);
 
   test('a decimal comma is a decimal comma, not a stripped thousands separator', () => {
     // The bug this pins: commas were deleted, so each of these was multiplied by a
     // power of ten and imported silently wrong.
-    expect(row('1,5').quantity).toBe(1.5);
-    expect(row('1,50').quantity).toBe(1.5);
-    expect(row('0,25').quantity).toBe(0.25);
-    expect(row('1,5000').quantity).toBe(1.5);
-    expect(row('1.234,56').quantity).toBe(1234.56);
+    expect(row('1,5').quantity).toBe('1.5');
+    expect(row('1,50').quantity).toBe('1.5');
+    expect(row('0,25').quantity).toBe('0.25');
+    expect(row('1,5000').quantity).toBe('1.5');
+    expect(row('1.234,56').quantity).toBe('1234.56');
     // A leading `+` carries no information and parseFloat always accepted it.
-    expect(row('+1,5').quantity).toBe(1.5);
+    expect(row('+1,5').quantity).toBe('1.5');
   });
 
   test('a three-digit group after a comma is still a thousands separator', () => {
     // Status quo, deliberately unchanged.
-    expect(row('1,500').quantity).toBe(1500);
-    expect(row('1,234,567').quantity).toBe(1234567);
-    expect(row('1,500.25').quantity).toBe(1500.25);
+    expect(row('1,500').quantity).toBe('1500');
+    expect(row('1,234,567').quantity).toBe('1234567');
+    expect(row('1,500.25').quantity).toBe('1500.25');
   });
 
   test('an ungrouped head is plain digits, of any length', () => {
@@ -34,13 +37,13 @@ describe('separator handling', () => {
     // broker emits no thousands separator at all: DEGIRO, Scalable Capital and
     // Trade Republic all write amounts like this. A leading group of one to three
     // digits was required here, which refused every one of them.
-    expect(row('1234,56').quantity).toBe(1234.56);
-    expect(row('12345,6').quantity).toBe(12345.6);
-    expect(row('123456,78').quantity).toBe(123456.78);
-    expect(row('1', '1234,56').price).toBe(1234.56);
+    expect(row('1234,56').quantity).toBe('1234.56');
+    expect(row('12345,6').quantity).toBe('12345.6');
+    expect(row('123456,78').quantity).toBe('123456.78');
+    expect(row('1', '1234,56').price).toBe('1234.56');
     // Same rule, with the dot as the thousands separator: the canonical European
     // spelling, and untested before.
-    expect(row('1.500,25').quantity).toBe(1500.25);
+    expect(row('1.500,25').quantity).toBe('1500.25');
   });
 
   test('one separator never does both jobs', () => {
@@ -71,16 +74,16 @@ describe('validateCsvRow', () => {
     expect(result.errors).toHaveLength(0);
     expect(result.symbol).toBe('AAPL');
     expect(result.type).toBe('BUY');
-    expect(result.quantity).toBe(100);
-    expect(result.price).toBe(150);
-    expect(result.fee).toBe(5);
+    expect(result.quantity).toBe('100');
+    expect(result.price).toBe('150');
+    expect(result.fee).toBe('5');
   });
 
   test('fee defaults to 0 when missing', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '150.00' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.fee).toBe(0);
+    expect(result.fee).toBe('0');
   });
 
   test('case-insensitive type accepted', () => {
@@ -102,7 +105,7 @@ describe('validateCsvRow', () => {
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
     expect(result.type).toBe('SPLIT');
-    expect(result.fee).toBe(0);
+    expect(result.fee).toBe('0');
   });
 
   test('SPLIT with zero price rejected', () => {
@@ -163,7 +166,7 @@ describe('validateCsvRow', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '0' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBe(0);
+    expect(result.price).toBe('0');
   });
 
   test('accepts DD/MM/YYYY dates where day > 12', () => {
@@ -176,49 +179,49 @@ describe('validateCsvRow', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '$4.55' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBe(4.55);
+    expect(result.price).toBe('4.55');
   });
 
   test('parses price with commas as thousands separator', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '1,234.56' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBe(1234.56);
+    expect(result.price).toBe('1234.56');
   });
 
   test('parses fee with currency symbol', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '150.00', fee: '$5.00' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.fee).toBe(5);
+    expect(result.fee).toBe('5');
   });
 
   test('parses quantity with currency symbol (tolerated)', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '€100', price: '150.00' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.quantity).toBe(100);
+    expect(result.quantity).toBe('100');
   });
 
   test('parses price with pound symbol', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '£4.55' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBeCloseTo(4.55);
+    expect(result.price).toBe('4.55');
   });
 
   test('parses price with yen symbol', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '¥150' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBe(150);
+    expect(result.price).toBe('150');
   });
 
   test('parses price with rupee symbol', () => {
     const row = { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty: '100', price: '₹1,234.56' };
     const result = validateCsvRow(row, columnMapping, 1);
     expect(result.errors).toHaveLength(0);
-    expect(result.price).toBeCloseTo(1234.56);
+    expect(result.price).toBe('1234.56');
   });
 
   test('parses fee with currency symbol and comma separator', () => {
@@ -288,5 +291,94 @@ describe('validateCsvFile', () => {
     const report = validateCsvFile(rows, partialMapping, ['AAPL'], { symbol: 'AAPL', type: 'BUY' });
     expect(report.validRows).toBe(2);
     expect(report.valid).toBe(true);
+  });
+});
+
+describe('decimal transport', () => {
+  // Whatever these return is posted to the API verbatim, so they are the wire
+  // format. A number here means the value passed through a binary float before
+  // the server ever saw it — the failure this path exists to prevent.
+  const money = (qty: string, price: string, fee: string) =>
+    validateCsvRow(
+      { date: '2024-01-15', symbol: 'AAPL', type: 'BUY', qty, price, fee },
+      columnMapping,
+      1,
+    );
+
+  test('money is carried as a string, not a number', () => {
+    const r = money('100', '150.00', '5.00');
+    expect([r.quantity, r.price, r.fee]).toEqual(['100', '150', '5']);
+  });
+
+  test('a value a float cannot hold exactly survives intact', () => {
+    // 9.99 is the example `backend_rust/tests/decimal_migration_test.rs` uses for
+    // why the columns are TEXT. Two values a float collapses to the same number
+    // must stay two different values on the way out.
+    expect(money('1', '9.99', '0').price).toBe('9.99');
+    expect(money('1', '10000000000000001', '0').price).toBe('10000000000000001');
+    expect(money('1', '10000000000000002', '0').price).toBe('10000000000000002');
+  });
+
+  test('leading and trailing zeros are canonicalized', () => {
+    // The import dedup key interpolates these, so `150.00` and `150` have to
+    // canonicalize to the same string or the same economic transaction would be
+    // imported twice.
+    const r = money('007', '150.00', '5.000');
+    expect([r.quantity, r.price, r.fee]).toEqual(['7', '150', '5']);
+    expect(money('-0', '150', '0').quantity).toBe('0');
+  });
+
+  test('currency symbols and thousands separators are stripped', () => {
+    const r = money('1,000', '$150.00', '€5.50');
+    expect([r.quantity, r.price, r.fee]).toEqual(['1000', '150', '5.5']);
+  });
+
+  test('a cell that is not a decimal is an error, not a silent zero', () => {
+    const r = money('abc', '150', '0');
+    expect(r.errors.some((e) => e.field === 'quantity')).toBe(true);
+  });
+
+  test('exponent form is refused rather than accepted and rejected downstream', () => {
+    // `parseFloat('1e3')` is 1000, so the old code accepted this and posted a
+    // number. The API takes a decimal string and will not take `1e3`; catching it
+    // here is one fewer failed row in the import results.
+    expect(money('1e3', '150', '0').errors.some((e) => e.field === 'quantity')).toBe(true);
+  });
+
+  test('parseDecimal refuses what the backend money rule refuses', () => {
+    // The whole claim of this function is "if it parses here it is accepted there". The
+    // backend's `is_canonical_decimal` caps the fractional part at MAX_DECIMAL_SCALE and
+    // the **total** digit count at MAX_DECIMAL_PRECISION; before these caps a 16-decimal
+    // cell cleared the browser and died at the API — the failed import row the doc comment
+    // promises not to produce.
+    const atScale = '1.' + '0'.repeat(MAX_DECIMAL_SCALE);
+    const pastScale = '1.' + '0'.repeat(MAX_DECIMAL_SCALE + 1);
+    expect(parseDecimal(atScale)).not.toBeNull();
+    expect(parseDecimal(pastScale)).toBeNull();
+
+    // Total, not integer-part: 20 integer digits plus 9 fractional is 29, over the cap,
+    // even though neither half alone looks alarming.
+    const pastTotal = '9'.repeat(MAX_DECIMAL_DIGITS) + '.9';
+    expect(parseDecimal(pastTotal)).toBeNull();
+    expect(parseDecimal('9'.repeat(MAX_DECIMAL_DIGITS))).not.toBeNull();
+  });
+
+  test('parseDecimal returns the string form or null', () => {
+    expect(parseDecimal(' 12.50 ')).toBe('12.5');
+    expect(parseDecimal('-0.0')).toBe('0');
+    expect(parseDecimal('')).toBeNull();
+    expect(parseDecimal('.5')).toBeNull();
+    expect(parseDecimal('1.2.3')).toBeNull();
+    // A leading `+` is dropped by `resolveSeparators` before the shape check ever sees it
+    // — it carries no information, and that function's own comment says refusing it would
+    // be a new rejection rather than a fixed one. Pinned here because the prose in
+    // `parseDecimal` once claimed the opposite.
+    expect(parseDecimal('+1.5')).toBe('1.5');
+    // A decimal comma is a locale, not an error: this is the whole reason the comma is left
+    // in for `resolveSeparators` instead of being stripped.
+    expect(parseDecimal('1,5')).toBe('1.5');
+    expect(parseDecimal('1.234,56')).toBe('1234.56');
+    // Exponent form is a number to `parseFloat` and is not a decimal string to the API.
+    expect(parseDecimal('1e3')).toBeNull();
   });
 });

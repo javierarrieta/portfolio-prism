@@ -166,7 +166,7 @@ for file in "${FILES[@]}"; do
     fi
   done <<< "$handlers"
 
-  if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(' "$file"; then
+  if grep -qE 'use crate::access::' "$file" && grep -qE '(^|[^A-Za-z_])require(_asset(_in)?|_transaction|_own_token|_own_staged_batch)?\(' "$file"; then
     echo "  ok       $name"
   elif [ "$total" -gt 0 ] && [ "$unmarked" -eq 0 ] && [ "$contradicted" -eq 0 ]; then
     echo "  ok       $name (every handler carries the global-config marker: none resolves a caller-supplied id)"
@@ -220,7 +220,7 @@ for file in "${FILES[@]}"; do
         sig = sig " " $0
         if ($0 ~ /->/) sigdone = 1
       }
-      if ($0 ~ /(^|[^A-Za-z_])require(_asset(_in)?|_transaction)?\(/ && reqline == 0) { req = 1; reqline = FNR }
+      if ($0 ~ /(^|[^A-Za-z_])require(_asset(_in)?|_transaction|_own_token|_own_staged_batch)?\(/ && reqline == 0) { req = 1; reqline = FNR }
       if ($0 ~ /(FROM|UPDATE|DELETE FROM)[ \t]+(portfolios|assets|transactions)[ \t].*WHERE[ \t]+id/ && idline == 0) { idq = 1; idline = FNR }
       if (sig ~ /AuthedUser/) authed = 1
       if ($0 ~ /^\}/) {
@@ -260,6 +260,60 @@ for file in "${FILES[@]}"; do
     [ "$ok" = "1" ] && cleared=$((cleared + 1))
   done <<< "$out"
 done
+
+# ---------------------------------------------------------------------------
+# Rule D — every MCP tool gates on scope before it touches anything
+#
+# Rules A–C read `src/api_routes`, because that is where the HTTP handlers live. But
+# `src/agent/tools.rs` resolves caller-supplied ids and issues raw SQL against the same
+# three protected tables, and it is not a Rocket handler file — its entry points are
+# `#[tool]` functions reached through `/mcp`. So the gate that promises "every data route
+# goes through the chokepoint" did not look at the one surface where a route string is
+# chosen by a JSON field in the body. That is the gap this closes.
+#
+# The rule is `self.gate(` appears in the tool body. It is deliberately weaker than Rule B
+# (no ordering check, no id-query detection): the tools call `gate()` as their first
+# statement by convention and the module says so, and what this rule buys is the guarantee
+# that the convention cannot be dropped silently by the next tool someone adds.
+# ---------------------------------------------------------------------------
+AGENT_TOOLS="src/agent/tools.rs"
+tools_inspected=0
+tools_ungated=0
+if [ -f "$AGENT_TOOLS" ]; then
+  while IFS=' ' read -r state line fn; do
+    [ -n "${state:-}" ] || continue
+    tools_inspected=$((tools_inspected + 1))
+    if [ "$state" = "1" ]; then
+      echo "  UNGATED $AGENT_TOOLS:$line $fn calls no scope gate"
+      tools_ungated=$((tools_ungated + 1))
+      fail=1
+    fi
+  done < <(awk -v file="$AGENT_TOOLS" '
+    { L[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (L[i] !~ /^[ \t]*#\[tool\(/) continue
+        fn = "(unknown)"; fl = 0
+        for (j = i; j <= i + 6 && j <= NR; j++) {
+          if (match(L[j], /fn [A-Za-z_0-9]+/)) {
+            fn = substr(L[j], RSTART + 3, RLENGTH - 3); fl = j; break
+          }
+        }
+        if (!fl) continue
+        gated = 0
+        for (k = fl; k <= NR; k++) {
+          if (k > fl && (L[k] ~ /^[ \t]*#\[tool\(/ || L[k] ~ /^\}/)) break
+          if (L[k] ~ /self\.gate\(/) { gated = 1; break }
+        }
+        if (!gated) printf "1 %d %s\n", fl, fn
+        else printf "0 %d %s\n", fl, fn
+      }
+    }
+  ' "$AGENT_TOOLS")
+  echo "agent tools inspected: $tools_inspected, ungated: $tools_ungated"
+else
+  echo "agent tools inspected: 0 (no $AGENT_TOOLS in this tree)"
+fi
 
 echo
 echo "handlers inspected: $handlers, cleared: $cleared, files checked: $files_checked"

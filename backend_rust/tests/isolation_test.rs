@@ -163,7 +163,7 @@ async fn b_cannot_add_an_asset_to_a_s_portfolio() {
 async fn b_cannot_write_a_transaction_into_a_s_asset() {
     let (pool, _) = db_with_user("b_cannot_write_a_transaction_into_a_s_asset").await;
     let u = seed_two_users(&pool).await;
-    let body = r#"{"quantity":1.0,"price":10.0,"fee":0.0,"date":"2024-01-01T00:00:00Z","type":"BUY"}"#;
+    let body = r#"{"quantity": "1","price": "10","fee": "0","date":"2024-01-01T00:00:00Z","type":"BUY"}"#;
     let b_path = format!("/api/portfolios/{}/assets/{}/transactions", u.b_portfolio, u.a_asset);
     let a_path = format!("/api/portfolios/{}/assets/{}/transactions", u.a_portfolio, u.a_asset);
 

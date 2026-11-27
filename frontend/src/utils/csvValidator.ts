@@ -202,19 +202,93 @@ function resolveSeparators(value: string): string | null {
     }
   }
 
+  // The caps are checked on the normalised form, after separators are gone, so
+  // `1.234.567,89` (a European thousands grouping) is measured as 7 digits and not as 9.
+  // Without this line a 16-decimal-place cell passes the browser, is refused by
+  // `strict_decimal_json`, and costs the user a failed import row for a number that looked
+  // fine in the preview — the exact failure this function's doc comment names.
+  if (!withinDecimalCaps(out)) return null;
+
   return negative ? `-${out}` : out;
 }
 
-function parseNumeric(val: string): number {
-  // The comma is deliberately not in the strip class any more; `resolveSeparators`
-  // needs to see it. Currency symbols and whitespace carry no ambiguity and still go.
+/**
+ * A decimal in the form the API accepts.
+ *
+ * Deliberately narrower than `parseFloat`. The backend's `strict_decimal_json`
+ * refuses anything it cannot name, so a cell that parses here and is then refused
+ * there costs the user a failed import row and a round trip. Exponent form is
+ * excluded for that reason: `1e3` is a number to `parseFloat` and is not a
+ * decimal string.
+ */
+const DECIMAL_ONLY = /^-?\d+(\.\d+)?$/;
+
+/**
+ * Fractional digits the API accepts. Mirrors `MAX_DECIMAL_SCALE` in
+ * `backend_rust/src/db_types.rs`; the two are pinned to the same number by
+ * `csvValidator.test.ts` because a cell that clears this file and is refused by the
+ * backend is exactly the round trip this function exists to prevent.
+ */
+export const MAX_DECIMAL_SCALE = 12;
+
+/**
+ * Total digits — integer plus fraction together — the API accepts. Mirrors
+ * `MAX_DECIMAL_PRECISION`, which the backend applies as a **total**, not as an integer-part
+ * bound. `rust_decimal` holds 28 significant digits and no more is representable, so a
+ * longer value is not merely refused, it cannot round-trip.
+ */
+export const MAX_DECIMAL_DIGITS = 28;
+
+/**
+ * True when `value` (already normalised, no sign, no separators) is inside both caps.
+ * Same rule as `is_canonical_decimal`, same order of checks.
+ */
+export function withinDecimalCaps(value: string): boolean {
+  const dot = value.indexOf('.');
+  const intDigits = dot === -1 ? value : value.slice(0, dot);
+  const fracDigits = dot === -1 ? '' : value.slice(dot + 1);
+  if (fracDigits.length > MAX_DECIMAL_SCALE) return false;
+  if (intDigits.length + fracDigits.length > MAX_DECIMAL_DIGITS) return false;
+  return true;
+}
+
+/**
+ * Parse one CSV cell into the exact decimal string that will be sent to the API,
+ * or `null` if the cell is not a decimal.
+ *
+ * No binary float is involved, and that is the entire point. `parseFloat` is how
+ * `9.99` became a value the tax engine could not trust; routing the write path
+ * back through a float would reintroduce at the boundary exactly what the string
+ * transport exists to prevent. The cell is cleaned, matched, and canonicalized as
+ * text.
+ *
+ * Currency symbols and whitespace are stripped here. The comma is deliberately
+ * left in for `resolveSeparators`, which decides by **position** whether it is a
+ * thousands separator or a decimal comma — see its comment for the rule and for
+ * why a blind strip was a corruption rather than a simplification.
+ *
+ * The two steps compose rather than overlap: `resolveSeparators` guarantees its
+ * output is `[-]digits[.digits]` or nothing at all, so `DECIMAL_ONLY` is left to
+ * reject only what it exists to reject — exponent form, stray characters, a bare
+ * sign. `.5` reaches here unchanged and is refused here, as it always was. A leading
+ * `+` does not: `resolveSeparators` strips it (it carries no information, and it has
+ * always been accepted), so `+1.5` arrives as `1.5` and passes.
+ */
+export function parseDecimal(val: string): string | null {
   const cleaned = (val ?? '').replace(/[$€£¥₹\s]/g, '');
   const resolved = resolveSeparators(cleaned);
-  // `NaN` is the callers' existing "not a number" signal — every caller tests it
-  // with `isNaN`, so an unresolvable grouping reports as an invalid cell rather
-  // than throwing its way through the validator.
-  if (resolved === null) return NaN;
-  return parseFloat(resolved);
+  if (resolved === null) return null;
+  if (!DECIMAL_ONLY.test(resolved)) return null;
+
+  const negative = resolved.startsWith('-');
+  const body = negative ? resolved.slice(1) : resolved;
+  const [intPart, fracPart] = body.split('.');
+  const int = intPart.replace(/^0+/, '') || '0';
+  const frac = fracPart ? fracPart.replace(/0+$/, '') : '';
+  const out = frac ? `${int}.${frac}` : int;
+  // `-0` is the same number as `0` and would otherwise make two identical rows
+  // look different to the import dedup key.
+  return negative && out !== '0' ? `-${out}` : out;
 }
 
 function validateQuantity(
@@ -228,13 +302,15 @@ function validateQuantity(
     return errors;
   }
 
-  const val = parseNumeric(qtyStr);
-  if (isNaN(val)) {
+  const val = parseDecimal(qtyStr);
+  if (val === null) {
     errors.push({ row, field: 'quantity', message: `Invalid quantity: "${qtyStr}"` });
     return errors;
   }
 
-  if (val <= 0) {
+  // `Number()` here is for the sign test only; the value that gets stored is the
+  // exact string. Sign and zero survive the conversion, magnitude does not.
+  if (Number(val) <= 0) {
     errors.push({ row, field: 'quantity', message: `Quantity must be positive, got ${val}` });
   }
 
@@ -252,13 +328,13 @@ function validatePrice(
     return errors;
   }
 
-  const val = parseNumeric(priceStr);
-  if (isNaN(val)) {
+  const val = parseDecimal(priceStr);
+  if (val === null) {
     errors.push({ row, field: 'price', message: `Invalid price: "${priceStr}"` });
     return errors;
   }
 
-  if (val < 0) {
+  if (Number(val) < 0) {
     errors.push({ row, field: 'price', message: `Price must be positive or zero, got ${val}` });
   }
 
@@ -275,13 +351,13 @@ function validateFee(
     return errors;
   }
 
-  const val = parseNumeric(feeStr);
-  if (isNaN(val)) {
+  const val = parseDecimal(feeStr);
+  if (val === null) {
     errors.push({ row, field: 'fee', message: `Invalid fee: "${feeStr}"` });
     return errors;
   }
 
-  if (val < 0) {
+  if (Number(val) < 0) {
     errors.push({ row, field: 'fee', message: `Fee must be non-negative, got ${val}` });
   }
 
@@ -293,9 +369,14 @@ export interface ValidatedRow {
   date: string;
   symbol: string;
   type: 'BUY' | 'SELL' | 'SPLIT';
-  quantity: number;
-  price: number;
-  fee: number;
+  /**
+   * Decimal strings, not numbers. These are posted to the API verbatim, and the
+   * API takes money as an exact decimal string; a `number` here would mean the
+   * value had already been through a binary float before it was ever sent.
+   */
+  quantity: string;
+  price: string;
+  fee: string;
   errors: CsvValidationRow[];
 }
 
@@ -344,7 +425,10 @@ export function validateCsvRow(
   const upperType = typeRaw.trim().toUpperCase();
   const normalizedType: 'BUY' | 'SELL' | 'SPLIT' = (upperType === 'SELL' ? 'SELL' : upperType === 'SPLIT' ? 'SPLIT' : 'BUY');
 
-  if (normalizedType === 'SPLIT' && !(parseNumeric(priceRaw) > 0)) {
+  const quantity = parseDecimal(qtyRaw) ?? '0';
+  const price = parseDecimal(priceRaw) ?? '0';
+
+  if (normalizedType === 'SPLIT' && !(Number(price) > 0)) {
     allErrors.push({ row: rowNum, field: 'price', message: 'SPLIT ratio denominator (shares before) must be positive' });
   }
 
@@ -353,9 +437,9 @@ export function validateCsvRow(
     date: dateRaw,
     symbol: symbolRaw.trim(),
     type: normalizedType,
-    quantity: parseNumeric(qtyRaw) || 0,
-    price: parseNumeric(priceRaw) || 0,
-    fee: normalizedType === 'SPLIT' ? 0 : (parseNumeric(feeRaw ?? '0') || 0),
+    quantity,
+    price,
+    fee: normalizedType === 'SPLIT' ? '0' : (parseDecimal(feeRaw ?? '0') ?? '0'),
     errors: allErrors,
   };
 }

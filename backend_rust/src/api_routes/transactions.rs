@@ -2,11 +2,9 @@ use rocket::{State, serde::json::Json, http::Status};
 use crate::db::DbPool;
 use crate::models::{Asset, Transaction};
 use crate::schemas::{AssetCreate, AssetOut, AssetUpdate, TransactionCreate, TransactionOut};
-use crate::api_routes::lookup::is_valid_isin;
 use crate::services::currency_service::CurrencyService;
 use crate::access::{require, require_asset, require_asset_in, require_transaction, Access};
 use crate::auth::guard::AuthedUser;
-use rust_decimal::Decimal;
 
 #[utoipa::path(
     post,
@@ -22,7 +20,7 @@ pub async fn create_asset(
     user: AuthedUser,
     portfolio_id: i64,
     pool: &State<DbPool>,
-    _currency_service: &State<CurrencyService>,
+    _currency_service: &State<std::sync::Arc<CurrencyService>>,
     asset: Json<AssetCreate>
 ) -> Result<Json<AssetOut>, Status> {
     // This also fixes a pre-existing hole: the insert used to accept any
@@ -30,62 +28,12 @@ pub async fn create_asset(
     // exist. A nonexistent portfolio is now 404 instead of 201-with-a-dangling-row.
     require(pool.inner(), user.id, portfolio_id, Access::Editor).await?;
 
-    let existing = sqlx::query_as!(
-        Asset,
-        "SELECT * FROM assets WHERE portfolio_id = $1 AND symbol = $2",
-        portfolio_id,
-        asset.symbol.to_uppercase()
-    )
-    .fetch_optional(pool.inner())
-    .await
-    .map_err(|_| Status::InternalServerError)?;
-
-    if existing.is_some() {
-        return Err(Status::BadRequest);
-    }
-
-    if !asset.isin.is_empty() {
-        let isin_upper = asset.isin.to_uppercase();
-        if !is_valid_isin(&isin_upper) {
-            return Err(Status::BadRequest);
-        }
-        // `assets.id` is BIGINT; reading it as `i32` is a runtime mismatched-types
-        // error under sqlx-postgres, not a compile error. The value is only tested for
-        // presence, but the row still has to decode.
-        let isin_exists: Option<i64> = sqlx::query_scalar!(
-            "SELECT id FROM assets WHERE portfolio_id = $1 AND isin = $2",
-            portfolio_id,
-            &isin_upper
-        )
-        .fetch_optional(pool.inner())
+    let mut conn = pool
+        .inner()
+        .acquire()
         .await
         .map_err(|_| Status::InternalServerError)?;
-        if isin_exists.is_some() {
-            return Err(Status::Conflict);
-        }
-    }
-
-    let resolved_currency = if asset.currency.is_empty() {
-        CurrencyService::detect_currency(&asset.symbol)
-    } else {
-        asset.currency.clone()
-    };
-
-    let res = sqlx::query_as!(
-        Asset,
-        "INSERT INTO assets (portfolio_id, symbol, name, asset_type, sector, currency, isin)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
-        portfolio_id,
-        asset.symbol.to_uppercase(),
-        &asset.name,
-        asset.asset_type.to_uppercase(),
-        asset.sector.as_deref(),
-        &resolved_currency,
-        if asset.isin.is_empty() { None } else { Some(asset.isin.to_uppercase()) }
-    )
-    .fetch_one(pool.inner())
-    .await
-    .map_err(|_| Status::InternalServerError)?;
+    let res = crate::services::assets::insert(&mut conn, portfolio_id, &asset).await?;
 
     Ok(Json(AssetOut {
         id: res.id,
@@ -236,36 +184,12 @@ pub async fn create_transaction(
         return Err(Status::NotFound);
     }
 
-    let tx_type = tx.r#type.to_uppercase();
-    if tx_type == "SPLIT" {
-        if tx.quantity <= Decimal::ZERO || tx.price <= Decimal::ZERO {
-            return Err(Status::BadRequest);
-        }
-    }
-    let tx_fee = if tx_type == "SPLIT" { Decimal::ZERO } else { tx.fee };
-
-    // Validate date is within reasonable range
-    let tx_date = tx.date.date_naive();
-    let min_date = chrono::NaiveDate::from_ymd_opt(1900, 1, 1).ok_or(Status::BadRequest)?;
-    let max_date = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).ok_or(Status::BadRequest)?;
-    if tx_date < min_date || tx_date > max_date {
-        return Err(Status::BadRequest);
-    }
-
-    let res = sqlx::query_as!(
-        Transaction,
-        "INSERT INTO transactions (asset_id, type, quantity, price, fee, date)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
-        asset_id,
-        &tx_type,
-        tx.quantity.to_string(),
-        tx.price.to_string(),
-        tx_fee.to_string(),
-        tx.date
-    )
-    .fetch_one(pool.inner())
-    .await
-    .map_err(|_| Status::InternalServerError)?;
+    let mut conn = pool
+        .inner()
+        .acquire()
+        .await
+        .map_err(|_| Status::InternalServerError)?;
+    let res = crate::services::transactions::insert(&mut conn, asset_id, &tx).await?;
 
     Ok(Json(TransactionOut {
         id: res.id,

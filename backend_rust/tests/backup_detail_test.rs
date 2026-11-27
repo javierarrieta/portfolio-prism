@@ -228,46 +228,73 @@ async fn an_asset_with_no_transactions_is_flagged_and_carries_no_dates() {
     assert_eq!(rows.0, 0);
 }
 
-/// Three copies of one symbol set the flag **once**, and it is a portfolio-level flag —
-/// the same shape the bundle side produces, and the thing Task 5's round-trip compares.
-#[tokio::test]
-async fn a_duplicated_symbol_sets_the_flag_once_and_never_in_asset_flags() {
-    let (pool, uid) = db_with_user("owned-detail-duplicate").await;
-    let pid = seed_portfolio(&pool, uid, "P", "USD").await;
-    for name in ["one", "two", "three"] {
-        let aid = seed_asset(&pool, pid, "DUP", name).await;
-        seed_transaction(&pool, aid, "BUY", 1.0, 1.0, 0.0).await;
-    }
-    let unique = seed_asset(&pool, pid, "UNIQUE", "Unique").await;
-    seed_transaction(&pool, unique, "BUY", 1.0, 1.0, 0.0).await;
-
-    let side = owned_detail(&pool, uid, today()).await.unwrap();
-    let p = &side.shown[0];
-    assert_eq!(p.assets, 4);
-    // `==` not `contains`: a flag pushed once per duplicate would produce three entries
-    // and pass a `contains` assertion.
-    assert_eq!(p.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
-    assert!(!p.asset_flags.contains_key(flag::DUPLICATE_SYMBOL));
+/// A bundle with duplicated symbols, as JSON, for the two tests below.
+///
+/// These moved here from the `owned_detail` side, and the move is the finding rather than a
+/// refactor: they seeded duplicate `assets` rows, and migration `0006_asset_symbol_unique.sql`
+/// makes the unique index on `(portfolio_id, upper(symbol))` refuse the seed insert itself.
+/// That is the fixture telling the reader the state is gone, not an obstacle to route around —
+/// the database can no longer hold a duplicated symbol, so the database side of the flag was
+/// deleted. What is left is the half that stays reachable: a bundle is caller-supplied JSON,
+/// and the preview is built before anything is inserted.
+///
+/// The one-copied-symbol case is already covered in-module by
+/// `detail::tests::the_same_symbol_twice_in_one_portfolio_is_flagged_once`; these two cover
+/// what that one does not.
+fn bundle_with_symbols(symbols: &[&str]) -> String {
+    json!({
+        "format": "portfolio-prism-backup",
+        "schema_version": 1,
+        "created_at": "2026-06-01T00:00:00Z",
+        "portfolios": [{
+            "ref": "p1", "name": "P", "description": null,
+            "currency": "USD", "base_currency": "USD",
+            "assets": symbols.iter().enumerate().map(|(i, s)| json!({
+                "ref": format!("a{i}"), "symbol": s, "name": format!("Asset {i}"),
+                "asset_type": "STOCK", "sector": null, "currency": "USD", "isin": null,
+                "transactions": []
+            })).collect::<Vec<_>>()
+        }]
+    })
+    .to_string()
 }
 
 /// Presence, not count: two symbols each duplicated twice reads exactly as one duplicated
-/// symbol does, so the producers cannot disagree about a number neither of them
-/// surfaces.
-#[tokio::test]
-async fn two_distinct_duplicated_symbols_still_report_the_flag_once() {
-    let (pool, uid) = db_with_user("owned-detail-duplicate-two").await;
-    let pid = seed_portfolio(&pool, uid, "P", "USD").await;
-    for symbol in ["AAA", "BBB"] {
-        for name in ["x", "y"] {
-            let aid = seed_asset(&pool, pid, symbol, name).await;
-            seed_transaction(&pool, aid, "BUY", 1.0, 1.0, 0.0).await;
-        }
-    }
-
-    let side = owned_detail(&pool, uid, today()).await.unwrap();
+/// symbol does, so a reader cannot infer a number neither producer surfaces.
+#[test]
+fn two_distinct_duplicated_symbols_in_a_bundle_still_report_the_flag_once() {
+    let parsed: Bundle =
+        serde_json::from_str(&bundle_with_symbols(&["AAA", "AAA", "BBB", "BBB"])).unwrap();
+    let side = detail_from_bundle(&parsed, today());
     let p = &side.shown[0];
     assert_eq!(p.assets, 4);
     assert_eq!(p.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
+}
+
+/// `aapl` beside `AAPL`: the index refuses it, and so does the flag.
+///
+/// This test used to assert the opposite, and its comment argued the asymmetry was
+/// deliberate: "the flag is a human-facing 'you listed this twice' hint about the spelling
+/// in front of them." That rationale depended on a premise that turns out to be false. The
+/// preview route runs `parse_and_validate` **before** it builds a plan, and `validate`
+/// refuses a case-insensitive duplicate — so no client ever sees this flag through HTTP,
+/// and there is no human looking at a spelling. What is left is a tripwire for a caller
+/// that plans without validating, and a tripwire that misses the exact case the rule it
+/// guards catches (`to_uppercase()`, matching `upper(symbol)`) is worse than none: it would
+/// stay silent in the one situation that would prove the ordering guarantee had broken.
+///
+/// So the flag now compares the way `validate` compares. If the operator decides the old
+/// reading was right — a preview that shows the spelling as written, duplicates and all —
+/// then the flag has to be made reachable first, or this test is pinning dead behaviour.
+#[test]
+fn a_case_variant_sets_the_bundle_flag_because_the_index_and_validate_both_refuse_it() {
+    let parsed: Bundle = serde_json::from_str(&bundle_with_symbols(&["aapl", "AAPL"])).unwrap();
+    let side = detail_from_bundle(&parsed, today());
+    assert_eq!(
+        side.shown[0].flags,
+        vec![flag::DUPLICATE_SYMBOL.to_string()],
+        "the flag must compare the way validate does: case-insensitively, matching upper(symbol)"
+    );
 }
 
 /// The date span on the SQL side, with one of the three dates bound as a `+02:00` instant
@@ -418,10 +445,14 @@ fn flagged_bundle() -> String {
                     // Flagged by neither side, and here to prove it stays that way.
                     asset("a-plus", "PLUSZERO", "Plus zero", "EUR",
                         vec![tx("+0", "2024-01-15T00:00:00Z")]),
-                    // duplicate_symbol: two assets, one symbol, one portfolio.
-                    asset("a-dup-1", "DUP", "Dup one", "EUR",
+                    // Distinct symbols, and they have to stay distinct: `assets` is unique on
+                    // `(portfolio_id, upper(symbol))` as of migration 0006, so a duplicated
+                    // symbol here would make `restore` refuse and this test could not compare
+                    // the two producers at all. The duplicate case is covered on the bundle
+                    // side, where it is still reachable.
+                    asset("a-dup-1", "DUP1", "Dup one", "EUR",
                         vec![tx("2.00", "2024-01-16T00:00:00Z")]),
-                    asset("a-dup-2", "DUP", "Dup two", "EUR",
+                    asset("a-dup-2", "DUP2", "Dup two", "EUR",
                         vec![tx("3.00", "2024-01-17T00:00:00Z")]),
                     // currency_mismatch: this portfolio is EUR.
                     asset("a-fx", "FX", "Fx", "USD",
@@ -451,8 +482,9 @@ fn flagged_bundle() -> String {
 /// read as a zero price, and the flags that conclusion produced.
 ///
 /// The key is symbol **and** name because the SQL side orders assets by symbol while the
-/// bundle side keeps the order they were written in, and `DUP` is one symbol held by two
-/// different assets. Comparing `shown` positionally would compare `ZERO` against `DUP`.
+/// bundle side keeps the order they were written in, and the two `DUP1`/`DUP2` assets are
+/// distinct symbols that a reader could still mistake for one. Comparing `shown`
+/// positionally would compare `ZERO` against `DUP1`.
 fn per_asset(p: &PlanPortfolio) -> BTreeMap<(&str, &str), (usize, Vec<&str>)> {
     p.shown
         .iter()
@@ -553,12 +585,25 @@ async fn after_a_restore_the_readback_matches_what_the_preview_promised() {
             "the database side never set {code}"
         );
     }
-    // `duplicate_symbol` is a portfolio fact, and the one code the loop above would
-    // least like to lose: the SQL side counts *duplicated symbols*, not duplicated
-    // assets, and this fixture has two assets sharing one symbol — a producer that
-    // counted assets would report 2, and the flag is presence either way.
-    assert_eq!(want_flags.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
-    assert_eq!(got_flags.flags, vec![flag::DUPLICATE_SYMBOL.to_string()]);
+    // `duplicate_symbol` is asserted absent on both sides, which is the opposite of what
+    // used to be here and needs the reason attached. This pair used to be the round-trip's
+    // only guard on the code: the fixture had two assets sharing one symbol, and both
+    // producers had to report it once. Migration `0006_asset_symbol_unique.sql` broke the
+    // symmetry in a way no fixture can repair — a bundle carrying a duplicated symbol can no
+    // longer be restored at all (`validate` refuses it, and the unique index on
+    // `(portfolio_id, upper(symbol))` is underneath that), so there is no bundle whose
+    // preview flags a duplicate and whose restored database does not. The database side
+    // cannot set the code; the bundle side can, and is tested doing it in
+    // `detail::tests::the_same_symbol_twice_in_one_portfolio_is_flagged_once`. What is left
+    // worth pinning is that the two sides still agree on a fixture that can actually exist —
+    // and that neither invents a flag the other cannot see.
+    assert!(
+        !want_flags.flags.contains(&flag::DUPLICATE_SYMBOL.to_string())
+            && !got_flags.flags.contains(&flag::DUPLICATE_SYMBOL.to_string()),
+        "neither side may flag a duplicate here: bundle {:?}, database {:?}",
+        want_flags.flags,
+        got_flags.flags
+    );
     // The clean half. Without a portfolio that has nothing to flag, the four codes above
     // could have come from a count taken across the whole caller rather than per
     // portfolio, and both producers could be wrong in the same direction.

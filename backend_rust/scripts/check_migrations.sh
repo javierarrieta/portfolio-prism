@@ -2,7 +2,7 @@
 # The migration is the schema. This checks a Postgres database against it, and it pins
 # four things, because each one has a different way of going wrong silently:
 #
-#   1. every column's type and NOT NULL-ness (all 36 columns of the six tables, 28 of
+#   1. every column's type and NOT NULL-ness (all 55 columns of the eight tables, 42 of
 #      them NOT NULL, not a sample — sqlx-postgres type-checks at run time, so a wrong
 #      column type is a request failing in production rather than a compile error, and a
 #      column made nullable is a `None` the Rust structs have no field for),
@@ -46,6 +46,23 @@ want() { # table column type
   [ -n "$t" ] || { echo "FAIL $1.$2 does not exist in $DATABASE_URL"; exit 1; }
   [ "$t" = "$3" ] || { echo "FAIL $1.$2 is '$t', expected '$3'"; exit 1; }
   echo "ok   $1.$2 = $3"
+}
+
+# An array column. `data_type` is the literal "ARRAY" for every array type, so
+# checking it alone would accept an int[] where a text[] is required; the element type
+# is in `udt_name`, and that is what this pins.
+want_array() { # table column element-udt-name
+  local t u
+  t=$(q "select data_type from information_schema.columns
+          where table_schema='public' and table_name='$1' and column_name='$2'") \
+    || { echo "FAIL could not read the type of $1.$2 from $DATABASE_URL"; exit 1; }
+  [ -n "$t" ] || { echo "FAIL $1.$2 does not exist in $DATABASE_URL"; exit 1; }
+  [ "$t" = "ARRAY" ] \
+    || { echo "FAIL $1.$2 is '$t', expected an array"; exit 1; }
+  u=$(q "select udt_name from information_schema.columns
+          where table_schema='public' and table_name='$1' and column_name='$2'")
+  [ "$u" = "$3" ] || { echo "FAIL $1.$2 is an array of '$u', expected '$3'"; exit 1; }
+  echo "ok   $1.$2 = $3 array"
 }
 
 want_notnull() { # table column
@@ -132,6 +149,13 @@ want_migration_ledger() {
     v=$((10#$v))
     d=${base#*_}
     d=${d%.sql}
+    # sqlx stores the description with underscores turned into spaces, so a migration
+    # whose name has more than one word in it never matched, and two branches each
+    # independently discovered this on their own first multi-word migration
+    # (0002_transaction_type_check.sql and 0003_api_token.sql). Comparing the file name
+    # verbatim reports an applied migration as missing. 0001_init.sql has one word, which
+    # is how it sat unnoticed through two migrations.
+    d=${d//_/ }
     sum=$(sha384sum "$f" | cut -d' ' -f1)
     stored=$(q "select encode(checksum, 'hex') from _sqlx_migrations
                   where version = $v and description = '$d' and success") \
@@ -150,7 +174,53 @@ want_migration_ledger() {
 # a split adjustment and corrupting cost basis. A gate that checked only tables and
 # column types would have passed that schema, which makes it complicit in the bug it
 # exists to prevent, so the index itself is asserted: present, unique, partial on SPLIT,
-# and keyed on the UTC calendar day.
+# and keyed on the UTC calendar day, on the same case-insensitive expression the CHECK uses.
+# The transaction-type CHECK, pinned to its exact definition.
+#
+# Three places name this vocabulary and nothing imports it between them: the `TxType` enum
+# the API accepts, `backup::KNOWN_TRANSACTION_TYPES` the bundle schema enumerates, and this
+# constraint. `tests/tx_type_test.rs` connects the first two and greps the SQL text for the
+# third; this connects the third to the *live database*, which is where a migration that
+# never ran would otherwise go unnoticed — the same blind spot `check_migrations.sh` exists
+# for everywhere else.
+#
+# The definition is `upper(btrim(type)) = ANY (...)` rather than `type IN (...)` on purpose:
+# legacy rows hold `buy` and the constraint must accept them without a rewrite. A future
+# edit that "simplifies" it to `type IN ('BUY','SELL','SPLIT')` would make every legacy
+# lowercase row refuse a later ALTER, so the whole expression is asserted, not just the
+# value list.
+want_type_check() {
+  local d
+  d=$(q "select coalesce(pg_get_constraintdef(oid), '') from pg_constraint
+          where conrelid = 'public.transactions'::regclass and conname = 'transactions_type_check'") \
+    || { echo "FAIL could not read transactions_type_check from $DATABASE_URL"; exit 1; }
+  [ -n "$d" ] \
+    || { echo "FAIL transactions has no transactions_type_check in $DATABASE_URL: migration 0002 has not been applied here, and a gate that passed anyway would be certifying an unconstrained column"; exit 1; }
+  [ "$d" = "CHECK ((upper(btrim(type)) = ANY (ARRAY['BUY'::text, 'SELL'::text, 'SPLIT'::text])))" ] \
+    || { echo "FAIL transactions_type_check is '$d', expected the case-insensitive upper(btrim(type)) form over BUY, SELL, SPLIT"; exit 1; }
+  echo "ok   transactions.transactions_type_check = upper(btrim(type)) IN BUY|SELL|SPLIT"
+}
+
+# The status CHECK, pinned to its exact definition.
+#
+# `staged -> approved -> applied` plus `discarded` is the whole approval gate, and the
+# transition rules live in `agent::staging` as conditional UPDATEs. This constraint is the
+# only thing that stops a fourth status being written by hand — and a status nothing
+# recognises would make a batch permanently unapproachable rather than visibly wrong.
+want_status_check() {
+  local d
+  d=$(q "select coalesce(pg_get_constraintdef(oid), '') from pg_constraint
+          where conrelid = 'public.agent_staged_batch'::regclass and conname = 'agent_staged_batch_status_check'") \
+    || { echo "FAIL could not read agent_staged_batch_status_check from $DATABASE_URL"; exit 1; }
+  [ -n "$d" ] \
+    || { echo "FAIL agent_staged_batch has no status CHECK in $DATABASE_URL: migration 0004 has not been applied here"; exit 1; }
+  case "$d" in
+    *"'staged'"*"'approved'"*"'applied'"*"'discarded'"*) ;;
+    *) echo "FAIL agent_staged_batch status CHECK is '$d', expected the four states staged/approved/applied/discarded"; exit 1 ;;
+  esac
+  echo "ok   agent_staged_batch.status CHECK = staged|approved|applied|discarded"
+}
+
 want_split_dedupe_index() {
   local row uniq partial pred def
   row=$(q "select concat_ws('|', i.indisunique, (i.indpred is not null),
@@ -169,9 +239,17 @@ want_split_dedupe_index() {
   [ "$uniq" = "t" ] || { echo "FAIL uq_split_asset_date must be UNIQUE, it is not"; exit 1; }
   [ "$partial" = "t" ] \
     || { echo "FAIL uq_split_asset_date must be partial (WHERE type = 'SPLIT'); a full index would constrain every transaction type"; exit 1; }
+  # Pinned to the case-insensitive form, and pinned tightly. `0001` created this predicate as
+  # `type = 'SPLIT'` and `0002`'s CHECK accepts a lowercase `split`, so a schema that regressed
+  # to the old predicate would still be a valid-looking unique index while being blind to every
+  # variant spelling — the exact asymmetry `0005` exists to close. Matching a substring that
+  # both forms satisfy would make this assertion vacuous, so it names the expression.
   case "$pred" in
-    *"type = 'SPLIT'"*) ;;
-    *) echo "FAIL uq_split_asset_date predicate is '$pred', expected type = 'SPLIT'"; exit 1 ;;
+    *"upper(btrim(type)) = 'SPLIT'"*) ;;
+    *"type = 'SPLIT'"*)
+      echo "FAIL uq_split_asset_date predicate is '$pred': case-sensitive, so a row typed 'split' passes transactions_type_check and escapes the dedupe. Migration 0005 rebuilds it on upper(btrim(type))."
+      exit 1 ;;
+    *) echo "FAIL uq_split_asset_date predicate is '$pred', expected upper(btrim(type)) = 'SPLIT'"; exit 1 ;;
   esac
   case "$def" in
     *"AT TIME ZONE 'UTC'"*::date*) ;;
@@ -182,6 +260,41 @@ want_split_dedupe_index() {
     *) echo "FAIL uq_split_asset_date must lead with asset_id; definition is: $def"; exit 1 ;;
   esac
   echo "ok   transactions.uq_split_asset_date = unique, partial on SPLIT, keyed on (asset_id, UTC day)"
+}
+
+# The asset-identity index, pinned to its exact definition.
+#
+# Asset identity inside a portfolio is the rule the whole import path is written against,
+# and until `0006` it lived only in software: a `SELECT`-then-`INSERT` with a window in the
+# middle. This asserts the constraint exists and keys on the expression the code compares,
+# because an index on the bare `symbol` would look identical in a `\d` listing while enforcing
+# a different rule — it would still admit `aapl` beside `AAPL`, which is the exact duplicate
+# the lookup is blind to.
+want_asset_symbol_index() {
+  local row uniq def cols
+  row=$(q "select concat_ws('|', i.indisunique, pg_get_indexdef(i.indexrelid))
+            from pg_class t
+            join pg_namespace n on n.oid = t.relnamespace
+            join pg_index i on i.indrelid = t.oid
+            join pg_class x on x.oid = i.indexrelid
+            where n.nspname = 'public' and t.relname = 'assets'
+              and x.relname = 'uq_assets_portfolio_symbol'") \
+    || { echo "FAIL could not read uq_assets_portfolio_symbol from $DATABASE_URL"; exit 1; }
+  [ -n "$row" ] \
+    || { echo "FAIL assets.uq_assets_portfolio_symbol is missing; asset identity is a SELECT-then-INSERT with no constraint behind it (migration 0006)"; exit 1; }
+  IFS='|' read -r uniq def <<<"$row"
+  [ "$uniq" = "t" ] || { echo "FAIL uq_assets_portfolio_symbol must be UNIQUE, it is not"; exit 1; }
+  case "$def" in
+    *"(portfolio_id, upper(symbol))"*) ;;
+    *) echo "FAIL uq_assets_portfolio_symbol must key on (portfolio_id, upper(symbol)); the code compares the upper-cased symbol, so an index on the bare column enforces a different rule. Definition is: $def"; exit 1 ;;
+  esac
+  # Leading column order, asserted separately so a definition that swaps the two — legal SQL,
+  # useless for the per-portfolio lookup — is named rather than waved through.
+  case "$def" in
+    *"(portfolio_id,"*) ;;
+    *) echo "FAIL uq_assets_portfolio_symbol must lead with portfolio_id; definition is: $def"; exit 1 ;;
+  esac
+  echo "ok   assets.uq_assets_portfolio_symbol = unique on (portfolio_id, upper(symbol))"
 }
 
 # --- users --------------------------------------------------------------------------
@@ -267,7 +380,64 @@ want split_sync covered_from   date
 want_notnull split_sync asset_id
 want_notnull split_sync last_synced_at
 
+# --- agent_staged_batch -----------------------------------------------------------
+# The row that makes the approval gate persistent. The nullable columns are the state
+# machine, so they are pinned as deliberately as any type: `approved_at` NULL means no
+# human has acted yet, `applied_at` NULL means nothing was written, and `approved_by` is
+# the only column here that is an audit field rather than a relationship.
+#
+# `payload` and `preview` are jsonb and NOT NULL together: a batch that stored one but not
+# the other would let the human approve something the apply step then writes differently.
+want agent_staged_batch id           bigint
+want agent_staged_batch handle       text
+want agent_staged_batch user_id      bigint
+want agent_staged_batch payload      jsonb
+want agent_staged_batch preview      jsonb
+want agent_staged_batch status       text
+want agent_staged_batch created_at   "timestamp with time zone"
+want agent_staged_batch expires_at   "timestamp with time zone"
+want agent_staged_batch approved_at  "timestamp with time zone"
+want agent_staged_batch approved_by  bigint
+want agent_staged_batch applied_at   "timestamp with time zone"
+want_notnull agent_staged_batch id
+want_notnull agent_staged_batch handle
+want_notnull agent_staged_batch user_id
+want_notnull agent_staged_batch payload
+want_notnull agent_staged_batch preview
+want_notnull agent_staged_batch status
+want_notnull agent_staged_batch created_at
+want_notnull agent_staged_batch expires_at
+
+# --- api_token ----------------------------------------------------------------------
+# `secret_hash` and not `secret`: the plaintext is shown once at mint and is
+# unrecoverable afterwards, so there is nothing in this table worth restoring or
+# cascading. `scopes` is TEXT[] rather than a CHECK over ('read','import') on purpose —
+# the vocabulary has exactly one authority, the `Scope` enum in `auth/pat.rs`, and a
+# second copy of it in a constraint is how the two drift apart.
+#
+# The three nullable timestamps are the table's whole design, so their nullability is
+# pinned as deliberately as any type: `expires_at` NULL means no expiry, `last_used_at`
+# NULL means never used, `revoked_at` NULL means live. A migration that made any of
+# them NOT NULL with a sentinel would silently change what "no expiry" means.
+want api_token id           bigint
+want api_token user_id      bigint
+want api_token secret_hash  text
+want api_token label        text
+want_array api_token scopes _text
+want api_token expires_at   "timestamp with time zone"
+want api_token last_used_at "timestamp with time zone"
+want api_token revoked_at   "timestamp with time zone"
+want api_token created_at   "timestamp with time zone"
+want_notnull api_token id
+want_notnull api_token user_id
+want_notnull api_token secret_hash
+want_notnull api_token label
+want_notnull api_token scopes
+want_notnull api_token created_at
+
 # --- keys, identity, and the ledger -------------------------------------------------
+want_identity api_token    id
+want_identity agent_staged_batch id
 want_identity users        id
 want_identity portfolios   id
 want_identity assets       id
@@ -282,8 +452,18 @@ want_pk historical_prices "PRIMARY KEY (symbol, date)"
 # `ON CONFLICT (issuer, subj) DO NOTHING` (auth/oidc.rs:304), so without this index every
 # first login fails when the plan is built rather than writing a duplicate identity.
 want_unique users uq_users_issuer_subj "(issuer, subj)"
+# The handle is the only name a batch has outside the database, and every route resolves
+# it. Without uniqueness two rows could answer the same handle and approval would land on
+# whichever the planner reached first.
+want_unique agent_staged_batch agent_staged_batch_handle_key "(handle)"
+# The uniqueness the token path depends on: `pat::lookup` finds exactly one row by
+# hash, and a second row with the same hash would make two tokens interchangeable.
+want_unique api_token api_token_secret_hash_key "(secret_hash)"
 
 want_split_dedupe_index
+want_asset_symbol_index
+want_type_check
+want_status_check
 want_migration_ledger
 
 echo "schema shape ok"

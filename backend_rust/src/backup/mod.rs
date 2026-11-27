@@ -408,6 +408,12 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
             }
         }
 
+        // Per portfolio, deliberately, not bundle-wide. `ref` is a bundle-local label so its
+        // namespace is the whole bundle; a symbol is an identity *within a portfolio*, and the
+        // same security in two portfolios is the ordinary case — anyone holding a tax-free
+        // wrapper beside a taxable account has it. A bundle-wide set here would refuse a
+        // perfectly valid backup.
+        let mut seen_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (ai, a) in p.assets.iter().enumerate() {
             let ap = format!("{pp}.assets[{ai}]");
             // The same `seen_refs` set as portfolios, deliberately: a ref is a
@@ -424,6 +430,23 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
             }
             if a.symbol.trim().is_empty() {
                 push(format!("{ap}.symbol"), "must not be empty".into());
+            } else if !seen_symbols.insert(a.symbol.to_uppercase()) {
+                // Two assets, one portfolio, one symbol. Without this rule the bundle passes
+                // validation and `restore::apply` discovers the collision mid-transaction as a
+                // raw `uq_assets_portfolio_symbol` violation: a 500 for what is a bad upload,
+                // with the constraint name as the only explanation. Validation is where a
+                // bundle gets a path and a reason; the index is the backstop underneath it, and
+                // both are wanted — the index because validation can be skipped by anything
+                // writing to the database directly.
+                //
+                // Upper-cased to match the index expression, `upper(symbol)`. A bundle holding
+                // both `aapl` and `AAPL` is a collision, and `restore` inserts the symbol
+                // verbatim, so the case that differs is real and would otherwise reach the
+                // insert.
+                push(
+                    ap.clone(),
+                    format!("duplicate symbol {:?} in this portfolio", a.symbol),
+                );
             }
             if a.name.trim().is_empty() {
                 push(format!("{ap}.name"), "must not be empty".into());
@@ -469,8 +492,28 @@ fn collect(bundle: &Bundle) -> (Vec<ValidationError>, bool) {
                         format!("{:?} is not one of {:?}", t.r#type, KNOWN_TRANSACTION_TYPES));
                 }
                 for (field, value) in [("quantity", &t.quantity), ("price", &t.price), ("fee", &t.fee)] {
-                    if rust_decimal::Decimal::from_str_exact(value).is_err() {
-                        push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                    // `from_str_exact` alone was not enough: it accepts any scale, so a
+                    // bundle could carry a 20-digit fraction that `strict_decimal_json`
+                    // refuses on `POST /api/transactions`. Two money write paths with two
+                    // rules is how a value enters the database that the ordinary API can
+                    // never write or rewrite. The grammar stays as it was — `+0` is a price
+                    // a bundle may really carry, and `restore.rs` writes the string verbatim
+                    // — and the **scale** now matches the API's.
+                    let parsed = match rust_decimal::Decimal::from_str_exact(value) {
+                        Err(_) => {
+                            push(format!("{tp}.{field}"), format!("{value:?} is not a valid decimal"));
+                            continue;
+                        }
+                        Ok(d) => d,
+                    };
+                    if parsed.scale() > crate::db_types::MAX_DECIMAL_SCALE as u32 {
+                        push(
+                            format!("{tp}.{field}"),
+                            format!(
+                                "{value:?} carries more than {} fractional digits, which the API's own money rule refuses",
+                                crate::db_types::MAX_DECIMAL_SCALE
+                            ),
+                        );
                     }
                 }
                 // A SPLIT is a ratio, not a trade, and the ordinary write path refuses
@@ -794,6 +837,13 @@ mod tests {
         }
     }
 
+    /// `asset` with the symbol chosen by the caller. `asset` hard-codes `AAPL`, so any two
+    /// assets built with it are already a duplicated symbol inside one portfolio — which
+    /// `validate` now refuses. Tests that want two distinct assets use this and say so.
+    fn asset_sym(r: &str, symbol: &str) -> BundleAsset {
+        BundleAsset { symbol: symbol.into(), ..asset(r, vec![]) }
+    }
+
     fn port(r: &str, assets: Vec<BundleAsset>) -> BundlePortfolio {
         BundlePortfolio {
             bundle_ref: r.into(),
@@ -963,6 +1013,54 @@ mod tests {
         let b = bundle(vec![port("p1", vec![asset("a1", vec![])]), port("p1", vec![])]);
         let errs = validate(&b);
         assert!(errs.iter().any(|e| e.reason.contains("duplicate ref")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_duplicate_symbol_in_one_portfolio_is_rejected_naming_the_asset() {
+        // Two assets, one portfolio, one symbol. Before `uq_assets_portfolio_symbol` this
+        // bundle restored and left a split cost basis; now it restores and dies mid-transaction
+        // on a raw index violation, which is a 500 for a bad upload. Validation is where a
+        // bundle gets a path and a reason; the index stays as the backstop for everything that
+        // writes to the database without going through validation.
+        let b = bundle(vec![port(
+            "p1",
+            vec![asset_sym("a1", "MSFT"), asset_sym("a2", "MSFT")],
+        )]);
+        let errs = validate(&b);
+        assert!(
+            errs.iter().any(|e| e.path == "portfolios[0].assets[1]"
+                && e.reason.contains("duplicate symbol")
+                && e.reason.contains("MSFT")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_symbol_is_compared_case_insensitively_to_match_the_index() {
+        // The index is on `upper(symbol)` and `restore` inserts the symbol verbatim, so
+        // `msft` beside `MSFT` is the same collision as far as Postgres is concerned. A
+        // case-sensitive check here would pass the bundle and take the violation on the insert.
+        let b = bundle(vec![port(
+            "p1",
+            vec![asset_sym("a1", "MSFT"), asset_sym("a2", "msft")],
+        )]);
+        assert!(
+            validate(&b).iter().any(|e| e.reason.contains("duplicate symbol")),
+            "a case variant is the same symbol to the index"
+        );
+    }
+
+    #[test]
+    fn the_same_symbol_in_two_portfolios_is_not_a_duplicate() {
+        // The rule is per portfolio, and this is the case that would make a bundle-wide rule
+        // wrong: holding one security in a taxable account and a wrapper is ordinary, not
+        // damage. A bundle-wide symbol set passes every other test in this module and refuses
+        // a perfectly good backup.
+        let b = bundle(vec![
+            port("p1", vec![asset_sym("a1", "MSFT")]),
+            port("p2", vec![asset_sym("a2", "MSFT")]),
+        ]);
+        assert!(validate(&b).is_empty(), "{:?}", validate(&b));
     }
 
     #[test]

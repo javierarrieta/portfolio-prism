@@ -53,7 +53,7 @@ pub async fn get_portfolio_tax_summary(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
     from: Option<String>,
@@ -116,7 +116,7 @@ pub async fn get_portfolio_tax_summary(
     }
 }
 
-async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError> {
+pub(crate) async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError> {
     // Column list, not `SELECT *`: `owner_id` is an authorization column and is not a
     // field of `models::Portfolio`.
     sqlx::query_as!(
@@ -130,7 +130,7 @@ async fn load_portfolio(pool: &DbPool, id: i64) -> Result<Portfolio, ReportError
     .ok_or_else(ReportError::not_found)
 }
 
-async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, ReportError> {
+pub(crate) async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, ReportError> {
     // `ORDER BY id` so a report lists assets in the order they were created, as the
     // file-backed build did; see the note on `portfolios::fetch_assets_for_portfolio`.
     sqlx::query_as!(Asset, "SELECT * FROM assets WHERE portfolio_id = $1 ORDER BY id", portfolio_id)
@@ -144,7 +144,7 @@ async fn load_assets(pool: &DbPool, portfolio_id: i64) -> Result<Vec<Asset>, Rep
 /// endpoint has always performed before reading. The dated path deliberately does not
 /// sync splits (issue #50). `strategy` is the normalized value the handler chose, so
 /// this response can never name a matching method the engine did not use.
-async fn undated_summary(
+pub(crate) async fn undated_summary(
     pool: &DbPool,
     currency_service: &CurrencyService,
     portfolio: &Portfolio,
@@ -252,7 +252,7 @@ pub async fn sync_portfolio_splits(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
 ) -> Result<Json<SyncSplitsOut>, ReportError> {
     // Editor, not Viewer: this writes rows that change cost basis.
     require(pool.inner(), user.id, id, Access::Editor)
@@ -305,7 +305,7 @@ pub async fn get_portfolio_performance(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
 ) -> Result<Json<serde_json::Value>, Status> {
     // Before the `WHERE asset_id IN (SELECT id FROM assets WHERE portfolio_id = $1)`
     // subquery: that shape is invisible to the gate script's grep, so this call is
@@ -372,7 +372,7 @@ pub async fn get_transaction_sell_pnl(
     user: AuthedUser,
     id: i64,
     pool: &State<DbPool>,
-    currency_service: &State<CurrencyService>,
+    currency_service: &State<std::sync::Arc<CurrencyService>>,
     strategy: Option<String>,
     threshold_days: Option<i64>,
 ) -> Result<Json<SellPnlResponse>, Status> {
@@ -725,7 +725,7 @@ impl<'r> Responder<'r, 'static> for TaxSummaryResponse {
 /// statement and `PortfolioDetail` read. `from` alone means through today and `to` alone
 /// means from inception — both-or-neither was rejected because it forces every caller to
 /// invent a start date, and an invented start silently changes the number.
-fn parse_window(
+pub(crate) fn parse_window(
     from: Option<&str>,
     to: Option<&str>,
     today: NaiveDate,
@@ -802,7 +802,7 @@ fn parse_date_param(param: &str, raw: &str) -> Result<NaiveDate, ReportError> {
 /// Strict on the dated path: a present-but-unrecognized strategy is a 422 naming the
 /// accepted values, rather than the silent fallback to FIFO that both this endpoint and
 /// the single-sell route used to run. Dated-path only (decision D6).
-fn strict_strategy(strategy: Option<&str>) -> Result<String, ReportError> {
+pub(crate) fn strict_strategy(strategy: Option<&str>) -> Result<String, ReportError> {
     match strategy {
         None => Ok("FIFO".to_string()),
         Some(raw) => match raw.to_uppercase().as_str() {
@@ -822,7 +822,7 @@ fn strict_strategy(strategy: Option<&str>) -> Result<String, ReportError> {
 /// so the response can never name a matching method the engine did not use. It still
 /// falls back to FIFO rather than rejecting: "absent parameters reproduce today's
 /// behaviour" holds for an unrecognized one too.
-fn normalize_strategy(strategy: Option<&str>) -> String {
+pub(crate) fn normalize_strategy(strategy: Option<&str>) -> String {
     match strategy.unwrap_or_default().to_uppercase().as_str() {
         "LIFO" => "LIFO".to_string(),
         "HYBRID" => "HYBRID".to_string(),

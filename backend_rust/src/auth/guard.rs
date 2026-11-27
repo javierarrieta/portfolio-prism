@@ -14,6 +14,7 @@ use rocket::response::Responder;
 use rocket::{Request, Response};
 
 use super::AuthMode;
+use super::pat::Scope;
 use super::session;
 
 /// The authenticated caller.
@@ -37,6 +38,34 @@ pub struct AuthedUser {
     /// `logout-all`, because the guard rejects `tv != token_version` and nothing
     /// ever lowers the column again.
     pub token_version: i64,
+    /// How this caller proved who they are. A session and a bearer token are not the
+    /// same credential and do not get the same permissions: `require_scope` in
+    /// `access.rs` is the only reader of this field, and a token has to hold the
+    /// scope a session gets for free.
+    pub credential: Credential,
+}
+
+/// The kind of credential that authenticated this request.
+///
+/// Two variants, because there are exactly two things that can walk through the
+/// door: a browser holding a signed session cookie, and a program holding a
+/// personal access token. Nothing else may be added here without also deciding what
+/// it means for every `require_scope` call.
+#[derive(Debug, Clone)]
+pub enum Credential {
+    /// A signed session cookie, or the development-mode identity. A human in a
+    /// browser, so every scope is implied — the ceiling is the user's own access.
+    Session,
+    /// A personal access token. Its scopes are a ceiling, not a description of the
+    /// person: `id` is the `api_token` row, so a log line can name which token did
+    /// what without ever seeing the secret.
+    Token { id: i64, scopes: Vec<Scope> },
+}
+
+impl Credential {
+    pub fn is_session(&self) -> bool {
+        matches!(self, Credential::Session)
+    }
 }
 
 impl AuthedUser {
@@ -119,6 +148,34 @@ pub async fn resolve_caller(
         AuthMode::Disabled { as_user } => (*as_user, None),
     };
 
+    let Some(user) = user_by_id(pool, uid).await? else {
+        return Ok(None);
+    };
+
+    if let Some(tv) = expected_tv {
+        // A session minted before a `logout-all` carries the old version.
+        if tv != user.token_version {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(user))
+}
+
+/// Read the caller's own `users` row and decide whether it is usable at all.
+///
+/// Extracted from [`resolve_caller`] so a bearer token and a session cookie cannot
+/// disagree about what a valid user is. A token yields a `user_id` and falls
+/// through to this function, which is how a deactivated account loses its tokens
+/// without this module knowing tokens exist.
+///
+/// The returned [`AuthedUser`] carries [`Credential::Session`] because that is what
+/// the only session caller needs; a token caller replaces the field, since it knows
+/// better than this function does.
+pub(crate) async fn user_by_id(
+    pool: &DbPool,
+    uid: i64,
+) -> Result<Option<AuthedUser>, sqlx::Error> {
     // `query!` infers the row, which is what the hand-written tuple alias here used to
     // pin by hand: `is_active` is `BOOLEAN` (`sqlx-postgres` will not decode it into an
     // integer, and `users.is_active` was `INTEGER` under SQLite), and `id` and
@@ -135,16 +192,9 @@ pub async fn resolve_caller(
         return Ok(None);
     };
 
-    // A deactivated account, or a session minted before a `logout-all`, is
-    // denied the same way a missing cookie is.
+    // A deactivated account is denied the same way a missing row is.
     if !row.is_active {
         return Ok(None);
-    }
-    if let Some(tv) = expected_tv {
-        // A session minted before a `logout-all` carries the old version.
-        if tv != row.token_version {
-            return Ok(None);
-        }
     }
 
     Ok(Some(AuthedUser {
@@ -153,6 +203,7 @@ pub async fn resolve_caller(
         name: row.name,
         sub: row.subj,
         token_version: row.token_version,
+        credential: Credential::Session,
     }))
 }
 

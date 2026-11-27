@@ -91,6 +91,34 @@ const PROTECTED_ROUTES: &[(&str, &str, Option<Access>)] = &[
     // Reads the caller's own portfolios and nothing else; scoped by `owner_id`
     // inside `owned_detail`, pinned by two users in `tests/backup_detail_test.rs`.
     ("GET", "/api/backup/owned", None),
+    // The three routes a human uses to look at and approve what an agent staged. They are
+    // here because they are authenticated `/api` routes like every other one, and the
+    // inventory is an inventory, not a list of the interesting ones.
+    //
+    // The list takes no level: the caller *is* the selector, so there is no id for
+    // `access.rs` to resolve and nothing to grade.
+    ("GET", "/api/staged-batches", None),
+    // A handle is a caller-supplied id naming a row that is about to become a write, so it
+    // goes through the chokepoint like any other. `Owner` because the only thing a
+    // non-owner could do with a handle is learn that somebody else has one.
+    ("GET", "/api/staged-batches/<handle>", Some(Access::Owner)),
+    // The state transition itself. Same resolution, same reason: approving someone else's
+    // batch would be the whole control defeated by guessing a handle.
+    ("POST", "/api/staged-batches/<handle>/approve", Some(Access::Owner)),
+    // Token routes. Mint and list resolve no caller-supplied id — the caller *is* the
+    // session, and there is no resource to authorise against — so they carry `None`,
+    // the same as `POST /api/portfolios/`.
+    ("POST", "/api/tokens", None),
+    ("GET", "/api/tokens", None),
+    // The incident-response lever: revokes every live token the caller owns. Session-only
+    // like the rest of this file — a token cannot revoke anything, which is the same
+    // property that stops it minting one.
+    ("POST", "/api/tokens/revoke-all", None),
+    // The one that does resolve a caller-supplied id, and the reason it is listed:
+    // without `require_own_token` on this path, any signed-in user revokes anyone's
+    // token by counting integers. `Owner` because a token is the caller's own
+    // credential, which is the closest thing to ownership this enum has.
+    ("DELETE", "/api/tokens/<id>", Some(Access::Owner)),
 ];
 
 /// Rocket trims a trailing slash when it composes a mount with a route path, so
@@ -166,7 +194,10 @@ async fn every_mounted_api_route_is_in_the_published_document() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 21, "the mounted /api surface is 21 operations");
+    // 21 on main, +3 token routes, +3 staged-batch routes, +1 for `revoke-all`. Both
+    // branches wrote 24 from the same base; git took the identical edit and the sum is only
+    // visible now.
+    assert_eq!(checked, 28, "the mounted /api surface is 28 operations");
 }
 
 #[tokio::test]
@@ -179,6 +210,22 @@ async fn no_mounted_route_escapes_the_prefix_rule() {
     // the assertion is inverted: every mounted route must be in a namespace that is
     // public by decision, and anything else is an escape.
     const PUBLIC_NAMESPACES: &[&str] = &["/api/", "/auth", "/_auth", "/api-docs"];
+
+    // Routes that sit outside `/api/` and therefore outside `AuthFairing`, but that
+    // authenticate themselves instead of being public.
+    //
+    // This is a separate list rather than an entry in `PUBLIC_NAMESPACES` because the two
+    // claims are opposites. "Public by decision" and "not covered by the fairing, so it
+    // must do its own checking" are different promises, and folding them together would let
+    // the next `/api`-external route be waved through by pointing at the MCP door.
+    //
+    // `/mcp` is here on one condition: `tests/mcp_mount_test.rs::mcp_refuses_a_session_cookie`
+    // and `mcp_refuses_a_request_with_no_credential` must keep passing. They are the only
+    // thing between that route and being an unauthenticated door onto every tool, and the
+    // route's own comment records that it landed inside the `/api` mount the first time and
+    // answered 404 — which is how the mistake announces itself. Removing those two tests
+    // should make this entry a lie.
+    const SELF_AUTHENTICATED: &[&str] = &["/mcp"];
     for (method, uri) in mounted("no_mounted_route_escapes_the_prefix_rule").await {
         let path = uri.split('?').next().unwrap();
         if path == "/api" {
@@ -193,7 +240,8 @@ async fn no_mounted_route_escapes_the_prefix_rule() {
             || PUBLIC_NAMESPACES.iter().any(|p| path.starts_with(p))
             // rocket_cors mounts its own responder under /cors/ and rewrites a
             // rejected request there; it is public by construction, not by us.
-            || path.starts_with("/cors/");
+            || path.starts_with("/cors/")
+            || SELF_AUTHENTICATED.contains(&path);
         assert!(
             allowed,
             "{method} {uri} (root {root}) is mounted outside every public namespace, \
@@ -288,7 +336,7 @@ async fn the_route_inventory_matches_the_mounted_surface_exactly() {
         extra.is_empty(),
         "PROTECTED_ROUTES names routes that are not mounted: {extra:?}"
     );
-    assert_eq!(PROTECTED_ROUTES.len(), 21);
+    assert_eq!(PROTECTED_ROUTES.len(), 28);
 }
 
 #[test]
@@ -302,8 +350,11 @@ fn every_inventory_entry_with_a_level_is_enforced_by_a_handler_call() {
         .filter(|(_, _, level)| level.is_some())
         .count();
     assert_eq!(
-        with_level, 15,
-        "six routes authenticate without checking an id"
+        // 15 on main, 17 with the staged-batch routes, 16 with the token routes, and 18
+        // with both. Each branch counted honestly from the same base; only the merge can
+        // know the sum.
+        with_level, 18,
+        "eight routes authenticate without checking an id"
     );
 }
 
