@@ -461,7 +461,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
                 <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Valid Rows</div>
               </div>
               <div style={{ padding: '12px', background: 'rgba(255,59,48,0.1)', border: '1px solid rgba(255,59,48,0.3)', borderRadius: '8px', textAlign: 'center' }}>
-                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: 'var(--color-error)' }}>{validationReport.totalRows - validationReport.validRows}</div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: 'var(--color-danger)' }}>{validationReport.totalRows - validationReport.validRows}</div>
                 <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Rows with Errors</div>
               </div>
               <div style={{ padding: '12px', background: 'rgba(0,123,255,0.1)', border: '1px solid rgba(0,123,255,0.3)', borderRadius: '8px', textAlign: 'center' }}>
@@ -481,7 +481,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
 
             {validationReport.errorRows.length > 0 && (
               <div style={{ maxHeight: '200px', overflowY: 'auto', marginBottom: '16px' }}>
-                <h5 style={{ marginBottom: '8px', color: 'var(--color-error)' }}>Errors by Row</h5>
+                <h5 style={{ marginBottom: '8px', color: 'var(--color-danger)' }}>Errors by Row</h5>
                 {validationReport.errorRows.map((err, i) => (
                   <div key={i} style={{ padding: '4px 0', fontSize: '0.875rem', borderBottom: '1px solid var(--border-color)' }}>
                     <strong>Row {err.row}:</strong> {err.message}
@@ -532,7 +532,7 @@ export default function CsvImportModal({ portfolioId, assets, onClose, onImportC
                 {importResults.filter((r) => r.success).length} transactions imported successfully
               </p>
               {importResults.filter((r) => !r.success).length > 0 && (
-                <p style={{ color: 'var(--color-error)', margin: '8px 0 0 0' }}>
+                <p style={{ color: 'var(--color-danger)', margin: '8px 0 0 0' }}>
                   <XCircle size={16} style={{ verticalAlign: 'middle', marginRight: '6px' }} />
                   {importResults.filter((r) => !r.success).length} rows failed
                 </p>

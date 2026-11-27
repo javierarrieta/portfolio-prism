@@ -638,7 +638,7 @@ export default function App() {
             right: 0,
             zIndex: 1000,
             padding: '12px 16px',
-            background: 'var(--danger-color, #b3261e)',
+            background: 'var(--color-danger)',
             color: '#fff',
             textAlign: 'center',
             fontWeight: 600,

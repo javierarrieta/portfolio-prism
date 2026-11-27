@@ -38,6 +38,18 @@ function tsxFiles(dir: string): string[] {
 }
 
 /**
+ * The stylesheets the app actually loads: `main.tsx` imports `index.css` and `print.css`.
+ * `App.css` is imported by nothing — 184 lines of Vite-template leftovers whose own rules
+ * reference seven custom properties that exist nowhere. Counting it as "defined" would let a
+ * class that lives only there pass as styled, which is the exact mistake this file exists to
+ * stop, so it is left out on purpose rather than by oversight.
+ */
+const LOADED_CSS = ['index.css', 'print.css']
+  .map((f) => readFileSync(resolve(SRC, f), 'utf8'))
+  .join('\n')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+
+/**
  * Every `<input>` / `<select>` opening tag in the tree, with the attributes that belong to it.
  *
  * The tag is read up to the first `>` outside braces, because `onChange={(e) => ...}` puts a
@@ -172,11 +184,7 @@ describe('classes used in JSX exist in a stylesheet', () => {
    * the debt, written down rather than discovered again, and a stale entry fails so the list
    * can only shrink.
    */
-  const css = ['index.css', 'App.css', 'print.css']
-    .map((f) => readFileSync(resolve(SRC, f), 'utf8'))
-    .join('\n')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-  const defined = new Set([...css.matchAll(/\.([a-zA-Z][\w-]*)/g)].map((m) => m[1]));
+  const defined = new Set([...LOADED_CSS.matchAll(/\.([a-zA-Z][\w-]*)/g)].map((m) => m[1]));
 
   // Six of these were cleared when `.text-muted` got a rule and the print statement's dead
   // hooks were deleted; the list went to two in one change, which is the point of it.
@@ -215,6 +223,46 @@ describe('classes used in JSX exist in a stylesheet', () => {
     expect(
       stale,
       `These are allowed to be unstyled but are no longer used anywhere: ${stale.join(', ')}. Remove them.`,
+    ).toEqual([]);
+  });
+});
+
+describe('custom properties used in JSX exist', () => {
+  /**
+   * The same defect one layer down. `color: 'var(--color-error)'` is not a syntax error and
+   * not a React error — the declaration is invalid at computed-value time, the element keeps
+   * its inherited colour, and nothing complains. Three were live: `--color-error` (three
+   * sites in the CSV import report) and `--color-info` rendered the "Rows with Errors" and
+   * "New Assets" figures in the same colour as the small grey labels under them, and
+   * `--danger-color` survived only because it carried a fallback — which painted a different
+   * red from the app's own `--color-danger`, forking the palette in one button.
+   *
+   * A fallback is not an exemption here. It hides the missing token, which is the part that
+   * made these invisible to whoever was looking for them.
+   */
+  const declared = new Set([...LOADED_CSS.matchAll(/(--[\w-]+)\s*:/g)].map((m) => m[1]));
+
+  const used = tsxFiles(SRC).flatMap((f) => {
+    const src = readFileSync(f, 'utf8');
+    return [...src.matchAll(/var\((--[\w-]+)/g)].map((m) => ({
+      name: m[1],
+      where: `${f.replace(SRC + '/', '')}:${src.slice(0, m.index).split('\n').length}`,
+    }));
+  });
+
+  it('finds the usages it claims to find', () => {
+    expect(declared.size).toBeGreaterThan(10);
+    expect(used.length).toBeGreaterThan(20);
+  });
+
+  it('names no custom property that a loaded stylesheet fails to declare', () => {
+    const missing = used
+      .filter((u) => !declared.has(u.name))
+      .map((u) => `${u.name}  (first used at ${u.where})`);
+    expect(
+      missing,
+      `These are referenced from JSX and declared in no stylesheet the app loads, so the\n` +
+        `declaration is dropped and the element keeps an inherited colour nobody chose.\n\n${missing.join('\n')}`,
     ).toEqual([]);
   });
 });
