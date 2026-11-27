@@ -39,10 +39,13 @@ function tsxFiles(dir: string): string[] {
 
 /**
  * The stylesheets the app actually loads: `main.tsx` imports `index.css` and `print.css`.
- * `App.css` is imported by nothing — 184 lines of Vite-template leftovers whose own rules
- * reference seven custom properties that exist nowhere. Counting it as "defined" would let a
- * class that lives only there pass as styled, which is the exact mistake this file exists to
- * stop, so it is left out on purpose rather than by oversight.
+ *
+ * A list, not a glob of `src/*.css`, because a stylesheet nothing imports defines nothing.
+ * `App.css` used to sit in this list — 184 lines of Vite-template leftovers, 26 rules
+ * referencing seven custom properties that exist nowhere and nine classes no component used,
+ * imported by nothing. Reading it meant a class defined only there counted as styled, which is
+ * the exact mistake this file exists to stop. It is deleted now; this list is where a file like
+ * that gets refused if one comes back.
  */
 const LOADED_CSS = ['index.css', 'print.css']
   .map((f) => readFileSync(resolve(SRC, f), 'utf8'))
@@ -263,6 +266,37 @@ describe('custom properties used in JSX exist', () => {
       missing,
       `These are referenced from JSX and declared in no stylesheet the app loads, so the\n` +
         `declaration is dropped and the element keeps an inherited colour nobody chose.\n\n${missing.join('\n')}`,
+    ).toEqual([]);
+  });
+});
+
+describe('no stylesheet sits unimported', () => {
+  /**
+   * The reason `App.css` was able to rot: nothing checked that a stylesheet was loaded, so a
+   * file could define rules forever while no browser ever fetched them — and its rules still
+   * looked authoritative to anything that globbed the directory, this test's own earlier
+   * version included. Dead CSS is worse than no CSS, because it reads as a contract.
+   */
+  function cssFiles(dir: string): string[] {
+    return readdirSync(dir).flatMap((name) => {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) return cssFiles(p);
+      return p.endsWith('.css') ? [p] : [];
+    });
+  }
+
+  const imported = new Set(
+    [...tsxFiles(SRC), ...readdirSync(SRC).filter((f) => f.endsWith('.ts')).map((f) => join(SRC, f))]
+      .flatMap((f) => [...readFileSync(f, 'utf8').matchAll(/import\s+['"]([^'"]+\.css)['"]/g)].map((m) => m[1])),
+  );
+
+  it('every stylesheet in src is imported somewhere', () => {
+    const orphans = cssFiles(SRC)
+      .filter((p) => !imported.has(`./${p.split('/').pop()}`))
+      .map((p) => p.replace(SRC + '/', ''));
+    expect(
+      orphans,
+      `Nothing imports these, so their rules never reach a browser. Delete them or import them.\n\n${orphans.join('\n')}`,
     ).toEqual([]);
   });
 });
