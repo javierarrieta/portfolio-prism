@@ -382,7 +382,19 @@ pub fn build_rocket(
     // needs `frontend/nginx.conf` to forward it — a route behind a proxy that does not
     // mention it is unreachable, which is how this surface shipped dark once.
     let rocket = if agent_cfg.mcp_mount {
-        rocket.mount("/", routes![agent::mount::mcp])
+        rocket.mount(
+            "/",
+            routes![
+                agent::mount::mcp,
+                // The method-mismatch handlers ride the same switch: with the surface
+                // unmounted there is nothing to knock on, and a `405` would claim a door
+                // exists here. `404` is the truth in that state.
+                agent::mount::mcp_get,
+                agent::mount::mcp_put,
+                agent::mount::mcp_delete,
+                agent::mount::mcp_patch,
+            ],
+        )
     } else {
         println!("WARN: AGENT_MCP_MOUNT is off; the /mcp agent surface is not mounted");
         rocket

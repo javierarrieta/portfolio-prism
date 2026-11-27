@@ -58,7 +58,7 @@ use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rocket::data::{Data, ToByteUnit};
-use rocket::http::{Header, Status};
+use rocket::http::{ContentType, Header, Status};
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::Responder;
 use sqlx::PgPool;
@@ -228,6 +228,69 @@ fn service(
         Arc::new(NeverSessionManager::default()),
         config,
     )
+}
+
+/// The answer to a request that found the door and knocked wrong.
+///
+/// Rocket answers a URI that exists under some other method with its own HTML `404`, and
+/// that is how a healthy endpoint came to be read as a missing one: a browser sends `GET`,
+/// the route below is `POST`-only, and the page says nothing about either fact — it looks
+/// exactly like "the deploy did not land". Answer `405`, name the method that works, and
+/// send `Allow` because RFC 9110 asks for it and because it is the one header that makes
+/// the reply self-explanatory.
+///
+/// No credential is needed to read this, which is the point: the request that needs
+/// telling is by definition one that has not authenticated yet.
+///
+/// A route rather than a `405` catcher on purpose. A catcher would fire for every method
+/// mismatch in the application, including under `/api`, where the fairing's `401` is the
+/// correct answer and a `405` would leak which paths exist. One handler per method, the
+/// same shape as the `/_auth` sentinels in `auth::routes`.
+///
+/// `HEAD` needs no handler: Rocket serves it from the `GET` route. `OPTIONS` is
+/// deliberately absent — `rocket_cors` owns preflight handling, and a route here would
+/// sit in front of it.
+pub(crate) struct MethodMismatch;
+
+impl std::fmt::Debug for MethodMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MethodMismatch")
+    }
+}
+
+/// Fixed body, never built from the request: the offending method is already in the
+/// status, and reflecting the path back would turn a diagnostic into an echo.
+pub(crate) const METHOD_MISMATCH_BODY: &str = r#"{"error":"method_not_allowed","detail":"the MCP endpoint accepts POST only (streamable HTTP)"}"#;
+
+impl Responder<'_, 'static> for MethodMismatch {
+    fn respond_to(self, _: &Request<'_>) -> Result<rocket::Response<'static>, Status> {
+        rocket::Response::build()
+            .status(Status::MethodNotAllowed)
+            .header(Header::new("Allow", "POST"))
+            .header(ContentType::JSON)
+            .sized_body(METHOD_MISMATCH_BODY.len(), Cursor::new(METHOD_MISMATCH_BODY))
+            .ok()
+    }
+}
+
+#[rocket::get("/mcp")]
+pub(crate) fn mcp_get() -> MethodMismatch {
+    MethodMismatch
+}
+
+#[rocket::put("/mcp")]
+pub(crate) fn mcp_put() -> MethodMismatch {
+    MethodMismatch
+}
+
+#[rocket::delete("/mcp")]
+pub(crate) fn mcp_delete() -> MethodMismatch {
+    MethodMismatch
+}
+
+#[rocket::patch("/mcp")]
+pub(crate) fn mcp_patch() -> MethodMismatch {
+    MethodMismatch
 }
 
 /// The whole door: authenticate, then hand the request to rmcp unchanged.

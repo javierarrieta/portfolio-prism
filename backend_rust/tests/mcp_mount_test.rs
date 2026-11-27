@@ -748,3 +748,94 @@ async fn a_batch_bigger_than_rockets_default_body_limit_still_reaches_the_tools(
         "every row arrived: {out}"
     );
 }
+
+// --- the method mismatch, which read as "not deployed" --------------------------------
+//
+// `/mcp` is POST-only, and Rocket answers a URI that exists under another method with its
+// own HTML 404. An operator opening the URL in a browser therefore sees the same page they
+// would see if the deploy had failed — which is exactly what happened in production, on a
+// healthy deployment. These pin the 405 that replaced that page, and that the kill switch
+// still removes it.
+
+#[tokio::test]
+async fn a_get_on_mcp_says_what_the_door_accepts() {
+    let (_pool, _user, client) = client("mcp_get_method").await;
+    let res = client.get("/mcp").dispatch().await;
+    assert_eq!(
+        res.status(),
+        Status::MethodNotAllowed,
+        "a browser's GET must not answer 404, which is what a healthy /mcp used to look like"
+    );
+    assert_eq!(
+        res.headers().get_one("Allow"),
+        Some("POST"),
+        "RFC 9110 wants Allow on a 405, and it is the one header that makes the reply usable"
+    );
+    let body: Value = serde_json::from_str(&res.into_string().await.unwrap()).unwrap();
+    assert_eq!(body["error"], "method_not_allowed");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("POST"),
+        "the body has to name the method, or the operator is back to guessing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_method_mismatch_needs_no_credential() {
+    // The request that needs telling is by definition one that has not authenticated. A
+    // 401 here would send the operator down the token path for a problem that is the method.
+    let (_pool, _user, client) = client("mcp_401_vs_405").await;
+    for (method, name) in [
+        (rocket::http::Method::Put, "PUT"),
+        (rocket::http::Method::Delete, "DELETE"),
+        (rocket::http::Method::Patch, "PATCH"),
+    ] {
+        let res = client
+            .req(method, "/mcp")
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(
+            res.status(),
+            Status::MethodNotAllowed,
+            "{name} /mcp answered {} instead of 405",
+            res.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_mismatch_routes_do_not_shadow_the_real_post() {
+    // The risk of mounting four more routes on the same path is that one of them wins a POST.
+    // The POST must still reach the bearer check, which is the only thing between the tools
+    // and the open internet.
+    let (_pool, _user, client) = client("mcp_post_still_live").await;
+    let (status, _) = rpc(&client, initialize(1), None).await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "POST /mcp must still hit the bearer check, not the method-mismatch routes"
+    );
+}
+
+#[tokio::test]
+async fn an_unmounted_surface_does_not_advertise_a_door() {
+    // With `AGENT_MCP_MOUNT` off there is nothing to knock on, so a 405 would be a lie —
+    // it would claim a POST-accepting endpoint exists here. 404 is the truth in that state.
+    let (pool, _user) = db_with_user("mcp_unmounted_get").await;
+    let cfg = backend_rust::agent::AgentConfig {
+        mcp_mount: false,
+        ..Default::default()
+    };
+    let client = Client::tracked(build_rocket_with_agent_config(pool.clone(), 1, cfg))
+        .await
+        .expect("valid rocket");
+    assert_eq!(
+        client.get("/mcp").dispatch().await.status(),
+        Status::NotFound,
+        "an unmounted surface must not answer 405"
+    );
+}
