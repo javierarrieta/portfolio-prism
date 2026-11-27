@@ -40,8 +40,8 @@ export default function PortfolioStatement(
   }
 
   return (
-    <section data-print="statement" className="statement">
-      <header className="statement-header">
+    <section data-print="statement">
+      <header>
         <h1>Portfolio Statement</h1>
         {runContext && <p data-testid="run-context">{runContext}</p>}
         <p data-testid="generated-at">Printed {printDate}</p>
@@ -55,19 +55,19 @@ export default function PortfolioStatement(
       ) : (
         <>
           <div className="statement-headline">
-            <div className="statement-figure">
+            <div>
               <span>Portfolio value</span>
               <strong data-testid="figure-value">
                 {formatCurrency(taxSummary.total_portfolio_value, currency)}
               </strong>
             </div>
-            <div className="statement-figure">
+            <div>
               <span data-testid="label-realized">Realized P&L — cumulative since inception</span>
               <strong data-testid="figure-realized">
                 {formatCurrency(taxSummary.total_realized_pnl, currency)}
               </strong>
             </div>
-            <div className="statement-figure">
+            <div>
               <span>Unrealized P&L — as of today</span>
               <strong data-testid="figure-unrealized">
                 {formatCurrency(taxSummary.total_unrealized_pnl, currency)}
@@ -99,7 +99,7 @@ export default function PortfolioStatement(
             </tbody>
           </table>
 
-          <footer className="statement-notes">
+          <footer>
             <p data-testid="rounding-note">
               Figures are rounded for display from full-precision calculations.
             </p>

@@ -723,6 +723,14 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.12);
 }
 
+/* Secondary text. The app already spells this 46 times as an inline
+   `color: var(--text-secondary)`; twelve more sites spelled it as a class that had never
+   been written, in two different ways, so they rendered at the full primary colour and the
+   visual hierarchy went flat. One rule, one spelling. */
+.text-muted {
+  color: var(--text-secondary);
+}
+
 /* Error text. Four call sites already say `className="error"`; with no rule they rendered
    at the inherited colour, which is how a failed load came to look like a sentence. The
    other convention in this app is an inline `color: var(--color-danger)`, and that is left

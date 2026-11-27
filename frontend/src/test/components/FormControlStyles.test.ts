@@ -178,13 +178,9 @@ describe('classes used in JSX exist in a stylesheet', () => {
     .replace(/\/\*[\s\S]*?\*\//g, '');
   const defined = new Set([...css.matchAll(/\.([a-zA-Z][\w-]*)/g)].map((m) => m[1]));
 
+  // Six of these were cleared when `.text-muted` got a rule and the print statement's dead
+  // hooks were deleted; the list went to two in one change, which is the point of it.
   const KNOWN_UNSTYLED: Record<string, string> = {
-    muted: 'secondary text renders at the inherited colour; de-emphasis is a design call',
-    'text-muted': 'same as `muted`, and the two spellings are themselves worth reconciling',
-    statement: 'print-statement hooks with no rule anywhere, including print.css',
-    'statement-header': 'as above',
-    'statement-notes': 'as above',
-    'statement-figure': 'figures render as stacked plain lines rather than a formatted row',
     'analytics-container': 'a layout hook that was never given a layout; the div stacks naturally',
     'portfolio-detail-container': 'as above',
   };

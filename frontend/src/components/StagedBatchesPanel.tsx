@@ -172,22 +172,22 @@ export default function StagedBatchesPanel() {
   return (
     <section className="glass-card" data-testid="staged-batches-panel" style={{ padding: '24px' }}>
       <h2>Agent staging area</h2>
-      <p className="muted">
+      <p className="text-muted">
         An agent can propose rows, and proposing writes nothing. Nothing here becomes part of a
         portfolio until you approve it. This panel approves; it does not edit.
       </p>
 
       {loadError && <p className="error">{loadError}</p>}
       {notice && (
-        <p className="muted" role="status" data-testid="staged-notice">
+        <p className="text-muted" role="status" data-testid="staged-notice">
           {notice}
         </p>
       )}
 
       {batches === null ? (
-        !loadError && <p className="muted">Loading…</p>
+        !loadError && <p className="text-muted">Loading…</p>
       ) : batches.length === 0 ? (
-        <p className="muted" data-testid="staged-empty">
+        <p className="text-muted" data-testid="staged-empty">
           <Inbox size={14} /> Nothing is waiting.
         </p>
       ) : (
@@ -257,7 +257,7 @@ export default function StagedBatchesPanel() {
                 </p>
               )}
               {preview.status !== 'staged' && (
-                <p className="muted">
+                <p className="text-muted">
                   <ShieldCheck size={14} /> This batch is already {preview.status}; nothing here
                   can change it.
                 </p>
